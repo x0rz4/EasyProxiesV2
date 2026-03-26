@@ -1,0 +1,19 @@
+# CI runtime-only image — binary is pre-built by GitHub Actions
+FROM debian:bookworm-slim
+ARG TARGETARCH
+RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates gosu \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -r -u 10001 easy \
+    && mkdir -p /etc/easy-proxies/data \
+    && chown -R easy:easy /etc/easy-proxies
+WORKDIR /app
+COPY dist/easy-proxies-linux-${TARGETARCH}/easy-proxies /usr/local/bin/easy-proxies
+RUN chmod +x /usr/local/bin/easy-proxies
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+COPY --chown=easy:easy config.example.yaml /etc/easy-proxies/config.yaml
+EXPOSE 2323 9091 24000-24200
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["--config", "/etc/easy-proxies/config.yaml"]
