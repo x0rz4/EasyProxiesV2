@@ -74,6 +74,33 @@ function latencyColor(ms: number): string {
   return 'text-error'
 }
 
+// Extract a normalized proxy type ("ss", "vless", "hysteria2", ...) from a node URI.
+function nodeType(uri: string): string {
+  const idx = uri.indexOf('://')
+  if (idx === -1) return ''
+  const scheme = uri.slice(0, idx).toLowerCase()
+  // "hy2" is an alias for "hysteria2".
+  if (scheme === 'hy2') return 'hysteria2'
+  return scheme
+}
+
+function typeLabel(t: string): string {
+  switch (t) {
+    case 'ss': return 'Shadowsocks'
+    case 'ssr': return 'SSR'
+    case 'vmess': return 'VMess'
+    case 'vless': return 'VLESS'
+    case 'trojan': return 'Trojan'
+    case 'hysteria': return 'Hysteria'
+    case 'hysteria2': return 'Hysteria2'
+    case 'anytls': return 'AnyTLS'
+    case 'http': return 'HTTP'
+    case 'socks5': return 'SOCKS5'
+    case 'socks': return 'SOCKS'
+    default: return t ? t.toUpperCase() : '-'
+  }
+}
+
 function SortIcon({ active, dir }: { active: boolean; dir: SortDir }) {
   if (!active) {
     return (
@@ -157,6 +184,7 @@ export default function ManagePanel() {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('')
   const [regionFilter, setRegionFilter] = useState('')
   const [sourceFilter, setSourceFilter] = useState('')
+  const [typeFilter, setTypeFilter] = useState('')
   const [subscriptionFilter, setSubscriptionFilter] = useState('all')
 
   // Sort
@@ -287,6 +315,25 @@ export default function ManagePanel() {
     return Array.from(set).sort()
   }, [mergedNodes])
 
+  const types = useMemo(() => {
+    const set = new Set<string>()
+    for (const n of mergedNodes) {
+      const t = nodeType(n.uri)
+      if (t) set.add(t)
+    }
+    // Fixed friendly order for common types, alphabetical for the rest.
+    const order = ['ss', 'ssr', 'vmess', 'vless', 'trojan', 'hysteria', 'hysteria2', 'anytls', 'http', 'socks5', 'socks']
+    const all = Array.from(set)
+    return all.sort((a, b) => {
+      const ia = order.indexOf(a)
+      const ib = order.indexOf(b)
+      if (ia !== -1 && ib !== -1) return ia - ib
+      if (ia !== -1) return -1
+      if (ib !== -1) return 1
+      return a.localeCompare(b)
+    })
+  }, [mergedNodes])
+
   const filteredNodes = useMemo(() => {
     return mergedNodes.filter(n => {
       if (filter) {
@@ -301,12 +348,13 @@ export default function ManagePanel() {
       if (statusFilter && n.runtimeStatus !== statusFilter) return false
       if (regionFilter && n.region !== regionFilter) return false
       if (sourceFilter && n.source !== sourceFilter) return false
+      if (typeFilter && nodeType(n.uri) !== typeFilter) return false
       if (subscriptionFilter === 'none' && n.source === 'subscription') return false
       if (subscriptionFilter !== 'all' && subscriptionFilter !== 'none' &&
           !n.subscription_ids.includes(Number(subscriptionFilter))) return false
       return true
     })
-  }, [mergedNodes, filter, statusFilter, regionFilter, sourceFilter, subscriptionFilter])
+  }, [mergedNodes, filter, statusFilter, regionFilter, sourceFilter, typeFilter, subscriptionFilter])
 
   const sortedNodes = useMemo(() => {
     return [...filteredNodes].sort((a, b) => compareManageNodes(a, b, sortKey, sortDir))
@@ -674,7 +722,7 @@ export default function ManagePanel() {
       {/* Filters Area */}
       <div className="panel-card p-4 lg:p-5">
         <div className="flex flex-col lg:flex-row gap-4 items-center">
-          <div className="relative flex-1 w-full">
+          <div className="relative w-full lg:w-80 shrink-0">
             <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-base-content/40">
               <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
             </div>
@@ -686,7 +734,7 @@ export default function ManagePanel() {
               onChange={(e) => setFilter(e.target.value)}
             />
           </div>
-          
+
           <div className="flex flex-wrap sm:flex-nowrap gap-3 w-full lg:w-auto">
             <select className="select select-md bg-base-200/50 focus:bg-base-100 flex-1 sm:w-40" value={subscriptionFilter} onChange={(e) => setSubscriptionFilter(e.target.value)}>
               <option value="all">全部节点</option>
@@ -695,6 +743,12 @@ export default function ManagePanel() {
                 <option key={subscription.id} value={subscription.id}>{subscription.name}</option>
               ))}
             </select>
+            {types.length > 0 && (
+              <select className="select select-md bg-base-200/50 focus:bg-base-100 flex-1 sm:w-36" value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)}>
+                <option value="">全部类型</option>
+                {types.map(t => <option key={t} value={t}>{typeLabel(t)}</option>)}
+              </select>
+            )}
             <select className="select select-md bg-base-200/50 focus:bg-base-100 flex-1 sm:w-36" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value as StatusFilter)}>
               <option value="">全部状态</option>
               <option value="normal">✅ 正常运行</option>
@@ -829,11 +883,11 @@ export default function ManagePanel() {
                         </svg>
                       </div>
                       <p className="text-base font-medium text-base-content">
-                        {filter || statusFilter || regionFilter || sourceFilter || subscriptionFilter !== 'all'
+                        {filter || statusFilter || regionFilter || sourceFilter || typeFilter || subscriptionFilter !== 'all'
                           ? '未找到匹配的节点数据'
                           : '暂无配置节点'}
                       </p>
-                      {!(filter || statusFilter || regionFilter || sourceFilter || subscriptionFilter !== 'all') && (
+                      {!(filter || statusFilter || regionFilter || sourceFilter || typeFilter || subscriptionFilter !== 'all') && (
                         <p className="text-sm text-base-content/50 mt-1">请点击右上角「添加节点」或导入配置以开始</p>
                       )}
                     </div>
