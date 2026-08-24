@@ -924,7 +924,10 @@ export default function ManagePanel() {
                     </td>
                     <td className="hidden md:table-cell text-sm text-base-content/70">
                       {node.country || node.region
-                        ? <div className="badge badge-ghost badge-sm">{node.country || node.region}</div>
+                        ? <div className="badge badge-ghost badge-sm gap-1">
+                            <span className="leading-none">{regionFlag(node.region)}</span>
+                            {node.country || node.region}
+                          </div>
                         : '-'}
                     </td>
                     <td className="hidden md:table-cell font-mono text-sm text-base-content/70">{node.port || '-'}</td>
