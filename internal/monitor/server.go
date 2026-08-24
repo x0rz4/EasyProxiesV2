@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/geoip"
 	"easy_proxies/internal/store"
 
 	"golang.org/x/sync/semaphore"
@@ -190,6 +191,11 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 	mux.HandleFunc("/api/subscriptions", s.withAuth(s.handleSubscriptions))
 	mux.HandleFunc("/api/subscriptions/", s.withAuth(s.handleSubscriptionItem))
 	mux.HandleFunc("/api/reload", s.withAuth(s.handleReload))
+
+	// GeoIP database management
+	mux.HandleFunc("/api/geoip/status", s.withAuth(s.handleGeoipStatus))
+	mux.HandleFunc("/api/geoip/download", s.withAuth(s.handleGeoipDownload))
+	mux.HandleFunc("/api/geoip/update", s.withAuth(s.handleGeoipUpdate))
 
 	// Default handler for static assets (React App)
 	mux.HandleFunc("/", s.handleIndex)
@@ -1804,6 +1810,103 @@ func (s *Server) respondNodeError(w http.ResponseWriter, err error) {
 	}
 	w.WriteHeader(status)
 	writeJSON(w, map[string]any{"error": err.Error()})
+}
+
+// geoipResponse is the JSON structure returned by the GeoIP management endpoints.
+type geoipResponse struct {
+	Enabled    bool                     `json:"enabled"`
+	Database   geoip.DatabaseStatusInfo `json:"database"`
+	Message    string                   `json:"message,omitempty"`
+	ReloadHint bool                     `json:"reload_hint,omitempty"` // true when the runtime GeoIP lookup should be reloaded to pick up the new db
+}
+
+// geoipDatabasePath reads the configured GeoIP database path under cfgSrc.
+func (s *Server) geoipDatabasePath() string {
+	s.cfgMu.RLock()
+	c := s.cfgSrc
+	s.cfgMu.RUnlock()
+	if c == nil {
+		return ""
+	}
+	c.RLock()
+	defer c.RUnlock()
+	return c.GeoIP.DatabasePath
+}
+
+// geoipEnabled reads the configured GeoIP enabled flag under cfgSrc.
+func (s *Server) geoipEnabled() bool {
+	s.cfgMu.RLock()
+	c := s.cfgSrc
+	s.cfgMu.RUnlock()
+	if c == nil {
+		return false
+	}
+	c.RLock()
+	defer c.RUnlock()
+	return c.GeoIP.Enabled
+}
+
+// handleGeoipStatus reports the on-disk state of the GeoIP database.
+func (s *Server) handleGeoipStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	dbPath := s.geoipDatabasePath()
+	writeJSON(w, geoipResponse{
+		Enabled:  s.geoipEnabled(),
+		Database: geoip.DatabaseStatus(dbPath),
+	})
+}
+
+// handleGeoipDownload downloads the GeoIP database if it is missing.
+func (s *Server) handleGeoipDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	dbPath := s.geoipDatabasePath()
+	if dbPath == "" {
+		writeAPIError(w, http.StatusBadRequest, "GeoIP 数据库路径未配置")
+		return
+	}
+
+	if err := geoip.EnsureDatabase(dbPath); err != nil {
+		s.logger.Printf("GeoIP database download failed: %v", err)
+		writeAPIError(w, http.StatusInternalServerError, fmt.Sprintf("下载 IP 库失败: %v", err))
+		return
+	}
+	writeJSON(w, geoipResponse{
+		Enabled:  s.geoipEnabled(),
+		Database: geoip.DatabaseStatus(dbPath),
+		Message:  "IP 库下载完成",
+	})
+}
+
+// handleGeoipUpdate forces a re-download (update) of the GeoIP database,
+// overwriting the existing file.
+func (s *Server) handleGeoipUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	dbPath := s.geoipDatabasePath()
+	if dbPath == "" {
+		writeAPIError(w, http.StatusBadRequest, "GeoIP 数据库路径未配置")
+		return
+	}
+
+	if err := geoip.DownloadDatabase(dbPath); err != nil {
+		s.logger.Printf("GeoIP database update failed: %v", err)
+		writeAPIError(w, http.StatusInternalServerError, fmt.Sprintf("更新 IP 库失败: %v", err))
+		return
+	}
+	writeJSON(w, geoipResponse{
+		Enabled:    s.geoipEnabled(),
+		Database:   geoip.DatabaseStatus(dbPath),
+		Message:    "IP 库更新完成，请重载配置以生效",
+		ReloadHint: true,
+	})
 }
 
 // Session management functions

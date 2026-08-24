@@ -16,6 +16,7 @@ import type {
   ProbeSSEEvent,
   TrafficStreamEvent,
   DebugLogEvent,
+  GeoipStatus,
 } from '../types'
 
 // ---- Token management ----
@@ -376,6 +377,20 @@ export async function batchDeleteConfigNodes(names: string[]): Promise<{ message
 
 export async function triggerReload(): Promise<{ message: string }> {
   return request('/api/reload', { method: 'POST' })
+}
+
+// ---- GeoIP database management API ----
+
+export async function fetchGeoipStatus(): Promise<GeoipStatus> {
+  return request<GeoipStatus>('/api/geoip/status')
+}
+
+export async function downloadGeoipDatabase(): Promise<GeoipStatus> {
+  return request<GeoipStatus>('/api/geoip/download', { method: 'POST' })
+}
+
+export async function updateGeoipDatabase(): Promise<GeoipStatus> {
+  return request<GeoipStatus>('/api/geoip/update', { method: 'POST' })
 }
 
 // ---- Subscription API ----

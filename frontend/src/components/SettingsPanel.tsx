@@ -1,9 +1,12 @@
 import { useState, useEffect } from 'react'
-import type { SettingsData } from '../types'
+import type { SettingsData, GeoipStatus } from '../types'
 import {
   fetchSettings,
   triggerReload,
   updateSettings,
+  fetchGeoipStatus,
+  downloadGeoipDatabase,
+  updateGeoipDatabase,
 } from '../api/client'
 import { PageContent, PageHeader, PageLayout } from './ui/PageLayout'
 
@@ -19,6 +22,22 @@ const settingResultLabels: Record<string, string> = {
 
 const formatSettingResults = (items: string[]) =>
   items.map(item => settingResultLabels[item] || item).join('、')
+
+function formatBytes(bytes: number): string {
+  if (!bytes || bytes <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB']
+  const i = Math.floor(Math.log(bytes) / Math.log(1024))
+  return `${(bytes / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 2)} ${units[i]}`
+}
+
+function formatTimestamp(ts: string): string {
+  if (!ts) return ''
+  try {
+    return new Date(ts).toLocaleString()
+  } catch {
+    return ts
+  }
+}
 
 const defaultSettings: SettingsData = {
   mode: 'pool',
@@ -77,6 +96,68 @@ export default function SettingsPanel() {
   const [applied, setApplied] = useState<string[]>([])
   const [pending, setPending] = useState<string[]>([])
   const [isDirty, setIsDirty] = useState(false)
+
+  // GeoIP database management state
+  const [geoipStatus, setGeoipStatus] = useState<GeoipStatus | null>(null)
+  const [geoipLoading, setGeoipLoading] = useState(false)
+  const [geoipError, setGeoipError] = useState('')
+  const [geoipSuccess, setGeoipSuccess] = useState('')
+
+  const loadGeoipStatus = async () => {
+    try {
+      const status = await fetchGeoipStatus()
+      setGeoipStatus(status)
+    } catch (err) {
+      setGeoipError(err instanceof Error ? err.message : '获取 IP 库状态失败')
+    }
+  }
+
+  useEffect(() => {
+    void loadGeoipStatus()
+  }, [])
+
+  useEffect(() => {
+    if (geoipSuccess) {
+      const timer = setTimeout(() => setGeoipSuccess(''), 5000)
+      return () => clearTimeout(timer)
+    }
+  }, [geoipSuccess])
+
+  const handleGeoipDownload = async () => {
+    setGeoipLoading(true)
+    setGeoipError('')
+    setGeoipSuccess('')
+    try {
+      const res = await downloadGeoipDatabase()
+      setGeoipStatus(res)
+      setGeoipSuccess(res.message || 'IP 库下载完成')
+    } catch (err) {
+      setGeoipError(err instanceof Error ? err.message : '下载 IP 库失败')
+    } finally {
+      setGeoipLoading(false)
+    }
+  }
+
+  const handleGeoipUpdate = async () => {
+    setGeoipLoading(true)
+    setGeoipError('')
+    setGeoipSuccess('')
+    try {
+      const res = await updateGeoipDatabase()
+      setGeoipStatus(res)
+      setGeoipSuccess(res.message || 'IP 库更新完成')
+      if (res.reload_hint) {
+        setNeedReload(true)
+        if (!pending.includes('runtime_config')) {
+          setPending([...pending, 'runtime_config'])
+        }
+      }
+    } catch (err) {
+      setGeoipError(err instanceof Error ? err.message : '更新 IP 库失败')
+    } finally {
+      setGeoipLoading(false)
+    }
+  }
 
   useEffect(() => {
     const load = async () => {
@@ -651,6 +732,81 @@ export default function SettingsPanel() {
                   onChange={(e) => updateField('geoip_database_path', e.target.value)}
                 />
               </fieldset>
+
+              {/* IP 库状态与下载/更新 */}
+              <div className="bg-base-200/30 p-4 rounded-xl border border-base-200 space-y-3">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="font-semibold text-base-content/80 text-sm">IP 库状态</span>
+                  {geoipStatus?.database?.exists ? (
+                    <span className="badge badge-success badge-sm gap-1">已下载</span>
+                  ) : (
+                    <span className="badge badge-ghost badge-sm gap-1">未下载</span>
+                  )}
+                </div>
+
+                {geoipStatus?.database && (
+                  <div className="text-xs text-base-content/60 space-y-1 font-mono">
+                    {geoipStatus.database.exists ? (
+                      <>
+                        <div>大小：{formatBytes(geoipStatus.database.size_bytes)}</div>
+                        {geoipStatus.database.modified_at && (
+                          <div>更新时间：{formatTimestamp(geoipStatus.database.modified_at)}</div>
+                        )}
+                      </>
+                    ) : (
+                      <div>数据库尚未下载，点击「下载 IP 库」获取</div>
+                    )}
+                    {geoipStatus.database.download_url && (
+                      <div className="truncate" title={geoipStatus.database.download_url}>
+                        来源：{geoipStatus.database.download_url}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {geoipError && (
+                  <div className="alert alert-error py-2 px-3 text-xs">
+                    <span>{geoipError}</span>
+                  </div>
+                )}
+                {geoipSuccess && (
+                  <div className="alert alert-success py-2 px-3 text-xs">
+                    <span>{geoipSuccess}</span>
+                  </div>
+                )}
+
+                <div className="flex flex-wrap gap-2 pt-1">
+                  <button
+                    type="button"
+                    className="btn btn-sm btn-outline"
+                    disabled={geoipLoading}
+                    onClick={handleGeoipDownload}
+                  >
+                    {geoipLoading ? <span className="loading loading-spinner loading-xs"></span> : null}
+                    下载 IP 库
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-sm btn-primary"
+                    disabled={geoipLoading}
+                    onClick={handleGeoipUpdate}
+                  >
+                    {geoipLoading ? <span className="loading loading-spinner loading-xs"></span> : null}
+                    更新 IP 库
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-sm btn-ghost"
+                    disabled={geoipLoading}
+                    onClick={() => void loadGeoipStatus()}
+                  >
+                    刷新状态
+                  </button>
+                </div>
+                <p className="text-xs text-base-content/40 m-0">
+                  「下载」仅在缺失时拉取；「更新」强制重新下载并覆盖。更新后需重载配置以使新库生效。
+                </p>
+              </div>
 
               <label className="flex items-center justify-between cursor-pointer gap-4 bg-base-200/30 p-4 rounded-xl border border-base-200 hover:border-base-300 transition-colors">
                 <span className="font-semibold text-base-content/90">自动更新数据库</span>

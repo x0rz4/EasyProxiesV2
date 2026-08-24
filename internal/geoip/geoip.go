@@ -69,7 +69,33 @@ func EnsureDatabase(dbPath string) error {
 	}
 
 	log.Printf("📥 GeoIP database not found at %s, downloading...", dbPath)
+	if err := fetchDatabase(dbPath); err != nil {
+		return err
+	}
+	log.Printf("✅ GeoIP database downloaded successfully to %s", dbPath)
+	return nil
+}
 
+// DownloadDatabase downloads the GeoIP database to dbPath, overwriting any
+// existing file. Use this to (re)download the IP library on demand from the
+// WebUI regardless of whether a file already exists.
+func DownloadDatabase(dbPath string) error {
+	if dbPath == "" {
+		return fmt.Errorf("geoip database path is empty")
+	}
+	log.Printf("📥 GeoIP database download requested for %s", dbPath)
+	if err := fetchDatabase(dbPath); err != nil {
+		return err
+	}
+	log.Printf("✅ GeoIP database downloaded successfully to %s", dbPath)
+	return nil
+}
+
+// fetchDatabase downloads the GeoIP database from DefaultGeoIPURL into a
+// temporary file in the same directory as dbPath, validates it, and atomically
+// renames it to dbPath, overwriting any existing file. The temp file lives in
+// the same directory so the rename is atomic on the same filesystem.
+func fetchDatabase(dbPath string) error {
 	// Create parent directory if needed
 	dir := filepath.Dir(dbPath)
 	if dir != "." {
@@ -143,9 +169,35 @@ func EnsureDatabase(dbPath string) error {
 		return fmt.Errorf("rename failed: %w", err)
 	}
 	cleanup = false
-
-	log.Printf("✅ GeoIP database downloaded successfully to %s", dbPath)
 	return nil
+}
+
+// DatabaseStatusInfo describes the on-disk GeoIP database file.
+type DatabaseStatusInfo struct {
+	DatabasePath string `json:"database_path"`
+	Exists       bool   `json:"exists"`
+	SizeBytes    int64  `json:"size_bytes"`
+	ModifiedAt   string `json:"modified_at"` // RFC3339 (UTC), empty if the file does not exist
+	DownloadURL  string `json:"download_url"`
+}
+
+// DatabaseStatus reports the on-disk state of the GeoIP database at dbPath.
+func DatabaseStatus(dbPath string) DatabaseStatusInfo {
+	info := DatabaseStatusInfo{
+		DatabasePath: dbPath,
+		DownloadURL:  DefaultGeoIPURL,
+	}
+	if dbPath == "" {
+		return info
+	}
+	st, err := os.Stat(dbPath)
+	if err != nil {
+		return info // exists stays false
+	}
+	info.Exists = true
+	info.SizeBytes = st.Size()
+	info.ModifiedAt = st.ModTime().UTC().Format(time.RFC3339)
+	return info
 }
 
 // progressWriter tracks download progress

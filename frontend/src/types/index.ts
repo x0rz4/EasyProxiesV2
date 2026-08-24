@@ -248,6 +248,23 @@ export interface SubscriptionActionResponse {
   ok: boolean
 }
 
+// ---- GeoIP database management types ----
+
+export interface GeoipDatabaseInfo {
+  database_path: string
+  exists: boolean
+  size_bytes: number
+  modified_at: string
+  download_url: string
+}
+
+export interface GeoipStatus {
+  enabled: boolean
+  database: GeoipDatabaseInfo
+  message?: string
+  reload_hint?: boolean
+}
+
 export interface SubscriptionStatus {
   enabled: boolean
   has_subscriptions?: boolean
