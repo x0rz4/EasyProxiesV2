@@ -1051,19 +1051,19 @@ export default function ManagePanel() {
               </div>
             )}
             <p className="text-sm text-base-content/60 mb-3">
-              每行一个代理 URI（支持 trojan://、vless://、vmess://、ss://、hysteria2:// 等），
+              支持代理 URI 列表（每行一个，如 trojan://、vless://、ss:// 等）、Clash 配置（含 "proxies:" 的完整 YAML 或行内项）、Base64 编码的订阅内容。
               可以直接粘贴导出文件的内容或从文件导入。
             </p>
             <div className="mb-3">
               <label className="btn btn-soft btn-sm">
                 <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" /></svg>
                 选择文件
-                <input type="file" accept=".txt,.conf,.list" className="hidden" onChange={handleFileImport} />
+                <input type="file" accept=".txt,.conf,.list,.yaml,.yml" className="hidden" onChange={handleFileImport} />
               </label>
             </div>
             <textarea
               className="textarea textarea-bordered w-full font-mono text-xs h-48"
-              placeholder={"trojan://password@host:port?sni=example.com#节点名称\nvless://uuid@host:port?encryption=none#另一个节点\n..."}
+              placeholder="# 支持以下格式：\n# 1. 代理 URI 列表（每行一个）\ntrojan://password@host:port?sni=example.com#节点名称\n\n# 2. Clash YAML 行内项\n- name: my-ss\n  type: ss\n  server: host\n  port: 8388\n  cipher: aes-256-gcm\n  password: pass\n\n# 3. 完整 Clash YAML 文档\nproxies:\n  - name: my-node\n    type: ss\n    ..."
               value={importContent}
               onChange={(e) => setImportContent(e.target.value)}
             />

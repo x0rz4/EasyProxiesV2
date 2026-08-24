@@ -648,6 +648,107 @@ func ParseSubscriptionContent(content string) ([]NodeConfig, error) {
 	return parseSubscriptionContent(content)
 }
 
+// ParseImportContent parses pasted or imported proxy content in any supported
+// format and returns normalized NodeConfig entries. Accepted formats:
+//   - Clash YAML document (contains a top-level `proxies:` key)
+//   - Clash YAML list items, one or more per line (e.g. `- { name: ..., type: ss, ... }`)
+//   - Base64-encoded payload (v2ray subscriptions) wrapping a URI list or Clash YAML
+//   - Plain proxy URI list (one URI per line, `#` comments allowed)
+//
+// Clash YAML entries are converted to standard proxy URIs via the same path used
+// for subscriptions, so import and subscription accept identical node formats.
+func ParseImportContent(content string) ([]NodeConfig, error) {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return nil, errors.New("import content is empty")
+	}
+
+	// 1. Full Clash YAML document (top-level `proxies:` key).
+	if hasProxiesKey(content) {
+		return parseClashYAML(content)
+	}
+
+	// 2. Inline Clash YAML list items ("- { ... }" or "- name: ...").
+	if looksLikeInlineYAML(content) {
+		return parseClashYAML(wrapAsClashProxiesDoc(content))
+	}
+
+	// 3. Base64-encoded payload (common for v2ray subscriptions).
+	if decoded, ok := tryBase64Decode(content); ok {
+		decoded = strings.TrimSpace(decoded)
+		if hasProxiesKey(decoded) {
+			return parseClashYAML(decoded)
+		}
+		if looksLikeInlineYAML(decoded) {
+			return parseClashYAML(wrapAsClashProxiesDoc(decoded))
+		}
+		return parseNodesFromContent(decoded)
+	}
+
+	// 4. Plain proxy URI list.
+	return parseNodesFromContent(content)
+}
+
+// hasProxiesKey reports whether content looks like a Clash YAML document by
+// checking for a top-level `proxies:` key in its leading bytes.
+func hasProxiesKey(content string) bool {
+	sampleSize := 200
+	if len(content) < sampleSize {
+		sampleSize = len(content)
+	}
+	return strings.Contains(content[:sampleSize], "proxies:")
+}
+
+// looksLikeInlineYAML reports whether the first non-empty, non-comment line is a
+// YAML list item ("- { ... }" flow style or "- key: value" block style).
+func looksLikeInlineYAML(content string) bool {
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		return strings.HasPrefix(line, "- ") || strings.HasPrefix(line, "-\t")
+	}
+	return false
+}
+
+// wrapAsClashProxiesDoc indents a list of YAML items so it parses as the value of
+// a top-level `proxies:` key. This lets bare `- { ... }` lines be parsed by
+// parseClashYAML, which expects a full Clash document.
+func wrapAsClashProxiesDoc(content string) string {
+	var b strings.Builder
+	b.WriteString("proxies:\n")
+	for _, line := range strings.Split(content, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		b.WriteString("  ")
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+// tryBase64Decode attempts to decode content as base64 using several common
+// alphabets (standard and URL-safe, with and without padding). It returns the
+// decoded string and true on success. Content that already contains a URI scheme
+// ("://") is treated as plaintext and not decoded.
+func tryBase64Decode(content string) (string, bool) {
+	content = strings.TrimSpace(content)
+	if content == "" || strings.Contains(content, "://") {
+		return "", false
+	}
+	for _, enc := range []*base64.Encoding{
+		base64.StdEncoding, base64.URLEncoding,
+		base64.RawStdEncoding, base64.RawURLEncoding,
+	} {
+		if decoded, err := enc.DecodeString(content); err == nil {
+			return string(decoded), true
+		}
+	}
+	return "", false
+}
+
 // parseNodesFromContent parses nodes from plain text content (one URI per line)
 func parseNodesFromContent(content string) ([]NodeConfig, error) {
 	var nodes []NodeConfig
@@ -663,9 +764,18 @@ func parseNodesFromContent(content string) ([]NodeConfig, error) {
 
 		// Check if it's a valid proxy URI
 		if IsProxyURI(line) {
-			nodes = append(nodes, NodeConfig{
+			node := NodeConfig{
 				URI: line,
-			})
+			}
+			// Extract node name from URI fragment (#name) if present
+			if parsed, perr := url.Parse(line); perr == nil && parsed.Fragment != "" {
+				if decoded, decErr := url.QueryUnescape(parsed.Fragment); decErr == nil {
+					node.Name = decoded
+				} else {
+					node.Name = parsed.Fragment
+				}
+			}
+			nodes = append(nodes, node)
 		}
 	}
 

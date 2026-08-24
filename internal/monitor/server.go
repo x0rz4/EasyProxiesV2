@@ -1163,7 +1163,13 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(strings.Join(lines, "\n")))
 }
 
-// handleImport 导入节点 URI 列表（每行一个），支持与导出格式互通
+// handleImport 导入节点配置，支持以下格式（自动识别，可混合）：
+//   - Clash YAML 文档（含 `proxies:` 顶级键）
+//   - Clash YAML 行内列表项（`- { name: ..., type: ss, ... }`，每行一个）
+//   - Base64 编码的 v2ray 订阅内容
+//   - 代理 URI 列表（每行一个，如 trojan://、vless:// 等）
+//
+// 解析出的节点统一转成标准 URI 后入库，与导出格式互通。
 func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -1174,7 +1180,7 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Content string `json:"content"` // 节点 URI 文本，每行一个
+		Content string `json:"content"` // 节点配置文本（URI / Clash YAML / Base64 均可）
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -1189,40 +1195,42 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 解析每行 URI
-	lines := strings.Split(content, "\n")
+	// 统一解析为节点列表（支持 Clash YAML / Base64 / URI 列表）
+	parsedNodes, err := config.ParseImportContent(content)
+	if err != nil {
+		writeJSON(w, map[string]any{"error": fmt.Sprintf("解析导入内容失败: %v", err)})
+		return
+	}
+
 	var imported int
 	var errs []string
 
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		// 跳过空行和注释
-		if line == "" || strings.HasPrefix(line, "#") {
+	for i := range parsedNodes {
+		node := parsedNodes[i]
+		node.URI = strings.TrimSpace(node.URI)
+		if node.URI == "" {
 			continue
 		}
 
-		// 验证是否为合法代理 URI
-		if !config.IsProxyURI(line) {
-			errs = append(errs, fmt.Sprintf("无效的代理 URI: %s", truncateStr(line, 60)))
-			continue
-		}
-
-		// 从 URI 中提取名称
-		name := ""
-		if parsed, err := url.Parse(line); err == nil && parsed.Fragment != "" {
-			if decoded, decErr := url.QueryUnescape(parsed.Fragment); decErr == nil {
-				name = decoded
-			} else {
-				name = parsed.Fragment
+		// 名称：优先用解析结果，其次从 URI fragment 提取，最后兜底
+		name := strings.TrimSpace(node.Name)
+		if name == "" {
+			if parsed, perr := url.Parse(node.URI); perr == nil && parsed.Fragment != "" {
+				if decoded, decErr := url.QueryUnescape(parsed.Fragment); decErr == nil {
+					name = decoded
+				} else {
+					name = parsed.Fragment
+				}
 			}
 		}
 		if name == "" {
 			name = fmt.Sprintf("imported-%d", imported+1)
 		}
+		node.Name = name
 
-		node := config.NodeConfig{
-			Name: name,
-			URI:  line,
+		if !config.IsProxyURI(node.URI) {
+			errs = append(errs, fmt.Sprintf("无效的代理 URI: %s", truncateStr(node.URI, 60)))
+			continue
 		}
 
 		if _, err := s.nodeMgr.CreateNode(r.Context(), node); err != nil {
