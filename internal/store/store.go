@@ -14,6 +14,9 @@ type Store interface {
 
 	// ListNodes returns nodes matching the given filter.
 	ListNodes(ctx context.Context, filter NodeFilter) ([]Node, error)
+	// ListManagedNodes returns nodes visible to node management. Subscription
+	// nodes are included only through enabled subscription memberships.
+	ListManagedNodes(ctx context.Context, subscriptionID *int64) ([]ManagedNode, error)
 
 	// GetNode returns a node by its ID.
 	GetNode(ctx context.Context, id int64) (*Node, error)
@@ -43,6 +46,23 @@ type Store interface {
 
 	// CountNodes returns the total number of nodes matching the filter.
 	CountNodes(ctx context.Context, filter NodeFilter) (int64, error)
+
+	// --- Subscriptions ---
+	ListSubscriptions(ctx context.Context) ([]Subscription, error)
+	GetSubscription(ctx context.Context, id int64) (*Subscription, error)
+	GetSubscriptionByURL(ctx context.Context, url string) (*Subscription, error)
+	CreateSubscription(ctx context.Context, subscription *Subscription) error
+	UpdateSubscription(ctx context.Context, subscription *Subscription) error
+	DeleteSubscription(ctx context.Context, id int64) error
+	SetSubscriptionEnabled(ctx context.Context, id int64, enabled bool) error
+	UpdateAllSubscriptionRefreshSettings(ctx context.Context, intervalSeconds, timeoutSeconds int) error
+	ActivateSubscriptionExclusive(ctx context.Context, id int64) error
+	ListSubscriptionNodes(ctx context.Context, subscriptionID int64) ([]SubscriptionNode, error)
+	// ListEffectiveSubscriptionNodes returns enabled nodes which are present in
+	// at least one enabled subscription, de-duplicated by node ID.
+	ListEffectiveSubscriptionNodes(ctx context.Context) ([]Node, error)
+	ReplaceSubscriptionNodes(ctx context.Context, subscriptionID int64, nodes []SubscriptionNodeInput) error
+	CommitSnapshot(ctx context.Context, subscriptionID int64, nodes []SubscriptionNodeInput, snapshot SubscriptionSnapshot) error
 
 	// --- Node stats ---
 
@@ -134,6 +154,12 @@ type Node struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// ManagedNode is the node-management view of a node and its enabled subscriptions.
+type ManagedNode struct {
+	Node
+	SubscriptionIDs []int64 `json:"subscription_ids"`
+}
+
 // NodeFilter specifies criteria for listing nodes.
 type NodeFilter struct {
 	Source  string // Filter by source (empty = all)
@@ -141,6 +167,54 @@ type NodeFilter struct {
 	Enabled *bool  // Filter by enabled status (nil = all)
 	Limit   int    // Max results (0 = no limit)
 	Offset  int    // Pagination offset
+}
+
+// Subscription is a remotely refreshed collection of nodes.
+type Subscription struct {
+	ID                     int64     `json:"id"`
+	Name                   string    `json:"name"`
+	URL                    string    `json:"url"`
+	Enabled                bool      `json:"enabled"`
+	RefreshIntervalSeconds int       `json:"refresh_interval_seconds"`
+	RefreshTimeoutSeconds  int       `json:"refresh_timeout_seconds"`
+	SortOrder              int       `json:"sort_order"`
+	LastAttempt            time.Time `json:"last_attempt"`
+	LastSuccess            time.Time `json:"last_success"`
+	LastError              string    `json:"last_error"`
+	NodeCount              int       `json:"node_count"`
+	ETag                   string    `json:"etag"`
+	LastModified           string    `json:"last_modified"`
+	CreatedAt              time.Time `json:"created_at"`
+	UpdatedAt              time.Time `json:"updated_at"`
+}
+
+// SubscriptionNode describes a node's membership in a subscription.
+type SubscriptionNode struct {
+	SubscriptionID int64 `json:"subscription_id"`
+	Position       int   `json:"position"`
+	Node           Node  `json:"node"`
+}
+
+// SubscriptionNodeInput contains the node data required to commit a snapshot.
+// Enabled is only used when a URI is first inserted; existing node state wins.
+type SubscriptionNodeInput struct {
+	URI      string `json:"uri"`
+	Name     string `json:"name"`
+	Port     uint16 `json:"port"`
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
+	Region   string `json:"region,omitempty"`
+	Country  string `json:"country,omitempty"`
+	Enabled  bool   `json:"enabled"`
+}
+
+// SubscriptionSnapshot is refresh metadata committed with a node snapshot.
+type SubscriptionSnapshot struct {
+	Attempt      time.Time
+	Success      time.Time
+	Error        string
+	ETag         string
+	LastModified string
 }
 
 // NodeStats holds runtime statistics for a node.

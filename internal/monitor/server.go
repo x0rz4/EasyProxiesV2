@@ -9,11 +9,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	mathrand "math/rand"
 	"net/http"
 	"net/url"
+	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -36,12 +39,24 @@ type Session struct {
 
 // NodeManager exposes config node CRUD and reload operations.
 type NodeManager interface {
-	ListConfigNodes(ctx context.Context) ([]config.NodeConfig, error)
+	ListConfigNodes(ctx context.Context, subscriptionID *int64) ([]ManagedNodeConfig, error)
 	CreateNode(ctx context.Context, node config.NodeConfig) (config.NodeConfig, error)
 	UpdateNode(ctx context.Context, name string, node config.NodeConfig) (config.NodeConfig, error)
 	DeleteNode(ctx context.Context, name string) error
 	SetNodeEnabled(ctx context.Context, name string, enabled bool) error
 	TriggerReload(ctx context.Context) error
+}
+
+// ManagedNodeConfig is the flattened API representation used by node management.
+type ManagedNodeConfig struct {
+	Name            string            `json:"name"`
+	URI             string            `json:"uri"`
+	Port            uint16            `json:"port"`
+	Username        string            `json:"username,omitempty"`
+	Password        string            `json:"password,omitempty"`
+	Source          config.NodeSource `json:"source,omitempty"`
+	Disabled        bool              `json:"disabled,omitempty"`
+	SubscriptionIDs []int64           `json:"subscription_ids"`
 }
 
 // Sentinel errors for node operations.
@@ -55,7 +70,39 @@ var (
 type SubscriptionRefresher interface {
 	RefreshNow() error
 	Status() SubscriptionStatus
+	List(ctx context.Context) ([]store.Subscription, error)
+	Get(ctx context.Context, id int64) (*store.Subscription, error)
+	Create(ctx context.Context, subscription store.Subscription) (*store.Subscription, error)
+	Update(ctx context.Context, id int64, subscription store.Subscription) (*store.Subscription, error)
+	Delete(ctx context.Context, id int64) error
+	SetEnabled(ctx context.Context, id int64, enabled bool) error
+	ActivateExclusive(ctx context.Context, id int64) error
+	RefreshOne(ctx context.Context, id int64) error
+	Nodes(ctx context.Context, id int64) ([]store.SubscriptionNode, error)
+	ApplyConfig(cfg *config.Config)
 }
+
+type ApplyPlan struct {
+	NeedReload  bool     `json:"need_reload"`
+	NeedRestart bool     `json:"need_restart"`
+	Applied     []string `json:"applied"`
+	Pending     []string `json:"pending"`
+}
+
+type SettingsUpdateResult struct {
+	Message     string   `json:"message"`
+	Saved       bool     `json:"saved"`
+	NeedReload  bool     `json:"need_reload"`
+	NeedRestart bool     `json:"need_restart"`
+	Reloaded    bool     `json:"reloaded"`
+	ReloadError string   `json:"reload_error,omitempty"`
+	Applied     []string `json:"applied"`
+	Pending     []string `json:"pending"`
+}
+
+type settingsValidationError struct{ err error }
+
+func (e settingsValidationError) Error() string { return e.err.Error() }
 
 // SubscriptionStatus represents subscription refresh status.
 type SubscriptionStatus struct {
@@ -135,10 +182,13 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 	mux.HandleFunc("/api/nodes/traffic/stream", s.withAuth(s.handleTrafficStream))
 	mux.HandleFunc("/api/nodes/", s.withAuth(s.handleNodeAction))
 	mux.HandleFunc("/api/debug", s.withAuth(s.handleDebug))
+	mux.HandleFunc("/api/debug/stream", s.withAuth(s.handleDebugStream))
 	mux.HandleFunc("/api/export", s.withAuth(s.handleExport))
 	mux.HandleFunc("/api/import", s.withAuth(s.handleImport))
 	mux.HandleFunc("/api/subscription/status", s.withAuth(s.handleSubscriptionStatus))
 	mux.HandleFunc("/api/subscription/refresh", s.withAuth(s.handleSubscriptionRefresh))
+	mux.HandleFunc("/api/subscriptions", s.withAuth(s.handleSubscriptions))
+	mux.HandleFunc("/api/subscriptions/", s.withAuth(s.handleSubscriptionItem))
 	mux.HandleFunc("/api/reload", s.withAuth(s.handleReload))
 
 	// Default handler for static assets (React App)
@@ -351,7 +401,7 @@ func (s *Server) getAllSettings() allSettingsResponse {
 }
 
 // updateAllSettings applies all settings from request and persists to config file.
-func (s *Server) updateAllSettings(req allSettingsRequest) error {
+func (s *Server) updateAllSettings(ctx context.Context, req allSettingsRequest) (SettingsUpdateResult, error) {
 	// Validate request before applying
 	if err := config.ValidateSettingsRequest(
 		req.Mode, req.ListenerPort, req.MultiPortBasePort,
@@ -360,7 +410,7 @@ func (s *Server) updateAllSettings(req allSettingsRequest) error {
 		req.SubRefreshHealthCheckTimeout, req.SubRefreshDrainTimeout,
 		req.GeoIPAutoUpdateInterval, req.ManagementHealthCheckInterval,
 	); err != nil {
-		return fmt.Errorf("参数验证失败: %w", err)
+		return SettingsUpdateResult{}, settingsValidationError{fmt.Errorf("参数验证失败: %w", err)}
 	}
 
 	s.cfgMu.RLock()
@@ -368,12 +418,11 @@ func (s *Server) updateAllSettings(req allSettingsRequest) error {
 	s.cfgMu.RUnlock()
 
 	if c == nil {
-		return errors.New("配置存储未初始化")
+		return SettingsUpdateResult{}, errors.New("配置存储未初始化")
 	}
-
-	// Lock the config object for writing
-	c.Lock()
-	defer c.Unlock()
+	old := c.Snapshot()
+	updated := old.Clone()
+	c = updated
 
 	// Global
 	c.Mode = req.Mode
@@ -442,33 +491,108 @@ func (s *Server) updateAllSettings(req allSettingsRequest) error {
 	}
 
 	// Subscriptions
-	c.Subscriptions = req.Subscriptions
+	// Legacy subscriptions are managed by the subscription API.
+	c.Subscriptions = append([]string(nil), old.Subscriptions...)
+	plan := settingsApplyPlan(old, c)
 
-	// Sync ALL monitor-level config fields for runtime effect
+	if err := c.SaveSettings(); err != nil {
+		return SettingsUpdateResult{}, fmt.Errorf("保存配置失败: %w", err)
+	}
+
+	s.cfgMu.Lock()
+	s.cfgSrc = c
 	s.cfg.ExternalIP = c.ExternalIP
 	s.cfg.ProbeTarget = c.Management.ProbeTarget
 	s.cfg.SkipCertVerify = c.SkipCertVerify
-	s.cfg.Password = c.Management.Password    // 密码立即生效
-	s.cfg.ProxyUsername = c.Listener.Username // 代理认证立即生效
-	s.cfg.ProxyPassword = c.Listener.Password
+	s.cfg.Password = c.Management.Password
+	s.cfgMu.Unlock()
 
-	if err := c.SaveSettings(); err != nil {
-		return fmt.Errorf("保存配置失败: %w", err)
-	}
-
-	// 动态更新 Manager 的探测目标，使其立即生效
-	if c.Management.ProbeTarget != "" && s.mgr != nil {
+	if s.mgr != nil {
 		if err := s.mgr.UpdateProbeTarget(c.Management.ProbeTarget); err != nil {
 			s.logger.Printf("更新探测目标失败: %v", err)
 		}
-	}
-	// 动态更新周期健康检查间隔，使其立即生效
-	if c.Management.HealthCheckInterval > 0 && s.mgr != nil {
 		s.mgr.SetHealthCheckInterval(c.Management.HealthCheckInterval)
 	}
+	if s.subRefresher != nil {
+		s.subRefresher.ApplyConfig(c)
+	}
+	if s.store != nil && (old.SubscriptionRefresh.Interval != c.SubscriptionRefresh.Interval || old.SubscriptionRefresh.Timeout != c.SubscriptionRefresh.Timeout) {
+		interval, timeout := 0, 0
+		if old.SubscriptionRefresh.Interval != c.SubscriptionRefresh.Interval {
+			interval = int(c.SubscriptionRefresh.Interval.Seconds())
+		}
+		if old.SubscriptionRefresh.Timeout != c.SubscriptionRefresh.Timeout {
+			timeout = int(c.SubscriptionRefresh.Timeout.Seconds())
+		}
+		if err := s.store.UpdateAllSubscriptionRefreshSettings(ctx, interval, timeout); err != nil {
+			s.logger.Printf("批量更新订阅刷新设置失败: %v", err)
+		}
+	}
+	result := SettingsUpdateResult{Saved: true, NeedReload: plan.NeedReload, NeedRestart: plan.NeedRestart, Applied: plan.Applied, Pending: plan.Pending}
+	if plan.NeedReload && s.nodeMgr != nil {
+		if err := s.nodeMgr.TriggerReload(ctx); err != nil {
+			result.ReloadError = err.Error()
+		} else {
+			result.NeedReload, result.Reloaded = false, true
+			result.Applied = append(result.Applied, "runtime_config")
+			result.Pending = removeString(result.Pending, "runtime_config")
+		}
+	}
+	if result.NeedRestart {
+		result.Message = "设置已保存；管理服务启用状态或监听地址变更，需重启进程生效"
+	} else if result.NeedReload {
+		result.Message = "设置已保存；运行时重载未完成"
+	} else {
+		result.Message = "设置已保存并应用"
+	}
+	return result, nil
+}
 
-	s.logger.Printf("✅ 设置已保存并同步到运行时")
-	return nil
+func settingsApplyPlan(old, updated *config.Config) ApplyPlan {
+	plan := ApplyPlan{Applied: []string{}, Pending: []string{}}
+	plan.NeedRestart = old.ManagementEnabled() != updated.ManagementEnabled() || old.Management.Listen != updated.Management.Listen
+	a, b := old.Clone(), updated.Clone()
+	a.Management.Enabled, b.Management.Enabled = nil, nil
+	a.Management.Listen, b.Management.Listen = "", ""
+	a.Management.Password, b.Management.Password = "", ""
+	a.Management.ProbeTarget, b.Management.ProbeTarget = "", ""
+	a.Management.HealthCheckInterval, b.Management.HealthCheckInterval = 0, 0
+	a.ExternalIP, b.ExternalIP = "", ""
+	a.SubscriptionRefresh.Enabled, b.SubscriptionRefresh.Enabled = false, false
+	a.Subscriptions, b.Subscriptions = nil, nil
+	plan.NeedReload = !reflect.DeepEqual(a, b)
+	if plan.NeedReload {
+		plan.Pending = append(plan.Pending, "runtime_config")
+	}
+	if plan.NeedRestart {
+		plan.Pending = append(plan.Pending, "management_server")
+	}
+	if old.Management.Password != updated.Management.Password {
+		plan.Applied = append(plan.Applied, "management_password")
+	}
+	if old.Management.ProbeTarget != updated.Management.ProbeTarget {
+		plan.Applied = append(plan.Applied, "management_probe_target")
+	}
+	if old.Management.HealthCheckInterval != updated.Management.HealthCheckInterval {
+		plan.Applied = append(plan.Applied, "management_health_check_interval")
+	}
+	if old.ExternalIP != updated.ExternalIP {
+		plan.Applied = append(plan.Applied, "external_ip")
+	}
+	if old.SubscriptionRefresh.Enabled != updated.SubscriptionRefresh.Enabled {
+		plan.Applied = append(plan.Applied, "sub_refresh_enabled")
+	}
+	return plan
+}
+
+func removeString(values []string, target string) []string {
+	result := values[:0]
+	for _, value := range values {
+		if value != target {
+			result = append(result, value)
+		}
+	}
+	return result
 }
 
 // Start launches the HTTP server.
@@ -616,6 +740,52 @@ func (s *Server) handleDebug(w http.ResponseWriter, r *http.Request) {
 		"total_success": totalSuccess,
 		"success_rate":  successRate,
 	})
+}
+
+func (s *Server) handleDebugStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	events, unsubscribe := s.mgr.SubscribeDebugLogs()
+	defer unsubscribe()
+	_, _ = io.WriteString(w, ": connected\n\n")
+	flusher.Flush()
+	heartbeat := time.NewTicker(20 * time.Second)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-s.done:
+			return
+		case event := <-events:
+			payload, err := json.Marshal(event)
+			if err != nil {
+				continue
+			}
+			if _, err = fmt.Fprintf(w, "data: %s\n\n", payload); err != nil {
+				return
+			}
+			flusher.Flush()
+		case <-heartbeat.C:
+			if _, err := io.WriteString(w, ": heartbeat\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
 }
 
 func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
@@ -869,7 +1039,10 @@ func writeJSON(w http.ResponseWriter, payload any) {
 func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// 如果没有配置密码，直接放行
-		if s.cfg.Password == "" {
+		s.cfgMu.RLock()
+		password := s.cfg.Password
+		s.cfgMu.RUnlock()
+		if password == "" {
 			next(w, r)
 			return
 		}
@@ -899,8 +1072,11 @@ func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 
 // handleAuth 处理登录认证
 func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
+	s.cfgMu.RLock()
+	password := s.cfg.Password
+	s.cfgMu.RUnlock()
 	// 如果没有配置密码，直接返回成功（不需要token）
-	if s.cfg.Password == "" {
+	if password == "" {
 		writeJSON(w, map[string]any{"message": "无需密码", "no_password": true})
 		return
 	}
@@ -927,7 +1103,7 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 使用 constant-time 比较防止时序攻击
-	if !secureCompareStrings(req.Password, s.cfg.Password) {
+	if !secureCompareStrings(req.Password, password) {
 		// 添加随机延迟防止暴力破解
 		time.Sleep(time.Duration(100+mathrand.Intn(200)) * time.Millisecond)
 		w.WriteHeader(http.StatusUnauthorized)
@@ -1088,16 +1264,18 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if err := s.updateAllSettings(req); err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
+		result, err := s.updateAllSettings(r.Context(), req)
+		if err != nil {
+			status := http.StatusInternalServerError
+			var validationErr settingsValidationError
+			if errors.As(err, &validationErr) {
+				status = http.StatusBadRequest
+			}
+			w.WriteHeader(status)
 			writeJSON(w, map[string]any{"error": err.Error()})
 			return
 		}
-
-		writeJSON(w, map[string]any{
-			"message":     "设置已保存",
-			"need_reload": false,
-		})
+		writeJSON(w, result)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -1171,6 +1349,166 @@ func (s *Server) handleSubscriptionRefresh(w http.ResponseWriter, r *http.Reques
 	})
 }
 
+func (s *Server) handleSubscriptions(w http.ResponseWriter, r *http.Request) {
+	if s.subRefresher == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "订阅管理器未初始化")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		subs, err := s.subRefresher.List(r.Context())
+		if err != nil {
+			writeAPIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, map[string]any{"subscriptions": subs})
+	case http.MethodPost:
+		var input store.Subscription
+		if err := decodeJSON(r, &input); err != nil {
+			writeAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		sub, err := s.subRefresher.Create(r.Context(), input)
+		if err != nil {
+			writeAPIError(w, subscriptionErrorStatus(err), err.Error())
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		writeJSON(w, sub)
+	default:
+		writeAPIError(w, http.StatusMethodNotAllowed, "请求方法不允许")
+	}
+}
+
+func (s *Server) handleSubscriptionItem(w http.ResponseWriter, r *http.Request) {
+	if s.subRefresher == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "订阅管理器未初始化")
+		return
+	}
+	path := strings.TrimPrefix(r.URL.Path, "/api/subscriptions/")
+	parts := strings.Split(path, "/")
+	if len(parts) < 1 || len(parts) > 2 || parts[0] == "" {
+		writeAPIError(w, http.StatusNotFound, "接口不存在")
+		return
+	}
+	id, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || id <= 0 {
+		writeAPIError(w, http.StatusBadRequest, "无效的订阅 ID")
+		return
+	}
+	if len(parts) == 1 {
+		s.handleSubscriptionCRUD(w, r, id)
+		return
+	}
+	switch parts[1] {
+	case "enabled":
+		if r.Method != http.MethodPatch {
+			writeAPIError(w, http.StatusMethodNotAllowed, "请求方法不允许")
+			return
+		}
+		var input struct {
+			Enabled *bool `json:"enabled"`
+		}
+		if err := decodeJSON(r, &input); err != nil || input.Enabled == nil {
+			writeAPIError(w, http.StatusBadRequest, "enabled 字段必填")
+			return
+		}
+		err = s.subRefresher.SetEnabled(r.Context(), id, *input.Enabled)
+	case "activate":
+		if r.Method != http.MethodPost {
+			writeAPIError(w, http.StatusMethodNotAllowed, "请求方法不允许")
+			return
+		}
+		err = s.subRefresher.ActivateExclusive(r.Context(), id)
+	case "refresh":
+		if r.Method != http.MethodPost {
+			writeAPIError(w, http.StatusMethodNotAllowed, "请求方法不允许")
+			return
+		}
+		err = s.subRefresher.RefreshOne(r.Context(), id)
+	case "nodes":
+		if r.Method != http.MethodGet {
+			writeAPIError(w, http.StatusMethodNotAllowed, "请求方法不允许")
+			return
+		}
+		var nodes []store.SubscriptionNode
+		nodes, err = s.subRefresher.Nodes(r.Context(), id)
+		if err == nil {
+			writeJSON(w, map[string]any{"nodes": nodes})
+			return
+		}
+	default:
+		writeAPIError(w, http.StatusNotFound, "接口不存在")
+		return
+	}
+	if err != nil {
+		writeAPIError(w, subscriptionErrorStatus(err), err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+func (s *Server) handleSubscriptionCRUD(w http.ResponseWriter, r *http.Request, id int64) {
+	switch r.Method {
+	case http.MethodGet:
+		sub, err := s.subRefresher.Get(r.Context(), id)
+		if err != nil {
+			writeAPIError(w, subscriptionErrorStatus(err), err.Error())
+			return
+		}
+		writeJSON(w, sub)
+	case http.MethodPut:
+		var input store.Subscription
+		if err := decodeJSON(r, &input); err != nil {
+			writeAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		sub, err := s.subRefresher.Update(r.Context(), id, input)
+		if err != nil {
+			writeAPIError(w, subscriptionErrorStatus(err), err.Error())
+			return
+		}
+		writeJSON(w, sub)
+	case http.MethodDelete:
+		if err := s.subRefresher.Delete(r.Context(), id); err != nil {
+			writeAPIError(w, subscriptionErrorStatus(err), err.Error())
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true})
+	default:
+		writeAPIError(w, http.StatusMethodNotAllowed, "请求方法不允许")
+	}
+}
+
+func decodeJSON(r *http.Request, dst any) error {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dst); err != nil {
+		return fmt.Errorf("请求格式错误: %w", err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return errors.New("请求只能包含一个 JSON 对象")
+	}
+	return nil
+}
+
+func writeAPIError(w http.ResponseWriter, status int, message string) {
+	w.WriteHeader(status)
+	writeJSON(w, map[string]any{"error": message})
+}
+
+func subscriptionErrorStatus(err error) int {
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "不存在") || strings.Contains(message, "not found") {
+		return http.StatusNotFound
+	}
+	if strings.Contains(message, "不能为空") || strings.Contains(message, "必须") || strings.Contains(message, "invalid") || strings.Contains(message, "unique") {
+		return http.StatusBadRequest
+	}
+	return http.StatusInternalServerError
+}
+
 // nodePayload is the JSON request body for node CRUD operations.
 type nodePayload struct {
 	Name     string `json:"name"`
@@ -1198,7 +1536,17 @@ func (s *Server) handleConfigNodes(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		nodes, err := s.nodeMgr.ListConfigNodes(r.Context())
+		var subscriptionID *int64
+		if raw := r.URL.Query().Get("subscription_id"); raw != "" {
+			id, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil || id <= 0 {
+				w.WriteHeader(http.StatusBadRequest)
+				writeJSON(w, map[string]any{"error": "subscription_id 必须是正整数"})
+				return
+			}
+			subscriptionID = &id
+		}
+		nodes, err := s.nodeMgr.ListConfigNodes(r.Context(), subscriptionID)
 		if err != nil {
 			s.respondNodeError(w, err)
 			return

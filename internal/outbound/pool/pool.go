@@ -3,7 +3,9 @@ package pool
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"strings"
@@ -324,42 +326,70 @@ func (p *poolOutbound) memberName(member *memberState) string {
 }
 
 func (p *poolOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	member, err := p.pickMember(network)
-	if err != nil {
-		return nil, err
-	}
 	dst := destination.String()
-	p.logger.Info("→ ", dst, " ⇒ ", p.memberName(member), " [", network, "]")
-	p.incActive(member)
-	conn, err := member.outbound.DialContext(ctx, network, destination)
-	if err != nil {
-		p.decActive(member)
-		p.recordFailure(member, err, dst)
-		return nil, err
+	attempted := make(map[*memberState]struct{})
+	var dialErr error
+	for {
+		member, err := p.pickMemberExcluding(network, attempted)
+		if err != nil {
+			if dialErr != nil {
+				return nil, fmt.Errorf("all available proxies failed for %s: %w", dst, dialErr)
+			}
+			return nil, err
+		}
+		attempted[member] = struct{}{}
+		p.logger.Info("→ ", dst, " ⇒ ", p.memberName(member), " [", network, "]")
+		p.incActive(member)
+		conn, err := member.outbound.DialContext(ctx, network, destination)
+		if err != nil {
+			p.decActive(member)
+			p.recordFailure(member, err, dst)
+			dialErr = err
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			continue
+		}
+		p.recordSuccess(member, dst)
+		return p.wrapConn(conn, member, dst), nil
 	}
-	p.recordSuccess(member, dst)
-	return p.wrapConn(conn, member), nil
 }
 
 func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	member, err := p.pickMember(N.NetworkUDP)
-	if err != nil {
-		return nil, err
-	}
 	dst := destination.String()
-	p.logger.Info("→ ", dst, " ⇒ ", p.memberName(member), " [udp]")
-	p.incActive(member)
-	conn, err := member.outbound.ListenPacket(ctx, destination)
-	if err != nil {
-		p.decActive(member)
-		p.recordFailure(member, err, dst)
-		return nil, err
+	attempted := make(map[*memberState]struct{})
+	var listenErr error
+	for {
+		member, err := p.pickMemberExcluding(N.NetworkUDP, attempted)
+		if err != nil {
+			if listenErr != nil {
+				return nil, fmt.Errorf("all available proxies failed for %s: %w", dst, listenErr)
+			}
+			return nil, err
+		}
+		attempted[member] = struct{}{}
+		p.logger.Info("→ ", dst, " ⇒ ", p.memberName(member), " [udp]")
+		p.incActive(member)
+		conn, err := member.outbound.ListenPacket(ctx, destination)
+		if err != nil {
+			p.decActive(member)
+			p.recordFailure(member, err, dst)
+			listenErr = err
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			continue
+		}
+		p.recordSuccess(member, dst)
+		return p.wrapPacketConn(conn, member, dst), nil
 	}
-	p.recordSuccess(member, dst)
-	return p.wrapPacketConn(conn, member), nil
 }
 
 func (p *poolOutbound) pickMember(network string) (*memberState, error) {
+	return p.pickMemberExcluding(network, nil)
+}
+
+func (p *poolOutbound) pickMemberExcluding(network string, excluded map[*memberState]struct{}) (*memberState, error) {
 	now := time.Now()
 	candidates := p.getCandidateBuffer()
 
@@ -372,12 +402,14 @@ func (p *poolOutbound) pickMember(network string) (*memberState, error) {
 		}
 	}
 	candidates = p.availableMembersLocked(now, network, candidates)
+	candidates = excludeMembers(candidates, excluded)
 	p.mu.Unlock()
 
 	if len(candidates) == 0 {
 		p.mu.Lock()
 		if p.releaseIfAllBlacklistedLocked(now) {
 			candidates = p.availableMembersLocked(now, network, candidates)
+			candidates = excludeMembers(candidates, excluded)
 		}
 		p.mu.Unlock()
 	}
@@ -390,6 +422,19 @@ func (p *poolOutbound) pickMember(network string) (*memberState, error) {
 	member := p.selectMember(candidates)
 	p.putCandidateBuffer(candidates)
 	return member, nil
+}
+
+func excludeMembers(candidates []*memberState, excluded map[*memberState]struct{}) []*memberState {
+	if len(excluded) == 0 {
+		return candidates
+	}
+	result := candidates[:0]
+	for _, member := range candidates {
+		if _, ok := excluded[member]; !ok {
+			result = append(result, member)
+		}
+	}
+	return result
 }
 
 func (p *poolOutbound) availableMembersLocked(now time.Time, network string, buf []*memberState) []*memberState {
@@ -473,7 +518,7 @@ func (p *poolOutbound) recordSuccess(member *memberState, destination string) {
 	}
 }
 
-func (p *poolOutbound) wrapConn(conn net.Conn, member *memberState) net.Conn {
+func (p *poolOutbound) wrapConn(conn net.Conn, member *memberState, destination string) net.Conn {
 	return &trackedConn{
 		Conn: conn,
 		release: func() {
@@ -484,10 +529,13 @@ func (p *poolOutbound) wrapConn(conn net.Conn, member *memberState) net.Conn {
 				member.shared.addTraffic(upload, download)
 			}
 		},
+		onError: func(err error) {
+			p.recordFailure(member, err, destination)
+		},
 	}
 }
 
-func (p *poolOutbound) wrapPacketConn(conn net.PacketConn, member *memberState) net.PacketConn {
+func (p *poolOutbound) wrapPacketConn(conn net.PacketConn, member *memberState, destination string) net.PacketConn {
 	return &trackedPacketConn{
 		PacketConn: conn,
 		release: func() {
@@ -497,6 +545,9 @@ func (p *poolOutbound) wrapPacketConn(conn net.PacketConn, member *memberState) 
 			if member.shared != nil {
 				member.shared.addTraffic(upload, download)
 			}
+		},
+		onError: func(err error) {
+			p.recordFailure(member, err, destination)
 		},
 	}
 }
@@ -665,6 +716,8 @@ type trackedConn struct {
 	once      sync.Once
 	release   func()
 	onTraffic func(upload, download int64)
+	onError   func(error)
+	errorOnce sync.Once
 }
 
 func (c *trackedConn) Read(b []byte) (int, error) {
@@ -672,6 +725,7 @@ func (c *trackedConn) Read(b []byte) (int, error) {
 	if n > 0 && c.onTraffic != nil {
 		c.onTraffic(0, int64(n))
 	}
+	c.recordIOError(err)
 	return n, err
 }
 
@@ -680,7 +734,35 @@ func (c *trackedConn) Write(b []byte) (int, error) {
 	if n > 0 && c.onTraffic != nil {
 		c.onTraffic(int64(n), 0)
 	}
+	c.recordIOError(err)
 	return n, err
+}
+
+func (c *trackedConn) recordIOError(err error) {
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
+		return
+	}
+	c.errorOnce.Do(func() {
+		if c.onError != nil {
+			c.onError(err)
+		}
+	})
+}
+
+func (c *trackedConn) CloseWrite() error {
+	conn, ok := c.Conn.(interface{ CloseWrite() error })
+	if !ok {
+		return E.New("underlying connection does not support CloseWrite")
+	}
+	return conn.CloseWrite()
+}
+
+func (c *trackedConn) CloseRead() error {
+	conn, ok := c.Conn.(interface{ CloseRead() error })
+	if !ok {
+		return E.New("underlying connection does not support CloseRead")
+	}
+	return conn.CloseRead()
 }
 
 func (c *trackedConn) Close() error {
@@ -694,6 +776,8 @@ type trackedPacketConn struct {
 	once      sync.Once
 	release   func()
 	onTraffic func(upload, download int64)
+	onError   func(error)
+	errorOnce sync.Once
 }
 
 func (c *trackedPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
@@ -701,6 +785,7 @@ func (c *trackedPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
 	if n > 0 && c.onTraffic != nil {
 		c.onTraffic(0, int64(n))
 	}
+	c.recordIOError(err)
 	return n, addr, err
 }
 
@@ -709,7 +794,19 @@ func (c *trackedPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	if n > 0 && c.onTraffic != nil {
 		c.onTraffic(int64(n), 0)
 	}
+	c.recordIOError(err)
 	return n, err
+}
+
+func (c *trackedPacketConn) recordIOError(err error) {
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
+		return
+	}
+	c.errorOnce.Do(func() {
+		if c.onError != nil {
+			c.onError(err)
+		}
+	})
 }
 
 func (c *trackedPacketConn) Close() error {

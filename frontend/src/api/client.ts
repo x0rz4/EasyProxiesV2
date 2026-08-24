@@ -8,8 +8,14 @@ import type {
   ConfigNodePayload,
   ConfigNodeMutationResponse,
   SubscriptionStatus,
+  Subscription,
+  SubscriptionPayload,
+  SubscriptionsResponse,
+  SubscriptionNodesResponse,
+  SubscriptionActionResponse,
   ProbeSSEEvent,
   TrafficStreamEvent,
+  DebugLogEvent,
 } from '../types'
 
 // ---- Token management ----
@@ -264,6 +270,47 @@ export async function fetchDebug(): Promise<DebugResponse> {
   return request<DebugResponse>('/api/debug')
 }
 
+export function streamDebugLogs(onEvent: (event: DebugLogEvent) => void, onStatus: (connected: boolean) => void): AbortController {
+  const controller = new AbortController()
+  const connect = async () => {
+    while (!controller.signal.aborted) {
+      try {
+        const headers: Record<string, string> = {}
+        if (authToken) headers.Authorization = `Bearer ${authToken}`
+        const response = await fetch('/api/debug/stream', { headers, credentials: 'include', signal: controller.signal })
+        if (response.status === 401) {
+          clearToken()
+          window.dispatchEvent(new CustomEvent('auth:unauthorized'))
+          return
+        }
+        if (!response.ok || !response.body) throw new ApiError(`HTTP ${response.status}`, response.status)
+        onStatus(true)
+        const reader = response.body.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
+        while (!controller.signal.aborted) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buffer += decoder.decode(value, { stream: true })
+          const messages = buffer.split('\n\n')
+          buffer = messages.pop() ?? ''
+          for (const message of messages) {
+            const line = message.split('\n').find((item) => item.startsWith('data: '))
+            if (line) onEvent(JSON.parse(line.slice(6)) as DebugLogEvent)
+          }
+        }
+      } catch (error) {
+        if ((error as Error).name === 'AbortError') return
+      } finally {
+        onStatus(false)
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2000))
+    }
+  }
+  void connect()
+  return controller
+}
+
 // ---- Settings API ----
 
 export async function fetchSettings(): Promise<SettingsData> {
@@ -279,8 +326,9 @@ export async function updateSettings(settings: SettingsData): Promise<SettingsUp
 
 // ---- Config Nodes CRUD API ----
 
-export async function fetchConfigNodes(): Promise<ConfigNodesResponse> {
-  return request<ConfigNodesResponse>('/api/nodes/config')
+export async function fetchConfigNodes(subscriptionId?: number): Promise<ConfigNodesResponse> {
+  const query = subscriptionId === undefined ? '' : `?subscription_id=${encodeURIComponent(subscriptionId)}`
+  return request<ConfigNodesResponse>(`/api/nodes/config${query}`)
 }
 
 export async function createConfigNode(payload: ConfigNodePayload): Promise<ConfigNodeMutationResponse> {
@@ -338,6 +386,47 @@ export async function fetchSubscriptionStatus(): Promise<SubscriptionStatus> {
 
 export async function refreshSubscription(): Promise<{ message: string; node_count: number }> {
   return request('/api/subscription/refresh', { method: 'POST' })
+}
+
+export async function listSubscriptions(): Promise<SubscriptionsResponse> {
+  return request<SubscriptionsResponse>('/api/subscriptions')
+}
+
+export async function createSubscription(payload: SubscriptionPayload): Promise<Subscription> {
+  return request<Subscription>('/api/subscriptions', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export async function updateSubscription(id: number, payload: SubscriptionPayload): Promise<Subscription> {
+  return request<Subscription>(`/api/subscriptions/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  })
+}
+
+export async function deleteSubscription(id: number): Promise<SubscriptionActionResponse> {
+  return request<SubscriptionActionResponse>(`/api/subscriptions/${id}`, { method: 'DELETE' })
+}
+
+export async function toggleSubscription(id: number, enabled: boolean): Promise<SubscriptionActionResponse> {
+  return request<SubscriptionActionResponse>(`/api/subscriptions/${id}/enabled`, {
+    method: 'PATCH',
+    body: JSON.stringify({ enabled }),
+  })
+}
+
+export async function activateSubscription(id: number): Promise<SubscriptionActionResponse> {
+  return request<SubscriptionActionResponse>(`/api/subscriptions/${id}/activate`, { method: 'POST' })
+}
+
+export async function refreshOneSubscription(id: number): Promise<SubscriptionActionResponse> {
+  return request<SubscriptionActionResponse>(`/api/subscriptions/${id}/refresh`, { method: 'POST' })
+}
+
+export async function listSubscriptionNodes(id: number): Promise<SubscriptionNodesResponse> {
+  return request<SubscriptionNodesResponse>(`/api/subscriptions/${id}/nodes`)
 }
 
 // ---- Export API ----

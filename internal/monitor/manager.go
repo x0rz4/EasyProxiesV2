@@ -49,6 +49,13 @@ type TimelineEvent struct {
 	Destination string    `json:"destination,omitempty"`
 }
 
+// DebugLogEvent identifies the node associated with a timeline event.
+type DebugLogEvent struct {
+	NodeTag  string        `json:"node_tag"`
+	NodeName string        `json:"node_name"`
+	Event    TimelineEvent `json:"event"`
+}
+
 const maxTimelineSize = 20
 
 // Snapshot is a runtime view of a proxy node.
@@ -123,6 +130,7 @@ type entry struct {
 	available        bool
 	reloadGen        uint64 // generation counter to track active registrations
 	mu               sync.RWMutex
+	onTimeline       func(DebugLogEvent)
 }
 
 // Manager aggregates all node states for the UI/API.
@@ -138,12 +146,14 @@ type Manager struct {
 	logger     Logger
 
 	// periodic health check control
-	healthMu        sync.Mutex
-	healthInterval  time.Duration
-	healthTimeout   time.Duration
-	healthTicker    *time.Ticker
-	healthIntervalC chan time.Duration
+	healthMu         sync.Mutex
+	healthInterval   time.Duration
+	healthTimeout    time.Duration
+	healthTicker     *time.Ticker
+	healthIntervalC  chan time.Duration
 	probeAllInFlight atomic.Bool
+	debugSubMu       sync.RWMutex
+	debugSubscribers map[chan DebugLogEvent]struct{}
 }
 
 // Logger interface for logging
@@ -156,10 +166,11 @@ type Logger interface {
 func NewManager(cfg Config) (*Manager, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Manager{
-		cfg:    cfg,
-		nodes:  make(map[string]*entry),
-		ctx:    ctx,
-		cancel: cancel,
+		cfg:              cfg,
+		nodes:            make(map[string]*entry),
+		ctx:              ctx,
+		cancel:           cancel,
+		debugSubscribers: make(map[chan DebugLogEvent]struct{}),
 	}
 	if cfg.ProbeTarget != "" {
 		target := cfg.ProbeTarget
@@ -454,14 +465,16 @@ func (m *Manager) Register(info NodeInfo) *EntryHandle {
 	e, ok := m.nodes[info.Tag]
 	if !ok {
 		e = &entry{
-			info:      info,
-			timeline:  make([]TimelineEvent, 0, maxTimelineSize),
-			reloadGen: m.reloadGen,
+			info:       info,
+			timeline:   make([]TimelineEvent, 0, maxTimelineSize),
+			reloadGen:  m.reloadGen,
+			onTimeline: m.publishDebugLog,
 		}
 		m.nodes[info.Tag] = e
 	} else {
 		e.info = info
 		e.reloadGen = m.reloadGen
+		e.onTimeline = m.publishDebugLog
 	}
 	return &EntryHandle{ref: e}
 }
@@ -478,12 +491,18 @@ func (m *Manager) DestinationForProbe() (M.Socksaddr, bool) {
 
 // UpdateProbeTarget dynamically updates the probe destination at runtime.
 func (m *Manager) UpdateProbeTarget(target string) error {
+	target = strings.TrimSpace(target)
 	if target == "" {
+		m.mu.Lock()
+		m.probeDst = M.Socksaddr{}
+		m.probeReady = false
+		m.cfg.ProbeTarget = ""
+		m.mu.Unlock()
 		return nil
 	}
-
-	// Strip URL scheme if present
+	defaultPort := "80"
 	if strings.HasPrefix(target, "https://") {
+		defaultPort = "443"
 		target = strings.TrimPrefix(target, "https://")
 	} else if strings.HasPrefix(target, "http://") {
 		target = strings.TrimPrefix(target, "http://")
@@ -495,9 +514,9 @@ func (m *Manager) UpdateProbeTarget(target string) error {
 
 	host, port, err := net.SplitHostPort(target)
 	if err != nil {
-		// If no port specified, use default port 80
+		// If no port specified, use the scheme's default port.
 		host = target
-		port = "80"
+		port = defaultPort
 	}
 
 	parsed := M.ParseSocksaddrHostPort(host, parsePort(port))
@@ -748,6 +767,33 @@ func (e *entry) appendTimelineLocked(success bool, latencyMs int64, errStr strin
 		e.timeline[len(e.timeline)-1] = evt
 	} else {
 		e.timeline = append(e.timeline, evt)
+	}
+	if e.onTimeline != nil {
+		e.onTimeline(DebugLogEvent{NodeTag: e.info.Tag, NodeName: e.info.Name, Event: evt})
+	}
+}
+
+// SubscribeDebugLogs returns a bounded real-time event stream and an unsubscribe function.
+func (m *Manager) SubscribeDebugLogs() (<-chan DebugLogEvent, func()) {
+	ch := make(chan DebugLogEvent, 128)
+	m.debugSubMu.Lock()
+	m.debugSubscribers[ch] = struct{}{}
+	m.debugSubMu.Unlock()
+	return ch, func() {
+		m.debugSubMu.Lock()
+		delete(m.debugSubscribers, ch)
+		m.debugSubMu.Unlock()
+	}
+}
+
+func (m *Manager) publishDebugLog(event DebugLogEvent) {
+	m.debugSubMu.RLock()
+	defer m.debugSubMu.RUnlock()
+	for subscriber := range m.debugSubscribers {
+		select {
+		case subscriber <- event:
+		default:
+		}
 	}
 }
 

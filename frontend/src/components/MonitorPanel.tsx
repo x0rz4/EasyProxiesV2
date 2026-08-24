@@ -7,6 +7,7 @@ import BarChart from './charts/BarChart'
 import LatencyRanking from './charts/LatencyRanking'
 import TrafficRanking from './charts/TrafficRanking'
 import RegionCards from './charts/RegionCards'
+import { PageContent, PageHeader, PageLayout, surfaceClass } from './ui/PageLayout'
 
 function latencyColor(ms: number): string {
   if (ms < 0) return 'text-base-content/50'
@@ -55,7 +56,8 @@ export default function MonitorPanel() {
   }, [])
 
   useEffect(() => {
-    loadData()
+    const initialLoad = setTimeout(loadData, 0)
+    return () => clearTimeout(initialLoad)
   }, [loadData])
 
   // Auto-refresh timer
@@ -289,22 +291,12 @@ export default function MonitorPanel() {
   }
 
   return (
-    <div className="flex flex-col min-h-full animate-in fade-in duration-500">
-      {/* Header */}
-      <div className="sticky top-0 z-30 bg-base-100/80 backdrop-blur-xl px-4 lg:px-8 py-4 border-b border-base-300/60 shadow-sm">
-        <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 max-w-[1600px] mx-auto w-full">
-          <div>
-            <h2 className="text-2xl font-bold flex items-center gap-3">
-              <div className="w-10 h-10 rounded-xl bg-primary/10 flex items-center justify-center text-primary shrink-0 border border-primary/20">
-                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
-                </svg>
-              </div>
-              节点监控
-            </h2>
-            <p className="text-sm text-base-content/50 mt-1.5 ml-[3.25rem]">实时数据仪表盘 · 可视化节点健康与流量状况</p>
-          </div>
-          <div className="flex items-center gap-3">
+    <PageLayout>
+      <PageHeader
+        title="节点监控"
+        description="实时数据仪表盘 · 可视化节点健康与流量状况"
+        icon={<svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>}
+        actions={<>
             {/* Auto refresh selector */}
             <div className="flex items-center gap-2 bg-base-200/50 px-2 py-1 lg:py-1.5 rounded-lg border border-base-300/50 transition-colors">
               {autoRefresh > 0 ? (
@@ -327,19 +319,18 @@ export default function MonitorPanel() {
                 <option value={60}>每 60 秒</option>
               </select>
             </div>
-            <button className="btn btn-sm lg:btn-md btn-primary shadow-sm gap-2" onClick={handleRefresh} disabled={loading}>
+            <button className="btn btn-primary btn-sm gap-2 shadow-sm lg:btn-md" onClick={handleRefresh} disabled={loading} title="刷新监控数据" aria-label="刷新监控数据">
               {loading ? (
                 <span className="loading loading-spinner loading-sm"></span>
               ) : (
                 <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
               )}
-              刷新
+              <span className="hidden sm:inline">刷新</span>
             </button>
-          </div>
-        </div>
-      </div>
+          </>}
+      />
 
-      <div className="p-4 lg:p-8 space-y-6 flex-1 pb-10 max-w-[1600px] mx-auto w-full">
+      <PageContent>
         {/* Error */}
         {error && (
         <div role="alert" className="alert alert-error alert-soft">
@@ -349,7 +340,7 @@ export default function MonitorPanel() {
       )}
 
       {/* Stats Cards */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         {/* Total Nodes */}
         <div className="rounded-2xl bg-base-100 border border-base-300/50 p-5 shadow-sm hover:shadow-md transition-all group overflow-hidden relative">
           <div className="absolute -right-4 -top-4 w-24 h-24 bg-primary/5 rounded-full blur-2xl group-hover:bg-primary/10 transition-colors"></div>
@@ -482,7 +473,7 @@ export default function MonitorPanel() {
       {/* Charts Row: Donut + Bar */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         {/* Status Distribution Donut */}
-        <div className="rounded-xl border border-base-300/40 bg-base-200/30 p-5">
+        <div className={`${surfaceClass} p-5 lg:p-6`}>
           <h3 className="text-sm font-semibold mb-4 flex items-center gap-2">
             <span className="w-1 h-4 bg-primary rounded-full"></span>
             状态分布
@@ -499,7 +490,7 @@ export default function MonitorPanel() {
         </div>
 
         {/* Latency Distribution Bar */}
-        <div className="rounded-xl border border-base-300/40 bg-base-200/30 p-5">
+        <div className={`${surfaceClass} p-5 lg:p-6`}>
           <BarChart
             bars={latencyBars}
             maxHeight={130}
@@ -509,7 +500,7 @@ export default function MonitorPanel() {
       </div>
 
       {/* Region Cards */}
-      <div className="rounded-xl border border-base-300/40 bg-base-200/30 p-5">
+      <div className={`${surfaceClass} p-5 lg:p-6`}>
         <RegionCards
           regions={regionStats}
           title="地区统计"
@@ -519,7 +510,7 @@ export default function MonitorPanel() {
       {/* Rankings Row: Latency + Traffic */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         {/* Latency Ranking */}
-        <div className="rounded-xl border border-base-300/40 bg-base-200/30 p-5">
+        <div className={`${surfaceClass} p-5 lg:p-6`}>
           <LatencyRanking
             items={rankingItems}
             maxItems={10}
@@ -528,7 +519,7 @@ export default function MonitorPanel() {
         </div>
 
         {/* Traffic Ranking */}
-        <div className="rounded-xl border border-base-300/40 bg-base-200/30 p-5">
+        <div className={`${surfaceClass} p-5 lg:p-6`}>
           <TrafficRanking
             items={trafficRankItems}
             maxItems={10}
@@ -549,7 +540,7 @@ export default function MonitorPanel() {
           </>
         )}
       </div>
-      </div>
-    </div>
+      </PageContent>
+    </PageLayout>
   )
 }

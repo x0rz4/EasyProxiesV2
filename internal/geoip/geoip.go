@@ -29,7 +29,7 @@ const (
 
 // Default GeoIP database download URL
 const (
-	DefaultGeoIPURL = "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb"
+	DefaultGeoIPURL = "https://ghproxy.net/https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb"
 )
 
 // RegionInfo contains region details

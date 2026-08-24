@@ -128,13 +128,79 @@ go build -tags "with_utls with_quic with_grpc with_wireguard with_gvisor" -o eas
 
 ---
 
-## 📦 Docker（可选）
+## 📦 Docker 部署
 
-如果你偏好容器部署，可使用现成的 `Dockerfile` 与 `docker-compose.yml`：
+### 1) 准备配置和数据目录
 
 ```bash
-docker build -t easy-proxies:latest .
-docker compose up -d
+mkdir -p easy-proxies/data
+cd easy-proxies
+curl -L https://raw.githubusercontent.com/xiamuceer-j/EasyProxiesV2/main/config.example.yaml -o config.yaml
+```
+
+编辑 `config.yaml`，至少确认代理模式、订阅地址、监听端口及管理密码。默认管理面板监听 `0.0.0.0:9888`。
+
+### 2) 拉取镜像
+
+```bash
+docker pull mumujie/easy_proxies:latest
+```
+
+生产环境建议将 `latest` 替换为明确的版本标签，避免升级时意外引入不兼容变更。
+
+### 3) 启动容器
+
+Linux 推荐使用主机网络，可完整支持代理池、多端口及端口自动重分配：
+
+```bash
+docker run -d \
+  --name easy-proxies \
+  --restart unless-stopped \
+  --network host \
+  -v "$(pwd)/config.yaml:/etc/easy-proxies/config.yaml" \
+  -v "$(pwd)/data:/etc/easy-proxies/data" \
+  mumujie/easy_proxies:latest
+```
+
+如果不能使用主机网络，可以显式映射所需端口：
+
+```bash
+docker run -d \
+  --name easy-proxies \
+  --restart unless-stopped \
+  -p 2323:2323 \
+  -p 9888:9888 \
+  -p 24000-24200:24000-24200 \
+  -v "$(pwd)/config.yaml:/etc/easy-proxies/config.yaml" \
+  -v "$(pwd)/data:/etc/easy-proxies/data" \
+  mumujie/easy_proxies:latest
+```
+
+只使用 `pool` 模式时无需映射 `24000-24200`；多端口范围应与 `config.yaml` 中的配置保持一致。
+
+### 4) 查看状态
+
+```bash
+docker logs -f easy-proxies
+```
+
+浏览器访问 `http://<服务器IP>:9888` 打开管理面板。代理池默认入口为 `http://<服务器IP>:2323`。
+
+### 5) 更新镜像
+
+```bash
+docker pull mumujie/easy_proxies:latest
+docker rm -f easy-proxies
+```
+
+然后重新执行上面的 `docker run` 命令。配置文件和运行数据保存在宿主机目录中，重建容器不会丢失。
+
+### 从源码构建镜像
+
+也可以克隆仓库后使用项目内的 `Dockerfile` 和 `docker-compose.yml` 本地构建：
+
+```bash
+docker compose up -d --build
 ```
 
 ## 📁 目录结构简述

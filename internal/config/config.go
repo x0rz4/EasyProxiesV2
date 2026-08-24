@@ -641,6 +641,13 @@ func parseSubscriptionContent(content string) ([]NodeConfig, error) {
 	return parseNodesFromContent(content)
 }
 
+// ParseSubscriptionContent parses Clash YAML, Base64 and plain URI
+// subscription payloads. It is shared by startup loading and refreshes so the
+// accepted formats remain consistent.
+func ParseSubscriptionContent(content string) ([]NodeConfig, error) {
+	return parseSubscriptionContent(content)
+}
+
 // parseNodesFromContent parses nodes from plain text content (one URI per line)
 func parseNodesFromContent(content string) ([]NodeConfig, error) {
 	var nodes []NodeConfig
@@ -997,6 +1004,16 @@ func (c *Config) Clone() *Config {
 	return &cloned
 }
 
+// Snapshot returns a deep copy protected against concurrent config updates.
+func (c *Config) Snapshot() *Config {
+	if c == nil {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.Clone()
+}
+
 // FilePath returns the config file path.
 func (c *Config) FilePath() string {
 	if c == nil {
@@ -1018,7 +1035,6 @@ func (c *Config) SetFilePath(path string) {
 
 // SaveSettings persists all editable settings to config.yaml.
 // Node data is managed by the SQLite Store, not config.yaml.
-// The caller must hold the config lock (c.mu) before calling this method.
 func (c *Config) SaveSettings() error {
 	if c == nil {
 		return errors.New("config is nil")

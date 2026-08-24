@@ -105,6 +105,40 @@ ALTER TABLE node_stats ADD COLUMN total_upload_bytes INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE node_stats ADD COLUMN total_download_bytes INTEGER NOT NULL DEFAULT 0;
 `,
 		},
+		{
+			Version:     3,
+			Description: "add multiple subscriptions",
+			Up: `
+CREATE TABLE subscriptions (
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    name                     TEXT    NOT NULL DEFAULT '',
+    url                      TEXT    NOT NULL UNIQUE,
+    enabled                  INTEGER NOT NULL DEFAULT 1,
+    refresh_interval_seconds INTEGER NOT NULL DEFAULT 3600,
+    refresh_timeout_seconds  INTEGER NOT NULL DEFAULT 30,
+    sort_order               INTEGER NOT NULL DEFAULT 0,
+    last_attempt             TEXT    NOT NULL DEFAULT '',
+    last_success             TEXT    NOT NULL DEFAULT '',
+    last_error               TEXT    NOT NULL DEFAULT '',
+    node_count               INTEGER NOT NULL DEFAULT 0,
+    etag                     TEXT    NOT NULL DEFAULT '',
+    last_modified            TEXT    NOT NULL DEFAULT '',
+    created_at               TEXT    NOT NULL DEFAULT (datetime('now')),
+    updated_at               TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE subscription_nodes (
+    subscription_id INTEGER NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+    node_id         INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    position        INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (subscription_id, node_id)
+);
+
+CREATE INDEX idx_subscriptions_enabled_order ON subscriptions(enabled, sort_order, id);
+CREATE INDEX idx_subscription_nodes_node ON subscription_nodes(node_id);
+CREATE INDEX idx_subscription_nodes_subscription_position ON subscription_nodes(subscription_id, position);
+`,
+		},
 	}
 }
 

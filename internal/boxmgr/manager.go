@@ -1,6 +1,7 @@
 package boxmgr
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"gopkg.in/yaml.v3"
 
 	"easy_proxies/internal/builder"
 	"easy_proxies/internal/config"
@@ -30,7 +33,7 @@ const (
 	defaultHealthCheckTimeout = 30 * time.Second
 	healthCheckPollInterval   = 500 * time.Millisecond
 	// periodicHealthInterval is configured via cfg.Management.HealthCheckInterval
-	periodicHealthTimeout     = 10 * time.Second
+	periodicHealthTimeout = 10 * time.Second
 )
 
 // Logger defines logging interface for the manager.
@@ -198,6 +201,12 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 	ctx := m.baseCtx
 	oldBox := m.currentBox
 	oldCfg := m.cfg
+	if oldBox != nil && runtimeConfigEqual(oldCfg, newCfg) {
+		m.mu.Unlock()
+		m.logger.Infof("reload skipped: runtime configuration unchanged")
+		return nil
+	}
+	drainTimeout := m.drainTimeout
 	m.currentBox = nil // Mark as reloading
 	m.mu.Unlock()
 
@@ -207,9 +216,10 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 
 	m.logger.Infof("reloading with %d nodes", len(newCfg.Nodes))
 
-	// For multi-port mode, we must close old instance first to release ports
-	// This causes a brief interruption but avoids port conflicts
+	// The old instance owns the listener ports, so let active connections drain
+	// before closing it and binding the replacement instance.
 	if oldBox != nil {
+		m.waitForConnectionsToDrain(drainTimeout)
 		m.logger.Infof("stopping old instance to release ports...")
 		if err := oldBox.Close(); err != nil {
 			m.logger.Warnf("error closing old instance: %v", err)
@@ -287,6 +297,35 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 	}
 	m.logger.Infof("reload completed successfully with %d nodes", len(newCfg.Nodes))
 	return nil
+}
+
+func runtimeConfigEqual(a, b *config.Config) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	aYAML, aErr := yaml.Marshal(a)
+	bYAML, bErr := yaml.Marshal(b)
+	return aErr == nil && bErr == nil && bytes.Equal(aYAML, bYAML)
+}
+
+func (m *Manager) waitForConnectionsToDrain(timeout time.Duration) {
+	active := pool.ActiveConnections()
+	if active == 0 || timeout <= 0 {
+		return
+	}
+	m.logger.Infof("waiting up to %s for %d active connections to drain", timeout, active)
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for active > 0 && time.Now().Before(deadline) {
+		<-ticker.C
+		active = pool.ActiveConnections()
+	}
+	if active > 0 {
+		m.logger.Warnf("drain timeout reached with %d active connections", active)
+	} else {
+		m.logger.Infof("active connections drained")
+	}
 }
 
 // AddConfigListener registers a listener to be notified when config changes after reload.
@@ -554,7 +593,7 @@ var errConfigUnavailable = errors.New("config is not initialized")
 // and also includes disabled nodes that are not in the active config.
 // Port numbers are taken from the active config (m.cfg.Nodes) since they
 // are dynamically assigned by NormalizeWithPortMap and may not be in the Store.
-func (m *Manager) ListConfigNodes(ctx context.Context) ([]config.NodeConfig, error) {
+func (m *Manager) ListConfigNodes(ctx context.Context, subscriptionID *int64) ([]monitor.ManagedNodeConfig, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -564,7 +603,11 @@ func (m *Manager) ListConfigNodes(ctx context.Context) ([]config.NodeConfig, err
 
 	// If no store, just return active nodes
 	if m.store == nil {
-		return cloneNodes(m.cfg.Nodes), nil
+		result := make([]monitor.ManagedNodeConfig, 0, len(m.cfg.Nodes))
+		for _, node := range m.cfg.Nodes {
+			result = append(result, managedNodeConfig(node, nil))
+		}
+		return result, nil
 	}
 
 	// Build a lookup from URI → runtime port from the active config.
@@ -578,34 +621,48 @@ func (m *Manager) ListConfigNodes(ctx context.Context) ([]config.NodeConfig, err
 	}
 
 	// Fetch all nodes from store (including disabled ones)
-	storeNodes, err := m.store.ListNodes(ctx, store.NodeFilter{})
+	storeNodes, err := m.store.ListManagedNodes(ctx, subscriptionID)
 	if err != nil {
 		// Fallback to config nodes if store fails
 		m.logger.Warnf("failed to list nodes from store: %v, falling back to config", err)
-		return cloneNodes(m.cfg.Nodes), nil
+		result := make([]monitor.ManagedNodeConfig, 0, len(m.cfg.Nodes))
+		for _, node := range m.cfg.Nodes {
+			result = append(result, managedNodeConfig(node, nil))
+		}
+		return result, nil
 	}
 
 	// Build result from store nodes (preserves disabled status)
 	// Merge runtime port assignments from active config
-	result := make([]config.NodeConfig, 0, len(storeNodes))
+	result := make([]monitor.ManagedNodeConfig, 0, len(storeNodes))
 	for _, n := range storeNodes {
 		port := n.Port
 		// Prefer runtime port from active config (dynamically assigned)
 		if runtimePort, ok := runtimePorts[n.URI]; ok && runtimePort > 0 {
 			port = runtimePort
 		}
-		result = append(result, config.NodeConfig{
-			Name:     n.Name,
-			URI:      n.URI,
-			Port:     port,
-			Username: n.Username,
-			Password: n.Password,
-			Source:   config.NodeSource(n.Source),
-			Disabled: !n.Enabled,
+		result = append(result, monitor.ManagedNodeConfig{
+			Name:            n.Name,
+			URI:             n.URI,
+			Port:            port,
+			Username:        n.Username,
+			Password:        n.Password,
+			Source:          config.NodeSource(n.Source),
+			Disabled:        !n.Enabled,
+			SubscriptionIDs: n.SubscriptionIDs,
 		})
 	}
 
 	return result, nil
+}
+
+func managedNodeConfig(node config.NodeConfig, subscriptionIDs []int64) monitor.ManagedNodeConfig {
+	if subscriptionIDs == nil {
+		subscriptionIDs = []int64{}
+	}
+	return monitor.ManagedNodeConfig{Name: node.Name, URI: node.URI, Port: node.Port,
+		Username: node.Username, Password: node.Password, Source: node.Source,
+		Disabled: node.Disabled, SubscriptionIDs: subscriptionIDs}
 }
 
 // CreateNode adds a new node and persists it to the Store.
@@ -891,6 +948,9 @@ func (m *Manager) TriggerReload(ctx context.Context) error {
 func (m *Manager) ReloadWithPortMap(newCfg *config.Config, portMap map[string]uint16) error {
 	if newCfg == nil {
 		return errors.New("new config is nil")
+	}
+	if len(newCfg.Nodes) == 0 {
+		return m.enterIdle(newCfg)
 	}
 
 	// Always normalize config (apply defaults, assign ports, etc.).

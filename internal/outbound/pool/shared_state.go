@@ -50,6 +50,16 @@ func ResetSharedStateStore() {
 	})
 }
 
+// ActiveConnections returns the number of currently open proxied connections.
+func ActiveConnections() int32 {
+	var total int32
+	sharedStateStore.Range(func(_, value any) bool {
+		total += value.(*sharedMemberState).activeCount()
+		return true
+	})
+	return total
+}
+
 func (s *sharedMemberState) attachEntry(entry *monitor.EntryHandle) {
 	if entry == nil {
 		return

@@ -129,7 +129,19 @@ export interface SettingsData {
 
 export interface SettingsUpdateResponse {
   message: string
+  saved: boolean
   need_reload: boolean
+  need_restart: boolean
+  reloaded: boolean
+  reload_error?: string
+  applied: string[]
+  pending: string[]
+}
+
+export interface DebugLogEvent {
+  node_tag: string
+  node_name: string
+  event: TimelineEvent
 }
 
 // ---- Auth types ----
@@ -162,6 +174,7 @@ export interface ConfigNodeConfig {
   password: string
   source?: string
   disabled?: boolean
+  subscription_ids: number[]
 }
 
 export interface ConfigNodesResponse {
@@ -174,6 +187,66 @@ export interface ConfigNodeMutationResponse {
 }
 
 // ---- Subscription types ----
+
+export interface Subscription {
+  id: number
+  name: string
+  url: string
+  enabled: boolean
+  refresh_interval_seconds: number
+  refresh_timeout_seconds: number
+  sort_order: number
+  last_attempt: string
+  last_success: string
+  last_error: string
+  node_count: number
+  etag: string
+  last_modified: string
+  created_at: string
+  updated_at: string
+}
+
+export interface SubscriptionPayload {
+  name: string
+  url: string
+  enabled: boolean
+  refresh_interval_seconds: number
+  refresh_timeout_seconds: number
+  sort_order: number
+}
+
+export interface SubscriptionNodeData {
+  id: number
+  uri: string
+  name: string
+  source: string
+  port: number
+  username?: string
+  password?: string
+  region?: string
+  country?: string
+  enabled: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface SubscriptionNode {
+  subscription_id: number
+  position: number
+  node: SubscriptionNodeData
+}
+
+export interface SubscriptionsResponse {
+  subscriptions: Subscription[]
+}
+
+export interface SubscriptionNodesResponse {
+  nodes: SubscriptionNode[]
+}
+
+export interface SubscriptionActionResponse {
+  ok: boolean
+}
 
 export interface SubscriptionStatus {
   enabled: boolean

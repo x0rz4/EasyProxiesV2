@@ -138,6 +138,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 // If the Store is empty, seeds it with whatever nodes config already has
 // (from config.yaml inline nodes or subscription fetch), then returns.
 func loadNodesFromStore(ctx context.Context, cfg *config.Config, s store.Store) error {
+	loadedConfigNodes := append([]config.NodeConfig(nil), cfg.Nodes...)
 	nodes, err := s.ListNodes(ctx, store.NodeFilter{})
 	if err != nil {
 		return fmt.Errorf("list nodes from store: %w", err)
@@ -157,12 +158,45 @@ func loadNodesFromStore(ctx context.Context, cfg *config.Config, s store.Store) 
 		return nil
 	}
 
-	// Convert store.Node to config.NodeConfig
+	// Subscription nodes are effective only through enabled memberships.
+	effectiveSubscriptionNodes, err := s.ListEffectiveSubscriptionNodes(ctx)
+	if err != nil {
+		return fmt.Errorf("list effective subscription nodes: %w", err)
+	}
+
+	// During the first v3 startup, legacy subscription nodes exist in the
+	// nodes table but no subscription membership has been imported yet. Keep
+	// the nodes fetched by config.Load for this one startup; SubscriptionManager
+	// imports the URLs and commits proper memberships immediately afterwards.
+	subscriptions, err := s.ListSubscriptions(ctx)
+	if err != nil {
+		return fmt.Errorf("list subscriptions: %w", err)
+	}
+	legacySnapshotPending := len(subscriptions) == 0
+	for _, sub := range subscriptions {
+		if sub.LastSuccess.IsZero() && sub.NodeCount == 0 {
+			legacySnapshotPending = true
+			break
+		}
+	}
+	legacyBootstrap := len(effectiveSubscriptionNodes) == 0 && legacySnapshotPending && len(cfg.Subscriptions) > 0 && len(loadedConfigNodes) > 0
+	if legacyBootstrap {
+		cfg.Nodes = loadedConfigNodes
+		log.Printf("[app] using %d freshly fetched nodes while subscription memberships are initialized", len(loadedConfigNodes))
+		return nil
+	}
+
+	// Convert enabled non-subscription and effective subscription nodes.
 	var configNodes []config.NodeConfig
+	seen := make(map[string]struct{}, len(nodes)+len(effectiveSubscriptionNodes))
 	for _, n := range nodes {
-		if !n.Enabled {
+		if !n.Enabled || n.Source == store.NodeSourceSubscription {
 			continue
 		}
+		if _, ok := seen[n.URI]; ok {
+			continue
+		}
+		seen[n.URI] = struct{}{}
 		configNodes = append(configNodes, config.NodeConfig{
 			Name:     n.Name,
 			URI:      n.URI,
@@ -172,11 +206,18 @@ func loadNodesFromStore(ctx context.Context, cfg *config.Config, s store.Store) 
 			Source:   config.NodeSource(n.Source),
 		})
 	}
-
-	if len(configNodes) > 0 {
-		cfg.Nodes = configNodes
-		log.Printf("[app] loaded %d nodes from store", len(configNodes))
+	for _, n := range effectiveSubscriptionNodes {
+		if _, ok := seen[n.URI]; ok {
+			continue
+		}
+		seen[n.URI] = struct{}{}
+		configNodes = append(configNodes, config.NodeConfig{Name: n.Name, URI: n.URI, Port: n.Port,
+			Username: n.Username, Password: n.Password, Source: config.NodeSourceSubscription})
 	}
+
+	// Always replace cfg.Nodes when the DB is non-empty, including all-disabled state.
+	cfg.Nodes = configNodes
+	log.Printf("[app] loaded %d effective nodes from store", len(configNodes))
 
 	return nil
 }
