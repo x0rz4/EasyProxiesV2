@@ -1,3 +1,5 @@
+import { regionFlag } from '../../utils/region'
+
 interface RankItem {
   name: string
   latency: number
@@ -16,15 +18,6 @@ function latencyColor(ms: number): string {
   if (ms <= 200) return 'oklch(0.80 0.18 84)'  // yellow
   if (ms <= 300) return 'oklch(0.75 0.18 55)'  // orange
   return 'oklch(0.63 0.24 29)'                  // red
-}
-
-function regionFlag(region?: string): string {
-  const flags: Record<string, string> = {
-    hk: '🇭🇰', jp: '🇯🇵', kr: '🇰🇷', us: '🇺🇸', tw: '🇹🇼',
-    sg: '🇸🇬', de: '🇩🇪', gb: '🇬🇧', fr: '🇫🇷', ca: '🇨🇦',
-    au: '🇦🇺', in: '🇮🇳', br: '🇧🇷', ru: '🇷🇺', nl: '🇳🇱',
-  }
-  return flags[region?.toLowerCase() || ''] || '🌐'
 }
 
 export default function LatencyRanking({ items, maxItems = 10, title }: LatencyRankingProps) {

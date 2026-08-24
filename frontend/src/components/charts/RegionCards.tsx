@@ -1,3 +1,5 @@
+import { regionFlag } from '../../utils/region'
+
 interface RegionStat {
   region: string
   total: number
@@ -8,15 +10,6 @@ interface RegionStat {
 interface RegionCardsProps {
   regions: RegionStat[]
   title?: string
-}
-
-function regionFlag(region?: string): string {
-  const flags: Record<string, string> = {
-    hk: '🇭🇰', jp: '🇯🇵', kr: '🇰🇷', us: '🇺🇸', tw: '🇹🇼',
-    sg: '🇸🇬', de: '🇩🇪', gb: '🇬🇧', fr: '🇫🇷', ca: '🇨🇦',
-    au: '🇦🇺', in: '🇮🇳', br: '🇧🇷', ru: '🇷🇺', nl: '🇳🇱',
-  }
-  return flags[region?.toLowerCase() || ''] || '🌐'
 }
 
 function healthColor(rate: number): string {

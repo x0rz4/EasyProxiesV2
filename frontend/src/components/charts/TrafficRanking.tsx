@@ -1,4 +1,5 @@
 import { formatBytes } from '../../utils/format'
+import { regionFlag } from '../../utils/region'
 
 interface TrafficRankItem {
   name: string
@@ -11,15 +12,6 @@ interface TrafficRankingProps {
   items: TrafficRankItem[]
   maxItems?: number
   title?: string
-}
-
-function regionFlag(region?: string): string {
-  const flags: Record<string, string> = {
-    hk: '🇭🇰', jp: '🇯🇵', kr: '🇰🇷', us: '🇺🇸', tw: '🇹🇼',
-    sg: '🇸🇬', de: '🇩🇪', gb: '🇬🇧', fr: '🇫🇷', ca: '🇨🇦',
-    au: '🇦🇺', in: '🇮🇳', br: '🇧🇷', ru: '🇷🇺', nl: '🇳🇱',
-  }
-  return flags[region?.toLowerCase() || ''] || '🌐'
 }
 
 export default function TrafficRanking({ items, maxItems = 10, title }: TrafficRankingProps) {

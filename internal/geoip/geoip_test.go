@@ -1,6 +1,8 @@
 package geoip
 
-import "testing"
+import (
+	"testing"
+)
 
 func TestExtractHostFromURISupportsHTTPAndSOCKS5(t *testing.T) {
 	tests := []struct {
@@ -16,5 +18,59 @@ func TestExtractHostFromURISupportsHTTPAndSOCKS5(t *testing.T) {
 		if got := extractHostFromURI(tt.uri); got != tt.want {
 			t.Fatalf("%s: extractHostFromURI(%q) = %q, want %q", tt.name, tt.uri, got, tt.want)
 		}
+	}
+}
+
+func TestIsoCodeToRegionIsCountryCode(t *testing.T) {
+	// Well-known regions keep their codes.
+	if got := isoCodeToRegion("JP"); got != "jp" {
+		t.Errorf("isoCodeToRegion(JP) = %q, want jp", got)
+	}
+	if got := isoCodeToRegion("SG"); got != "sg" {
+		t.Errorf("isoCodeToRegion(SG) = %q, want sg", got)
+	}
+	if got := isoCodeToRegion("DE"); got != "de" {
+		t.Errorf("isoCodeToRegion(DE) = %q, want de", got)
+	}
+	// Unknown/empty falls back to "other".
+	if got := isoCodeToRegion(""); got != RegionOther {
+		t.Errorf("isoCodeToRegion(\"\") = %q, want %q", got, RegionOther)
+	}
+}
+
+func TestRegionNameShowsCountryCode(t *testing.T) {
+	// Well-known regions show friendly names.
+	if got := RegionName(RegionJP); got != "Japan" {
+		t.Errorf("RegionName(jp) = %q, want Japan", got)
+	}
+	// Any 2-letter code shows the uppercased code (not "Unknown").
+	if got := RegionName("sg"); got != "SG" {
+		t.Errorf("RegionName(sg) = %q, want SG", got)
+	}
+	if got := RegionName("de"); got != "DE" {
+		t.Errorf("RegionName(de) = %q, want DE", got)
+	}
+}
+
+func TestRegionEmojiFromAnyCountryCode(t *testing.T) {
+	// "other" keeps the globe.
+	if got := RegionEmoji(RegionOther); got != "🌍" {
+		t.Errorf("RegionEmoji(other) = %q, want 🌍", got)
+	}
+	// Any 2-letter ISO code yields the correct flag via regional indicators.
+	cases := map[string]string{
+		"jp": "🇯🇵", "us": "🇺🇸", "sg": "🇸🇬", "de": "🇩🇪", "gb": "🇬🇧",
+	}
+	for code, want := range cases {
+		if got := RegionEmoji(code); got != want {
+			t.Errorf("RegionEmoji(%q) = %q, want %q", code, got, want)
+		}
+	}
+	// Garbage / wrong-length inputs return the question flag.
+	if got := RegionEmoji(""); got != "❓" {
+		t.Errorf("RegionEmoji(\"\") = %q, want ❓", got)
+	}
+	if got := RegionEmoji("usa"); got != "❓" {
+		t.Errorf("RegionEmoji(usa) = %q, want ❓", got)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/netip"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -51,11 +52,10 @@ func Build(cfg *config.Config) (option.Options, error) {
 		}
 	}
 
-	// Track nodes by region for GeoIP routing
+	// Track nodes by region for GeoIP routing.
+	// Region codes are open-ended (any lowercased ISO country code can appear),
+	// so this map is grown on demand instead of pre-seeded with a fixed set.
 	regionMembers := make(map[string][]string)
-	for _, region := range geoip.AllRegions() {
-		regionMembers[region] = []string{}
-	}
 
 	for _, node := range cfg.Nodes {
 		baseTag := sanitizeTag(node.Name)
@@ -127,8 +127,11 @@ func Build(cfg *config.Config) (option.Options, error) {
 
 	// Log GeoIP region distribution
 	if cfg.GeoIP.Enabled {
+		// Stable, friendly ordering: well-known regions first, then any others
+		// (e.g. sg, de, gb, ...) sorted alphabetically.
+		ordered := orderedRegions(regionMembers)
 		log.Println("🌍 GeoIP Region Distribution:")
-		for _, region := range geoip.AllRegions() {
+		for _, region := range ordered {
 			count := len(regionMembers[region])
 			if count > 0 {
 				log.Printf("   %s %s: %d nodes", geoip.RegionEmoji(region), geoip.RegionName(region), count)
@@ -231,8 +234,9 @@ func Build(cfg *config.Config) (option.Options, error) {
 
 	// Build GeoIP region-based pool outbounds and routing
 	if cfg.GeoIP.Enabled && enablePoolInbound {
-		// Create pool outbound for each region that has nodes
-		for _, region := range geoip.AllRegions() {
+		// Create pool outbound for each region that has nodes, in a stable,
+		// friendly order (well-known regions first, others alphabetical).
+		for _, region := range orderedRegions(regionMembers) {
 			members := regionMembers[region]
 			if len(members) == 0 {
 				continue
@@ -270,7 +274,17 @@ func Build(cfg *config.Config) (option.Options, error) {
 		}
 		log.Println("🌐 GeoIP Region Routing Enabled:")
 		log.Printf("   Access via: http://%s:%d/{region}", geoipListen, geoipPort)
-		log.Println("   Available regions: /jp, /kr, /us, /hk, /tw, /other")
+		// List the regions that actually have nodes.
+		active := orderedRegions(regionMembers)
+		regionList := make([]string, 0, len(active))
+		for _, r := range active {
+			if len(regionMembers[r]) > 0 {
+				regionList = append(regionList, "/"+r)
+			}
+		}
+		if len(regionList) > 0 {
+			log.Printf("   Available regions: %s", strings.Join(regionList, ", "))
+		}
 		log.Println("   Default (no path): all nodes pool")
 	}
 
@@ -1002,6 +1016,39 @@ func parseAddr(value string) (*badoption.Addr, error) {
 	}
 	bad := badoption.Addr(parsed)
 	return &bad, nil
+}
+
+// orderedRegions returns the region codes present in regionMembers in a stable,
+// friendly order: the well-known regions first (jp, kr, us, hk, tw) in their
+// fixed order, then any additional country codes (e.g. sg, de, gb, ...) sorted
+// alphabetically, and finally "other" last.
+func orderedRegions(regionMembers map[string][]string) []string {
+	seen := make(map[string]bool, len(regionMembers))
+	result := make([]string, 0, len(regionMembers))
+	// Well-known regions except "other", in fixed order.
+	for _, r := range geoip.AllRegions() {
+		if r == geoip.RegionOther {
+			continue
+		}
+		if _, ok := regionMembers[r]; ok {
+			result = append(result, r)
+			seen[r] = true
+		}
+	}
+	// Any additional country codes, sorted alphabetically.
+	var extra []string
+	for r := range regionMembers {
+		if !seen[r] && r != geoip.RegionOther {
+			extra = append(extra, r)
+		}
+	}
+	sort.Strings(extra)
+	result = append(result, extra...)
+	// "other" always last, if present.
+	if _, ok := regionMembers[geoip.RegionOther]; ok {
+		result = append(result, geoip.RegionOther)
+	}
+	return result
 }
 
 func sanitizeTag(name string) string {

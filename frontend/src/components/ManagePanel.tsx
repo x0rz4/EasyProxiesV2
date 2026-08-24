@@ -6,6 +6,7 @@ import {
   importNodes, exportProxies,
   fetchNodes, probeNode, releaseNode, listSubscriptions,
 } from '../api/client'
+import { regionFlag } from '../utils/region'
 import { PageContent, PageHeader, PageLayout } from './ui/PageLayout'
 
 // ---- Merged node type ----
@@ -71,15 +72,6 @@ function latencyColor(ms: number): string {
   if (ms <= 100) return 'text-success'
   if (ms <= 300) return 'text-warning'
   return 'text-error'
-}
-
-function regionFlag(region?: string): string {
-  const flags: Record<string, string> = {
-    hk: '🇭🇰', jp: '🇯🇵', kr: '🇰🇷', us: '🇺🇸', tw: '🇹🇼',
-    sg: '🇸🇬', de: '🇩🇪', gb: '🇬🇧', fr: '🇫🇷', ca: '🇨🇦',
-    au: '🇦🇺', in: '🇮🇳', br: '🇧🇷', ru: '🇷🇺', nl: '🇳🇱',
-  }
-  return flags[region?.toLowerCase() || ''] || '🌐'
 }
 
 function SortIcon({ active, dir }: { active: boolean; dir: SortDir }) {

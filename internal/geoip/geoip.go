@@ -554,30 +554,28 @@ func extractSSRHost(uri string) string {
 	return ""
 }
 
-// isoCodeToRegion maps ISO country codes to our region codes
+// isoCodeToRegion maps an ISO 3166-1 alpha-2 country code to a region code.
+//
+// The region code is simply the lowercased country code (e.g. "JP" -> "jp",
+// "SG" -> "sg"), so statistics and routing reflect the actual country rather
+// than collapsing most of the world into "other". An empty code (unknown /
+// unresolvable host) falls back to RegionOther.
 func isoCodeToRegion(isoCode string) string {
-	switch strings.ToUpper(isoCode) {
-	case "JP":
-		return RegionJP
-	case "KR":
-		return RegionKR
-	case "US":
-		return RegionUS
-	case "HK":
-		return RegionHK
-	case "TW":
-		return RegionTW
-	default:
+	code := strings.ToLower(strings.TrimSpace(isoCode))
+	if code == "" {
 		return RegionOther
 	}
+	return code
 }
 
-// AllRegions returns all supported region codes
+// AllRegions returns the well-known region codes. Region codes are not limited
+// to this set at runtime — any lowercased ISO country code may appear — but
+// these are the ones treated as first-class for routing and display.
 func AllRegions() []string {
 	return []string{RegionJP, RegionKR, RegionUS, RegionHK, RegionTW, RegionOther}
 }
 
-// RegionName returns the display name for a region code
+// RegionName returns the display name for a region code.
 func RegionName(code string) string {
 	switch code {
 	case RegionJP:
@@ -593,26 +591,39 @@ func RegionName(code string) string {
 	case RegionOther:
 		return "Other"
 	default:
+		// Region codes are lowercased ISO country codes; surface the code
+		// uppercased rather than a generic "Unknown".
+		upper := strings.ToUpper(code)
+		if len(upper) == 2 && isAlpha(upper) {
+			return upper
+		}
 		return "Unknown"
 	}
 }
 
-// RegionEmoji returns the flag emoji for a region code
+// RegionEmoji returns the flag emoji for a region code.
+//
+// For any 2-letter ISO country code the flag is computed from the regional
+// indicator symbols, so every country is supported without a hardcoded table.
 func RegionEmoji(code string) string {
-	switch code {
-	case RegionJP:
-		return "🇯🇵"
-	case RegionKR:
-		return "🇰🇷"
-	case RegionUS:
-		return "🇺🇸"
-	case RegionHK:
-		return "🇭🇰"
-	case RegionTW:
-		return "🇹🇼"
-	case RegionOther:
+	if code == RegionOther {
 		return "🌍"
-	default:
+	}
+	c := strings.ToLower(code)
+	if len(c) != 2 || !isAlpha(c) {
 		return "❓"
 	}
+	const base = 0x1f1e6 // regional indicator symbol A
+	return string([]rune{rune(c[0]) - 'a' + base, rune(c[1]) - 'a' + base})
+}
+
+// isAlpha reports whether s consists of two ASCII letters (a-z, A-Z).
+func isAlpha(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+			return false
+		}
+	}
+	return len(s) == 2
 }
