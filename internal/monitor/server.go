@@ -2677,7 +2677,12 @@ func (s *Server) groupFromInput(ctx context.Context, input groupPoolInput, exist
 	if err != nil {
 		return nil, nil, err
 	}
-	if input.DispatchMode != "random" {
+	switch strings.ToLower(strings.TrimSpace(input.DispatchMode)) {
+	case "random":
+		input.DispatchMode = "random"
+	case "lowest_latency":
+		input.DispatchMode = "lowest_latency"
+	default:
 		input.DispatchMode = "fixed"
 	}
 	if input.FailureWindowSeconds <= 0 {

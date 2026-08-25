@@ -74,6 +74,34 @@ func TestBuildCreatesIndependentGroupListenerSelectorAndPool(t *testing.T) {
 	}
 }
 
+func TestBuildLeavesLowestLatencyGroupWithoutSyntheticCurrent(t *testing.T) {
+	cfg := &config.Config{Mode: "pool", Listener: config.ListenerConfig{Address: "127.0.0.1", Port: 2323, Protocol: "http"},
+		Pool: config.PoolConfig{Mode: "random", FailureThreshold: 3, BlacklistDuration: time.Hour},
+		Nodes: []config.NodeConfig{{ID: 1, Name: "first", URI: "http://first.example:80", Region: "hk"},
+			{ID: 2, Name: "second", URI: "http://second.example:80", Region: "hk"}},
+		Groups: []config.GroupPoolConfig{{ID: 8, Name: "lowest", BindAddress: "127.0.0.1", BindPort: 10008,
+			Protocol: "mixed", DispatchMode: "lowest_latency", Regions: []string{"hk"},
+			FailureWindow: 5 * time.Minute, FailureThreshold: 3, Enabled: true}}}
+	opts, err := Build(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, outbound := range opts.Outbounds {
+		if outbound.Tag != "group-pool-8" {
+			continue
+		}
+		poolOptions, ok := outbound.Options.(*poolout.Options)
+		if !ok {
+			t.Fatalf("group pool options type = %T", outbound.Options)
+		}
+		if poolOptions.Mode != "lowest_latency" || poolOptions.PreferredMember != "" {
+			t.Fatalf("mode=%q preferred=%q, want lowest_latency with no synthetic current", poolOptions.Mode, poolOptions.PreferredMember)
+		}
+		return
+	}
+	t.Fatal("group pool outbound not found")
+}
+
 func TestBuildNodeOutboundSupportsHTTP(t *testing.T) {
 	outbound, err := buildNodeOutbound("http-node", "http://alice:wonderland@example.com:8080/proxy", false)
 	if err != nil {

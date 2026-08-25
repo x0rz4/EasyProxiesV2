@@ -32,10 +32,11 @@ const (
 	// Tag is the default outbound tag used by builder.
 	Tag = "proxy-pool"
 
-	modeSequential = "sequential"
-	modeRandom     = "random"
-	modeBalance    = "balance"
-	modeFixed      = "fixed"
+	modeSequential    = "sequential"
+	modeRandom        = "random"
+	modeBalance       = "balance"
+	modeFixed         = "fixed"
+	modeLowestLatency = "lowest_latency"
 )
 
 // Options controls pool outbound behaviour.
@@ -92,6 +93,7 @@ type poolOutbound struct {
 	monitor               *monitor.Manager
 	selector              selectorOutbound
 	selectorMu            sync.Mutex
+	waitForInitialLatency atomic.Bool
 	candidatesPool        sync.Pool
 	unsubscribeHealth     func()
 	unsubscribeActivation func()
@@ -133,6 +135,9 @@ func newPool(ctx context.Context, _ adapter.Router, logger log.ContextLogger, ta
 				return make([]*memberState, 0, memberCount)
 			},
 		},
+	}
+	if normalized.Mode == modeLowestLatency && normalized.PreferredMember == "" {
+		p.waitForInitialLatency.Store(true)
 	}
 	group.Register(normalized.GroupID, normalized.FailureWindow, normalized.FailureThreshold,
 		normalized.PreferredMember, normalized.InitialGroupState)
@@ -196,6 +201,8 @@ func normalizeOptions(options Options) Options {
 		options.Mode = modeBalance
 	case modeFixed:
 		options.Mode = modeFixed
+	case modeLowestLatency:
+		options.Mode = modeLowestLatency
 	default:
 		options.Mode = modeSequential
 	}
@@ -261,6 +268,7 @@ func (p *poolOutbound) activateNodeID(nodeID int64) error {
 	if p.selector != nil && !p.selector.SelectOutbound(selected.tag) {
 		return errors.New("selector rejected group member")
 	}
+	p.waitForInitialLatency.Store(false)
 	group.SetCurrentTag(p.options.GroupID, selected.tag)
 	return nil
 }
@@ -426,6 +434,7 @@ func (p *poolOutbound) dialSelected(ctx context.Context, member *memberState, ne
 	if !p.selector.SelectOutbound(member.tag) {
 		return nil, E.New("selector rejected member: ", member.tag)
 	}
+	p.waitForInitialLatency.Store(false)
 	group.SetCurrentTag(p.options.GroupID, member.tag)
 	return p.selector.DialContext(ctx, network, destination)
 }
@@ -439,6 +448,7 @@ func (p *poolOutbound) listenPacketSelected(ctx context.Context, member *memberS
 	if !p.selector.SelectOutbound(member.tag) {
 		return nil, E.New("selector rejected member: ", member.tag)
 	}
+	p.waitForInitialLatency.Store(false)
 	group.SetCurrentTag(p.options.GroupID, member.tag)
 	return p.selector.ListenPacket(ctx, destination)
 }
@@ -561,26 +571,80 @@ func (p *poolOutbound) selectMember(candidates []*memberState) *memberState {
 		}
 		return selected
 	case modeFixed:
-		current := group.CurrentTag(p.options.GroupID)
-		for _, member := range candidates {
-			if member.tag == current {
-				return member
-			}
+		if current := memberByTag(candidates, group.CurrentTag(p.options.GroupID)); current != nil {
+			return current
 		}
-		selected := candidates[0]
-		for _, candidate := range candidates[1:] {
-			if p.fixedMemberLess(candidate, selected) {
-				selected = candidate
-			}
+		return p.nextFixedMember(candidates, p.selectorCurrentTag())
+	case modeLowestLatency:
+		if current := memberByTag(candidates, group.CurrentTag(p.options.GroupID)); current != nil {
+			return current
 		}
-		return selected
+		return p.lowestLatencyMember(candidates)
 	default:
 		idx := int(p.rrCounter.Add(1)-1) % len(candidates)
 		return candidates[idx]
 	}
 }
 
-func (p *poolOutbound) fixedMemberLess(left, right *memberState) bool {
+func memberByTag(candidates []*memberState, tag string) *memberState {
+	if tag == "" {
+		return nil
+	}
+	for _, candidate := range candidates {
+		if candidate.tag == tag {
+			return candidate
+		}
+	}
+	return nil
+}
+
+func (p *poolOutbound) selectorCurrentTag() string {
+	p.selectorMu.Lock()
+	defer p.selectorMu.Unlock()
+	if p.selector == nil {
+		return ""
+	}
+	return p.selector.Now()
+}
+
+func (p *poolOutbound) nextFixedMember(candidates []*memberState, previousTag string) *memberState {
+	if previousTag == "" || len(p.members) == 0 {
+		return candidates[0]
+	}
+	available := make(map[string]*memberState, len(candidates))
+	for _, candidate := range candidates {
+		available[candidate.tag] = candidate
+	}
+	previousIndex := -1
+	for index, member := range p.members {
+		if member.tag == previousTag {
+			previousIndex = index
+			break
+		}
+	}
+	if previousIndex < 0 {
+		return candidates[0]
+	}
+	for offset := 1; offset <= len(p.members); offset++ {
+		member := p.members[(previousIndex+offset)%len(p.members)]
+		if candidate := available[member.tag]; candidate != nil {
+			return candidate
+		}
+	}
+	return candidates[0]
+}
+
+func (p *poolOutbound) lowestLatencyMember(candidates []*memberState) *memberState {
+	selected := candidates[0]
+	for _, candidate := range candidates[1:] {
+		if p.latencyMemberLess(candidate, selected) {
+			selected = candidate
+		}
+	}
+	return selected
+}
+
+func (p *poolOutbound) latencyMemberLess(left, right *memberState) bool {
 	leftLatency, rightLatency := int64(-1), int64(-1)
 	if p.monitor != nil {
 		if snapshot := p.monitor.SnapshotForTag(left.tag); snapshot != nil {
@@ -636,10 +700,16 @@ func (p *poolOutbound) reconcileCurrent() {
 	current := group.CurrentTag(p.options.GroupID)
 	for _, candidate := range candidates {
 		if candidate.tag == current {
+			p.waitForInitialLatency.Store(false)
 			p.putCandidateBuffer(candidates)
 			return
 		}
 	}
+	if p.waitForInitialLatency.Load() && !p.allInitialChecksDone() {
+		p.putCandidateBuffer(candidates)
+		return
+	}
+	p.waitForInitialLatency.Store(false)
 	if len(candidates) == 0 {
 		p.putCandidateBuffer(candidates)
 		group.SetCurrentTag(p.options.GroupID, "")
@@ -654,6 +724,19 @@ func (p *poolOutbound) reconcileCurrent() {
 		return
 	}
 	group.SetCurrentTag(p.options.GroupID, selected.tag)
+}
+
+func (p *poolOutbound) allInitialChecksDone() bool {
+	if p.monitor == nil {
+		return true
+	}
+	for _, tag := range p.options.Members {
+		snapshot := p.monitor.SnapshotForTag(tag)
+		if snapshot == nil || !snapshot.InitialCheckDone {
+			return false
+		}
+	}
+	return true
 }
 
 func (p *poolOutbound) recordFailure(member *memberState, cause error, destination string) {

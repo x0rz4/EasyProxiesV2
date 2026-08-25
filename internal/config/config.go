@@ -312,9 +312,12 @@ func (c *Config) applyDefaults() error {
 			return fmt.Errorf("group %q: %w", g.Name, err)
 		}
 		g.Protocol = groupProtocol
-		if strings.EqualFold(g.DispatchMode, "random") {
+		switch strings.ToLower(strings.TrimSpace(g.DispatchMode)) {
+		case "random":
 			g.DispatchMode = "random"
-		} else {
+		case "lowest_latency":
+			g.DispatchMode = "lowest_latency"
+		default:
 			g.DispatchMode = "fixed"
 		}
 		if g.FailureWindow <= 0 {

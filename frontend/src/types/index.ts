@@ -94,7 +94,7 @@ export interface GroupPool {
   protocol: string
   username?: string
   password?: string
-  dispatch_mode: 'fixed' | 'random'
+  dispatch_mode: 'fixed' | 'lowest_latency' | 'random'
   regions: string[]
   explicit_node_ids: number[]
   excluded_node_ids: number[]
@@ -129,7 +129,7 @@ export interface GroupPoolPayload {
   protocol: string
   username: string
   password: string
-  dispatch_mode: 'fixed' | 'random'
+  dispatch_mode: 'fixed' | 'lowest_latency' | 'random'
   regions: string[]
   explicit_node_ids: number[]
   excluded_node_ids: number[]

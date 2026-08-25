@@ -91,7 +91,7 @@ func TestGroupFromInputDropsUnavailableExplicitNodes(t *testing.T) {
 
 	server := &Server{store: db, mgr: mgr}
 	groupPool, removed, err := server.groupFromInput(ctx, groupPoolInput{Name: "HK", BindAddress: "127.0.0.1",
-		BindPort: 12091, Protocol: "mixed", DispatchMode: "fixed", Regions: []string{"HK"},
+		BindPort: 12091, Protocol: "mixed", DispatchMode: "lowest_latency", Regions: []string{"HK"},
 		ExplicitNodeIDs: []int64{available.ID, unavailable.ID}}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -104,6 +104,17 @@ func TestGroupFromInputDropsUnavailableExplicitNodes(t *testing.T) {
 	}
 	if len(groupPool.Regions) != 1 || groupPool.Regions[0] != "hk" {
 		t.Fatalf("regions changed while filtering explicit nodes: %v", groupPool.Regions)
+	}
+	if groupPool.DispatchMode != "lowest_latency" {
+		t.Fatalf("dispatch mode = %q, want lowest_latency", groupPool.DispatchMode)
+	}
+	fallback, _, err := server.groupFromInput(ctx, groupPoolInput{Name: "fallback", BindAddress: "127.0.0.1",
+		BindPort: 12090, Protocol: "mixed", DispatchMode: "unsupported"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fallback.DispatchMode != "fixed" {
+		t.Fatalf("unknown dispatch mode = %q, want fixed fallback", fallback.DispatchMode)
 	}
 }
 

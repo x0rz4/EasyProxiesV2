@@ -32,10 +32,15 @@ type fakeOutbound struct {
 type fakeSelector struct {
 	adapter.Outbound
 	selected string
+	calls    atomic.Int32
 }
 
-func (s *fakeSelector) SelectOutbound(tag string) bool { s.selected = tag; return true }
-func (s *fakeSelector) Now() string                    { return s.selected }
+func (s *fakeSelector) SelectOutbound(tag string) bool {
+	s.calls.Add(1)
+	s.selected = tag
+	return true
+}
+func (s *fakeSelector) Now() string { return s.selected }
 
 func (o *fakeOutbound) Network() []string { return []string{N.NetworkTCP} }
 
@@ -169,7 +174,37 @@ func TestActiveConnections(t *testing.T) {
 	first.decActive()
 }
 
-func TestFixedSelectionKeepsHealthyCurrentThenUsesLowestLatency(t *testing.T) {
+func TestFixedSelectionKeepsHealthyCurrentThenUsesMemberOrder(t *testing.T) {
+	group.Reset()
+	defer group.Reset()
+	group.Register(20, 5*time.Minute, 3, "b", map[string]group.GroupInitialState{
+		"a": {NodeID: 1}, "b": {NodeID: 2}, "c": {NodeID: 3}, "d": {NodeID: 4},
+	})
+	a := &memberState{tag: "a", shared: acquireSharedState("a")}
+	b := &memberState{tag: "b", shared: acquireSharedState("b")}
+	c := &memberState{tag: "c", shared: acquireSharedState("c")}
+	d := &memberState{tag: "d", shared: acquireSharedState("d")}
+	selector := &fakeSelector{selected: "b"}
+	p := &poolOutbound{mode: modeFixed, selector: selector, options: Options{GroupID: 20},
+		members: []*memberState{a, b, c, d}}
+	if selected := p.selectMember([]*memberState{a, b, c, d}); selected != b {
+		t.Fatalf("healthy current changed to %s", selected.tag)
+	}
+	group.SetCurrentTag(20, "")
+	if selected := p.selectMember([]*memberState{a, d}); selected != d {
+		t.Fatalf("replacement = %s, want next available d", selected.tag)
+	}
+	selector.selected = "d"
+	if selected := p.selectMember([]*memberState{a}); selected != a {
+		t.Fatalf("wrapped replacement = %s, want a", selected.tag)
+	}
+	selector.selected = ""
+	if selected := p.selectMember([]*memberState{a, d}); selected != a {
+		t.Fatalf("initial replacement = %s, want first available a", selected.tag)
+	}
+}
+
+func TestLowestLatencySelectionKeepsHealthyCurrentThenUsesLatency(t *testing.T) {
 	group.Reset()
 	defer group.Reset()
 	mgr, err := monitor.NewManager(monitor.Config{})
@@ -177,23 +212,74 @@ func TestFixedSelectionKeepsHealthyCurrentThenUsesLowestLatency(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer mgr.Stop()
-	aEntry := mgr.Register(monitor.NodeInfo{Tag: "a"})
-	bEntry := mgr.Register(monitor.NodeInfo{Tag: "b"})
-	aEntry.RecordSuccessWithLatency(80 * time.Millisecond)
-	bEntry.RecordSuccessWithLatency(10 * time.Millisecond)
-	group.Register(20, 5*time.Minute, 3, "a", map[string]group.GroupInitialState{
+	mgr.Register(monitor.NodeInfo{Tag: "a"}).RecordSuccessWithLatency(80 * time.Millisecond)
+	mgr.Register(monitor.NodeInfo{Tag: "b"}).RecordSuccessWithLatency(10 * time.Millisecond)
+	group.Register(25, 5*time.Minute, 3, "a", map[string]group.GroupInitialState{
 		"a": {NodeID: 1}, "b": {NodeID: 2},
 	})
 	a := &memberState{tag: "a", shared: acquireSharedState("a")}
 	b := &memberState{tag: "b", shared: acquireSharedState("b")}
-	p := &poolOutbound{mode: modeFixed, monitor: mgr, options: Options{GroupID: 20,
+	p := &poolOutbound{mode: modeLowestLatency, monitor: mgr, options: Options{GroupID: 25,
 		Metadata: map[string]MemberMeta{"a": {NodeID: 1}, "b": {NodeID: 2}}}}
 	if selected := p.selectMember([]*memberState{a, b}); selected != a {
 		t.Fatalf("healthy current changed to %s", selected.tag)
 	}
-	group.SetCurrentTag(20, "")
+	group.SetCurrentTag(25, "")
 	if selected := p.selectMember([]*memberState{a, b}); selected != b {
 		t.Fatalf("replacement = %s, want lowest-latency b", selected.tag)
+	}
+}
+
+func TestLowestLatencySelectionUsesKnownLatencyThenStableNodeOrder(t *testing.T) {
+	mgr, err := monitor.NewManager(monitor.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	mgr.Register(monitor.NodeInfo{Tag: "unknown"})
+	mgr.Register(monitor.NodeInfo{Tag: "higher-id"}).RecordSuccessWithLatency(25 * time.Millisecond)
+	mgr.Register(monitor.NodeInfo{Tag: "lower-id"}).RecordSuccessWithLatency(25 * time.Millisecond)
+	unknown := &memberState{tag: "unknown"}
+	higherID := &memberState{tag: "higher-id"}
+	lowerID := &memberState{tag: "lower-id"}
+	p := &poolOutbound{mode: modeLowestLatency, monitor: mgr, options: Options{Metadata: map[string]MemberMeta{
+		"unknown": {NodeID: 1}, "higher-id": {NodeID: 3}, "lower-id": {NodeID: 2},
+	}}}
+	if selected := p.selectMember([]*memberState{unknown, higherID, lowerID}); selected != lowerID {
+		t.Fatalf("selected %s, want known latency with lowest stable node ID", selected.tag)
+	}
+}
+
+func TestLowestLatencyInitialSelectionWaitsForAllInitialChecks(t *testing.T) {
+	group.Reset()
+	defer group.Reset()
+	mgr, err := monitor.NewManager(monitor.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	mgr.Register(monitor.NodeInfo{Tag: "a"}).RecordSuccessWithLatency(80 * time.Millisecond)
+	bEntry := mgr.Register(monitor.NodeInfo{Tag: "b"})
+	group.Register(28, 5*time.Minute, 3, "", map[string]group.GroupInitialState{
+		"a": {NodeID: 1}, "b": {NodeID: 2},
+	})
+	selector := &fakeSelector{selected: "a"}
+	p := &poolOutbound{
+		logger: boxlog.NewNOPFactory().Logger(), mode: modeLowestLatency, monitor: mgr, selector: selector,
+		options: Options{GroupID: 28, Members: []string{"a", "b"}, Metadata: map[string]MemberMeta{
+			"a": {NodeID: 1}, "b": {NodeID: 2},
+		}},
+		members: []*memberState{{tag: "a", shared: acquireSharedState("a")}, {tag: "b", shared: acquireSharedState("b")}},
+	}
+	p.waitForInitialLatency.Store(true)
+	p.reconcileCurrent()
+	if selector.calls.Load() != 0 || group.CurrentTag(28) != "" {
+		t.Fatalf("selected before all initial checks: calls=%d current=%q", selector.calls.Load(), group.CurrentTag(28))
+	}
+	bEntry.RecordSuccessWithLatency(10 * time.Millisecond)
+	p.reconcileCurrent()
+	if selector.calls.Load() != 1 || selector.selected != "b" || group.CurrentTag(28) != "b" {
+		t.Fatalf("initial lowest selection: calls=%d selector=%q current=%q", selector.calls.Load(), selector.selected, group.CurrentTag(28))
 	}
 }
 
@@ -207,20 +293,73 @@ func TestHealthFailureHotSwitchesSelector(t *testing.T) {
 	defer mgr.Stop()
 	aEntry := mgr.Register(monitor.NodeInfo{Tag: "a"})
 	bEntry := mgr.Register(monitor.NodeInfo{Tag: "b"})
-	aEntry.MarkInitialCheckDone(false)
-	bEntry.RecordSuccessWithLatency(15 * time.Millisecond)
-	group.Register(21, 5*time.Minute, 3, "a", map[string]group.GroupInitialState{
+	cEntry := mgr.Register(monitor.NodeInfo{Tag: "c"})
+	aEntry.RecordSuccessWithLatency(5 * time.Millisecond)
+	bEntry.MarkInitialCheckDone(false)
+	cEntry.RecordSuccessWithLatency(15 * time.Millisecond)
+	group.Register(21, 5*time.Minute, 3, "b", map[string]group.GroupInitialState{
+		"a": {NodeID: 1}, "b": {NodeID: 2}, "c": {NodeID: 3},
+	})
+	selector := &fakeSelector{selected: "b"}
+	p := &poolOutbound{
+		logger: boxlog.NewNOPFactory().Logger(), mode: modeFixed, monitor: mgr, selector: selector,
+		options: Options{GroupID: 21, Metadata: map[string]MemberMeta{"a": {NodeID: 1}, "b": {NodeID: 2}, "c": {NodeID: 3}}},
+		members: []*memberState{{tag: "a", shared: acquireSharedState("a")}, {tag: "b", shared: acquireSharedState("b")}, {tag: "c", shared: acquireSharedState("c")}},
+	}
+	p.handleHealthResult(monitor.HealthResultEvent{Tag: "b", Error: "down", CheckedAt: time.Now()})
+	if selector.selected != "c" || group.CurrentTag(21) != "c" {
+		t.Fatalf("selector=%q current=%q, want ordered replacement c", selector.selected, group.CurrentTag(21))
+	}
+}
+
+func TestFixedHealthSuccessDoesNotSwitchHealthyCurrent(t *testing.T) {
+	group.Reset()
+	defer group.Reset()
+	mgr, err := monitor.NewManager(monitor.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	mgr.Register(monitor.NodeInfo{Tag: "a"}).RecordSuccessWithLatency(80 * time.Millisecond)
+	mgr.Register(monitor.NodeInfo{Tag: "b"}).RecordSuccessWithLatency(10 * time.Millisecond)
+	group.Register(27, 5*time.Minute, 3, "a", map[string]group.GroupInitialState{
 		"a": {NodeID: 1}, "b": {NodeID: 2},
 	})
 	selector := &fakeSelector{selected: "a"}
 	p := &poolOutbound{
 		logger: boxlog.NewNOPFactory().Logger(), mode: modeFixed, monitor: mgr, selector: selector,
-		options: Options{GroupID: 21, Metadata: map[string]MemberMeta{"a": {NodeID: 1}, "b": {NodeID: 2}}},
+		options: Options{GroupID: 27},
 		members: []*memberState{{tag: "a", shared: acquireSharedState("a")}, {tag: "b", shared: acquireSharedState("b")}},
 	}
-	p.handleHealthResult(monitor.HealthResultEvent{Tag: "a", Error: "down", CheckedAt: time.Now()})
-	if selector.selected != "b" || group.CurrentTag(21) != "b" {
-		t.Fatalf("selector=%q current=%q, want b", selector.selected, group.CurrentTag(21))
+	p.handleHealthResult(monitor.HealthResultEvent{Tag: "b", Success: true, Latency: 10 * time.Millisecond, CheckedAt: time.Now()})
+	if selector.calls.Load() != 0 || selector.selected != "a" || group.CurrentTag(27) != "a" {
+		t.Fatalf("healthy fixed current switched: calls=%d selector=%q current=%q", selector.calls.Load(), selector.selected, group.CurrentTag(27))
+	}
+}
+
+func TestLowestLatencyHealthFailureHotSwitchesToLowestCandidate(t *testing.T) {
+	group.Reset()
+	defer group.Reset()
+	mgr, err := monitor.NewManager(monitor.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	mgr.Register(monitor.NodeInfo{Tag: "a"}).RecordSuccessWithLatency(5 * time.Millisecond)
+	mgr.Register(monitor.NodeInfo{Tag: "b"}).MarkInitialCheckDone(false)
+	mgr.Register(monitor.NodeInfo{Tag: "c"}).RecordSuccessWithLatency(15 * time.Millisecond)
+	group.Register(26, 5*time.Minute, 3, "b", map[string]group.GroupInitialState{
+		"a": {NodeID: 1}, "b": {NodeID: 2}, "c": {NodeID: 3},
+	})
+	selector := &fakeSelector{selected: "b"}
+	p := &poolOutbound{
+		logger: boxlog.NewNOPFactory().Logger(), mode: modeLowestLatency, monitor: mgr, selector: selector,
+		options: Options{GroupID: 26, Metadata: map[string]MemberMeta{"a": {NodeID: 1}, "b": {NodeID: 2}, "c": {NodeID: 3}}},
+		members: []*memberState{{tag: "a", shared: acquireSharedState("a")}, {tag: "b", shared: acquireSharedState("b")}, {tag: "c", shared: acquireSharedState("c")}},
+	}
+	p.handleHealthResult(monitor.HealthResultEvent{Tag: "b", Error: "down", CheckedAt: time.Now()})
+	if selector.selected != "a" || group.CurrentTag(26) != "a" {
+		t.Fatalf("selector=%q current=%q, want lowest-latency replacement a", selector.selected, group.CurrentTag(26))
 	}
 }
 
@@ -257,15 +396,15 @@ func TestManualActivationUsesSelectorAndRejectsUnhealthyMember(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer mgr.Stop()
-	mgr.Register(monitor.NodeInfo{Tag: "a"}).RecordSuccessWithLatency(20 * time.Millisecond)
+	mgr.Register(monitor.NodeInfo{Tag: "a"}).RecordSuccessWithLatency(10 * time.Millisecond)
 	bEntry := mgr.Register(monitor.NodeInfo{Tag: "b"})
-	bEntry.RecordSuccessWithLatency(10 * time.Millisecond)
+	bEntry.RecordSuccessWithLatency(20 * time.Millisecond)
 	group.Register(24, 5*time.Minute, 3, "a", map[string]group.GroupInitialState{
 		"a": {NodeID: 1}, "b": {NodeID: 2},
 	})
 	selector := &fakeSelector{selected: "a"}
 	p := &poolOutbound{
-		logger: boxlog.NewNOPFactory().Logger(), mode: modeFixed, monitor: mgr, selector: selector,
+		logger: boxlog.NewNOPFactory().Logger(), mode: modeLowestLatency, monitor: mgr, selector: selector,
 		options: Options{GroupID: 24, Metadata: map[string]MemberMeta{"a": {NodeID: 1}, "b": {NodeID: 2}}},
 		members: []*memberState{{tag: "a", shared: acquireSharedState("a")}, {tag: "b", shared: acquireSharedState("b")}},
 	}
@@ -276,6 +415,10 @@ func TestManualActivationUsesSelectorAndRejectsUnhealthyMember(t *testing.T) {
 	}
 	if selector.selected != "b" || group.CurrentTag(24) != "b" {
 		t.Fatalf("selector=%q current=%q, want b", selector.selected, group.CurrentTag(24))
+	}
+	p.handleHealthResult(monitor.HealthResultEvent{Tag: "a", Success: true, Latency: 10 * time.Millisecond, CheckedAt: time.Now()})
+	if selector.calls.Load() != 1 || selector.selected != "b" || group.CurrentTag(24) != "b" {
+		t.Fatalf("manual healthy current did not persist: calls=%d selector=%q current=%q", selector.calls.Load(), selector.selected, group.CurrentTag(24))
 	}
 	bEntry.MarkInitialCheckDone(false)
 	if err := group.ActivateMember(24, 2); err == nil {

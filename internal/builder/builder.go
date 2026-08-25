@@ -297,14 +297,18 @@ func Build(cfg *config.Config) (option.Options, error) {
 			}
 		}
 		preferredTag := nodeTagsByID[group.CurrentActiveNodeID]
-		if preferredTag == "" {
+		if preferredTag == "" && group.DispatchMode != "lowest_latency" {
 			preferredTag = members[0]
+		}
+		selectorDefault := preferredTag
+		if selectorDefault == "" {
+			selectorDefault = members[0]
 		}
 		selectorTag := fmt.Sprintf("group-selector-%d", group.ID)
 		groupOutboundTag := fmt.Sprintf("group-pool-%d", group.ID)
 		groupInboundTag := fmt.Sprintf("group-in-%d", group.ID)
 		outbounds = append(outbounds, option.Outbound{Type: C.TypeSelector, Tag: selectorTag,
-			Options: &option.SelectorOutboundOptions{Outbounds: members, Default: preferredTag, InterruptExistConnections: false}})
+			Options: &option.SelectorOutboundOptions{Outbounds: members, Default: selectorDefault, InterruptExistConnections: false}})
 		groupOptions := poolout.Options{Mode: group.DispatchMode, Members: members,
 			FailureThreshold: group.FailureThreshold, FailureWindow: group.FailureWindow,
 			HealthCheckInterval: group.HealthCheckInterval,

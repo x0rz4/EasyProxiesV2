@@ -1,8 +1,8 @@
 import { useMemo, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  Activity, CheckCircle2, ChevronDown, CircleAlert, Copy, Dices, KeyRound, Layers3, Link2, Network, Pencil,
-  Plus, Power, RefreshCw, RotateCcw, Search, Server, ShieldOff, Trash2, X, Crosshair,
+  Activity, CheckCircle2, ChevronDown, CircleAlert, Copy, KeyRound, Layers3, Link2, Network, Pencil,
+  Plus, Power, RefreshCw, RotateCcw, Search, ShieldOff, Trash2, X, Crosshair,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import type { GroupMember, GroupNodeOption, GroupPool, GroupPoolPayload, GroupMemberStatus } from '../types'
@@ -33,6 +33,18 @@ const nodeStatusStyle: Record<GroupNodeOption['status'], { label: string; badge:
   blacklisted: { label: '已拉黑', badge: 'badge-warning' },
   pending: { label: '待检测', badge: 'badge-ghost' },
   disabled: { label: '已禁用', badge: 'badge-ghost' },
+}
+
+const dispatchModeLabel: Record<GroupPool['dispatch_mode'], string> = {
+  fixed: '固定出口',
+  lowest_latency: '延迟最低',
+  random: '随机出口',
+}
+
+const dispatchModeHint: Record<GroupPoolPayload['dispatch_mode'], string> = {
+  fixed: '保持当前健康出口；失效后按成员列表顺序切换到下一个可用节点。',
+  lowest_latency: '保持当前健康出口；首次选择或失效后切换到延迟最低的可用节点。',
+  random: '每个新连接在全部健康成员中随机选择出口。',
 }
 
 async function copyTextWithFallback(value: string): Promise<boolean> {
@@ -290,14 +302,13 @@ export default function GroupPoolsPanel() {
               <Field label="入口协议"><select className={cn('select w-full', controlClass)} value={form.protocol} onChange={(e) => setForm({ ...form, protocol: e.target.value })}><option value="mixed">Mixed (HTTP + SOCKS5)</option><option value="http">HTTP</option><option value="socks5">SOCKS5</option></select></Field>
             </div>
 
-            <div className="grid gap-4 sm:grid-cols-2">
-              <button type="button" className={cn('cursor-pointer rounded-2xl border p-4 text-left transition-colors', form.dispatch_mode === 'fixed' ? 'border-primary bg-primary/10' : 'border-base-300 hover:bg-base-200/50')} onClick={() => setForm({ ...form, dispatch_mode: 'fixed' })}>
-                <div className="flex items-center gap-2 font-bold"><Server className="h-4 w-4" />固定出口</div><p className="mt-2 text-xs leading-5 text-base-content/55">保持当前主出口；失效或被踢出时自动切到下一可用节点。</p>
-              </button>
-              <button type="button" className={cn('cursor-pointer rounded-2xl border p-4 text-left transition-colors', form.dispatch_mode === 'random' ? 'border-primary bg-primary/10' : 'border-base-300 hover:bg-base-200/50')} onClick={() => setForm({ ...form, dispatch_mode: 'random' })}>
-                <div className="flex items-center gap-2 font-bold"><Dices className="h-4 w-4" />随机出口</div><p className="mt-2 text-xs leading-5 text-base-content/55">每个新连接在全部健康成员中随机选择出口。</p>
-              </button>
-            </div>
+            <Field label="出口调度模式" hint={dispatchModeHint[form.dispatch_mode]}>
+              <select className={cn('select w-full', controlClass)} value={form.dispatch_mode} onChange={(event) => setForm({ ...form, dispatch_mode: event.target.value as GroupPoolPayload['dispatch_mode'] })}>
+                <option value="fixed">固定出口模式</option>
+                <option value="lowest_latency">延迟最低模式</option>
+                <option value="random">随机出口模式</option>
+              </select>
+            </Field>
 
             <div className="grid gap-4 sm:grid-cols-3">
               <Field label="失败窗口（秒）"><input type="number" min={30} className={cn('input w-full', controlClass)} value={form.failure_window_seconds} onChange={(e) => setForm({ ...form, failure_window_seconds: Number(e.target.value) })} /></Field>
@@ -441,7 +452,7 @@ function GroupCard({ group, busy, expanded, onToggleExpanded, onEdit, onDelete, 
 	}
   return <article className={cn(surfaceClass, 'overflow-hidden transition-colors', !group.enabled && 'opacity-70')}>
     <div className="border-b border-base-200 p-5">
-      <div className="flex items-start gap-3"><div className={cn('flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl', group.enabled ? 'bg-primary/10 text-primary' : 'bg-base-200 text-base-content/40')}><Layers3 className="h-5 w-5" /></div><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><h3 className="truncate text-lg font-bold">{group.name}</h3><span className={cn('badge badge-sm', group.enabled ? 'badge-success' : 'badge-ghost')}>{group.enabled ? '运行中' : '已停用'}</span><span className="badge badge-outline badge-sm">{group.dispatch_mode === 'fixed' ? '固定出口' : '随机出口'}</span></div><div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-base-content/55"><code className="font-semibold text-primary">{group.bind_address}:{group.bind_port}</code><span className="uppercase">{group.protocol}</span><span>{group.failure_window_seconds / 60} 分钟 / {group.failure_threshold} 次踢出</span></div></div><div className="dropdown dropdown-end"><button tabIndex={0} className="btn btn-ghost btn-sm btn-square" aria-label="分组操作"><Pencil className="h-4 w-4" /></button><ul tabIndex={0} className="dropdown-content z-20 mt-1 w-36 rounded-box border border-base-300 bg-base-100 p-1.5 shadow-xl"><li><button className="flex w-full cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-sm hover:bg-base-200" onClick={onEdit}><Pencil className="h-4 w-4" />编辑</button></li><li><button className="flex w-full cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-sm hover:bg-base-200" onClick={onToggle}><Power className="h-4 w-4" />{group.enabled ? '停用' : '启用'}</button></li><li><button className="flex w-full cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-sm text-error hover:bg-error/10" onClick={onDelete}><Trash2 className="h-4 w-4" />删除</button></li></ul></div></div>
+      <div className="flex items-start gap-3"><div className={cn('flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl', group.enabled ? 'bg-primary/10 text-primary' : 'bg-base-200 text-base-content/40')}><Layers3 className="h-5 w-5" /></div><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><h3 className="truncate text-lg font-bold">{group.name}</h3><span className={cn('badge badge-sm', group.enabled ? 'badge-success' : 'badge-ghost')}>{group.enabled ? '运行中' : '已停用'}</span><span className="badge badge-outline badge-sm">{dispatchModeLabel[group.dispatch_mode]}</span></div><div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-base-content/55"><code className="font-semibold text-primary">{group.bind_address}:{group.bind_port}</code><span className="uppercase">{group.protocol}</span><span>{group.failure_window_seconds / 60} 分钟 / {group.failure_threshold} 次踢出</span></div></div><div className="dropdown dropdown-end"><button tabIndex={0} className="btn btn-ghost btn-sm btn-square" aria-label="分组操作"><Pencil className="h-4 w-4" /></button><ul tabIndex={0} className="dropdown-content z-20 mt-1 w-36 rounded-box border border-base-300 bg-base-100 p-1.5 shadow-xl"><li><button className="flex w-full cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-sm hover:bg-base-200" onClick={onEdit}><Pencil className="h-4 w-4" />编辑</button></li><li><button className="flex w-full cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-sm hover:bg-base-200" onClick={onToggle}><Power className="h-4 w-4" />{group.enabled ? '停用' : '启用'}</button></li><li><button className="flex w-full cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-sm text-error hover:bg-error/10" onClick={onDelete}><Trash2 className="h-4 w-4" />删除</button></li></ul></div></div>
       <div className="mt-4 grid grid-cols-3 gap-2"><MiniMetric label="成员" value={group.member_count} /><MiniMetric label="健康" value={group.alive_count} tone="text-success" /><MiniMetric label="踢出" value={group.evicted_count} tone={group.evicted_count ? 'text-error' : ''} /></div>
       {(group.regions?.length > 0 || group.explicit_node_ids?.length > 0) && <div className="mt-4 flex flex-wrap gap-1.5">{group.regions?.map((region) => <span key={region} className="badge badge-primary badge-outline badge-sm uppercase">{region}</span>)}{group.explicit_node_ids?.length > 0 && <span className="badge badge-ghost badge-sm">手动 {group.explicit_node_ids.length} 个</span>}</div>}
 		<div className={cn('mt-4 rounded-xl border p-3', group.subscription_enabled ? 'border-info/20 bg-info/5' : 'border-base-200 bg-base-200/25')}>
@@ -451,7 +462,7 @@ function GroupCard({ group, busy, expanded, onToggleExpanded, onEdit, onDelete, 
 		</div>
     </div>
     <div className="p-4 sm:p-5">
-      {group.dispatch_mode === 'fixed' && <div className={cn('mb-3 flex items-center gap-3 rounded-xl border px-3 py-2.5', active ? 'border-success/25 bg-success/5' : 'border-warning/25 bg-warning/5')}><Activity className={cn('h-4 w-4 shrink-0', active ? 'text-success' : 'text-warning')} /><div className="min-w-0 flex-1"><p className="text-[11px] font-semibold uppercase tracking-wider text-base-content/45">当前主出口</p><p className="truncate text-sm font-semibold">{active?.name || '等待首个连接选择'}</p></div>{active?.latency_ms && active.latency_ms > 0 ? <span className="text-xs font-mono text-base-content/55">{active.latency_ms} ms</span> : null}</div>}
+      {group.dispatch_mode !== 'random' && <div className={cn('mb-3 flex items-center gap-3 rounded-xl border px-3 py-2.5', active ? 'border-success/25 bg-success/5' : 'border-warning/25 bg-warning/5')}><Activity className={cn('h-4 w-4 shrink-0', active ? 'text-success' : 'text-warning')} /><div className="min-w-0 flex-1"><p className="text-[11px] font-semibold uppercase tracking-wider text-base-content/45">当前主出口</p><p className="truncate text-sm font-semibold">{active?.name || '等待首个连接选择'}</p></div>{active?.latency_ms && active.latency_ms > 0 ? <span className="text-xs font-mono text-base-content/55">{active.latency_ms} ms</span> : null}</div>}
       <div className="space-y-2">{(expanded ? group.members : group.members.slice(0, 8)).map((member) => { const style = statusStyle[member.status]; const StatusIcon = style.icon; return <div key={member.node_id} className="flex min-w-0 items-center gap-2 rounded-xl border border-base-200 bg-base-200/20 px-3 py-2.5"><StatusIcon className={cn('h-4 w-4 shrink-0', member.status === 'ALIVE' ? 'text-success' : member.status === 'SUSPECT' ? 'text-warning' : 'text-error')} /><div className="min-w-0 flex-1"><div className="flex items-center gap-2"><span className="truncate text-sm font-medium">{member.name || member.tag}</span>{member.region && <span className="text-[10px] font-bold uppercase text-base-content/40">{member.region}</span>}</div>{member.last_error && <p className="mt-0.5 truncate text-[11px] text-error/75" title={member.last_error}>{member.last_error}</p>}</div><span className={cn('badge badge-sm', style.badge)}>{style.label}</span>{member.latency_ms > 0 && <span className="hidden w-14 text-right font-mono text-xs text-base-content/45 sm:block">{member.latency_ms} ms</span>}<div className="flex shrink-0 items-center gap-1">{member.status === 'ALIVE' && !member.is_active && <button className="btn btn-ghost btn-xs btn-square text-primary" disabled={busy === `activate-${group.id}-${member.node_id}`} onClick={() => onActivate(member.node_id)} title={group.dispatch_mode === 'random' ? '立即切换；random 模式下后续连接仍会随机选择' : '强制设为当前出口'} aria-label={`将 ${member.name || member.tag} 设为当前出口`}><Crosshair className="h-3.5 w-3.5" /></button>}{member.status === 'EVICTED' && <button className="btn btn-ghost btn-xs gap-1 text-primary" disabled={busy === `restore-${group.id}-${member.node_id}`} onClick={() => onRestore(member.node_id)} title="恢复入池"><RotateCcw className="h-3 w-3" /><span className="hidden sm:inline">恢复</span></button>}<button className="btn btn-ghost btn-xs btn-square text-error" disabled={busy === `remove-member-${group.id}-${member.node_id}`} onClick={() => onRemoveMember(member)} title="从此分组移除" aria-label={`从分组移除 ${member.name || member.tag}`}><Trash2 className="h-3.5 w-3.5" /></button></div></div> })}</div>
       {group.member_count === 0 && <div className="rounded-xl border border-dashed border-warning/40 bg-warning/5 px-4 py-8 text-center"><CircleAlert className="mx-auto h-6 w-6 text-warning" /><p className="mt-2 text-sm font-medium">当前没有匹配的有效节点</p><p className="mt-1 text-xs text-base-content/45">检查地区码、手动成员或节点启用状态</p></div>}
       {group.member_count > 8 && <button type="button" className="mt-3 flex min-h-9 w-full cursor-pointer items-center justify-center gap-1.5 rounded-lg text-xs font-medium text-base-content/55 transition-colors hover:bg-base-200/60 hover:text-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary" onClick={onToggleExpanded} aria-expanded={expanded}>
