@@ -52,6 +52,20 @@ type NodeManager interface {
 	TriggerReload(ctx context.Context) error
 }
 
+type GroupRuntimeStatus struct {
+	Status string `json:"runtime_status"`
+	Error  string `json:"runtime_error,omitempty"`
+}
+
+// GroupRuntimeManager is implemented by runtimes that can apply one group
+// without reloading every listener. The HTTP layer keeps a TriggerReload
+// fallback for lightweight test managers and older integrations.
+type GroupRuntimeManager interface {
+	ApplyGroupRuntime(ctx context.Context, before, after *store.GroupPool) error
+	ActivateGroupMember(ctx context.Context, groupID, nodeID int64) error
+	GroupRuntimeStatus(groupID int64) GroupRuntimeStatus
+}
+
 // ManagedNodeConfig is the flattened API representation used by node management.
 type ManagedNodeConfig struct {
 	Name            string            `json:"name"`
@@ -140,6 +154,7 @@ type Server struct {
 	// Concurrency control
 	probeSem        *semaphore.Weighted
 	groupMutationMu sync.Mutex
+	groupOperationLocks sync.Map // map[int64]*sync.Mutex
 
 	// Lifecycle
 	done chan struct{} // closed on Shutdown to stop background goroutines
@@ -2325,6 +2340,8 @@ type groupNodeOptionResponse struct {
 
 type groupPoolResponse struct {
 	store.GroupPool
+	RuntimeStatus    string                `json:"runtime_status"`
+	RuntimeError     string                `json:"runtime_error,omitempty"`
 	CurrentActiveTag string                `json:"current_active_tag,omitempty"`
 	Members          []groupMemberResponse `json:"members"`
 	MemberCount      int                   `json:"member_count"`
@@ -2347,21 +2364,25 @@ func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.groupMutationMu.Lock()
+		defer s.groupMutationMu.Unlock()
 		group, removedNodeIDs, err := s.groupFromInput(r.Context(), input, nil)
 		if err != nil {
-			s.groupMutationMu.Unlock()
 			writeAPIError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if err := s.store.CreateGroupPool(r.Context(), group); err != nil {
-			s.groupMutationMu.Unlock()
 			writeAPIError(w, http.StatusConflict, err.Error())
 			return
 		}
-		s.groupMutationMu.Unlock()
-		reloadError := s.reloadAfterGroupMutation(r.Context())
+		reloadError := s.applyGroupRuntimeMutation(r.Context(), nil, group)
+		if reloadError != "" {
+			rolledBack := s.store.DeleteGroupPool(r.Context(), group.ID) == nil
+			w.WriteHeader(http.StatusConflict)
+			writeJSON(w, map[string]any{"error": reloadError, "reloaded": false, "reload_error": reloadError, "rolled_back": rolledBack})
+			return
+		}
 		w.WriteHeader(http.StatusCreated)
-		writeJSON(w, map[string]any{"group": group, "reloaded": reloadError == "", "reload_error": reloadError,
+		writeJSON(w, map[string]any{"group": group, "reloaded": true, "reload_error": "",
 			"removed_unavailable_node_ids": removedNodeIDs})
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -2379,14 +2400,36 @@ func (s *Server) handleGroupItem(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "无效的分组 ID")
 		return
 	}
+	mutationRequest := (len(parts) == 3 && parts[1] == "members" && r.Method == http.MethodDelete) ||
+		(len(parts) == 1 && (r.Method == http.MethodPut || r.Method == http.MethodDelete))
+	if mutationRequest {
+		operationLock := s.groupOperationLock(groupID)
+		operationLock.Lock()
+		defer operationLock.Unlock()
+	}
 	if len(parts) == 4 && parts[1] == "members" && parts[3] == "activate" && r.Method == http.MethodPost {
 		nodeID, err := strconv.ParseInt(parts[2], 10, 64)
 		if err != nil || nodeID <= 0 {
 			writeAPIError(w, http.StatusBadRequest, "无效的节点 ID")
 			return
 		}
-		if err := group.ActivateMember(groupID, nodeID); err != nil {
-			writeAPIError(w, http.StatusConflict, err.Error())
+		groupPool, lookupErr := s.store.GetGroupPool(r.Context(), groupID)
+		if lookupErr != nil || groupPool == nil {
+			writeAPIError(w, http.StatusNotFound, "分组不存在")
+			return
+		}
+		if !groupPool.Enabled {
+			writeAPIError(w, http.StatusConflict, "分组未启用")
+			return
+		}
+		activateErr := error(nil)
+		if runtimeManager, ok := s.nodeMgr.(GroupRuntimeManager); ok {
+			activateErr = runtimeManager.ActivateGroupMember(r.Context(), groupID, nodeID)
+		} else {
+			activateErr = group.ActivateMember(groupID, nodeID)
+		}
+		if activateErr != nil {
+			writeAPIError(w, http.StatusConflict, activateErr.Error())
 			return
 		}
 		writeJSON(w, map[string]any{"message": "当前出口已切换", "group_id": groupID, "node_id": nodeID})
@@ -2439,6 +2482,7 @@ func (s *Server) handleGroupItem(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, http.StatusNotFound, "分组不存在")
 			return
 		}
+		originalGroup := cloneGroupPool(groupPool)
 		groupPool.ExplicitNodeIDs = removeInt64(groupPool.ExplicitNodeIDs, nodeID)
 		if !containsInt64(groupPool.ExcludedNodeIDs, nodeID) {
 			groupPool.ExcludedNodeIDs = append(groupPool.ExcludedNodeIDs, nodeID)
@@ -2452,9 +2496,15 @@ func (s *Server) handleGroupItem(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		reloadError := s.reloadAfterGroupMutation(r.Context())
+		reloadError := s.applyGroupRuntimeMutation(r.Context(), originalGroup, groupPool)
+		if reloadError != "" {
+			rolledBack := s.store.UpdateGroupPool(r.Context(), originalGroup) == nil
+			w.WriteHeader(http.StatusConflict)
+			writeJSON(w, map[string]any{"error": reloadError, "reloaded": false, "reload_error": reloadError, "rolled_back": rolledBack})
+			return
+		}
 		writeJSON(w, map[string]any{"message": "节点已从当前分组移除", "group_id": groupID, "node_id": nodeID,
-			"reloaded": reloadError == "", "reload_error": reloadError})
+			"reloaded": true, "reload_error": ""})
 		return
 	}
 	if len(parts) == 3 && parts[1] == "subscription" && parts[2] == "reset-token" && r.Method == http.MethodPost {
@@ -2505,16 +2555,27 @@ func (s *Server) handleGroupItem(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, http.StatusConflict, err.Error())
 			return
 		}
-		reloadError := s.reloadAfterGroupMutation(r.Context())
+		reloadError := s.applyGroupRuntimeMutation(r.Context(), existing, updated)
+		if reloadError != "" {
+			rolledBack := s.store.UpdateGroupPool(r.Context(), existing) == nil
+			w.WriteHeader(http.StatusConflict)
+			writeJSON(w, map[string]any{"error": reloadError, "reloaded": false, "reload_error": reloadError, "rolled_back": rolledBack})
+			return
+		}
 		writeJSON(w, map[string]any{"group": updated, "reloaded": reloadError == "", "reload_error": reloadError,
 			"removed_unavailable_node_ids": removedNodeIDs})
 	case http.MethodDelete:
+		if reloadError := s.applyGroupRuntimeMutation(r.Context(), existing, nil); reloadError != "" {
+			w.WriteHeader(http.StatusConflict)
+			writeJSON(w, map[string]any{"error": reloadError, "reloaded": false, "reload_error": reloadError, "rolled_back": true})
+			return
+		}
 		if err := s.store.DeleteGroupPool(r.Context(), groupID); err != nil {
+			_ = s.applyGroupRuntimeMutation(r.Context(), nil, existing)
 			writeAPIError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		reloadError := s.reloadAfterGroupMutation(r.Context())
-		writeJSON(w, map[string]any{"message": "分组已删除", "reloaded": reloadError == "", "reload_error": reloadError})
+		writeJSON(w, map[string]any{"message": "分组已删除", "reloaded": true, "reload_error": ""})
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -2546,7 +2607,18 @@ func (s *Server) writeGroupList(w http.ResponseWriter, r *http.Request) {
 	responses := make([]groupPoolResponse, 0, len(groups))
 	for _, group := range groups {
 		response := groupPoolResponse{GroupPool: group, Members: []groupMemberResponse{}}
+		if runtimeManager, ok := s.nodeMgr.(GroupRuntimeManager); ok {
+			runtimeStatus := runtimeManager.GroupRuntimeStatus(group.ID)
+			response.RuntimeStatus, response.RuntimeError = runtimeStatus.Status, runtimeStatus.Error
+		} else if !group.Enabled {
+			response.RuntimeStatus = "stopped"
+		} else {
+			response.RuntimeStatus = "starting"
+		}
 		if runtimeState, ok := runtimes[group.ID]; ok {
+			if response.RuntimeStatus == "starting" {
+				response.RuntimeStatus = "ready"
+			}
 			response.CurrentActiveTag = runtimeState.CurrentTag
 			for _, member := range runtimeState.Members {
 				node := nodeByID[member.NodeID]
@@ -2880,6 +2952,33 @@ func (s *Server) reloadAfterGroupMutation(ctx context.Context) string {
 		return err.Error()
 	}
 	return ""
+}
+
+func (s *Server) applyGroupRuntimeMutation(ctx context.Context, before, after *store.GroupPool) string {
+	if runtimeManager, ok := s.nodeMgr.(GroupRuntimeManager); ok {
+		if err := runtimeManager.ApplyGroupRuntime(ctx, before, after); err != nil {
+			return err.Error()
+		}
+		return ""
+	}
+	return s.reloadAfterGroupMutation(ctx)
+}
+
+func cloneGroupPool(groupPool *store.GroupPool) *store.GroupPool {
+	if groupPool == nil {
+		return nil
+	}
+	cloned := *groupPool
+	cloned.Regions = append([]string(nil), groupPool.Regions...)
+	cloned.ExplicitNodeIDs = append([]int64(nil), groupPool.ExplicitNodeIDs...)
+	cloned.ExcludedNodeIDs = append([]int64(nil), groupPool.ExcludedNodeIDs...)
+	cloned.NodeStates = append([]store.GroupNodeState(nil), groupPool.NodeStates...)
+	return &cloned
+}
+
+func (s *Server) groupOperationLock(groupID int64) *sync.Mutex {
+	lock, _ := s.groupOperationLocks.LoadOrStore(groupID, &sync.Mutex{})
+	return lock.(*sync.Mutex)
 }
 
 func containsInt64(values []int64, target int64) bool {

@@ -66,3 +66,46 @@ func TestProbeDueUsesShortestScheduleForMemberOnly(t *testing.T) {
 		t.Fatal("unrelated node inherited another group's interval")
 	}
 }
+
+func TestBeginReloadPreservesIndependentGroupSchedules(t *testing.T) {
+	mgr, err := NewManager(Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	mgr.RegisterGroupHealthSchedule(7, []string{"node-a"}, 2*time.Minute)
+	mgr.BeginReload()
+	mgr.groupScheduleMu.RLock()
+	_, exists := mgr.groupSchedules[7]
+	mgr.groupScheduleMu.RUnlock()
+	if !exists {
+		t.Fatal("base reload cleared an independently running group's health schedule")
+	}
+}
+
+func TestOldGroupScheduleCleanupDoesNotDeleteNewGeneration(t *testing.T) {
+	mgr, err := NewManager(Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	cleanupOld := mgr.RegisterGroupHealthSchedule(8, []string{"old"}, 2*time.Minute)
+	cleanupNew := mgr.RegisterGroupHealthSchedule(8, []string{"new"}, time.Minute)
+	cleanupOld()
+	mgr.groupScheduleMu.RLock()
+	schedule, exists := mgr.groupSchedules[8]
+	mgr.groupScheduleMu.RUnlock()
+	if !exists {
+		t.Fatal("old runtime cleanup removed the new generation's health schedule")
+	}
+	if _, ok := schedule.tags["new"]; !ok {
+		t.Fatalf("active schedule = %+v, want new generation", schedule)
+	}
+	cleanupNew()
+	mgr.groupScheduleMu.RLock()
+	_, exists = mgr.groupSchedules[8]
+	mgr.groupScheduleMu.RUnlock()
+	if exists {
+		t.Fatal("active generation cleanup did not remove its schedule")
+	}
+}

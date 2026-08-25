@@ -145,6 +145,7 @@ type Store interface {
 	GetGroupPool(ctx context.Context, id int64) (*GroupPool, error)
 	CreateGroupPool(ctx context.Context, group *GroupPool) error
 	UpdateGroupPool(ctx context.Context, group *GroupPool) error
+	UpdateGroupCurrentActiveNode(ctx context.Context, groupID, nodeID int64) error
 	DeleteGroupPool(ctx context.Context, id int64) error
 	UpsertGroupNodeState(ctx context.Context, state *GroupNodeState) error
 	ClearGroupNodeState(ctx context.Context, groupID, nodeID int64) error

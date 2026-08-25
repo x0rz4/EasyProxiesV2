@@ -18,16 +18,19 @@ import (
 
 	"easy_proxies/internal/builder"
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/group"
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/outbound/pool"
 	"easy_proxies/internal/store"
 
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/include"
+	"github.com/sagernet/sing-box/option"
 )
 
 // Ensure Manager implements monitor.NodeManager.
 var _ monitor.NodeManager = (*Manager)(nil)
+var _ monitor.GroupRuntimeManager = (*Manager)(nil)
 
 const (
 	defaultDrainTimeout       = 10 * time.Second
@@ -87,6 +90,16 @@ type Manager struct {
 	// since m.cfg may have been mutated by updateAllSettings before reload.
 	lastAppliedMode     string
 	lastAppliedBasePort uint16
+
+	groupSlotsMu sync.Mutex
+	groupSlots   map[int64]*groupRuntimeSlot
+}
+
+type groupRuntimeSlot struct {
+	gate  chan struct{}
+	box   *box.Box
+	mu    sync.RWMutex
+	state monitor.GroupRuntimeStatus
 }
 
 // New creates a BoxManager with the given config.
@@ -94,6 +107,7 @@ func New(cfg *config.Config, monitorCfg monitor.Config, opts ...Option) *Manager
 	m := &Manager{
 		cfg:        cfg,
 		monitorCfg: monitorCfg,
+		groupSlots: make(map[int64]*groupRuntimeSlot),
 	}
 	m.applyConfigSettings(cfg)
 	for _, opt := range opts {
@@ -136,7 +150,7 @@ func (m *Manager) Start(ctx context.Context) error {
 	maxRetries := 10
 	for retry := 0; retry < maxRetries; retry++ {
 		var err error
-		instance, err = m.createBox(ctx, cfg)
+		instance, err = m.createBaseBox(ctx, cfg)
 		if err != nil {
 			return err
 		}
@@ -146,7 +160,7 @@ func (m *Manager) Start(ctx context.Context) error {
 			if conflictPort := extractPortFromBindError(err); conflictPort > 0 {
 				m.logger.Warnf("port %d is in use, reassigning and retrying...", conflictPort)
 				if reassigned := reassignConflictingPort(cfg, conflictPort); reassigned {
-					pool.ResetSharedStateStore() // Reset shared state for rebuild
+					pool.ResetAllRuntimeState() // no group boxes have started yet
 					continue
 				}
 			}
@@ -160,6 +174,18 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.lastAppliedMode = cfg.Mode
 	m.lastAppliedBasePort = cfg.MultiPort.BasePort
 	m.mu.Unlock()
+
+	for index := range cfg.Groups {
+		groupCfg := cfg.Groups[index]
+		if !groupCfg.Enabled || groupCfg.ID == 0 {
+			m.setGroupRuntimeStatus(groupCfg.ID, "stopped", "")
+			continue
+		}
+		if err := m.startInitialGroup(ctx, groupCfg.ID); err != nil {
+			m.setGroupRuntimeStatus(groupCfg.ID, "error", err.Error())
+			m.logger.Errorf("start group %d: %v", groupCfg.ID, err)
+		}
+	}
 
 	// Start periodic health check after nodes are registered
 	m.mu.Lock()
@@ -228,7 +254,6 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 		// Give OS time to release ports
 		time.Sleep(500 * time.Millisecond)
 	}
-
 	// Begin a new reload generation. Nodes re-registered during createBox will
 	// be marked with the new generation; stale (disabled/removed) nodes will be
 	// swept after the new box is successfully started.
@@ -236,15 +261,12 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 		m.monitorMgr.BeginReload()
 	}
 
-	// Reset shared state store to ensure clean state for new config
-	pool.ResetSharedStateStore()
-
 	// Create and start new box instance with automatic port conflict resolution
 	var instance *box.Box
 	maxRetries := 10
 	for retry := 0; retry < maxRetries; retry++ {
 		var err error
-		instance, err = m.createBox(ctx, newCfg)
+		instance, err = m.createBaseBox(ctx, newCfg)
 		if err != nil {
 			m.rollbackToOldConfig(ctx, oldCfg)
 			return fmt.Errorf("create new box: %w", err)
@@ -255,7 +277,6 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 			if conflictPort := extractPortFromBindError(err); conflictPort > 0 {
 				m.logger.Warnf("port %d is in use, reassigning and retrying...", conflictPort)
 				if reassigned := reassignConflictingPort(newCfg, conflictPort); reassigned {
-					pool.ResetSharedStateStore()
 					continue
 				}
 			}
@@ -287,6 +308,7 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 	listeners := make([]ConfigUpdateListener, len(m.configListeners))
 	copy(listeners, m.configListeners)
 	m.mu.Unlock()
+	groupReloadErr := m.syncGroupRuntimesAfterBaseReload(ctx, oldCfg, newCfg)
 
 	for _, l := range listeners {
 		l.OnConfigUpdate(newCfg)
@@ -297,8 +319,120 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 		m.monitorMgr.SetHealthCheckInterval(effectiveHealthCheckInterval(newCfg))
 		go m.monitorMgr.RequestProbeAllOnce(periodicHealthTimeout)
 	}
-	m.logger.Infof("reload completed successfully with %d nodes", len(newCfg.Nodes))
-	return nil
+	if groupReloadErr != nil {
+		m.logger.Warnf("base reload completed with group runtime errors: %v", groupReloadErr)
+	} else {
+		m.logger.Infof("reload completed successfully with %d nodes", len(newCfg.Nodes))
+	}
+	return groupReloadErr
+}
+
+func (m *Manager) syncGroupRuntimesAfterBaseReload(ctx context.Context, oldCfg, newCfg *config.Config) error {
+	oldGroups := make(map[int64]*store.GroupPool)
+	if oldCfg != nil {
+		for index := range oldCfg.Groups {
+			groupPool := storeGroupFromConfig(oldCfg.Groups[index])
+			oldGroups[groupPool.ID] = groupPool
+		}
+	}
+	newGroups := make(map[int64]*store.GroupPool)
+	if newCfg != nil {
+		for index := range newCfg.Groups {
+			groupPool := storeGroupFromConfig(newCfg.Groups[index])
+			newGroups[groupPool.ID] = groupPool
+		}
+	}
+	ids := make(map[int64]struct{}, len(oldGroups)+len(newGroups))
+	for id := range oldGroups {
+		ids[id] = struct{}{}
+	}
+	for id := range newGroups {
+		ids[id] = struct{}{}
+	}
+	var result error
+	for id := range ids {
+		if groupRuntimeTopologyEqual(oldCfg, newCfg, id) {
+			continue
+		}
+		if err := m.applyGroupRuntime(ctx, oldGroups[id], newGroups[id], true); err != nil {
+			result = errors.Join(result, fmt.Errorf("group %d: %w", id, err))
+		}
+	}
+	return result
+}
+
+func groupRuntimeTopologyEqual(oldCfg, newCfg *config.Config, groupID int64) bool {
+	oldGroup, oldOK := groupConfigByID(oldCfg, groupID)
+	newGroup, newOK := groupConfigByID(newCfg, groupID)
+	if oldOK != newOK {
+		return false
+	}
+	if !oldOK {
+		return true
+	}
+	if !groupRuntimeEqual(storeGroupFromConfig(oldGroup), storeGroupFromConfig(newGroup)) {
+		return false
+	}
+	return reflect.DeepEqual(groupMemberNodes(oldCfg, oldGroup), groupMemberNodes(newCfg, newGroup))
+}
+
+func groupConfigByID(cfg *config.Config, groupID int64) (config.GroupPoolConfig, bool) {
+	if cfg != nil {
+		for _, groupCfg := range cfg.Groups {
+			if groupCfg.ID == groupID {
+				return groupCfg, true
+			}
+		}
+	}
+	return config.GroupPoolConfig{}, false
+}
+
+func groupMemberNodes(cfg *config.Config, groupCfg config.GroupPoolConfig) []config.NodeConfig {
+	if cfg == nil || !groupCfg.Enabled {
+		return nil
+	}
+	regions := make(map[string]struct{}, len(groupCfg.Regions))
+	for _, region := range groupCfg.Regions {
+		regions[strings.ToLower(strings.TrimSpace(region))] = struct{}{}
+	}
+	explicit := make(map[int64]struct{}, len(groupCfg.ExplicitNodeIDs))
+	for _, nodeID := range groupCfg.ExplicitNodeIDs {
+		explicit[nodeID] = struct{}{}
+	}
+	excluded := make(map[int64]struct{}, len(groupCfg.ExcludedNodeIDs))
+	for _, nodeID := range groupCfg.ExcludedNodeIDs {
+		excluded[nodeID] = struct{}{}
+	}
+	result := make([]config.NodeConfig, 0)
+	for _, node := range cfg.Nodes {
+		if _, skip := excluded[node.ID]; skip {
+			continue
+		}
+		_, manuallyIncluded := explicit[node.ID]
+		_, regionIncluded := regions[strings.ToLower(strings.TrimSpace(node.Region))]
+		if manuallyIncluded || regionIncluded {
+			result = append(result, node)
+		}
+	}
+	return result
+}
+
+func storeGroupFromConfig(groupCfg config.GroupPoolConfig) *store.GroupPool {
+	groupPool := &store.GroupPool{ID: groupCfg.ID, Name: groupCfg.Name, BindAddress: groupCfg.BindAddress,
+		BindPort: groupCfg.BindPort, Protocol: groupCfg.Protocol, Username: groupCfg.Username, Password: groupCfg.Password,
+		DispatchMode: groupCfg.DispatchMode, Regions: append([]string(nil), groupCfg.Regions...),
+		ExplicitNodeIDs: append([]int64(nil), groupCfg.ExplicitNodeIDs...), ExcludedNodeIDs: append([]int64(nil), groupCfg.ExcludedNodeIDs...),
+		FailureWindowSeconds: int(groupCfg.FailureWindow / time.Second), FailureThreshold: groupCfg.FailureThreshold,
+		HealthCheckSeconds: int(groupCfg.HealthCheckInterval / time.Second), CurrentActiveNodeID: groupCfg.CurrentActiveNodeID,
+		Enabled: groupCfg.Enabled, SubscriptionEnabled: groupCfg.SubscriptionEnabled, SubscriptionToken: groupCfg.SubscriptionToken,
+		SubscriptionMode: groupCfg.SubscriptionMode, ExternalHost: groupCfg.ExternalHost,
+		CreatedAt: groupCfg.CreatedAt, UpdatedAt: groupCfg.UpdatedAt}
+	for _, state := range groupCfg.NodeStates {
+		groupPool.NodeStates = append(groupPool.NodeStates, store.GroupNodeState{GroupID: groupCfg.ID, NodeID: state.NodeID,
+			FailureHistory: append([]int64(nil), state.FailureHistory...), Evicted: state.Evicted,
+			LastError: state.LastError, EvictedAt: state.EvictedAt})
+	}
+	return groupPool
 }
 
 func runtimeConfigEqual(a, b *config.Config) bool {
@@ -354,7 +488,7 @@ func (m *Manager) rollbackToOldConfig(ctx context.Context, oldCfg *config.Config
 		return
 	}
 	m.logger.Warnf("attempting rollback to previous config...")
-	instance, err := m.createBox(ctx, oldCfg)
+	instance, err := m.createBaseBox(ctx, oldCfg)
 	if err != nil {
 		m.logger.Errorf("rollback failed to create box: %v", err)
 		return
@@ -373,12 +507,16 @@ func (m *Manager) rollbackToOldConfig(ctx context.Context, oldCfg *config.Config
 
 // Close terminates the active instance and auxiliary components.
 func (m *Manager) Close() error {
+	groupErr := m.closeAllGroupRuntimes("stopped", "")
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	var err error
+	err := groupErr
 	if m.currentBox != nil {
-		err = m.currentBox.Close()
+		if closeErr := m.currentBox.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
 		m.currentBox = nil
 	}
 	if m.monitorServer != nil {
@@ -391,6 +529,7 @@ func (m *Manager) Close() error {
 		m.healthCheckStarted = false
 	}
 	m.baseCtx = nil
+	pool.ResetAllRuntimeState()
 	return err
 }
 
@@ -408,8 +547,289 @@ func (m *Manager) MonitorServer() *monitor.Server {
 	return m.monitorServer
 }
 
-// createBox builds a sing-box instance from config.
-func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, error) {
+func (m *Manager) groupSlot(groupID int64) *groupRuntimeSlot {
+	m.groupSlotsMu.Lock()
+	defer m.groupSlotsMu.Unlock()
+	if slot := m.groupSlots[groupID]; slot != nil {
+		return slot
+	}
+	slot := &groupRuntimeSlot{gate: make(chan struct{}, 1), state: monitor.GroupRuntimeStatus{Status: "stopped"}}
+	slot.gate <- struct{}{}
+	m.groupSlots[groupID] = slot
+	return slot
+}
+
+func acquireGroupSlot(ctx context.Context, slot *groupRuntimeSlot) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-slot.gate:
+		return nil
+	}
+}
+
+func releaseGroupSlot(slot *groupRuntimeSlot) { slot.gate <- struct{}{} }
+
+func (m *Manager) setGroupRuntimeStatus(groupID int64, status, runtimeError string) {
+	if groupID == 0 {
+		return
+	}
+	slot := m.groupSlot(groupID)
+	slot.mu.Lock()
+	slot.state = monitor.GroupRuntimeStatus{Status: status, Error: runtimeError}
+	slot.mu.Unlock()
+}
+
+func (m *Manager) GroupRuntimeStatus(groupID int64) monitor.GroupRuntimeStatus {
+	slot := m.groupSlot(groupID)
+	slot.mu.RLock()
+	defer slot.mu.RUnlock()
+	return slot.state
+}
+
+func (m *Manager) startInitialGroup(ctx context.Context, groupID int64) error {
+	slot := m.groupSlot(groupID)
+	if err := acquireGroupSlot(ctx, slot); err != nil {
+		return err
+	}
+	defer releaseGroupSlot(slot)
+	m.setGroupRuntimeStatus(groupID, "starting", "")
+	m.mu.RLock()
+	cfg := m.cfg.Clone()
+	baseCtx := m.baseCtx
+	m.mu.RUnlock()
+	if baseCtx == nil {
+		baseCtx = ctx
+	}
+	instance, err := m.createGroupBox(baseCtx, cfg, groupID)
+	if err == nil {
+		err = instance.Start()
+	}
+	if err != nil {
+		if instance != nil {
+			_ = instance.Close()
+		}
+		return err
+	}
+	slot.mu.Lock()
+	slot.box = instance
+	slot.state = monitor.GroupRuntimeStatus{Status: "ready"}
+	slot.mu.Unlock()
+	return nil
+}
+
+func (m *Manager) ApplyGroupRuntime(ctx context.Context, before, after *store.GroupPool) error {
+	return m.applyGroupRuntime(ctx, before, after, false)
+}
+
+func (m *Manager) applyGroupRuntime(ctx context.Context, before, after *store.GroupPool, force bool) error {
+	groupID := int64(0)
+	if after != nil {
+		groupID = after.ID
+	} else if before != nil {
+		groupID = before.ID
+	}
+	if groupID == 0 {
+		return errors.New("invalid group ID")
+	}
+	slot := m.groupSlot(groupID)
+	if err := acquireGroupSlot(ctx, slot); err != nil {
+		return err
+	}
+	defer releaseGroupSlot(slot)
+
+	if !force && groupRuntimeEqual(before, after) {
+		m.replaceCachedGroup(after)
+		return nil
+	}
+
+	slot.mu.Lock()
+	oldBox := slot.box
+	slot.state = monitor.GroupRuntimeStatus{Status: "reconfiguring"}
+	slot.mu.Unlock()
+
+	if after == nil || !after.Enabled {
+		if oldBox != nil {
+			if err := oldBox.Close(); err != nil {
+				m.mu.RLock()
+				baseCtx := m.baseCtx
+				m.mu.RUnlock()
+				rollbackErr := m.restoreGroupBox(baseCtx, slot, before)
+				if rollbackErr != nil {
+					m.setGroupRuntimeStatus(groupID, "error", rollbackErr.Error())
+					return fmt.Errorf("stop group runtime: %w; rollback runtime: %v", err, rollbackErr)
+				}
+				return fmt.Errorf("stop group runtime: %w", err)
+			}
+		}
+		slot.mu.Lock()
+		slot.box = nil
+		slot.state = monitor.GroupRuntimeStatus{Status: "stopped"}
+		slot.mu.Unlock()
+		m.replaceCachedGroup(after)
+		return nil
+	}
+
+	candidateCfg := m.configWithGroup(after)
+	m.mu.RLock()
+	baseCtx := m.baseCtx
+	m.mu.RUnlock()
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	newBox, err := m.createGroupBox(baseCtx, candidateCfg, groupID)
+	if err != nil {
+		if force {
+			if oldBox != nil {
+				_ = oldBox.Close()
+			}
+			slot.mu.Lock()
+			slot.box = nil
+			slot.state = monitor.GroupRuntimeStatus{Status: "error", Error: err.Error()}
+			slot.mu.Unlock()
+			m.replaceCachedGroup(after)
+			return err
+		}
+		if oldBox != nil {
+			m.setGroupRuntimeStatus(groupID, "ready", "")
+		} else {
+			m.setGroupRuntimeStatus(groupID, "error", err.Error())
+		}
+		return err
+	}
+	if oldBox != nil {
+		_ = oldBox.Close()
+	}
+	if err = newBox.Start(); err != nil {
+		_ = newBox.Close()
+		if force {
+			slot.mu.Lock()
+			slot.box = nil
+			slot.state = monitor.GroupRuntimeStatus{Status: "error", Error: err.Error()}
+			slot.mu.Unlock()
+			m.replaceCachedGroup(after)
+			return fmt.Errorf("start new group runtime: %w", err)
+		}
+		rollbackErr := m.restoreGroupBox(baseCtx, slot, before)
+		if rollbackErr != nil {
+			m.setGroupRuntimeStatus(groupID, "error", rollbackErr.Error())
+			return fmt.Errorf("start new group runtime: %w; rollback runtime: %v", err, rollbackErr)
+		}
+		return fmt.Errorf("start new group runtime: %w", err)
+	}
+	slot.mu.Lock()
+	slot.box = newBox
+	slot.state = monitor.GroupRuntimeStatus{Status: "ready"}
+	slot.mu.Unlock()
+	m.replaceCachedGroup(after)
+	return nil
+}
+
+func (m *Manager) restoreGroupBox(ctx context.Context, slot *groupRuntimeSlot, previous *store.GroupPool) error {
+	if previous == nil || !previous.Enabled {
+		slot.mu.Lock()
+		slot.box = nil
+		slot.state = monitor.GroupRuntimeStatus{Status: "stopped"}
+		slot.mu.Unlock()
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rollbackCfg := m.configWithGroup(previous)
+	instance, err := m.createGroupBox(ctx, rollbackCfg, previous.ID)
+	if err == nil {
+		err = instance.Start()
+	}
+	if err != nil {
+		if instance != nil {
+			_ = instance.Close()
+		}
+		return err
+	}
+	slot.mu.Lock()
+	slot.box = instance
+	slot.state = monitor.GroupRuntimeStatus{Status: "ready"}
+	slot.mu.Unlock()
+	return nil
+}
+
+func (m *Manager) ActivateGroupMember(ctx context.Context, groupID, nodeID int64) error {
+	slot := m.groupSlot(groupID)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := acquireGroupSlot(waitCtx, slot); err != nil {
+		return errors.New("分组运行时尚未就绪")
+	}
+	defer releaseGroupSlot(slot)
+	status := m.GroupRuntimeStatus(groupID)
+	if status.Status != "ready" {
+		return errors.New("分组运行时尚未就绪")
+	}
+	if err := group.ActivateMember(groupID, nodeID); err != nil {
+		if strings.Contains(err.Error(), "runtime not found") {
+			return errors.New("分组运行时尚未就绪")
+		}
+		return err
+	}
+	return nil
+}
+
+func (m *Manager) configWithGroup(groupPool *store.GroupPool) *config.Config {
+	m.mu.RLock()
+	cfg := m.cfg.Clone()
+	m.mu.RUnlock()
+	groups := make([]config.GroupPoolConfig, 0, len(cfg.Groups)+1)
+	for _, existing := range cfg.Groups {
+		if groupPool == nil || existing.ID != groupPool.ID {
+			groups = append(groups, existing)
+		}
+	}
+	if groupPool != nil {
+		groups = append(groups, groupConfigsFromStore([]store.GroupPool{*groupPool})[0])
+	}
+	cfg.Groups = groups
+	return cfg
+}
+
+func (m *Manager) replaceCachedGroup(groupPool *store.GroupPool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cfg == nil {
+		return
+	}
+	groups := make([]config.GroupPoolConfig, 0, len(m.cfg.Groups)+1)
+	for _, existing := range m.cfg.Groups {
+		if groupPool == nil || existing.ID != groupPool.ID {
+			groups = append(groups, existing)
+		}
+	}
+	if groupPool != nil {
+		groups = append(groups, groupConfigsFromStore([]store.GroupPool{*groupPool})[0])
+	}
+	m.cfg.Groups = groups
+}
+
+func groupRuntimeEqual(before, after *store.GroupPool) bool {
+	if before == nil || after == nil {
+		return before == after
+	}
+	return before.ID == after.ID && before.BindAddress == after.BindAddress && before.BindPort == after.BindPort &&
+		before.Protocol == after.Protocol && before.Username == after.Username && before.Password == after.Password &&
+		before.DispatchMode == after.DispatchMode && reflect.DeepEqual(before.Regions, after.Regions) &&
+		reflect.DeepEqual(before.ExplicitNodeIDs, after.ExplicitNodeIDs) && reflect.DeepEqual(before.ExcludedNodeIDs, after.ExcludedNodeIDs) &&
+		before.FailureWindowSeconds == after.FailureWindowSeconds && before.FailureThreshold == after.FailureThreshold &&
+		before.HealthCheckSeconds == after.HealthCheckSeconds && before.Enabled == after.Enabled
+}
+
+// createBaseBox builds the application-wide instance without group listeners.
+func (m *Manager) createBaseBox(ctx context.Context, cfg *config.Config) (*box.Box, error) {
 	if cfg == nil {
 		return nil, errors.New("config is nil")
 	}
@@ -417,10 +837,25 @@ func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, 
 		return nil, errors.New("monitor manager not initialized")
 	}
 
-	opts, err := builder.Build(cfg)
+	opts, err := builder.BuildBase(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("build sing-box options: %w", err)
 	}
+	return m.createBoxFromOptions(ctx, opts)
+}
+
+func (m *Manager) createGroupBox(ctx context.Context, cfg *config.Config, groupID int64) (*box.Box, error) {
+	if cfg == nil {
+		return nil, errors.New("config is nil")
+	}
+	opts, err := builder.BuildGroup(cfg, groupID)
+	if err != nil {
+		return nil, err
+	}
+	return m.createBoxFromOptions(ctx, opts)
+}
+
+func (m *Manager) createBoxFromOptions(ctx context.Context, opts option.Options) (*box.Box, error) {
 
 	inboundRegistry := include.InboundRegistry()
 	outboundRegistry := include.OutboundRegistry()
@@ -1048,13 +1483,13 @@ func (m *Manager) enterIdle(newCfg *config.Config) error {
 			m.logger.Warnf("error closing instance during idle transition: %v", err)
 		}
 	}
+	m.closeAllGroupRuntimes("stopped", "没有已启用节点")
 
 	// Clean up monitor and shared state
 	if m.monitorMgr != nil {
 		m.monitorMgr.BeginReload()
 		m.monitorMgr.SweepStaleNodes()
 	}
-	pool.ResetSharedStateStore()
 
 	_ = ctx // baseCtx preserved for future resume
 
@@ -1064,6 +1499,32 @@ func (m *Manager) enterIdle(newCfg *config.Config) error {
 
 	m.logger.Infof("entered idle state (0 enabled nodes); re-enable nodes and reload to resume")
 	return nil
+}
+
+func (m *Manager) closeAllGroupRuntimes(status, runtimeError string) error {
+	m.groupSlotsMu.Lock()
+	slots := make([]*groupRuntimeSlot, 0, len(m.groupSlots))
+	for _, slot := range m.groupSlots {
+		slots = append(slots, slot)
+	}
+	m.groupSlotsMu.Unlock()
+	var result error
+	for _, slot := range slots {
+		if err := acquireGroupSlot(context.Background(), slot); err != nil {
+			continue
+		}
+		slot.mu.Lock()
+		if slot.box != nil {
+			if err := slot.box.Close(); err != nil {
+				result = errors.Join(result, err)
+			}
+			slot.box = nil
+		}
+		slot.state = monitor.GroupRuntimeStatus{Status: status, Error: runtimeError}
+		slot.mu.Unlock()
+		releaseGroupSlot(slot)
+	}
+	return result
 }
 
 // CurrentPortMap returns the current port mapping from the active configuration.

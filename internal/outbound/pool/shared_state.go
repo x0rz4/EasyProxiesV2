@@ -43,12 +43,19 @@ func lookupSharedState(tag string) (*sharedMemberState, bool) {
 	return v.(*sharedMemberState), true
 }
 
-// ResetSharedStateStore clears all shared state (used during config reload).
+// ResetSharedStateStore clears all shared node state during final cleanup or a
+// startup retry. Routine reloads preserve it so independent groups keep state.
 func ResetSharedStateStore() {
 	sharedStateStore.Range(func(key, _ any) bool {
 		sharedStateStore.Delete(key)
 		return true
 	})
+}
+
+// ResetAllRuntimeState is reserved for process startup retries, shutdown, and
+// tests. Routine base/group reloads must not clear unrelated group runtimes.
+func ResetAllRuntimeState() {
+	ResetSharedStateStore()
 	group.Reset()
 }
 

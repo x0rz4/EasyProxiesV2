@@ -52,6 +52,7 @@ type Options struct {
 	PreferredMember     string
 	InitialGroupState   map[string]group.GroupInitialState
 	SelectorTag         string
+	MonitorObserverOnly bool
 }
 
 // MemberMeta carries optional descriptive information for monitoring UI.
@@ -97,6 +98,8 @@ type poolOutbound struct {
 	candidatesPool        sync.Pool
 	unsubscribeHealth     func()
 	unsubscribeActivation func()
+	unregisterSchedule    func()
+	unregisterRuntime     func()
 	closeOnce             sync.Once
 }
 
@@ -139,11 +142,11 @@ func newPool(ctx context.Context, _ adapter.Router, logger log.ContextLogger, ta
 	if normalized.Mode == modeLowestLatency && normalized.PreferredMember == "" {
 		p.waitForInitialLatency.Store(true)
 	}
-	group.Register(normalized.GroupID, normalized.FailureWindow, normalized.FailureThreshold,
+	p.unregisterRuntime = group.Register(normalized.GroupID, normalized.FailureWindow, normalized.FailureThreshold,
 		normalized.PreferredMember, normalized.InitialGroupState)
 
 	// Register nodes immediately if monitor is available
-	if monitorMgr != nil {
+	if monitorMgr != nil && !normalized.MonitorObserverOnly {
 		logger.Info("registering ", len(normalized.Members), " nodes to monitor")
 		for _, memberTag := range normalized.Members {
 			// Acquire shared state for this tag (creates if not exists)
@@ -220,13 +223,13 @@ func (p *poolOutbound) Start(stage adapter.StartStage) error {
 		return err
 	}
 	if p.monitor != nil && p.options.GroupID != 0 {
-		p.monitor.RegisterGroupHealthSchedule(p.options.GroupID, p.options.Members, p.options.HealthCheckInterval)
+		p.unregisterSchedule = p.monitor.RegisterGroupHealthSchedule(p.options.GroupID, p.options.Members, p.options.HealthCheckInterval)
 		p.unsubscribeHealth = p.monitor.SubscribeHealthResults(p.handleHealthResult)
 		p.reconcileCurrent()
 		p.unsubscribeActivation = group.RegisterActivationHandler(p.options.GroupID, p.activateNodeID)
 	}
 	// 在初始化完成后，立即在后台触发健康检查
-	if p.monitor != nil {
+	if p.monitor != nil && !p.options.MonitorObserverOnly {
 		go p.probeAllMembersOnStartup()
 	}
 	return nil
@@ -237,11 +240,14 @@ func (p *poolOutbound) Close() error {
 		if p.unsubscribeActivation != nil {
 			p.unsubscribeActivation()
 		}
-		if p.monitor != nil && p.options.GroupID != 0 {
-			p.monitor.UnregisterGroupHealthSchedule(p.options.GroupID)
+		if p.unregisterSchedule != nil {
+			p.unregisterSchedule()
 		}
 		if p.unsubscribeHealth != nil {
 			p.unsubscribeHealth()
+		}
+		if p.unregisterRuntime != nil {
+			p.unregisterRuntime()
 		}
 	})
 	return nil
@@ -299,26 +305,28 @@ func (p *poolOutbound) initializeMembersLocked() error {
 		// Connect to existing monitor entry if available
 		if p.monitor != nil {
 			meta := p.options.Metadata[tag]
-			info := monitor.NodeInfo{
-				Tag:           tag,
-				Name:          meta.Name,
-				URI:           meta.URI,
-				Mode:          meta.Mode,
-				ListenAddress: meta.ListenAddress,
-				Port:          meta.Port,
-				Region:        meta.Region,
-				Country:       meta.Country,
+			var entry *monitor.EntryHandle
+			if p.options.MonitorObserverOnly {
+				entry = p.monitor.HandleForTag(tag)
+			} else {
+				entry = p.monitor.Register(monitor.NodeInfo{
+					Tag: tag, Name: meta.Name, URI: meta.URI, Mode: meta.Mode,
+					ListenAddress: meta.ListenAddress, Port: meta.Port, Region: meta.Region, Country: meta.Country,
+				})
 			}
-			entry := p.monitor.Register(info)
 			if entry != nil {
-				state.attachEntry(entry)
-				member.entry = entry
-				entry.SetRelease(p.makeReleaseFunc(member))
-				if probe := p.makeProbeFunc(member); probe != nil {
-					entry.SetProbe(probe)
+				if !p.options.MonitorObserverOnly {
+					state.attachEntry(entry)
 				}
-				if dialer := p.makeDialerFunc(member); dialer != nil {
-					entry.SetDialer(dialer)
+				member.entry = entry
+				if !p.options.MonitorObserverOnly {
+					entry.SetRelease(p.makeReleaseFunc(member))
+					if probe := p.makeProbeFunc(member); probe != nil {
+						entry.SetProbe(probe)
+					}
+					if dialer := p.makeDialerFunc(member); dialer != nil {
+						entry.SetDialer(dialer)
+					}
 				}
 			}
 		}

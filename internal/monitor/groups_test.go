@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -46,7 +47,7 @@ func TestGroupNodeOptionsUseManagedAvailableNodes(t *testing.T) {
 	hiddenHandle := mgr.Register(NodeInfo{Tag: "hidden-tag", Name: hiddenSubscription.Name, URI: hiddenSubscription.URI})
 	hiddenHandle.MarkInitialCheckDone(true)
 
-	server := &Server{store: db, mgr: mgr}
+	server := &Server{store: db, mgr: mgr, nodeMgr: &reloadNodeManager{}}
 	monitorByTag := make(map[string]Snapshot)
 	for _, snapshot := range mgr.Snapshot() {
 		monitorByTag[snapshot.Tag] = snapshot
@@ -147,7 +148,7 @@ func TestUpdateGroupAPIReportsRemovedUnavailableNodes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := &Server{store: db, mgr: mgr}
+	server := &Server{store: db, mgr: mgr, nodeMgr: &reloadNodeManager{}}
 	request := httptest.NewRequest(http.MethodPut, "/api/groups/"+strconv.FormatInt(groupPool.ID, 10), bytes.NewReader(body))
 	response := httptest.NewRecorder()
 	server.handleGroupItem(response, request)
@@ -279,14 +280,105 @@ func TestActivateRunningMemberUsesRuntimeHandler(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	groupPool := &store.GroupPool{Name: "group", BindAddress: "127.0.0.1", BindPort: 12097, Protocol: "mixed",
+		DispatchMode: "fixed", FailureWindowSeconds: 300, FailureThreshold: 3, HealthCheckSeconds: 60, Enabled: true}
+	if err := db.CreateGroupPool(context.Background(), groupPool); err != nil {
+		t.Fatal(err)
+	}
 	var activated int64
-	unregister := group.RegisterActivationHandler(77, func(nodeID int64) error { activated = nodeID; return nil })
+	unregister := group.RegisterActivationHandler(groupPool.ID, func(nodeID int64) error { activated = nodeID; return nil })
 	defer unregister()
 	server := &Server{store: db}
 	response := httptest.NewRecorder()
-	server.handleGroupItem(response, httptest.NewRequest(http.MethodPost, "/api/groups/77/members/9/activate", nil))
+	server.handleGroupItem(response, httptest.NewRequest(http.MethodPost, "/api/groups/"+strconv.FormatInt(groupPool.ID, 10)+"/members/9/activate", nil))
 	if response.Code != http.StatusOK || activated != 9 {
 		t.Fatalf("status=%d activated=%d body=%s", response.Code, activated, response.Body.String())
+	}
+}
+
+type isolatedGroupRuntimeManager struct {
+	reloadNodeManager
+	applyErr error
+	applies  atomic.Int32
+}
+
+func (m *isolatedGroupRuntimeManager) ApplyGroupRuntime(context.Context, *store.GroupPool, *store.GroupPool) error {
+	m.applies.Add(1)
+	return m.applyErr
+}
+
+func (m *isolatedGroupRuntimeManager) ActivateGroupMember(context.Context, int64, int64) error {
+	return nil
+}
+
+func (m *isolatedGroupRuntimeManager) GroupRuntimeStatus(int64) GroupRuntimeStatus {
+	return GroupRuntimeStatus{Status: "ready"}
+}
+
+func TestUpdateGroupUsesIsolatedRuntimeWithoutGlobalReload(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "group-isolated-update.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	groupPool := &store.GroupPool{Name: "before", BindAddress: "127.0.0.1", BindPort: 12101, Protocol: "mixed",
+		DispatchMode: "fixed", FailureWindowSeconds: 300, FailureThreshold: 3, HealthCheckSeconds: 60, Enabled: true}
+	if err := db.CreateGroupPool(ctx, groupPool); err != nil {
+		t.Fatal(err)
+	}
+	runtimeManager := &isolatedGroupRuntimeManager{}
+	server := &Server{store: db, nodeMgr: runtimeManager}
+	body, _ := json.Marshal(groupPoolInput{Name: "after", BindAddress: "127.0.0.1", BindPort: groupPool.BindPort,
+		Protocol: "mixed", DispatchMode: "fixed", FailureWindowSeconds: 300, FailureThreshold: 3, HealthCheckSeconds: 60})
+	response := httptest.NewRecorder()
+	server.handleGroupItem(response, httptest.NewRequest(http.MethodPut,
+		"/api/groups/"+strconv.FormatInt(groupPool.ID, 10), bytes.NewReader(body)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if runtimeManager.applies.Load() != 1 || runtimeManager.reloads.Load() != 0 {
+		t.Fatalf("target applies=%d global reloads=%d", runtimeManager.applies.Load(), runtimeManager.reloads.Load())
+	}
+}
+
+func TestUpdateGroupRuntimeFailureRollsBackDatabase(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "group-update-rollback.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	groupPool := &store.GroupPool{Name: "before", BindAddress: "127.0.0.1", BindPort: 12102, Protocol: "mixed",
+		DispatchMode: "fixed", FailureWindowSeconds: 300, FailureThreshold: 3, HealthCheckSeconds: 60, Enabled: true}
+	if err := db.CreateGroupPool(ctx, groupPool); err != nil {
+		t.Fatal(err)
+	}
+	runtimeManager := &isolatedGroupRuntimeManager{applyErr: errors.New("group start failed")}
+	server := &Server{store: db, nodeMgr: runtimeManager}
+	body, _ := json.Marshal(groupPoolInput{Name: "after", BindAddress: "127.0.0.1", BindPort: groupPool.BindPort,
+		Protocol: "mixed", DispatchMode: "random", FailureWindowSeconds: 300, FailureThreshold: 3, HealthCheckSeconds: 60})
+	response := httptest.NewRecorder()
+	server.handleGroupItem(response, httptest.NewRequest(http.MethodPut,
+		"/api/groups/"+strconv.FormatInt(groupPool.ID, 10), bytes.NewReader(body)))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		RolledBack bool `json:"rolled_back"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil || !payload.RolledBack {
+		t.Fatalf("rollback response=%+v err=%v", payload, err)
+	}
+	stored, err := db.GetGroupPool(ctx, groupPool.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Name != "before" || stored.DispatchMode != "fixed" {
+		t.Fatalf("database was not rolled back: %+v", stored)
+	}
+	if runtimeManager.reloads.Load() != 0 {
+		t.Fatalf("rollback triggered %d global reloads", runtimeManager.reloads.Load())
 	}
 }
 

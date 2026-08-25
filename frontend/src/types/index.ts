@@ -103,6 +103,8 @@ export interface GroupPool {
   health_check_seconds: number
   current_active_node_id?: number
   enabled: boolean
+  runtime_status: 'starting' | 'ready' | 'reconfiguring' | 'stopped' | 'error'
+  runtime_error?: string
   subscription_enabled: boolean
   subscription_token?: string
   subscription_mode: 'members' | 'entry'
@@ -146,6 +148,7 @@ export interface GroupPoolMutationResponse {
   group: GroupPool
   reloaded: boolean
   reload_error?: string
+  rolled_back?: boolean
   removed_unavailable_node_ids: number[]
 }
 

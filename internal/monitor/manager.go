@@ -179,11 +179,13 @@ type Manager struct {
 	healthSubscribers map[uint64]func(HealthResultEvent)
 	groupScheduleMu   sync.RWMutex
 	groupSchedules    map[int64]groupHealthSchedule
+	groupScheduleNext uint64
 }
 
 type groupHealthSchedule struct {
 	tags     map[string]struct{}
 	interval time.Duration
+	token    uint64
 }
 
 // Logger interface for logging
@@ -324,9 +326,9 @@ func (m *Manager) SetHealthCheckInterval(d time.Duration) {
 // RegisterGroupHealthSchedule sets the member set and requested interval for
 // one group. A shared node is probed at the shortest interval requested by
 // management or any enabled group that contains it.
-func (m *Manager) RegisterGroupHealthSchedule(groupID int64, tags []string, interval time.Duration) {
+func (m *Manager) RegisterGroupHealthSchedule(groupID int64, tags []string, interval time.Duration) func() {
 	if groupID == 0 || interval <= 0 {
-		return
+		return func() {}
 	}
 	tagSet := make(map[string]struct{}, len(tags))
 	for _, tag := range tags {
@@ -335,8 +337,17 @@ func (m *Manager) RegisterGroupHealthSchedule(groupID int64, tags []string, inte
 		}
 	}
 	m.groupScheduleMu.Lock()
-	m.groupSchedules[groupID] = groupHealthSchedule{tags: tagSet, interval: interval}
+	m.groupScheduleNext++
+	token := m.groupScheduleNext
+	m.groupSchedules[groupID] = groupHealthSchedule{tags: tagSet, interval: interval, token: token}
 	m.groupScheduleMu.Unlock()
+	return func() {
+		m.groupScheduleMu.Lock()
+		if current, ok := m.groupSchedules[groupID]; ok && current.token == token {
+			delete(m.groupSchedules, groupID)
+		}
+		m.groupScheduleMu.Unlock()
+	}
 }
 
 func (m *Manager) UnregisterGroupHealthSchedule(groupID int64) {
@@ -523,9 +534,6 @@ func (m *Manager) BeginReload() {
 	m.mu.Lock()
 	m.reloadGen++
 	m.mu.Unlock()
-	m.groupScheduleMu.Lock()
-	m.groupSchedules = make(map[int64]groupHealthSchedule)
-	m.groupScheduleMu.Unlock()
 }
 
 // SweepStaleNodes removes nodes that were not re-registered during the current
@@ -570,6 +578,19 @@ func (m *Manager) Register(info NodeInfo) *EntryHandle {
 		e.onTimeline = m.publishDebugLog
 	}
 	return &EntryHandle{ref: e}
+}
+
+// HandleForTag returns an existing monitor entry without changing its reload
+// generation, callbacks, or node metadata. Independent group runtimes use this
+// to observe the base runtime's health state without becoming probe owners.
+func (m *Manager) HandleForTag(tag string) *EntryHandle {
+	m.mu.RLock()
+	entry := m.nodes[tag]
+	m.mu.RUnlock()
+	if entry == nil {
+		return nil
+	}
+	return &EntryHandle{ref: entry}
 }
 
 // DestinationForProbe exposes the configured destination for health checks.

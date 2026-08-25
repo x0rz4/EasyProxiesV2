@@ -1,9 +1,16 @@
 package boxmgr
 
 import (
+	"context"
+	"fmt"
+	"net"
 	"testing"
+	"time"
 
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/group"
+	"easy_proxies/internal/monitor"
+	"easy_proxies/internal/store"
 )
 
 func TestRuntimeConfigEqual(t *testing.T) {
@@ -21,4 +28,180 @@ func TestRuntimeConfigEqual(t *testing.T) {
 	if runtimeConfigEqual(a, b) {
 		t.Fatal("group configuration change was ignored")
 	}
+}
+
+func TestApplyGroupRuntimeDoesNotReplaceBaseOrSiblingRuntime(t *testing.T) {
+	group.Reset()
+	defer group.Reset()
+	ports := reserveTCPPorts(t, 3)
+	basePort, firstPort, secondPort := ports[0], ports[1], ports[2]
+	cfg := &config.Config{
+		Mode:     "pool",
+		Listener: config.ListenerConfig{Address: "127.0.0.1", Port: basePort, Protocol: "http"},
+		Pool:     config.PoolConfig{Mode: "fixed", FailureThreshold: 3, BlacklistDuration: time.Minute},
+		Nodes:    []config.NodeConfig{{ID: 1, Name: "node", URI: "http://127.0.0.1:65530", Region: "hk"}},
+		Groups: []config.GroupPoolConfig{
+			{ID: 1, Name: "one", BindAddress: "127.0.0.1", BindPort: firstPort, Protocol: "mixed", DispatchMode: "fixed", Regions: []string{"hk"}, FailureWindow: 5 * time.Minute, FailureThreshold: 3, HealthCheckInterval: time.Minute, Enabled: true},
+			{ID: 2, Name: "two", BindAddress: "127.0.0.1", BindPort: secondPort, Protocol: "mixed", DispatchMode: "fixed", Regions: []string{"hk"}, FailureWindow: 5 * time.Minute, FailureThreshold: 3, HealthCheckInterval: time.Minute, Enabled: true},
+		},
+		LogLevel: "error",
+	}
+	if err := cfg.NormalizeWithPortMap(nil); err != nil {
+		t.Fatal(err)
+	}
+	manager := New(cfg, monitor.Config{})
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	manager.mu.RLock()
+	baseBefore := manager.currentBox
+	manager.mu.RUnlock()
+	siblingBefore := manager.groupSlot(2).box
+	if baseBefore == nil || siblingBefore == nil {
+		t.Fatal("expected base and sibling runtimes to be running")
+	}
+	assertTCPListening(t, secondPort)
+
+	before := storeGroupFromConfig(cfg.Groups[0])
+	after := cloneStoreGroupForTest(before)
+	after.Enabled = false
+	if err := manager.ApplyGroupRuntime(context.Background(), before, after); err != nil {
+		t.Fatal(err)
+	}
+
+	manager.mu.RLock()
+	baseAfter := manager.currentBox
+	manager.mu.RUnlock()
+	if baseAfter != baseBefore {
+		t.Fatal("targeted group update replaced the base sing-box instance")
+	}
+	if manager.groupSlot(2).box != siblingBefore {
+		t.Fatal("targeted group update replaced a sibling group instance")
+	}
+	assertTCPListening(t, secondPort)
+	if status := manager.GroupRuntimeStatus(1).Status; status != "stopped" {
+		t.Fatalf("target group status = %q, want stopped", status)
+	}
+}
+
+func TestActivateGroupMemberWaitsForSameGroupRebuild(t *testing.T) {
+	group.Reset()
+	defer group.Reset()
+	manager := New(&config.Config{}, monitor.Config{})
+	slot := manager.groupSlot(91)
+	if err := acquireGroupSlot(context.Background(), slot); err != nil {
+		t.Fatal(err)
+	}
+	manager.setGroupRuntimeStatus(91, "reconfiguring", "")
+	activated := make(chan int64, 1)
+	unregister := group.RegisterActivationHandler(91, func(nodeID int64) error {
+		activated <- nodeID
+		return nil
+	})
+	defer unregister()
+
+	result := make(chan error, 1)
+	go func() { result <- manager.ActivateGroupMember(context.Background(), 91, 7) }()
+	select {
+	case err := <-result:
+		t.Fatalf("activation returned before rebuild completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	manager.setGroupRuntimeStatus(91, "ready", "")
+	releaseGroupSlot(slot)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	if nodeID := <-activated; nodeID != 7 {
+		t.Fatalf("activated node = %d, want 7", nodeID)
+	}
+}
+
+func TestGroupRuntimeTopologyOnlyChangesForAffectedMembers(t *testing.T) {
+	base := &config.Config{Nodes: []config.NodeConfig{
+		{ID: 1, Name: "hk", URI: "http://hk.example:80", Region: "hk"},
+		{ID: 2, Name: "us", URI: "http://us.example:80", Region: "us"},
+	}, Groups: []config.GroupPoolConfig{
+		{ID: 1, Enabled: true, Regions: []string{"hk"}, BindPort: 10001, Protocol: "mixed", DispatchMode: "fixed"},
+		{ID: 2, Enabled: true, Regions: []string{"us"}, BindPort: 10002, Protocol: "mixed", DispatchMode: "fixed"},
+	}}
+	updated := base.Clone()
+	updated.Nodes[0].URI = "http://new-hk.example:80"
+	if groupRuntimeTopologyEqual(base, updated, 1) {
+		t.Fatal("group using the changed HK node was considered unaffected")
+	}
+	if !groupRuntimeTopologyEqual(base, updated, 2) {
+		t.Fatal("unrelated US group was considered affected by an HK node change")
+	}
+}
+
+func TestForcedTopologyUpdateDoesNotKeepRemovedNodeRuntime(t *testing.T) {
+	group.Reset()
+	defer group.Reset()
+	ports := reserveTCPPorts(t, 2)
+	cfg := &config.Config{
+		Mode: "pool", Listener: config.ListenerConfig{Address: "127.0.0.1", Port: ports[0], Protocol: "http"},
+		Pool:  config.PoolConfig{Mode: "fixed", FailureThreshold: 3, BlacklistDuration: time.Minute},
+		Nodes: []config.NodeConfig{{ID: 1, Name: "node", URI: "http://127.0.0.1:65530", Region: "hk"}},
+		Groups: []config.GroupPoolConfig{{ID: 11, Name: "group", BindAddress: "127.0.0.1", BindPort: ports[1],
+			Protocol: "mixed", DispatchMode: "fixed", Regions: []string{"hk"}, FailureWindow: 5 * time.Minute,
+			FailureThreshold: 3, HealthCheckInterval: time.Minute, Enabled: true}}, LogLevel: "error",
+	}
+	if err := cfg.NormalizeWithPortMap(nil); err != nil {
+		t.Fatal(err)
+	}
+	manager := New(cfg, monitor.Config{})
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	before := storeGroupFromConfig(cfg.Groups[0])
+	after := cloneStoreGroupForTest(before)
+	after.Regions = []string{"us"}
+	if err := manager.applyGroupRuntime(context.Background(), before, after, true); err == nil {
+		t.Fatal("forced topology update with no members unexpectedly succeeded")
+	}
+	slot := manager.groupSlot(11)
+	if slot.box != nil || manager.GroupRuntimeStatus(11).Status != "error" {
+		t.Fatalf("removed-node runtime remained active: box=%p status=%+v", slot.box, manager.GroupRuntimeStatus(11))
+	}
+}
+
+func reserveTCPPorts(t *testing.T, count int) []uint16 {
+	t.Helper()
+	listeners := make([]net.Listener, 0, count)
+	ports := make([]uint16, 0, count)
+	for range count {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		listeners = append(listeners, listener)
+		ports = append(ports, uint16(listener.Addr().(*net.TCPAddr).Port))
+	}
+	for _, listener := range listeners {
+		if err := listener.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return ports
+}
+
+func assertTCPListening(t *testing.T, port uint16) {
+	t.Helper()
+	connection, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", fmt.Sprint(port)), time.Second)
+	if err != nil {
+		t.Fatalf("port %d is not listening: %v", port, err)
+	}
+	_ = connection.Close()
+}
+
+func cloneStoreGroupForTest(value *store.GroupPool) *store.GroupPool {
+	copyValue := *value
+	copyValue.Regions = append([]string(nil), value.Regions...)
+	copyValue.ExplicitNodeIDs = append([]int64(nil), value.ExplicitNodeIDs...)
+	copyValue.ExcludedNodeIDs = append([]int64(nil), value.ExcludedNodeIDs...)
+	return &copyValue
 }

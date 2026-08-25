@@ -90,3 +90,16 @@ func TestCurrentClearEmitsExplicitChange(t *testing.T) {
 		t.Fatalf("current tag = %q, want empty", got)
 	}
 }
+
+func TestOldRuntimeCleanupDoesNotDeleteNewGeneration(t *testing.T) {
+	Reset()
+	defer Reset()
+	cleanupOld := Register(99, time.Minute, 3, "old", map[string]GroupInitialState{"old": {NodeID: 1}})
+	cleanupNew := Register(99, time.Minute, 3, "new", map[string]GroupInitialState{"new": {NodeID: 2}})
+	defer cleanupNew()
+	cleanupOld()
+	snapshot, ok := GroupRuntimeSnapshots()[99]
+	if !ok || len(snapshot.Members) != 1 || snapshot.Members[0].NodeID != 2 {
+		t.Fatalf("new runtime generation was removed: %+v, present=%v", snapshot, ok)
+	}
+}

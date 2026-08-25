@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -186,17 +187,11 @@ func (p *groupStatePersister) run() {
 	pendingCurrent := make(map[int64]int64)
 	flushCurrent := func() {
 		for groupID, nodeID := range pendingCurrent {
-			groupPool, err := p.store.GetGroupPool(context.Background(), groupID)
-			if err != nil || groupPool == nil {
-				if err != nil {
-					log.Printf("[app] persist group current %d: %v", groupID, err)
-				}
-				delete(pendingCurrent, groupID)
-				continue
-			}
-			groupPool.CurrentActiveNodeID = nodeID
-			if err := p.store.UpdateGroupPool(context.Background(), groupPool); err != nil {
+			if err := p.store.UpdateGroupCurrentActiveNode(context.Background(), groupID, nodeID); err != nil {
 				log.Printf("[app] persist group current %d: %v", groupID, err)
+				if strings.Contains(err.Error(), "not found") {
+					delete(pendingCurrent, groupID)
+				}
 				continue
 			}
 			delete(pendingCurrent, groupID)

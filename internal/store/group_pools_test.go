@@ -63,3 +63,32 @@ func TestGroupPoolCRUDAndState(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestUpdateGroupCurrentActiveNodeDoesNotOverwriteEditedFields(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "group-current.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	groupPool := &GroupPool{Name: "before", BindAddress: "127.0.0.1", BindPort: 10002, Protocol: "mixed",
+		DispatchMode: "fixed", FailureWindowSeconds: 300, FailureThreshold: 3, HealthCheckSeconds: 60, Enabled: true}
+	if err := db.CreateGroupPool(ctx, groupPool); err != nil {
+		t.Fatal(err)
+	}
+	groupPool.Name = "edited"
+	groupPool.DispatchMode = "random"
+	if err := db.UpdateGroupPool(ctx, groupPool); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpdateGroupCurrentActiveNode(ctx, groupPool.ID, 42); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := db.GetGroupPool(ctx, groupPool.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.CurrentActiveNodeID != 42 || stored.Name != "edited" || stored.DispatchMode != "random" {
+		t.Fatalf("targeted current update overwrote group fields: %+v", stored)
+	}
+}

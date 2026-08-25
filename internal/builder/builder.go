@@ -398,6 +398,80 @@ func Build(cfg *config.Config) (option.Options, error) {
 	return opts, nil
 }
 
+// BuildBase builds the application-wide runtime without any group listeners.
+// Groups are hosted by independent boxes so mutating one group never requires
+// rebinding the global listener or another group's listener.
+func BuildBase(cfg *config.Config) (option.Options, error) {
+	baseCfg := cfg.Clone()
+	baseCfg.Groups = nil
+	return Build(baseCfg)
+}
+
+// BuildGroup builds a self-contained sing-box instance for one enabled group.
+// It retains only the target group's inbound, selector, pool, and the member
+// outbounds on which that pool depends.
+func BuildGroup(cfg *config.Config, groupID int64) (option.Options, error) {
+	groupCfg := cfg.Clone()
+	groupCfg.Groups = nil
+	for _, candidate := range cfg.Groups {
+		if candidate.ID == groupID {
+			groupCfg.Groups = []config.GroupPoolConfig{candidate}
+			break
+		}
+	}
+	if len(groupCfg.Groups) != 1 || !groupCfg.Groups[0].Enabled {
+		return option.Options{}, fmt.Errorf("group %d is not enabled", groupID)
+	}
+	opts, err := Build(groupCfg)
+	if err != nil {
+		return option.Options{}, err
+	}
+	poolTag := fmt.Sprintf("group-pool-%d", groupID)
+	selectorTag := fmt.Sprintf("group-selector-%d", groupID)
+	inboundTag := fmt.Sprintf("group-in-%d", groupID)
+	keep := map[string]struct{}{poolTag: {}, selectorTag: {}}
+	foundPool := false
+	for _, outbound := range opts.Outbounds {
+		if outbound.Tag != poolTag {
+			continue
+		}
+		poolOptions, ok := outbound.Options.(*poolout.Options)
+		if !ok {
+			return option.Options{}, fmt.Errorf("group %d has invalid pool options", groupID)
+		}
+		poolOptions.MonitorObserverOnly = true
+		for _, memberTag := range poolOptions.Members {
+			keep[memberTag] = struct{}{}
+		}
+		foundPool = true
+		break
+	}
+	if !foundPool {
+		return option.Options{}, fmt.Errorf("group %d has no routable members", groupID)
+	}
+	filteredOutbounds := opts.Outbounds[:0]
+	for _, outbound := range opts.Outbounds {
+		if _, ok := keep[outbound.Tag]; ok {
+			filteredOutbounds = append(filteredOutbounds, outbound)
+		}
+	}
+	filteredInbounds := opts.Inbounds[:0]
+	for _, inbound := range opts.Inbounds {
+		if inbound.Tag == inboundTag {
+			filteredInbounds = append(filteredInbounds, inbound)
+		}
+	}
+	if len(filteredInbounds) != 1 {
+		return option.Options{}, fmt.Errorf("group %d listener was not built", groupID)
+	}
+	opts.Inbounds = filteredInbounds
+	opts.Outbounds = filteredOutbounds
+	opts.Route = &option.RouteOptions{Final: poolTag}
+	opts.Experimental = nil
+	opts.Services = nil
+	return opts, nil
+}
+
 func buildPoolInbound(cfg *config.Config) (option.Inbound, error) {
 	listenAddr, err := parseAddr(cfg.Listener.Address)
 	if err != nil {

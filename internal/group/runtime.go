@@ -113,9 +113,9 @@ func notifyGroupState(event GroupStateEvent) {
 	}
 }
 
-func Register(groupID int64, failureWindow time.Duration, failureThreshold int, currentTag string, members map[string]GroupInitialState) {
+func Register(groupID int64, failureWindow time.Duration, failureThreshold int, currentTag string, members map[string]GroupInitialState) func() {
 	if groupID == 0 {
-		return
+		return func() {}
 	}
 	preferredTag := currentTag
 	runtime := &groupRuntime{
@@ -151,6 +151,9 @@ func Register(groupID int64, failureWindow time.Duration, failureThreshold int, 
 		if member.evicted {
 			propagateEviction(member.nodeID, member.lastError, member.evictedAt)
 		}
+	}
+	return func() {
+		groupRuntimeStore.CompareAndDelete(groupID, runtime)
 	}
 }
 

@@ -1233,6 +1233,16 @@ subscription_mode=?, external_host=?, updated_at=? WHERE id=?`,
 	return requireAffected(result, "group pool not found")
 }
 
+func (s *sqliteStore) UpdateGroupCurrentActiveNode(ctx context.Context, groupID, nodeID int64) error {
+	result, err := s.conn().ExecContext(ctx,
+		"UPDATE group_pools SET current_active_node_id=?, updated_at=? WHERE id=?",
+		nodeID, formatTime(time.Now()), groupID)
+	if err != nil {
+		return fmt.Errorf("update group current active node: %w", err)
+	}
+	return requireAffected(result, "group pool not found")
+}
+
 func (s *sqliteStore) DeleteGroupPool(ctx context.Context, id int64) error {
 	result, err := s.conn().ExecContext(ctx, "DELETE FROM group_pools WHERE id = ?", id)
 	if err != nil {

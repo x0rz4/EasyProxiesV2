@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -100,6 +101,41 @@ func TestBuildLeavesLowestLatencyGroupWithoutSyntheticCurrent(t *testing.T) {
 		return
 	}
 	t.Fatal("group pool outbound not found")
+}
+
+func TestBuildBaseAndGroupAreRuntimeIsolated(t *testing.T) {
+	cfg := &config.Config{Mode: "pool", Listener: config.ListenerConfig{Address: "127.0.0.1", Port: 2323, Protocol: "http"},
+		Pool:  config.PoolConfig{Mode: "random", FailureThreshold: 3, BlacklistDuration: time.Hour},
+		Nodes: []config.NodeConfig{{ID: 1, Name: "hk", URI: "http://hk.example:80", Region: "hk"}},
+		Groups: []config.GroupPoolConfig{{ID: 9, Name: "isolated", BindAddress: "127.0.0.1", BindPort: 10009,
+			Protocol: "mixed", DispatchMode: "fixed", Regions: []string{"hk"},
+			FailureWindow: 5 * time.Minute, FailureThreshold: 3, Enabled: true}}}
+	base, err := BuildBase(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, inbound := range base.Inbounds {
+		if strings.HasPrefix(inbound.Tag, "group-in-") {
+			t.Fatalf("base topology contains group inbound %q", inbound.Tag)
+		}
+	}
+	groupOptions, err := BuildGroup(cfg, 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(groupOptions.Inbounds) != 1 || groupOptions.Inbounds[0].Tag != "group-in-9" || groupOptions.Route.Final != "group-pool-9" {
+		t.Fatalf("isolated group topology: inbounds=%v final=%q", groupOptions.Inbounds, groupOptions.Route.Final)
+	}
+	for _, outbound := range groupOptions.Outbounds {
+		if outbound.Tag == "group-pool-9" {
+			poolOptions := outbound.Options.(*poolout.Options)
+			if !poolOptions.MonitorObserverOnly {
+				t.Fatal("isolated group pool became a monitor callback owner")
+			}
+			return
+		}
+	}
+	t.Fatal("isolated group pool not found")
 }
 
 func TestBuildNodeOutboundSupportsHTTP(t *testing.T) {
