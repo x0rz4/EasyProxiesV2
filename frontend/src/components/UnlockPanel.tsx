@@ -36,14 +36,14 @@ export default function UnlockPanel() {
   // Filter / search
   const [filter, setFilter] = useState('')
   const [statusFilter, setStatusFilter] = useState<'' | 'unlocked' | 'locked' | 'mixed' | 'failed'>('')
+  const [countryFilter, setCountryFilter] = useState('')
 
   // ---- Node list ----
   const loadNodes = useCallback(async () => {
     try {
       const res = await fetchNodes()
-      // Only nodes that are actually wired up (have a tag + available) can be
       // unlock-checked; the dialer is registered per member tag.
-      const usable = (res.nodes || []).filter((n) => n.tag)
+      const usable = (res.nodes || []).filter((n) => n.tag && n.initial_check_done && n.available && !n.blacklisted)
       setNodes(usable)
       // Load any previously persisted detection results so the user sees
       // last-saved state without re-running checks. Best-effort: a failure
@@ -147,9 +147,19 @@ export default function UnlockPanel() {
   }, [])
 
   // ---- Derived ----
+  const countries = useMemo(() => {
+    const set = new Set<string>()
+    for (const n of nodes) {
+      if (n.country) set.add(n.country)
+    }
+    return Array.from(set).sort()
+  }, [nodes])
+
   const filteredNodes = useMemo(() => {
     const q = filter.trim().toLowerCase()
     return nodes.filter((n) => {
+      if (countryFilter && n.country !== countryFilter) return false
+      
       if (q) {
         const hay = `${n.name} ${n.region || ''} ${n.country || ''} ${n.tag}`.toLowerCase()
         if (!hay.includes(q)) return false
@@ -172,7 +182,7 @@ export default function UnlockPanel() {
       }
       return true
     })
-  }, [nodes, filter, statusFilter, results, errors])
+  }, [nodes, filter, statusFilter, countryFilter, results, errors])
 
   const summary = useMemo(() => {
     const checked = Object.values(results)
@@ -273,7 +283,18 @@ export default function UnlockPanel() {
               onChange={(e) => setFilter(e.target.value)}
             />
           </div>
-          <div className="flex gap-1.5">
+          <div className="flex gap-1.5 sm:gap-2 flex-wrap">
+            <select
+              className="select select-sm select-bordered w-full sm:w-auto"
+              value={countryFilter}
+              onChange={(e) => setCountryFilter(e.target.value)}
+            >
+              <option value="">所有国家</option>
+              {countries.map((c) => (
+                <option key={c} value={c}>{c}</option>
+              ))}
+            </select>
+            <div className="flex gap-1.5 w-full sm:w-auto overflow-x-auto pb-1 sm:pb-0">
             {([
               ['', '全部'],
               ['unlocked', '全解锁'],
@@ -289,6 +310,7 @@ export default function UnlockPanel() {
                 {label}
               </button>
             ))}
+            </div>
           </div>
         </div>
 
@@ -461,6 +483,15 @@ function UnlockRow({
       </td>
       <td>
         <div className="flex flex-col gap-1 max-w-[300px]">
+           <div className="flex items-center gap-2">
+             {node.last_latency_ms > 0 ? (
+               <span className={`text-xs ${node.last_latency_ms <= 100 ? 'text-success' : node.last_latency_ms <= 300 ? 'text-warning' : 'text-error'}`}>
+                 {node.last_latency_ms}ms
+               </span>
+             ) : (
+               <span className="text-xs text-base-content/40">超时</span>
+             )}
+           </div>
            {renderBadges()}
            {err && <span className="text-[10px] text-error truncate" title={err}>{err}</span>}
         </div>
