@@ -1,13 +1,13 @@
 import { useMemo, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  Activity, CheckCircle2, CircleAlert, Copy, Dices, KeyRound, Layers3, Link2, Network, Pencil,
-  Plus, Power, RefreshCw, RotateCcw, Server, ShieldOff, Trash2, X,
+  Activity, CheckCircle2, ChevronDown, CircleAlert, Copy, Dices, KeyRound, Layers3, Link2, Network, Pencil,
+  Plus, Power, RefreshCw, RotateCcw, Search, Server, ShieldOff, Trash2, X,
 } from 'lucide-react'
 import { toast } from 'sonner'
-import type { GroupPool, GroupPoolPayload, GroupMemberStatus } from '../types'
+import type { GroupMember, GroupNodeOption, GroupPool, GroupPoolPayload, GroupMemberStatus } from '../types'
 import {
-  createGroupPool, deleteGroupPool, listGroupPools, resetGroupSubscriptionToken, restoreGroupMember, updateGroupPool,
+  createGroupPool, deleteGroupPool, listGroupPools, probeNode, resetGroupSubscriptionToken, restoreGroupMember, updateGroupPool,
 } from '../api/client'
 import { cn } from '../utils/cn'
 import { controlClass, PageContent, PageHeader, PageLayout, surfaceClass } from './ui/PageLayout'
@@ -23,6 +23,14 @@ const statusStyle: Record<GroupMemberStatus, { label: string; badge: string; ico
   ALIVE: { label: '可用', badge: 'badge-success', icon: CheckCircle2 },
   SUSPECT: { label: '观察中', badge: 'badge-warning', icon: CircleAlert },
   EVICTED: { label: '已踢出', badge: 'badge-error', icon: ShieldOff },
+}
+
+const nodeStatusStyle: Record<GroupNodeOption['status'], { label: string; badge: string }> = {
+  normal: { label: '可用', badge: 'badge-success' },
+  unavailable: { label: '不可用', badge: 'badge-error' },
+  blacklisted: { label: '已拉黑', badge: 'badge-warning' },
+  pending: { label: '待检测', badge: 'badge-ghost' },
+  disabled: { label: '已禁用', badge: 'badge-ghost' },
 }
 
 function payloadFromGroup(group: GroupPool): GroupPoolPayload {
@@ -52,38 +60,64 @@ export default function GroupPoolsPanel() {
   const [nodeSearch, setNodeSearch] = useState('')
   const [deleteTarget, setDeleteTarget] = useState<GroupPool | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
+  const [expandedGroups, setExpandedGroups] = useState<Set<number>>(() => new Set())
+  const [removedDraftNodes, setRemovedDraftNodes] = useState<string[]>([])
+  const [draftNodeCache, setDraftNodeCache] = useState<Record<number, GroupNodeOption>>({})
+  const [probingNodeIDs, setProbingNodeIDs] = useState<Set<number>>(() => new Set())
+  const [latencyOverrides, setLatencyOverrides] = useState<Record<number, number>>({})
+  const [batchProbeProgress, setBatchProbeProgress] = useState<{ current: number; total: number } | null>(null)
 
   const filteredNodes = useMemo(() => {
     const keyword = nodeSearch.trim().toLowerCase()
-    if (!keyword) return nodes
-    return nodes.filter((node) => `${node.name} ${node.region || ''} ${node.country || ''}`.toLowerCase().includes(keyword))
-  }, [nodes, nodeSearch])
+    return nodes.filter((node) => node.selectable && !form.explicit_node_ids.includes(node.id))
+      .filter((node) => !keyword || `${node.name} ${node.region || ''} ${node.country || ''}`.toLowerCase().includes(keyword))
+  }, [nodes, nodeSearch, form.explicit_node_ids])
+
+  const selectedNodeOptions = useMemo(() => {
+    const byID = new Map(nodes.map((node) => [node.id, node]))
+    return form.explicit_node_ids.map((id) => {
+      const current = byID.get(id)
+      if (current) return current
+      const cached = draftNodeCache[id]
+      return cached ? { ...cached, status: 'unavailable' as const, available: false, selectable: false, latency_ms: -1 } : undefined
+    }).filter((node): node is GroupNodeOption => Boolean(node))
+  }, [nodes, form.explicit_node_ids, draftNodeCache])
 
   const openCreate = () => {
-    setEditing(null); setForm(emptyPayload()); setRegionsText(''); setNodeSearch(''); setEditorOpen(true)
+    setEditing(null); setForm(emptyPayload()); setRegionsText(''); setNodeSearch(''); setRemovedDraftNodes([]); setDraftNodeCache({}); setEditorOpen(true)
   }
   const openEdit = (group: GroupPool) => {
-    setEditing(group); setForm(payloadFromGroup(group)); setRegionsText((group.regions || []).join(', '));
-    setNodeSearch(''); setEditorOpen(true)
+    const nodeByID = new Map(nodes.map((node) => [node.id, node]))
+    const keptIDs = group.explicit_node_ids.filter((id) => nodeByID.get(id)?.selectable)
+    const removedNames = group.explicit_node_ids.filter((id) => !nodeByID.get(id)?.selectable).map((id) =>
+      nodeByID.get(id)?.name || group.members.find((member) => member.node_id === id)?.name || `节点 #${id}`)
+    const cache = Object.fromEntries(keptIDs.map((id) => [id, nodeByID.get(id)]).filter((entry): entry is [number, GroupNodeOption] => Boolean(entry[1])))
+    setEditing(group); setForm({ ...payloadFromGroup(group), explicit_node_ids: keptIDs }); setRegionsText((group.regions || []).join(', '));
+    setNodeSearch(''); setRemovedDraftNodes(removedNames); setDraftNodeCache(cache); setEditorOpen(true)
   }
-  const closeEditor = () => { setEditorOpen(false); setEditing(null) }
+  const closeEditor = () => { setEditorOpen(false); setEditing(null); setRemovedDraftNodes([]); setBatchProbeProgress(null) }
 
   const refresh = async () => {
     await queryClient.invalidateQueries({ queryKey: ['groupPools'] })
     await queryClient.invalidateQueries({ queryKey: ['nodes'] })
   }
   const save = async () => {
+    const selectableIDs = new Set(nodes.filter((node) => node.selectable).map((node) => node.id))
+    const keptNodeIDs = form.explicit_node_ids.filter((id) => selectableIDs.has(id))
+    const locallyRemoved = form.explicit_node_ids.length - keptNodeIDs.length
     const payload = {
       ...form,
       name: form.name.trim(),
       regions: regionsText.split(/[,，\s]+/).map((value) => value.trim().toLowerCase()).filter(Boolean),
+      explicit_node_ids: keptNodeIDs,
     }
     if (!payload.name) return
     setBusy('save')
     try {
-      if (editing) await updateGroupPool(editing.id, payload)
-      else await createGroupPool(payload)
-      toast.success(editing ? '分组池已更新' : '分组池已创建并加载')
+      const result = editing ? await updateGroupPool(editing.id, payload) : await createGroupPool(payload)
+      const removedCount = locallyRemoved + (result.removed_unavailable_node_ids?.length || 0)
+      toast.success(editing ? '分组池已更新' : '分组池已创建并加载', removedCount > 0
+        ? { description: `${removedCount} 个不可用手动节点未被保存` } : undefined)
       closeEditor(); await refresh()
     } catch (error) {
       toast.error(error instanceof Error ? error.message : '保存分组池失败')
@@ -95,6 +129,66 @@ export default function GroupPoolsPanel() {
     try { await task(); toast.success(message); await refresh() }
     catch (error) { toast.error(error instanceof Error ? error.message : '操作失败') }
     finally { setBusy(null) }
+  }
+
+  const removeManualNode = (node: GroupNodeOption) => {
+    setForm((current) => ({ ...current, explicit_node_ids: current.explicit_node_ids.filter((id) => id !== node.id) }))
+    const regions = new Set(regionsText.split(/[,，\s]+/).map((value) => value.trim().toLowerCase()).filter(Boolean))
+    if (node.region && regions.has(node.region.toLowerCase())) {
+      toast.info('已取消手动指定', { description: `${node.name} 仍匹配地区规则，会继续自动入池` })
+    }
+  }
+
+  const probeOption = async (node: Pick<GroupNodeOption, 'id' | 'name' | 'tag'>, quiet = false) => {
+    if (!node.tag) return false
+    setProbingNodeIDs((current) => new Set(current).add(node.id))
+    try {
+      const result = await probeNode(node.tag)
+      setLatencyOverrides((current) => ({ ...current, [node.id]: result.latency_ms }))
+      if (!quiet) toast.success(`${node.name} 延迟 ${result.latency_ms} ms`)
+      return true
+    } catch (error) {
+      const removed = form.explicit_node_ids.includes(node.id)
+      setForm((current) => {
+        if (!current.explicit_node_ids.includes(node.id)) return current
+        return { ...current, explicit_node_ids: current.explicit_node_ids.filter((id) => id !== node.id) }
+      })
+      if (removed) setRemovedDraftNodes((current) => current.includes(node.name) ? current : [...current, node.name])
+      if (!quiet) toast.error(error instanceof Error ? error.message : '延迟测试失败', removed
+        ? { description: `${node.name} 已从当前编辑草稿移除` } : undefined)
+      return false
+    } finally {
+      setProbingNodeIDs((current) => { const next = new Set(current); next.delete(node.id); return next })
+      if (!quiet) {
+        await queryClient.invalidateQueries({ queryKey: ['groupPools'] })
+        await queryClient.invalidateQueries({ queryKey: ['nodes'] })
+      }
+    }
+  }
+
+  const probeSelectedNodes = async () => {
+    const targets = selectedNodeOptions.filter((node) => node.tag)
+    if (targets.length === 0) return toast.error('已选节点中没有可测试的运行节点')
+    setBatchProbeProgress({ current: 0, total: targets.length })
+    let succeeded = 0
+    let failed = 0
+    let completed = 0
+    for (let index = 0; index < targets.length; index += 10) {
+      const batch = targets.slice(index, index + 10)
+      const results = await Promise.all(batch.map(async (node) => {
+        const result = await probeOption(node, true)
+        completed++
+        setBatchProbeProgress({ current: completed, total: targets.length })
+        return result
+      }))
+      succeeded += results.filter(Boolean).length
+      failed += results.filter((result) => !result).length
+    }
+    setBatchProbeProgress(null)
+    await queryClient.invalidateQueries({ queryKey: ['groupPools'] })
+    await queryClient.invalidateQueries({ queryKey: ['nodes'] })
+    toast.success(`批量测试完成：${succeeded} 成功，${failed} 失败`, failed > 0
+      ? { description: '失败节点已从当前编辑草稿移除' } : undefined)
   }
 
   const activeGroups = groups.filter((group) => group.enabled).length
@@ -131,6 +225,8 @@ export default function GroupPoolsPanel() {
         ) : (
           <section className="grid items-start gap-5 xl:grid-cols-2">
             {groups.map((group) => <GroupCard key={group.id} group={group} busy={busy}
+              expanded={expandedGroups.has(group.id)}
+              onToggleExpanded={() => setExpandedGroups((current) => { const next = new Set(current); if (next.has(group.id)) next.delete(group.id); else next.add(group.id); return next })}
               onEdit={() => openEdit(group)} onDelete={() => setDeleteTarget(group)}
               onToggle={() => void run(`toggle-${group.id}`, () => updateGroupPool(group.id, { ...payloadFromGroup(group), enabled: !group.enabled }), group.enabled ? '分组已停用' : '分组已启用')}
 				onResetToken={() => void run(`token-${group.id}`, () => resetGroupSubscriptionToken(group.id), '订阅 Token 已重置，旧链接已失效')}
@@ -140,7 +236,7 @@ export default function GroupPoolsPanel() {
       </PageContent>
 
       {editorOpen && <div className="modal modal-open" role="dialog" aria-modal="true" aria-label={editing ? '编辑分组池' : '新建分组池'}>
-        <div className="modal-box max-h-[92vh] w-11/12 max-w-3xl overflow-y-auto p-0">
+        <div className="modal-box max-h-[92vh] w-11/12 max-w-5xl overflow-y-auto p-0">
           <div className="sticky top-0 z-10 flex items-center justify-between border-b border-base-300 bg-base-100/95 px-5 py-4 backdrop-blur-xl">
             <div><h3 className="text-lg font-bold">{editing ? '编辑分组池' : '新建分组池'}</h3><p className="mt-0.5 text-xs text-base-content/50">地区与手动节点取并集，订阅刷新后会自动重新匹配</p></div>
             <button className="btn btn-ghost btn-sm btn-square" onClick={closeEditor} aria-label="关闭"><X className="h-4 w-4" /></button>
@@ -176,16 +272,49 @@ export default function GroupPoolsPanel() {
 				</div></div>
 			</div>
 
-            <div className="rounded-2xl border border-base-300 bg-base-200/25 p-4">
-              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"><div><h4 className="font-bold">手动指定节点</h4><p className="mt-0.5 text-xs text-base-content/50">已选择 {form.explicit_node_ids.length} 个；可与地区规则同时使用</p></div><input className="input input-sm w-full sm:w-64" value={nodeSearch} onChange={(e) => setNodeSearch(e.target.value)} placeholder="搜索节点或地区" /></div>
-              <div className="mt-3 max-h-52 space-y-1 overflow-y-auto pr-1">
-                {filteredNodes.map((node) => <label key={node.id} className="flex cursor-pointer items-center gap-3 rounded-xl px-3 py-2.5 transition-colors hover:bg-base-200">
-                  <input type="checkbox" className="checkbox checkbox-primary checkbox-sm" checked={form.explicit_node_ids.includes(node.id)} onChange={() => setForm({ ...form, explicit_node_ids: form.explicit_node_ids.includes(node.id) ? form.explicit_node_ids.filter((id) => id !== node.id) : [...form.explicit_node_ids, node.id] })} />
-                  <span className="min-w-0 flex-1 truncate text-sm font-medium">{node.name}</span>{node.region && <span className="badge badge-ghost badge-sm uppercase">{node.region}</span>}
-                </label>)}
-                {filteredNodes.length === 0 && <p className="py-8 text-center text-sm text-base-content/45">没有匹配的节点</p>}
+            <section aria-labelledby="member-editor-title">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+                <div><h4 id="member-editor-title" className="font-bold">节点成员管理</h4><p className="mt-1 text-xs leading-5 text-base-content/55">只能新增节点管理中状态可用的节点；地区规则与手动节点取并集</p></div>
+                {selectedNodeOptions.length > 0 && <button type="button" className="btn btn-outline btn-sm gap-2" onClick={() => void probeSelectedNodes()} disabled={Boolean(batchProbeProgress)}>
+                  {batchProbeProgress ? <span className="loading loading-spinner loading-xs" /> : <Activity className="h-4 w-4" />}
+                  {batchProbeProgress ? `${batchProbeProgress.current}/${batchProbeProgress.total}` : '测试全部已选'}
+                </button>}
               </div>
-            </div>
+
+              {removedDraftNodes.length > 0 && <div role="status" className="mt-3 flex items-start gap-2 rounded-xl border border-warning/30 bg-warning/8 px-3 py-2.5 text-xs leading-5 text-warning-content">
+                <CircleAlert className="mt-0.5 h-4 w-4 shrink-0 text-warning" /><span><strong>已从编辑草稿移除 {removedDraftNodes.length} 个不可用节点：</strong> {removedDraftNodes.join('、')}。取消编辑不会修改原配置，保存后生效。</span>
+              </div>}
+
+              <div className="mt-4 grid gap-4 lg:grid-cols-2">
+                <div className="rounded-2xl border border-base-300 bg-base-200/25 p-4">
+                  <div><h5 className="text-sm font-bold">已手动指定</h5><p className="mt-0.5 text-xs text-base-content/50">当前草稿共 {selectedNodeOptions.length} 个节点</p></div>
+                  <div className="mt-3 max-h-72 space-y-2 overflow-y-auto pr-1">
+                    {selectedNodeOptions.map((node) => <NodeOptionRow key={node.id} node={node} latency={latencyOverrides[node.id] ?? node.latency_ms} probing={probingNodeIDs.has(node.id)}
+                      action="remove" onAction={() => removeManualNode(node)} onProbe={() => void probeOption(node)} />)}
+                    {selectedNodeOptions.length === 0 && <EmptyMemberList message="尚未手动指定节点" />}
+                  </div>
+                </div>
+
+                <div className="rounded-2xl border border-base-300 bg-base-200/25 p-4">
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"><div><h5 className="text-sm font-bold">可添加节点</h5><p className="mt-0.5 text-xs text-base-content/50">仅显示节点管理状态为“可用”的节点</p></div><label className="input input-sm flex w-full items-center gap-2 sm:w-56"><Search className="h-3.5 w-3.5 text-base-content/40" /><input className="min-w-0 grow" value={nodeSearch} onChange={(e) => setNodeSearch(e.target.value)} placeholder="搜索节点或地区" aria-label="搜索可添加节点" /></label></div>
+                  <div className="mt-3 max-h-72 space-y-2 overflow-y-auto pr-1">
+                    {filteredNodes.map((node) => <NodeOptionRow key={node.id} node={node} latency={latencyOverrides[node.id] ?? node.latency_ms} probing={probingNodeIDs.has(node.id)}
+                      action="add" onAction={() => { setDraftNodeCache((current) => ({ ...current, [node.id]: node })); setForm((current) => ({ ...current, explicit_node_ids: [...current.explicit_node_ids, node.id] })) }} onProbe={() => void probeOption(node)} />)}
+                    {filteredNodes.length === 0 && <EmptyMemberList message={nodeSearch ? '没有匹配的可用节点' : '当前没有其他可用节点'} />}
+                  </div>
+                </div>
+              </div>
+
+              {editing && <div className="mt-4 rounded-2xl border border-base-300 bg-base-200/15 p-4">
+                <div><h5 className="text-sm font-bold">当前运行成员</h5><p className="mt-0.5 text-xs text-base-content/50">来自已保存的地区与手动规则；修改将在保存并重载后生效</p></div>
+                <div className="mt-3 grid max-h-80 gap-2 overflow-y-auto pr-1 md:grid-cols-2">
+                  {editing.members.map((member) => <RuntimeMemberRow key={member.node_id} member={member} manual={form.explicit_node_ids.includes(member.node_id)}
+                    regional={Boolean(member.region && regionsText.split(/[,，\s]+/).some((region) => region.toLowerCase() === member.region?.toLowerCase()))}
+                    latency={latencyOverrides[member.node_id] ?? member.latency_ms} probing={probingNodeIDs.has(member.node_id)} onProbe={() => void probeOption({ id: member.node_id, name: member.name || member.tag, tag: member.tag })} />)}
+                  {editing.members.length === 0 && <div className="md:col-span-2"><EmptyMemberList message="当前没有运行成员" /></div>}
+                </div>
+              </div>}
+            </section>
 
             <details className="collapse-arrow collapse rounded-2xl border border-base-300 bg-base-200/20"><summary className="collapse-title min-h-0 py-3 text-sm font-semibold">入口认证（可选）</summary><div className="collapse-content grid gap-4 sm:grid-cols-2"><Field label="用户名"><input className={cn('input w-full', controlClass)} value={form.username} onChange={(e) => setForm({ ...form, username: e.target.value })} /></Field><Field label="密码"><input type="password" className={cn('input w-full', controlClass)} value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} /></Field></div></details>
           </div>
@@ -206,7 +335,48 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
   return <fieldset className="fieldset"><legend className="fieldset-legend font-semibold text-base-content/80">{label}</legend>{children}{hint && <p className="mt-1 text-xs text-base-content/45">{hint}</p>}</fieldset>
 }
 
-function GroupCard({ group, busy, onEdit, onDelete, onToggle, onResetToken, onRestore }: { group: GroupPool; busy: string | null; onEdit: () => void; onDelete: () => void; onToggle: () => void; onResetToken: () => void; onRestore: (nodeId: number) => void }) {
+function LatencyValue({ value }: { value: number }) {
+  if (value < 0) return <span className="font-mono text-[11px] text-base-content/35">未测试</span>
+  const tone = value < 200 ? 'text-success' : value < 500 ? 'text-warning' : 'text-error'
+  return <span className={cn('whitespace-nowrap font-mono text-[11px] font-semibold tabular-nums', tone)}>{value} ms</span>
+}
+
+function EmptyMemberList({ message }: { message: string }) {
+  return <div className="rounded-xl border border-dashed border-base-300 px-3 py-8 text-center text-xs text-base-content/45">{message}</div>
+}
+
+function NodeOptionRow({ node, latency, probing, action, onAction, onProbe }: {
+  node: GroupNodeOption
+  latency: number
+  probing: boolean
+  action: 'add' | 'remove'
+  onAction: () => void
+  onProbe: () => void
+}) {
+  const style = nodeStatusStyle[node.status]
+  return <div className="flex min-w-0 items-center gap-2 rounded-xl border border-base-200 bg-base-100/75 px-3 py-2.5 transition-colors hover:border-base-300">
+    <div className="min-w-0 flex-1"><div className="flex min-w-0 items-center gap-2"><span className="truncate text-sm font-medium" title={node.name}>{node.name}</span>{node.region && <span className="shrink-0 text-[10px] font-bold uppercase text-base-content/45">{node.region}</span>}</div><div className="mt-1 flex items-center gap-2"><span className={cn('badge badge-xs', style.badge)}>{style.label}</span><LatencyValue value={latency} /></div></div>
+    <button type="button" className="btn btn-ghost btn-xs btn-square text-primary" onClick={onProbe} disabled={!node.tag || probing} aria-label={`测试 ${node.name} 延迟`} title={node.tag ? '测试延迟' : '节点暂无运行时标识'}>{probing ? <span className="loading loading-spinner loading-xs" /> : <Activity className="h-3.5 w-3.5" />}</button>
+    <button type="button" className={cn('btn btn-ghost btn-xs btn-square', action === 'remove' ? 'text-error' : 'text-success')} onClick={onAction} aria-label={`${action === 'remove' ? '移除' : '添加'} ${node.name}`} title={action === 'remove' ? '取消手动指定' : '添加到手动节点'}>{action === 'remove' ? <Trash2 className="h-3.5 w-3.5" /> : <Plus className="h-3.5 w-3.5" />}</button>
+  </div>
+}
+
+function RuntimeMemberRow({ member, manual, regional, latency, probing, onProbe }: {
+  member: GroupMember
+  manual: boolean
+  regional: boolean
+  latency: number
+  probing: boolean
+  onProbe: () => void
+}) {
+  const style = statusStyle[member.status]
+  return <div className="flex min-w-0 items-center gap-2 rounded-xl border border-base-200 bg-base-100/70 px-3 py-2.5">
+    <div className="min-w-0 flex-1"><div className="flex min-w-0 items-center gap-2"><span className="truncate text-sm font-medium">{member.name || member.tag}</span>{member.region && <span className="shrink-0 text-[10px] font-bold uppercase text-base-content/45">{member.region}</span>}</div><div className="mt-1 flex flex-wrap items-center gap-1.5"><span className={cn('badge badge-xs', style.badge)}>{style.label}</span>{manual && <span className="badge badge-outline badge-xs">手动</span>}{regional && <span className="badge badge-ghost badge-xs">地区</span>}<LatencyValue value={latency} /></div></div>
+    <button type="button" className="btn btn-ghost btn-xs btn-square text-primary" onClick={onProbe} disabled={!member.tag || probing} aria-label={`测试 ${member.name || member.tag} 延迟`} title="测试延迟">{probing ? <span className="loading loading-spinner loading-xs" /> : <Activity className="h-3.5 w-3.5" />}</button>
+  </div>
+}
+
+function GroupCard({ group, busy, expanded, onToggleExpanded, onEdit, onDelete, onToggle, onResetToken, onRestore }: { group: GroupPool; busy: string | null; expanded: boolean; onToggleExpanded: () => void; onEdit: () => void; onDelete: () => void; onToggle: () => void; onResetToken: () => void; onRestore: (nodeId: number) => void }) {
   const active = group.members.find((member) => member.is_active)
 	const copySubscription = async (format: 'clash' | 'base64', mode: 'members' | 'entry') => {
 		if (!group.subscription_token) { toast.error('当前分组没有可用的订阅 Token'); return }
@@ -228,9 +398,11 @@ function GroupCard({ group, busy, onEdit, onDelete, onToggle, onResetToken, onRe
     </div>
     <div className="p-4 sm:p-5">
       {group.dispatch_mode === 'fixed' && <div className={cn('mb-3 flex items-center gap-3 rounded-xl border px-3 py-2.5', active ? 'border-success/25 bg-success/5' : 'border-warning/25 bg-warning/5')}><Activity className={cn('h-4 w-4 shrink-0', active ? 'text-success' : 'text-warning')} /><div className="min-w-0 flex-1"><p className="text-[11px] font-semibold uppercase tracking-wider text-base-content/45">当前主出口</p><p className="truncate text-sm font-semibold">{active?.name || '等待首个连接选择'}</p></div>{active?.latency_ms && active.latency_ms > 0 ? <span className="text-xs font-mono text-base-content/55">{active.latency_ms} ms</span> : null}</div>}
-      <div className="space-y-2">{group.members.slice(0, 8).map((member) => { const style = statusStyle[member.status]; const StatusIcon = style.icon; return <div key={member.node_id} className="flex items-center gap-3 rounded-xl border border-base-200 bg-base-200/20 px-3 py-2.5"><StatusIcon className={cn('h-4 w-4 shrink-0', member.status === 'ALIVE' ? 'text-success' : member.status === 'SUSPECT' ? 'text-warning' : 'text-error')} /><div className="min-w-0 flex-1"><div className="flex items-center gap-2"><span className="truncate text-sm font-medium">{member.name || member.tag}</span>{member.region && <span className="text-[10px] font-bold uppercase text-base-content/40">{member.region}</span>}</div>{member.last_error && <p className="mt-0.5 truncate text-[11px] text-error/75" title={member.last_error}>{member.last_error}</p>}</div><span className={cn('badge badge-sm', style.badge)}>{style.label}</span>{member.latency_ms > 0 && <span className="hidden w-14 text-right font-mono text-xs text-base-content/45 sm:block">{member.latency_ms} ms</span>}{member.status === 'EVICTED' && <button className="btn btn-ghost btn-xs gap-1 text-primary" disabled={busy === `restore-${group.id}-${member.node_id}`} onClick={() => onRestore(member.node_id)} title="恢复入池"><RotateCcw className="h-3 w-3" /><span className="hidden sm:inline">恢复</span></button>}</div> })}</div>
+      <div className="space-y-2">{(expanded ? group.members : group.members.slice(0, 8)).map((member) => { const style = statusStyle[member.status]; const StatusIcon = style.icon; return <div key={member.node_id} className="flex items-center gap-3 rounded-xl border border-base-200 bg-base-200/20 px-3 py-2.5"><StatusIcon className={cn('h-4 w-4 shrink-0', member.status === 'ALIVE' ? 'text-success' : member.status === 'SUSPECT' ? 'text-warning' : 'text-error')} /><div className="min-w-0 flex-1"><div className="flex items-center gap-2"><span className="truncate text-sm font-medium">{member.name || member.tag}</span>{member.region && <span className="text-[10px] font-bold uppercase text-base-content/40">{member.region}</span>}</div>{member.last_error && <p className="mt-0.5 truncate text-[11px] text-error/75" title={member.last_error}>{member.last_error}</p>}</div><span className={cn('badge badge-sm', style.badge)}>{style.label}</span>{member.latency_ms > 0 && <span className="hidden w-14 text-right font-mono text-xs text-base-content/45 sm:block">{member.latency_ms} ms</span>}{member.status === 'EVICTED' && <button className="btn btn-ghost btn-xs gap-1 text-primary" disabled={busy === `restore-${group.id}-${member.node_id}`} onClick={() => onRestore(member.node_id)} title="恢复入池"><RotateCcw className="h-3 w-3" /><span className="hidden sm:inline">恢复</span></button>}</div> })}</div>
       {group.member_count === 0 && <div className="rounded-xl border border-dashed border-warning/40 bg-warning/5 px-4 py-8 text-center"><CircleAlert className="mx-auto h-6 w-6 text-warning" /><p className="mt-2 text-sm font-medium">当前没有匹配的有效节点</p><p className="mt-1 text-xs text-base-content/45">检查地区码、手动成员或节点启用状态</p></div>}
-      {group.member_count > 8 && <p className="mt-3 text-center text-xs text-base-content/45">还有 {group.member_count - 8} 个成员未展开</p>}
+      {group.member_count > 8 && <button type="button" className="mt-3 flex min-h-9 w-full cursor-pointer items-center justify-center gap-1.5 rounded-lg text-xs font-medium text-base-content/55 transition-colors hover:bg-base-200/60 hover:text-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary" onClick={onToggleExpanded} aria-expanded={expanded}>
+        <ChevronDown className={cn('h-3.5 w-3.5 transition-transform duration-200', expanded && 'rotate-180')} />{expanded ? '收起成员' : `展开其余 ${group.member_count - 8} 个成员`}
+      </button>}
     </div>
   </article>
 }

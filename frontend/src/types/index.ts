@@ -61,6 +61,12 @@ export interface GroupNodeOption {
   region?: string
   country?: string
   enabled: boolean
+  tag?: string
+  status: 'normal' | 'unavailable' | 'blacklisted' | 'pending' | 'disabled'
+  latency_ms: number
+  available: boolean
+  initial_check_done: boolean
+  selectable: boolean
 }
 
 export type GroupMemberStatus = 'ALIVE' | 'SUSPECT' | 'EVICTED'
@@ -132,6 +138,13 @@ export interface GroupPoolPayload {
   subscription_enabled: boolean
   subscription_mode: 'members' | 'entry'
   external_host: string
+}
+
+export interface GroupPoolMutationResponse {
+  group: GroupPool
+  reloaded: boolean
+  reload_error?: string
+  removed_unavailable_node_ids: number[]
 }
 
 export interface DebugNode {

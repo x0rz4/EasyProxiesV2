@@ -22,6 +22,7 @@ import type {
   GeoipStatus,
   GroupPoolsResponse,
   GroupPoolPayload,
+  GroupPoolMutationResponse,
 } from '../types'
 
 // ---- Token management ----
@@ -144,11 +145,11 @@ export async function listGroupPools(): Promise<GroupPoolsResponse> {
   return request<GroupPoolsResponse>('/api/groups')
 }
 
-export async function createGroupPool(payload: GroupPoolPayload) {
+export async function createGroupPool(payload: GroupPoolPayload): Promise<GroupPoolMutationResponse> {
   return request('/api/groups', { method: 'POST', body: JSON.stringify(payload) })
 }
 
-export async function updateGroupPool(id: number, payload: GroupPoolPayload) {
+export async function updateGroupPool(id: number, payload: GroupPoolPayload): Promise<GroupPoolMutationResponse> {
   return request(`/api/groups/${id}`, { method: 'PUT', body: JSON.stringify(payload) })
 }
 

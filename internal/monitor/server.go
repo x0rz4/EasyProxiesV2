@@ -885,7 +885,7 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 		latency, err := s.mgr.Probe(ctx, tag)
 		if err != nil {
-			writeJSON(w, map[string]any{"error": err.Error()})
+			writeAPIError(w, http.StatusBadGateway, err.Error())
 			return
 		}
 		latencyMs := latency.Milliseconds()
@@ -2303,6 +2303,21 @@ type groupMemberResponse struct {
 	IsActive     bool      `json:"is_active"`
 }
 
+type groupNodeOptionResponse struct {
+	ID               int64  `json:"id"`
+	Name             string `json:"name"`
+	URI              string `json:"uri"`
+	Region           string `json:"region,omitempty"`
+	Country          string `json:"country,omitempty"`
+	Enabled          bool   `json:"enabled"`
+	Tag              string `json:"tag,omitempty"`
+	Status           string `json:"status"`
+	LatencyMs        int64  `json:"latency_ms"`
+	Available        bool   `json:"available"`
+	InitialCheckDone bool   `json:"initial_check_done"`
+	Selectable       bool   `json:"selectable"`
+}
+
 type groupPoolResponse struct {
 	store.GroupPool
 	CurrentActiveTag string                `json:"current_active_tag,omitempty"`
@@ -2326,7 +2341,7 @@ func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, http.StatusBadRequest, "无效的请求数据")
 			return
 		}
-		group, err := s.groupFromInput(r.Context(), input, nil)
+		group, removedNodeIDs, err := s.groupFromInput(r.Context(), input, nil)
 		if err != nil {
 			writeAPIError(w, http.StatusBadRequest, err.Error())
 			return
@@ -2337,7 +2352,8 @@ func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
 		}
 		reloadError := s.reloadAfterGroupMutation(r.Context())
 		w.WriteHeader(http.StatusCreated)
-		writeJSON(w, map[string]any{"group": group, "reloaded": reloadError == "", "reload_error": reloadError})
+		writeJSON(w, map[string]any{"group": group, "reloaded": reloadError == "", "reload_error": reloadError,
+			"removed_unavailable_node_ids": removedNodeIDs})
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -2411,7 +2427,7 @@ func (s *Server) handleGroupItem(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, http.StatusBadRequest, "无效的请求数据")
 			return
 		}
-		updated, err := s.groupFromInput(r.Context(), input, existing)
+		updated, removedNodeIDs, err := s.groupFromInput(r.Context(), input, existing)
 		if err != nil {
 			writeAPIError(w, http.StatusBadRequest, err.Error())
 			return
@@ -2421,7 +2437,8 @@ func (s *Server) handleGroupItem(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		reloadError := s.reloadAfterGroupMutation(r.Context())
-		writeJSON(w, map[string]any{"group": updated, "reloaded": reloadError == "", "reload_error": reloadError})
+		writeJSON(w, map[string]any{"group": updated, "reloaded": reloadError == "", "reload_error": reloadError,
+			"removed_unavailable_node_ids": removedNodeIDs})
 	case http.MethodDelete:
 		if err := s.store.DeleteGroupPool(r.Context(), groupID); err != nil {
 			writeAPIError(w, http.StatusInternalServerError, err.Error())
@@ -2452,6 +2469,11 @@ func (s *Server) writeGroupList(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	runtimes := group.GroupRuntimeSnapshots()
+	nodeOptions, err := s.groupNodeOptions(r.Context(), groups, monitorByTag)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	responses := make([]groupPoolResponse, 0, len(groups))
 	for _, group := range groups {
 		response := groupPoolResponse{GroupPool: group, Members: []groupMemberResponse{}}
@@ -2485,26 +2507,106 @@ func (s *Server) writeGroupList(w http.ResponseWriter, r *http.Request) {
 		response.MemberCount = len(response.Members)
 		responses = append(responses, response)
 	}
-	writeJSON(w, map[string]any{"groups": responses, "nodes": nodes, "port_range": map[string]int{"start": 10000, "end": 19999}})
+	writeJSON(w, map[string]any{"groups": responses, "nodes": nodeOptions, "port_range": map[string]int{"start": 10000, "end": 19999}})
 }
 
-func (s *Server) groupFromInput(ctx context.Context, input groupPoolInput, existing *store.GroupPool) (*store.GroupPool, error) {
+func (s *Server) groupNodeOptions(ctx context.Context, groups []store.GroupPool, monitorByTag map[string]Snapshot) ([]groupNodeOptionResponse, error) {
+	managedNodes, err := s.store.ListManagedNodes(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("读取节点管理列表: %w", err)
+	}
+	referenced := make(map[int64]struct{})
+	for _, groupPool := range groups {
+		for _, nodeID := range groupPool.ExplicitNodeIDs {
+			referenced[nodeID] = struct{}{}
+		}
+	}
+	monitorByURI := make(map[string]Snapshot, len(monitorByTag))
+	monitorByName := make(map[string]Snapshot, len(monitorByTag))
+	for _, snapshot := range monitorByTag {
+		if snapshot.URI != "" {
+			monitorByURI[snapshot.URI] = snapshot
+		}
+		if snapshot.Name != "" {
+			monitorByName[snapshot.Name] = snapshot
+		}
+	}
+	options := make([]groupNodeOptionResponse, 0, len(managedNodes))
+	for _, managed := range managedNodes {
+		snapshot, found := monitorByURI[managed.URI]
+		if !found {
+			snapshot, found = monitorByName[managed.Name]
+		}
+		status := "pending"
+		if !managed.Enabled {
+			status = "disabled"
+		} else if found && snapshot.Blacklisted {
+			status = "blacklisted"
+		} else if found && snapshot.InitialCheckDone && snapshot.Available {
+			status = "normal"
+		} else if found && snapshot.InitialCheckDone {
+			status = "unavailable"
+		}
+		selectable := managed.Enabled && found && snapshot.InitialCheckDone && snapshot.Available && !snapshot.Blacklisted
+		if _, isReferenced := referenced[managed.ID]; !selectable && !isReferenced {
+			continue
+		}
+		latencyMs := int64(-1)
+		if found {
+			latencyMs = snapshot.LastLatencyMs
+		}
+		region, country := managed.Region, managed.Country
+		if found && snapshot.Region != "" {
+			region = snapshot.Region
+		}
+		if found && snapshot.Country != "" {
+			country = snapshot.Country
+		}
+		options = append(options, groupNodeOptionResponse{ID: managed.ID, Name: managed.Name, URI: managed.URI,
+			Region: region, Country: country, Enabled: managed.Enabled, Tag: snapshot.Tag, Status: status,
+			LatencyMs: latencyMs, Available: found && snapshot.Available,
+			InitialCheckDone: found && snapshot.InitialCheckDone, Selectable: selectable})
+	}
+	return options, nil
+}
+
+func (s *Server) selectableGroupNodeIDs(ctx context.Context) (map[int64]struct{}, error) {
+	monitorByTag := make(map[string]Snapshot)
+	if s.mgr != nil {
+		for _, snapshot := range s.mgr.Snapshot() {
+			monitorByTag[snapshot.Tag] = snapshot
+		}
+	}
+	options, err := s.groupNodeOptions(ctx, nil, monitorByTag)
+	if err != nil {
+		return nil, err
+	}
+	selectable := make(map[int64]struct{}, len(options))
+	for _, option := range options {
+		if option.Selectable {
+			selectable[option.ID] = struct{}{}
+		}
+	}
+	return selectable, nil
+}
+
+func (s *Server) groupFromInput(ctx context.Context, input groupPoolInput, existing *store.GroupPool) (*store.GroupPool, []int64, error) {
 	input.Name = strings.TrimSpace(input.Name)
 	if input.Name == "" {
-		return nil, errors.New("分组名称不能为空")
+		return nil, nil, errors.New("分组名称不能为空")
 	}
 	if input.BindAddress == "" {
 		input.BindAddress = "0.0.0.0"
 	}
 	if net.ParseIP(input.BindAddress) == nil && input.BindAddress != "localhost" {
-		return nil, errors.New("监听地址无效")
+		return nil, nil, errors.New("监听地址无效")
 	}
 	if input.Protocol == "" {
 		input.Protocol = config.InboundProtocolMixed
 	}
 	protocol, err := config.NormalizeInboundProtocol(input.Protocol)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if input.DispatchMode != "random" {
 		input.DispatchMode = "fixed"
@@ -2522,10 +2624,31 @@ func (s *Server) groupFromInput(ctx context.Context, input groupPoolInput, exist
 	if autoPort {
 		input.BindPort, err = s.allocateGroupPort(ctx)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	} else if err := s.validateGroupPort(ctx, input.BindAddress, input.BindPort, existing); err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	selectableNodeIDs, err := s.selectableGroupNodeIDs(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	keptNodeIDs := make([]int64, 0, len(input.ExplicitNodeIDs))
+	removedNodeIDs := make([]int64, 0)
+	seenNodeIDs := make(map[int64]struct{}, len(input.ExplicitNodeIDs))
+	for _, nodeID := range input.ExplicitNodeIDs {
+		if nodeID <= 0 {
+			continue
+		}
+		if _, duplicate := seenNodeIDs[nodeID]; duplicate {
+			continue
+		}
+		seenNodeIDs[nodeID] = struct{}{}
+		if _, ok := selectableNodeIDs[nodeID]; !ok {
+			removedNodeIDs = append(removedNodeIDs, nodeID)
+			continue
+		}
+		keptNodeIDs = append(keptNodeIDs, nodeID)
 	}
 	regions := make([]string, 0, len(input.Regions))
 	seenRegions := make(map[string]struct{})
@@ -2561,19 +2684,19 @@ func (s *Server) groupFromInput(ctx context.Context, input groupPoolInput, exist
 	if subscriptionToken == "" {
 		subscriptionToken, err = s.generateSessionToken()
 		if err != nil {
-			return nil, fmt.Errorf("生成订阅 Token: %w", err)
+			return nil, nil, fmt.Errorf("生成订阅 Token: %w", err)
 		}
 	}
 	group := &store.GroupPool{Name: input.Name, BindAddress: input.BindAddress, BindPort: input.BindPort,
 		Protocol: protocol, Username: input.Username, Password: input.Password, DispatchMode: input.DispatchMode,
-		Regions: regions, ExplicitNodeIDs: input.ExplicitNodeIDs, FailureWindowSeconds: input.FailureWindowSeconds,
+		Regions: regions, ExplicitNodeIDs: keptNodeIDs, FailureWindowSeconds: input.FailureWindowSeconds,
 		FailureThreshold: input.FailureThreshold, HealthCheckSeconds: input.HealthCheckSeconds, Enabled: enabled,
 		SubscriptionEnabled: subscriptionEnabled, SubscriptionToken: subscriptionToken,
 		SubscriptionMode: input.SubscriptionMode, ExternalHost: strings.TrimSpace(input.ExternalHost)}
 	if existing != nil {
 		group.ID, group.CurrentActiveNodeID, group.CreatedAt, group.NodeStates = existing.ID, existing.CurrentActiveNodeID, existing.CreatedAt, existing.NodeStates
 	}
-	return group, nil
+	return group, removedNodeIDs, nil
 }
 
 func (s *Server) allocateGroupPort(ctx context.Context) (uint16, error) {
