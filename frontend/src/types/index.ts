@@ -9,6 +9,7 @@ export interface NodeInfo {
   port?: number
   region?: string
   country?: string
+  tags?: string[]
 }
 
 export interface TimelineEvent {
@@ -309,7 +310,7 @@ export type ProbeSSEEvent = ProbeSSEStart | ProbeSSEProgress | ProbeSSEComplete
 
 // A single streaming/AI service unlock result.
 export interface UnlockServiceResult {
-  name: 'netflix' | 'disney_plus' | 'chatgpt'
+  name: 'netflix' | 'disney_plus' | 'chatgpt' | 'youtube' | 'tiktok' | 'amazon' | 'reddit'
   display_name: string
   status: 'unlocked' | 'originals_only' | 'locked' | 'failed'
   region?: string
@@ -323,6 +324,12 @@ export interface UnlockIPInfo {
   iso_code?: string
   region?: string
   pure: boolean
+  asn?: string
+  org?: string
+  ip_type?: string
+  usage_type?: string
+  fraud_score?: number
+  risk_level?: string
 }
 
 // Full unlock report for one node (matches unlock.Result on the backend).

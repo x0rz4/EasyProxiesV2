@@ -7,7 +7,9 @@ import type {
 } from '../types'
 import { fetchNodes, unlockNode, unlockAllNodes, fetchUnlockResults } from '../api/client'
 import { regionFlag } from '../utils/region'
+import { formatRelative } from '../utils/format'
 import { PageContent, PageHeader, PageLayout, surfaceClass } from './ui/PageLayout'
+import UnlockDrawer from './UnlockDrawer'
 
 // ---- Status styling ----
 
@@ -61,6 +63,10 @@ export default function UnlockPanel() {
   const [errors, setErrors] = useState<Record<string, string>>({})
   // Per-node in-flight state. Either set (batch) or tag (single).
   const [checking, setChecking] = useState<Record<string, boolean>>({})
+  
+  // Drawer state
+  const [drawerOpen, setDrawerOpen] = useState(false)
+  const [selectedNode, setSelectedNode] = useState<NodeSnapshot | null>(null)
 
   // Batch progress
   const [batchRunning, setBatchRunning] = useState(false)
@@ -80,6 +86,17 @@ export default function UnlockPanel() {
       // unlock-checked; the dialer is registered per member tag.
       const usable = (res.nodes || []).filter((n) => n.tag)
       setNodes(usable)
+      // Load any previously persisted detection results so the user sees
+      // last-saved state without re-running checks. Best-effort: a failure
+      // here is ignored (the panel still works, just without history).
+      try {
+        const saved = await fetchUnlockResults()
+        if (saved?.results) {
+          setResults((prev) => ({ ...saved.results, ...prev }))
+        }
+      } catch {
+        /* persisted results are optional */
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : '加载节点失败')
     } finally {
@@ -218,12 +235,45 @@ export default function UnlockPanel() {
     batchProgress.total > 0
       ? Math.round((batchProgress.current / batchProgress.total) * 100)
       : 0
+  const openDrawer = (node: NodeSnapshot) => {
+    setSelectedNode(node)
+    setDrawerOpen(true)
+  }
+
+  // ---- Render helpers ----
+  
+  const renderBadges = (result: UnlockResult | undefined) => {
+    if (!result) return <span className="opacity-40 text-xs">暂无数据</span>
+    if (result.error) return <span className="badge badge-sm badge-error">检测失败</span>
+    
+    return (
+      <div className="flex flex-wrap gap-1">
+        {result.ip?.pure && <span className="badge badge-sm badge-success">原生IP</span>}
+        {(result.ip?.risk_level === 'High' || result.ip?.risk_level === 'Medium') && 
+          <span className="badge badge-sm badge-error">高风险</span>
+        }
+        {result.services?.slice(0, 3).map(svc => {
+          if (svc.status === 'unlocked') {
+            const isNetflix = svc.name === 'netflix'
+            return (
+              <span key={svc.name} className={`badge badge-sm ${isNetflix ? 'bg-[#E50914] text-white border-none' : 'badge-primary'}`}>
+                {svc.display_name}
+              </span>
+            )
+          }
+          return null
+        })}
+        {(result.services?.filter(s => s.status === 'unlocked').length || 0) > 3 && (
+           <span className="badge badge-sm badge-ghost">+{result.services.filter(s => s.status === 'unlocked').length - 3}</span>
+        )}
+      </div>
+    )
+  }
 
   return (
-    <PageLayout fill>
-      <PageHeader
-        title="解锁检测"
-        description="通过节点出口发送特定请求，检测 Netflix、Disney+、ChatGPT 解锁状态及原生 IP 纯净度"
+    <PageLayout title="解锁检测">
+      <PageHeader>
+        <div className="flex flex-col sm:flex-row gap-4 justify-between w-full">通过节点出口发送特定请求，检测 Netflix、Disney+、ChatGPT 解锁状态及原生 IP 纯净度"
         icon={
           <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 11V7a4 4 0 118 0m-4 8v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2z" />
@@ -329,21 +379,21 @@ export default function UnlockPanel() {
         {/* ---- Results table ---- */}
         <div className={`${surfaceClass} flex-1 min-h-0 flex flex-col`}>
           <div className="overflow-auto flex-1">
-            <table className="table table-sm">
+            <div className="overflow-x-auto w-full">
+            <table className="table table-sm w-full relative">
               <thead>
-                <tr className="text-xs uppercase text-base-content/50">
-                  <th>节点</th>
-                  <th className="text-center">Netflix</th>
-                  <th className="text-center">Disney+</th>
-                  <th className="text-center">ChatGPT</th>
-                  <th>原生 IP</th>
-                  <th className="text-right">操作</th>
+                <tr>
+                  <th className="w-10">#</th>
+                  <th className="w-48 max-w-[200px]">节点名称</th>
+                  <th className="w-48 max-w-[200px]">IP 地址</th>
+                  <th className="w-auto">解锁状态</th>
+                  <th className="w-24 text-right">操作</th>
                 </tr>
               </thead>
               <tbody>
                 {loading && (
                   <tr>
-                    <td colSpan={6} className="text-center py-10 text-base-content/50">
+                    <td colSpan={5} className="text-center py-10 text-base-content/50">
                       <span className="loading loading-spinner loading-sm mr-2" />
                       加载节点中…
                     </td>
@@ -351,19 +401,25 @@ export default function UnlockPanel() {
                 )}
                 {!loading && filteredNodes.length === 0 && (
                   <tr>
-                    <td colSpan={6} className="text-center py-10 text-base-content/50">
+                    <td colSpan={5} className="text-center py-10 text-base-content/50">
                       {nodes.length === 0 ? '暂无可用节点' : '没有匹配的节点'}
                     </td>
                   </tr>
                 )}
-                {filteredNodes.map((n) => (
+                {filteredNodes.map((n, i) => (
                   <UnlockRow
                     key={n.tag}
+                    index={i}
                     node={n}
                     result={results[n.tag]}
                     nodeError={errors[n.tag]}
                     checking={!!checking[n.tag]}
-                    onCheck={() => void runSingle(n.tag)}
+                    isSelected={selectedNode?.tag === n.tag}
+                    onClick={() => openDrawer(n)}
+                    onCheck={(e) => {
+                      e.stopPropagation()
+                      void runSingle(n.tag)
+                    }}
                   />
                 ))}
               </tbody>
@@ -371,6 +427,12 @@ export default function UnlockPanel() {
           </div>
         </div>
       </PageContent>
+      <UnlockDrawer 
+        node={selectedNode}
+        result={selectedNode ? results[selectedNode.tag] || null : null}
+        isOpen={drawerOpen}
+        onClose={() => setDrawerOpen(false)}
+      />
     </PageLayout>
   )
 }
@@ -386,132 +448,116 @@ function SummaryCard({ label, value, accent }: { label: string; value: number; a
   )
 }
 
-function ServiceCell({ result }: { result?: UnlockServiceResult }) {
-  if (!result) {
-    return (
-      <td className="text-center">
-        <span className="text-base-content/30">—</span>
-      </td>
-    )
-  }
-  const meta = statusMeta[result.status]
-  return (
-    <td className="text-center">
-      <div className="flex flex-col items-center gap-1">
-        <span className={`badge ${meta.badge} badge-sm gap-1`}>
-          <span className={`inline-block h-1.5 w-1.5 rounded-full ${meta.dot}`} />
-          {meta.label}
-        </span>
-        {(result.region || result.detail) && (
-          <span className="text-[10px] text-base-content/45 leading-tight max-w-[120px] truncate" title={result.detail}>
-            {result.region ? `${regionFlag(result.region)} ${result.region}` : result.detail}
-          </span>
-        )}
-      </div>
-    </td>
-  )
-}
-
 function UnlockRow({
+  index,
   node,
   result,
   nodeError,
   checking,
+  isSelected,
+  onClick,
   onCheck,
 }: {
+  index: number
   node: NodeSnapshot
   result?: UnlockResult
   nodeError?: string
   checking: boolean
-  onCheck: () => void
+  isSelected: boolean
+  onClick: () => void
+  onCheck: (e: React.MouseEvent) => void
 }) {
-  const svcByName = useMemo(() => {
-    const m: Record<string, UnlockServiceResult> = {}
-    if (result) for (const s of result.services) m[s.name] = s
-    return m
-  }, [result])
 
-  const flag = regionFlag(node.region)
-  const overall = result ? statusFromResult(result) : undefined
-  const rowTint =
-    overall === 'unlocked'
-      ? 'bg-success/5'
-      : overall === 'locked' || overall === 'originals_only'
-        ? 'bg-error/5'
-        : overall === 'failed'
-          ? 'bg-base-200/40'
-          : ''
+  const renderBadges = () => {
+    if (!result) return <span className="opacity-40 text-xs">—</span>
+    if (result.error || nodeError) return <span className="badge badge-sm badge-error">检测失败</span>
+    
+    return (
+      <div className="flex flex-wrap gap-1">
+        {result.ip?.pure && <span className="badge badge-sm badge-success border-none text-[10px]">原生IP</span>}
+        {(result.ip?.risk_level === 'High' || result.ip?.risk_level === 'Medium') && 
+          <span className="badge badge-sm badge-error border-none text-[10px]">高风险</span>
+        }
+        {result.services?.slice(0, 4).map(svc => {
+          if (svc.status === 'unlocked') {
+            const isNetflix = svc.name === 'netflix'
+            const isDisney = svc.name === 'disney_plus'
+            const isChatgpt = svc.name === 'chatgpt'
+            const isYT = svc.name === 'youtube'
+            const colorClass = isNetflix ? 'bg-[#E50914] text-white' : 
+                               isDisney ? 'bg-[#113CCF] text-white' : 
+                               isChatgpt ? 'bg-[#10A37F] text-white' : 
+                               isYT ? 'bg-[#FF0000] text-white' : 'badge-primary'
+            return (
+              <span key={svc.name} className={`badge badge-sm border-none text-[10px] ${colorClass}`}>
+                {svc.display_name}
+              </span>
+            )
+          }
+          return null
+        })}
+        {(result.services?.filter(s => s.status === 'unlocked').length || 0) > 4 && (
+           <span className="badge badge-sm badge-ghost text-[10px]">+{result.services.filter(s => s.status === 'unlocked').length - 4}</span>
+        )}
+      </div>
+    )
+  }
+
+  const rowTint = isSelected ? 'bg-base-200' : ''
+  const err = nodeError || result?.error
 
   return (
-    <tr className={`${rowTint} hover:bg-base-200/40 transition-colors`}>
-      <td>
-        <div className="flex items-center gap-2">
-          <span className="text-lg leading-none">{flag}</span>
-          <div className="min-w-0">
-            <div className="font-medium truncate max-w-[200px]" title={node.name}>
-              {node.name}
-            </div>
-            <div className="text-[11px] text-base-content/45 truncate">
-              {node.region ? node.region.toUpperCase() : '—'}
-              {node.country ? ` · ${node.country}` : ''}
-            </div>
-          </div>
-        </div>
-      </td>
-      <ServiceCell result={svcByName.netflix} />
-      <ServiceCell result={svcByName.disney_plus} />
-      <ServiceCell result={svcByName.chatgpt} />
-
-      {/* Native IP / purity */}
-      <td>
-        {result?.ip && result.ip.ip ? (
-          <div className="flex flex-col gap-0.5">
-            <div className="flex items-center gap-1.5 text-sm">
-              <span>{regionFlag(result.ip.iso_code || result.ip.region)}</span>
-              <span className="font-mono text-xs">{result.ip.ip}</span>
-              {result.ip.pure ? (
-                <span className="badge badge-success badge-xs">原生</span>
-              ) : (
-                <span className="badge badge-warning badge-xs">疑似</span>
-              )}
-            </div>
-            {result.ip.country && (
-              <div className="text-[11px] text-base-content/45">
-                {result.ip.country}
-                {result.ip.iso_code ? ` (${result.ip.iso_code})` : ''}
-              </div>
-            )}
-          </div>
-        ) : nodeError ? (
-          <span className="text-xs text-error/80" title={nodeError}>
-            ⚠ {nodeError.length > 24 ? nodeError.slice(0, 24) + '…' : nodeError}
-          </span>
+    <tr className={`${rowTint} hover:bg-base-200/50 cursor-pointer transition-colors`} onClick={onClick}>
+      <td className="text-base-content/40 text-xs">
+        {checking ? (
+          <span className="loading loading-spinner loading-xs text-primary" />
         ) : (
-          <span className="text-base-content/30">—</span>
+          index + 1
         )}
       </td>
-
-      <td className="text-right">
+      <td className="max-w-[200px] truncate" title={node.name}>
+        <div className="flex items-center gap-2">
+          <span className="text-xl leading-none" title={node.region}>
+            {regionFlag(node.region || '')}
+          </span>
+          <span className="truncate font-medium">{node.name}</span>
+        </div>
+        {node.tags && node.tags.length > 0 && (
+           <div className="flex flex-wrap gap-1 mt-1">
+             {node.tags.slice(0, 3).map(tag => (
+               <span key={tag} className="badge badge-[10px] badge-ghost opacity-60 px-1 py-0">{tag}</span>
+             ))}
+           </div>
+        )}
+      </td>
+      <td className="max-w-[200px] truncate">
+         {result?.ip?.ip ? (
+           <div className="flex flex-col">
+             <span className="font-mono text-xs">{result.ip.ip}</span>
+             <span className="text-[10px] opacity-60 truncate" title={`${result.ip.iso_code} ${result.ip.asn} ${result.ip.org}`}>
+               {result.ip.iso_code} {result.ip.asn} {result.ip.org}
+             </span>
+           </div>
+         ) : (
+           <span className="opacity-40 text-xs">—</span>
+         )}
+      </td>
+      <td>
+        <div className="flex flex-col gap-1 max-w-[300px]">
+           {renderBadges()}
+           {err && <span className="text-[10px] text-error truncate" title={err}>{err}</span>}
+        </div>
+      </td>
+      <td className="text-right whitespace-nowrap">
         <button
-          className="btn btn-ghost btn-xs gap-1"
+          className="btn btn-xs btn-ghost text-primary hover:bg-primary/20"
           onClick={onCheck}
           disabled={checking}
         >
-          {checking ? (
-            <>
-              <span className="loading loading-spinner loading-xs" />
-              检测中
-            </>
-          ) : (
-            <>
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-              </svg>
-              {result ? '重测' : '检测'}
-            </>
-          )}
+          {result ? '重测' : '检测'}
         </button>
       </td>
     </tr>
   )
 }
+

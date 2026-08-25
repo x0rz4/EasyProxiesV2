@@ -898,6 +898,45 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, map[string]any{"message": "已解除拉黑"})
+	case "speedtest":
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+
+		dialer, err := s.mgr.DialerFor(tag)
+		if err != nil {
+			fmt.Fprintf(w, "event: error\ndata: %s\n\n", err.Error())
+			flusher.Flush()
+			return
+		}
+		
+		// Wrap dialer slightly to fit signature
+		wrappedDialer := func(ctx context.Context, network, addr string) (interface{}, error) {
+			return dialer(ctx, network, addr)
+		}
+
+		runner := &SpeedtestRunner{}
+		err = runner.Run(r.Context(), wrappedDialer, func(mbps float64, isDone bool) {
+			if isDone {
+				fmt.Fprintf(w, "event: done\ndata: {\"mbps\": %.2f}\n\n", mbps)
+			} else {
+				fmt.Fprintf(w, "event: progress\ndata: {\"mbps\": %.2f}\n\n", mbps)
+			}
+			flusher.Flush()
+		})
+		if err != nil {
+			fmt.Fprintf(w, "event: error\ndata: %s\n\n", err.Error())
+			flusher.Flush()
+		}
 	case "unlock":
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -1350,11 +1389,17 @@ func (s *Server) persistUnlockResult(snap *Snapshot, result *unlock.Result) {
 		CheckedAt:  time.Now().UTC(),
 		ResultJSON: resultJSON,
 		IP: store.UnlockIPInfo{
-			IP:      result.IP.IP,
-			Country: result.IP.Country,
-			ISOCode: result.IP.ISOCode,
-			Region:  result.IP.Region,
-			Pure:    result.IP.Pure,
+			IP:         result.IP.IP,
+			Country:    result.IP.Country,
+			ISOCode:    result.IP.ISOCode,
+			Region:     result.IP.Region,
+			Pure:       result.IP.Pure,
+			ASN:        result.IP.ASN,
+			Org:        result.IP.Org,
+			IPType:     result.IP.IPType,
+			UsageType:  result.IP.UsageType,
+			FraudScore: result.IP.FraudScore,
+			RiskLevel:  result.IP.RiskLevel,
 		},
 	}
 	for _, svc := range result.Services {
@@ -1371,6 +1416,27 @@ func (s *Server) persistUnlockResult(snap *Snapshot, result *unlock.Result) {
 	defer cancel()
 	if err := s.store.UpsertUnlockResult(ctx, stored); err != nil {
 		s.logger.Printf("[unlock] failed to persist result for node %d (%s): %v", nodeID, snap.Tag, err)
+	}
+
+	// Auto-tagging logic
+	if node, err := s.store.GetNode(ctx, nodeID); err == nil && node != nil {
+		var newTags []string
+		if result.IP.Pure {
+			newTags = append(newTags, "原生IP")
+		}
+		if result.IP.RiskLevel == "High" || result.IP.RiskLevel == "Medium" {
+			newTags = append(newTags, "高风险")
+		}
+		for _, svc := range result.Services {
+			if svc.Status == unlock.StatusUnlocked {
+				newTags = append(newTags, svc.DisplayName+"解锁")
+			}
+		}
+		
+		node.Tags = newTags
+		if err := s.store.UpdateNode(ctx, node); err != nil {
+			s.logger.Printf("[unlock] failed to update tags for node %d: %v", nodeID, err)
+		}
 	}
 }
 

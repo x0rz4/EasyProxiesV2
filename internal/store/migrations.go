@@ -169,6 +169,13 @@ CREATE TABLE IF NOT EXISTS node_unlock_results (
 CREATE INDEX IF NOT EXISTS idx_unlock_status ON node_unlock_results(netflix_status, disney_plus_status, chatgpt_status);
 `,
 		},
+		{
+			Version:     5,
+			Description: "add tags column to nodes",
+			Up: `
+ALTER TABLE nodes ADD COLUMN tags TEXT NOT NULL DEFAULT '[]';
+`,
+		},
 	}
 }
 

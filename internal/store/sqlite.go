@@ -69,7 +69,7 @@ type querier interface {
 // ===================== Node operations =====================
 
 func (s *sqliteStore) ListNodes(ctx context.Context, filter NodeFilter) ([]Node, error) {
-	query := "SELECT id, uri, name, source, port, username, password, region, country, enabled, created_at, updated_at FROM nodes"
+	query := "SELECT id, uri, name, source, port, username, password, region, country, enabled, tags, created_at, updated_at FROM nodes"
 	var conditions []string
 	var args []any
 
@@ -112,7 +112,7 @@ func (s *sqliteStore) ListNodes(ctx context.Context, filter NodeFilter) ([]Node,
 
 func (s *sqliteStore) ListManagedNodes(ctx context.Context, subscriptionID *int64) ([]ManagedNode, error) {
 	query := `SELECT n.id, n.uri, n.name, n.source, n.port, n.username, n.password,
-		n.region, n.country, n.enabled, n.created_at, n.updated_at,
+		n.region, n.country, n.enabled, n.tags, n.created_at, n.updated_at,
 		COALESCE(GROUP_CONCAT(DISTINCT CASE WHEN subscriptions.enabled=1 THEN subscriptions.id END), '')
 		FROM nodes n
 		LEFT JOIN subscription_nodes ON subscription_nodes.node_id=n.id
@@ -140,13 +140,16 @@ func (s *sqliteStore) ListManagedNodes(ctx context.Context, subscriptionID *int6
 	for rows.Next() {
 		var managed ManagedNode
 		var enabled int
-		var createdAt, updatedAt, subscriptionIDs string
+		var createdAt, updatedAt, subscriptionIDs, tagsJSON string
 		if err := rows.Scan(&managed.ID, &managed.URI, &managed.Name, &managed.Source, &managed.Port,
 			&managed.Username, &managed.Password, &managed.Region, &managed.Country, &enabled,
-			&createdAt, &updatedAt, &subscriptionIDs); err != nil {
+			&tagsJSON, &createdAt, &updatedAt, &subscriptionIDs); err != nil {
 			return nil, fmt.Errorf("scan managed node: %w", err)
 		}
 		managed.Enabled = enabled != 0
+		if tagsJSON != "" && tagsJSON != "[]" {
+			_ = json.Unmarshal([]byte(tagsJSON), &managed.Tags)
+		}
 		managed.CreatedAt, managed.UpdatedAt = parseTime(createdAt), parseTime(updatedAt)
 		if subscriptionIDs != "" {
 			for _, value := range strings.Split(subscriptionIDs, ",") {
@@ -167,19 +170,19 @@ func (s *sqliteStore) ListManagedNodes(ctx context.Context, subscriptionID *int6
 
 func (s *sqliteStore) GetNode(ctx context.Context, id int64) (*Node, error) {
 	row := s.conn().QueryRowContext(ctx,
-		"SELECT id, uri, name, source, port, username, password, region, country, enabled, created_at, updated_at FROM nodes WHERE id = ?", id)
+		"SELECT id, uri, name, source, port, username, password, region, country, enabled, tags, created_at, updated_at FROM nodes WHERE id = ?", id)
 	return scanNode(row)
 }
 
 func (s *sqliteStore) GetNodeByURI(ctx context.Context, uri string) (*Node, error) {
 	row := s.conn().QueryRowContext(ctx,
-		"SELECT id, uri, name, source, port, username, password, region, country, enabled, created_at, updated_at FROM nodes WHERE uri = ?", uri)
+		"SELECT id, uri, name, source, port, username, password, region, country, enabled, tags, created_at, updated_at FROM nodes WHERE uri = ?", uri)
 	return scanNode(row)
 }
 
 func (s *sqliteStore) GetNodeByName(ctx context.Context, name string) (*Node, error) {
 	row := s.conn().QueryRowContext(ctx,
-		"SELECT id, uri, name, source, port, username, password, region, country, enabled, created_at, updated_at FROM nodes WHERE name = ?", name)
+		"SELECT id, uri, name, source, port, username, password, region, country, enabled, tags, created_at, updated_at FROM nodes WHERE name = ?", name)
 	return scanNode(row)
 }
 
@@ -196,12 +199,19 @@ func (s *sqliteStore) CreateNode(ctx context.Context, node *Node) error {
 		enabled = 1
 	}
 
+	var tagsJSON = "[]"
+	if len(node.Tags) > 0 {
+		if b, err := json.Marshal(node.Tags); err == nil {
+			tagsJSON = string(b)
+		}
+	}
+
 	result, err := s.conn().ExecContext(ctx,
-		`INSERT INTO nodes (uri, name, source, port, username, password, region, country, enabled, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO nodes (uri, name, source, port, username, password, region, country, enabled, tags, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		node.URI, node.Name, node.Source, node.Port,
 		node.Username, node.Password, node.Region, node.Country,
-		enabled, now, now,
+		enabled, tagsJSON, now, now,
 	)
 	if err != nil {
 		return fmt.Errorf("create node: %w", err)
@@ -230,13 +240,20 @@ func (s *sqliteStore) UpdateNode(ctx context.Context, node *Node) error {
 		enabled = 1
 	}
 
+	var tagsJSON = "[]"
+	if len(node.Tags) > 0 {
+		if b, err := json.Marshal(node.Tags); err == nil {
+			tagsJSON = string(b)
+		}
+	}
+
 	result, err := s.conn().ExecContext(ctx,
 		`UPDATE nodes SET uri=?, name=?, source=?, port=?, username=?, password=?,
-		 region=?, country=?, enabled=?, updated_at=?
+		 region=?, country=?, enabled=?, tags=?, updated_at=?
 		 WHERE id=?`,
 		node.URI, node.Name, node.Source, node.Port,
 		node.Username, node.Password, node.Region, node.Country,
-		enabled, now, node.ID,
+		enabled, tagsJSON, now, node.ID,
 	)
 	if err != nil {
 		return fmt.Errorf("update node %d: %w", node.ID, err)
@@ -483,7 +500,7 @@ func (s *sqliteStore) ActivateSubscriptionExclusive(ctx context.Context, id int6
 func (s *sqliteStore) ListSubscriptionNodes(ctx context.Context, subscriptionID int64) ([]SubscriptionNode, error) {
 	rows, err := s.conn().QueryContext(ctx, `SELECT sn.subscription_id, sn.position,
 		n.id, n.uri, n.name, n.source, n.port, n.username, n.password, n.region, n.country,
-		n.enabled, n.created_at, n.updated_at
+		n.enabled, n.tags, n.created_at, n.updated_at
 		FROM subscription_nodes sn JOIN nodes n ON n.id=sn.node_id
 		WHERE sn.subscription_id=? ORDER BY sn.position, n.id`, subscriptionID)
 	if err != nil {
@@ -494,13 +511,16 @@ func (s *sqliteStore) ListSubscriptionNodes(ctx context.Context, subscriptionID 
 	for rows.Next() {
 		var member SubscriptionNode
 		var enabled int
-		var createdAt, updatedAt string
+		var tagsJSON, createdAt, updatedAt string
 		if err := rows.Scan(&member.SubscriptionID, &member.Position, &member.Node.ID, &member.Node.URI,
 			&member.Node.Name, &member.Node.Source, &member.Node.Port, &member.Node.Username,
-			&member.Node.Password, &member.Node.Region, &member.Node.Country, &enabled, &createdAt, &updatedAt); err != nil {
+			&member.Node.Password, &member.Node.Region, &member.Node.Country, &enabled, &tagsJSON, &createdAt, &updatedAt); err != nil {
 			return nil, err
 		}
 		member.Node.Enabled = enabled != 0
+		if tagsJSON != "" && tagsJSON != "[]" {
+			_ = json.Unmarshal([]byte(tagsJSON), &member.Node.Tags)
+		}
 		member.Node.CreatedAt, member.Node.UpdatedAt = parseTime(createdAt), parseTime(updatedAt)
 		result = append(result, member)
 	}
@@ -509,7 +529,7 @@ func (s *sqliteStore) ListSubscriptionNodes(ctx context.Context, subscriptionID 
 
 func (s *sqliteStore) ListEffectiveSubscriptionNodes(ctx context.Context) ([]Node, error) {
 	rows, err := s.conn().QueryContext(ctx, `SELECT DISTINCT n.id, n.uri, n.name, n.source, n.port,
-		n.username, n.password, n.region, n.country, n.enabled, n.created_at, n.updated_at
+		n.username, n.password, n.region, n.country, n.enabled, n.tags, n.created_at, n.updated_at
 		FROM nodes n JOIN subscription_nodes sn ON sn.node_id=n.id
 		JOIN subscriptions s ON s.id=sn.subscription_id
 		WHERE n.enabled=1 AND s.enabled=1 ORDER BY n.id`)
@@ -1205,12 +1225,12 @@ func requireAffected(result sql.Result, notFound string) error {
 func scanNode(row *sql.Row) (*Node, error) {
 	var n Node
 	var enabled int
-	var createdAtStr, updatedAtStr string
+	var createdAtStr, updatedAtStr, tagsJSON string
 
 	err := row.Scan(
 		&n.ID, &n.URI, &n.Name, &n.Source, &n.Port,
 		&n.Username, &n.Password, &n.Region, &n.Country,
-		&enabled, &createdAtStr, &updatedAtStr,
+		&enabled, &tagsJSON, &createdAtStr, &updatedAtStr,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -1220,6 +1240,9 @@ func scanNode(row *sql.Row) (*Node, error) {
 	}
 
 	n.Enabled = enabled != 0
+	if tagsJSON != "" && tagsJSON != "[]" {
+		_ = json.Unmarshal([]byte(tagsJSON), &n.Tags)
+	}
 	n.CreatedAt = parseTime(createdAtStr)
 	n.UpdatedAt = parseTime(updatedAtStr)
 	return &n, nil
@@ -1230,18 +1253,21 @@ func scanNodes(rows *sql.Rows) ([]Node, error) {
 	for rows.Next() {
 		var n Node
 		var enabled int
-		var createdAtStr, updatedAtStr string
+		var createdAtStr, updatedAtStr, tagsJSON string
 
 		err := rows.Scan(
 			&n.ID, &n.URI, &n.Name, &n.Source, &n.Port,
 			&n.Username, &n.Password, &n.Region, &n.Country,
-			&enabled, &createdAtStr, &updatedAtStr,
+			&enabled, &tagsJSON, &createdAtStr, &updatedAtStr,
 		)
 		if err != nil {
 			return nil, err
 		}
 
 		n.Enabled = enabled != 0
+		if tagsJSON != "" && tagsJSON != "[]" {
+			_ = json.Unmarshal([]byte(tagsJSON), &n.Tags)
+		}
 		n.CreatedAt = parseTime(createdAtStr)
 		n.UpdatedAt = parseTime(updatedAtStr)
 		nodes = append(nodes, n)

@@ -76,7 +76,13 @@ type IPInfo struct {
 	// a flagged datacenter/VPN range. Inference here is heuristic: the IP is
 	// considered pure when its GeoIP country resolves cleanly and the IP
 	// inspection endpoint returns a non-empty loc field.
-	Pure bool `json:"pure"`
+	Pure       bool   `json:"pure"`
+	ASN        string `json:"asn,omitempty"`
+	Org        string `json:"org,omitempty"`
+	IPType     string `json:"ip_type,omitempty"`
+	UsageType  string `json:"usage_type,omitempty"`
+	FraudScore int    `json:"fraud_score,omitempty"`
+	RiskLevel  string `json:"risk_level,omitempty"`
 }
 
 // Result is the full unlock report for one node.
@@ -90,12 +96,16 @@ type Result struct {
 }
 
 // Services is the ordered list of services checked, in display order.
-var Services = []string{"netflix", "disney_plus", "chatgpt"}
+var Services = []string{"netflix", "disney_plus", "chatgpt", "youtube", "tiktok", "amazon", "reddit"}
 
 var serviceDisplay = map[string]string{
 	"netflix":     "Netflix",
 	"disney_plus": "Disney+",
 	"chatgpt":     "ChatGPT",
+	"youtube":     "YouTube",
+	"tiktok":      "TikTok",
+	"amazon":      "PrimeVideo",
+	"reddit":      "Reddit",
 }
 
 // DisplayName returns the human label for a service id.
@@ -137,6 +147,10 @@ func Check(ctx context.Context, dialer DialFunc, tag, name string, geoLookup *ge
 		checkNetflix(ctx, client, timeout),
 		checkDisneyPlus(ctx, client, timeout),
 		checkChatGPT(ctx, client, timeout),
+		checkYouTube(ctx, client, timeout),
+		checkTikTok(ctx, client, timeout),
+		checkAmazon(ctx, client, timeout),
+		checkReddit(ctx, client, timeout),
 	}
 
 	res.Duration = time.Since(start).Milliseconds()
@@ -221,9 +235,23 @@ func probeIP(ctx context.Context, client *http.Client, geo *geoip.Lookup, timeou
 	}
 
 	// Heuristic purity: a clean country resolution with a non-empty trace loc
-	// is treated as native. (A truly flagged datacenter IP would normally still
-	// resolve; this is a best-effort signal without a risk database.)
+	// is treated as native.
 	info.Pure = info.ISOCode != "" && info.IP != ""
+	
+	if info.IP != "" {
+		// Enhance with IP-API / Risk data
+		riskInfo := fetchIPQualityRisk(ctx, client, info.IP, timeout)
+		info.ASN = riskInfo.ASN
+		info.Org = riskInfo.Org
+		info.IPType = riskInfo.IPType
+		info.UsageType = riskInfo.UsageType
+		info.FraudScore = riskInfo.FraudScore
+		info.RiskLevel = riskInfo.RiskLevel
+		if riskInfo.Pure {
+			info.Pure = true
+		}
+	}
+	
 	return info
 }
 

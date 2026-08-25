@@ -164,6 +164,7 @@ type Node struct {
 	Region    string    `json:"region,omitempty"`
 	Country   string    `json:"country,omitempty"`
 	Enabled   bool      `json:"enabled"`
+	Tags      []string  `json:"tags,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -308,11 +309,17 @@ type UnlockServiceResult struct {
 
 // UnlockIPInfo is the persisted native-IP classification. Mirrors unlock.IPInfo.
 type UnlockIPInfo struct {
-	IP      string `json:"ip"`
-	Country string `json:"country,omitempty"`
-	ISOCode string `json:"iso_code,omitempty"`
-	Region  string `json:"region,omitempty"`
-	Pure    bool   `json:"pure"`
+	IP          string `json:"ip"`
+	Country     string `json:"country,omitempty"`
+	ISOCode     string `json:"iso_code,omitempty"`
+	Region      string `json:"region,omitempty"`
+	Pure        bool   `json:"pure"`
+	ASN         string `json:"asn,omitempty"`
+	Org         string `json:"org,omitempty"`
+	IPType      string `json:"ip_type,omitempty"`
+	UsageType   string `json:"usage_type,omitempty"`
+	FraudScore  int    `json:"fraud_score,omitempty"`
+	RiskLevel   string `json:"risk_level,omitempty"`
 }
 
 // UnlockResult is the latest unlock detection result stored for a node.
