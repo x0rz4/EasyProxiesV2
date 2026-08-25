@@ -259,11 +259,28 @@ func loadNodesFromStore(ctx context.Context, cfg *config.Config, s store.Store) 
 	if err != nil {
 		return fmt.Errorf("list subscriptions: %w", err)
 	}
-	legacySnapshotPending := len(subscriptions) == 0
+	legacySnapshotPending := len(subscriptions) == 0 && len(cfg.Subscriptions) > 0
 	for _, sub := range subscriptions {
 		if sub.LastSuccess.IsZero() && sub.NodeCount == 0 {
 			legacySnapshotPending = true
 			break
+		}
+	}
+	if !legacySnapshotPending {
+		adopted, adoptErr := s.AdoptOrphanSubscriptionNodes(ctx)
+		if adoptErr != nil {
+			return fmt.Errorf("recover orphan subscription nodes: %w", adoptErr)
+		}
+		if adopted > 0 {
+			log.Printf("[app] recovered %d orphan subscription nodes as manual nodes", adopted)
+			nodes, err = s.ListNodes(ctx, store.NodeFilter{})
+			if err != nil {
+				return fmt.Errorf("reload recovered nodes: %w", err)
+			}
+			effectiveSubscriptionNodes, err = s.ListEffectiveSubscriptionNodes(ctx)
+			if err != nil {
+				return fmt.Errorf("reload effective subscription nodes: %w", err)
+			}
 		}
 	}
 	legacyBootstrap := len(effectiveSubscriptionNodes) == 0 && legacySnapshotPending && len(cfg.Subscriptions) > 0 && len(loadedConfigNodes) > 0

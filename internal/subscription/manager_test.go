@@ -99,3 +99,68 @@ func TestRefreshNowKeepsFailedMembershipAndCommitsSuccessfulSubscription(t *test
 		t.Fatalf("failure metadata not persisted: sub=%+v err=%v", gotA, err)
 	}
 }
+
+func TestChangedSubscriptionURLMergesOldAndNewNodes(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/old":
+			_, _ = w.Write([]byte("http://a.example:80#A\nhttp://b.example:80#B"))
+		case "/new":
+			_, _ = w.Write([]byte("http://b.example:80#B\nhttp://c.example:80#C"))
+		case "/empty":
+			_, _ = w.Write([]byte("\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	db, err := store.Open(filepath.Join(t.TempDir(), "url-change.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	cfg := &config.Config{}
+	cfg.SubscriptionRefresh.Interval = time.Hour
+	cfg.SubscriptionRefresh.Timeout = time.Second
+	mgr := New(cfg, nil, WithStore(db), WithHTTPClient(server.Client()))
+	defer mgr.Stop()
+	sub, err := mgr.Create(context.Background(), store.Subscription{Name: "changing", URL: server.URL + "/old", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.RefreshOne(context.Background(), sub.ID); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := mgr.Update(context.Background(), sub.ID, store.Subscription{Name: "changing", URL: server.URL + "/new", Enabled: true,
+		RefreshIntervalSeconds: sub.RefreshIntervalSeconds, RefreshTimeoutSeconds: sub.RefreshTimeoutSeconds})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.RefreshOne(context.Background(), updated.ID); err != nil {
+		t.Fatal(err)
+	}
+	members, err := mgr.Nodes(context.Background(), sub.ID)
+	if err != nil || len(members) != 3 {
+		t.Fatalf("merged members=%+v err=%v", members, err)
+	}
+	byURI := make(map[string]store.SubscriptionNode, len(members))
+	for _, member := range members {
+		byURI[member.Node.URI] = member
+	}
+	for _, uri := range []string{"http://a.example:80#A", "http://b.example:80#B", "http://c.example:80#C"} {
+		if _, ok := byURI[uri]; !ok {
+			t.Fatalf("node %q missing after URL change: %+v", uri, members)
+		}
+	}
+	updated.URL = server.URL + "/empty"
+	if _, err := mgr.Update(context.Background(), updated.ID, *updated); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.RefreshOne(context.Background(), updated.ID); err == nil {
+		t.Fatal("empty subscription refresh unexpectedly succeeded")
+	}
+	afterEmpty, err := mgr.Nodes(context.Background(), sub.ID)
+	if err != nil || len(afterEmpty) != 3 {
+		t.Fatalf("empty refresh changed members=%+v err=%v", afterEmpty, err)
+	}
+}

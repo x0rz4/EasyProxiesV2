@@ -54,6 +54,9 @@ type Store interface {
 	CreateSubscription(ctx context.Context, subscription *Subscription) error
 	UpdateSubscription(ctx context.Context, subscription *Subscription) error
 	DeleteSubscription(ctx context.Context, id int64) error
+	// AdoptOrphanSubscriptionNodes converts historical subscription nodes with
+	// no remaining subscription membership into ordinary manual nodes.
+	AdoptOrphanSubscriptionNodes(ctx context.Context) (int64, error)
 	SetSubscriptionEnabled(ctx context.Context, id int64, enabled bool) error
 	UpdateAllSubscriptionRefreshSettings(ctx context.Context, intervalSeconds, timeoutSeconds int) error
 	ActivateSubscriptionExclusive(ctx context.Context, id int64) error
@@ -61,7 +64,11 @@ type Store interface {
 	// ListEffectiveSubscriptionNodes returns enabled nodes which are present in
 	// at least one enabled subscription, de-duplicated by node ID.
 	ListEffectiveSubscriptionNodes(ctx context.Context) ([]Node, error)
+	// ReplaceSubscriptionNodes is an explicit authoritative replacement. Normal
+	// refreshes use CommitSnapshot and therefore do not remove missing members.
 	ReplaceSubscriptionNodes(ctx context.Context, subscriptionID int64, nodes []SubscriptionNodeInput) error
+	// CommitSnapshot incrementally merges a successful non-empty snapshot and
+	// retains members omitted by the latest provider response.
 	CommitSnapshot(ctx context.Context, subscriptionID int64, nodes []SubscriptionNodeInput, snapshot SubscriptionSnapshot) error
 
 	// --- Node stats ---

@@ -132,4 +132,51 @@ func TestLoadNodesFromStoreRecoversIncompleteImportedSubscription(t *testing.T) 
 	if len(cfg.Nodes) != 1 || cfg.Nodes[0].URI != "ss://fresh" {
 		t.Fatalf("expected incomplete import recovery node, got %#v", cfg.Nodes)
 	}
+	legacy, err := db.GetNodeByURI(ctx, "ss://legacy")
+	if err != nil || legacy == nil || legacy.Source != store.NodeSourceSubscription {
+		t.Fatalf("pending legacy node was adopted too early: node=%+v err=%v", legacy, err)
+	}
+}
+
+func TestLoadNodesFromStoreAdoptsEstablishedOrphanSubscriptionNodes(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "data.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	sub := &store.Subscription{Name: "established", URL: "https://example.com/sub", Enabled: true,
+		RefreshIntervalSeconds: 3600, RefreshTimeoutSeconds: 30}
+	if err := db.CreateSubscription(ctx, sub); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CommitSnapshot(ctx, sub.ID, []store.SubscriptionNodeInput{{URI: "ss://current", Name: "current", Enabled: true}},
+		store.SubscriptionSnapshot{Attempt: time.Now(), Success: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	orphan := &store.Node{URI: "ss://orphan", Name: "orphan", Source: store.NodeSourceSubscription,
+		Region: "hk", Country: "Hong Kong", Enabled: true}
+	if err := db.CreateNode(ctx, orphan); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertNodeStats(ctx, &store.NodeStats{NodeID: orphan.ID, SuccessCount: 3, LastLatencyMs: 44}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{Subscriptions: []string{sub.URL}}
+	if err := loadNodesFromStore(ctx, cfg, db); err != nil {
+		t.Fatal(err)
+	}
+	byURI := make(map[string]config.NodeConfig, len(cfg.Nodes))
+	for _, node := range cfg.Nodes {
+		byURI[node.URI] = node
+	}
+	if len(byURI) != 2 || byURI[orphan.URI].ID != orphan.ID || byURI[orphan.URI].Source != config.NodeSourceManual {
+		t.Fatalf("startup nodes=%+v", cfg.Nodes)
+	}
+	recovered, _ := db.GetNode(ctx, orphan.ID)
+	stats, _ := db.GetNodeStats(ctx, orphan.ID)
+	if recovered == nil || recovered.Source != store.NodeSourceManual || recovered.Region != "hk" ||
+		stats == nil || stats.SuccessCount != 3 || stats.LastLatencyMs != 44 {
+		t.Fatalf("recovered=%+v stats=%+v", recovered, stats)
+	}
 }

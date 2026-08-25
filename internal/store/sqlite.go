@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -445,11 +446,45 @@ func (s *sqliteStore) UpdateSubscription(ctx context.Context, subscription *Subs
 }
 
 func (s *sqliteStore) DeleteSubscription(ctx context.Context, id int64) error {
-	result, err := s.conn().ExecContext(ctx, "DELETE FROM subscriptions WHERE id = ?", id)
+	return s.runInTx(ctx, func(tx *sqliteStore) error {
+		var exists int
+		if err := tx.conn().QueryRowContext(ctx, "SELECT 1 FROM subscriptions WHERE id=?", id).Scan(&exists); err != nil {
+			if err == sql.ErrNoRows {
+				return fmt.Errorf("subscription %d not found", id)
+			}
+			return err
+		}
+		now := formatTime(time.Now().UTC())
+		if _, err := tx.conn().ExecContext(ctx, `UPDATE nodes SET source=?, updated_at=?
+			WHERE source=?
+			AND id IN (SELECT node_id FROM subscription_nodes WHERE subscription_id=?)
+			AND NOT EXISTS (
+				SELECT 1 FROM subscription_nodes other
+				WHERE other.node_id=nodes.id AND other.subscription_id<>?
+			)`, NodeSourceManual, now, NodeSourceSubscription, id, id); err != nil {
+			return fmt.Errorf("preserve nodes for subscription %d: %w", id, err)
+		}
+		result, err := tx.conn().ExecContext(ctx, "DELETE FROM subscriptions WHERE id=?", id)
+		if err != nil {
+			return fmt.Errorf("delete subscription %d: %w", id, err)
+		}
+		return requireAffected(result, fmt.Sprintf("subscription %d not found", id))
+	})
+}
+
+func (s *sqliteStore) AdoptOrphanSubscriptionNodes(ctx context.Context) (int64, error) {
+	result, err := s.conn().ExecContext(ctx, `UPDATE nodes SET source=?, updated_at=?
+		WHERE source=? AND NOT EXISTS (
+			SELECT 1 FROM subscription_nodes memberships WHERE memberships.node_id=nodes.id
+		)`, NodeSourceManual, formatTime(time.Now().UTC()), NodeSourceSubscription)
 	if err != nil {
-		return fmt.Errorf("delete subscription %d: %w", id, err)
+		return 0, fmt.Errorf("adopt orphan subscription nodes: %w", err)
 	}
-	return requireAffected(result, fmt.Sprintf("subscription %d not found", id))
+	count, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("count adopted orphan subscription nodes: %w", err)
+	}
+	return count, nil
 }
 
 func (s *sqliteStore) SetSubscriptionEnabled(ctx context.Context, id int64, enabled bool) error {
@@ -548,7 +583,7 @@ func (s *sqliteStore) ReplaceSubscriptionNodes(ctx context.Context, subscription
 
 func (s *sqliteStore) CommitSnapshot(ctx context.Context, subscriptionID int64, nodes []SubscriptionNodeInput, snapshot SubscriptionSnapshot) error {
 	return s.runInTx(ctx, func(tx *sqliteStore) error {
-		if err := tx.replaceSubscriptionNodes(ctx, subscriptionID, nodes); err != nil {
+		if err := tx.mergeSubscriptionNodes(ctx, subscriptionID, nodes); err != nil {
 			return err
 		}
 		var nodeCount int
@@ -568,6 +603,32 @@ func (s *sqliteStore) CommitSnapshot(ctx context.Context, subscriptionID int64, 
 }
 
 func (s *sqliteStore) replaceSubscriptionNodes(ctx context.Context, subscriptionID int64, nodes []SubscriptionNodeInput) error {
+	if err := s.requireSubscription(ctx, subscriptionID); err != nil {
+		return err
+	}
+	if _, err := s.conn().ExecContext(ctx, "DELETE FROM subscription_nodes WHERE subscription_id=?", subscriptionID); err != nil {
+		return fmt.Errorf("clear subscription %d nodes: %w", subscriptionID, err)
+	}
+	return s.upsertSubscriptionNodes(ctx, subscriptionID, nodes)
+}
+
+func (s *sqliteStore) mergeSubscriptionNodes(ctx context.Context, subscriptionID int64, nodes []SubscriptionNodeInput) error {
+	if err := s.requireSubscription(ctx, subscriptionID); err != nil {
+		return err
+	}
+	if len(nodes) == 0 {
+		return errors.New("subscription snapshot contains no nodes")
+	}
+	// Move retained members behind the current snapshot. Members present in the
+	// new snapshot are upserted back to positions starting at zero below.
+	if _, err := s.conn().ExecContext(ctx, `UPDATE subscription_nodes SET position=position+?
+		WHERE subscription_id=?`, len(nodes), subscriptionID); err != nil {
+		return fmt.Errorf("reorder retained subscription %d nodes: %w", subscriptionID, err)
+	}
+	return s.upsertSubscriptionNodes(ctx, subscriptionID, nodes)
+}
+
+func (s *sqliteStore) requireSubscription(ctx context.Context, subscriptionID int64) error {
 	var exists int
 	if err := s.conn().QueryRowContext(ctx, "SELECT 1 FROM subscriptions WHERE id=?", subscriptionID).Scan(&exists); err != nil {
 		if err == sql.ErrNoRows {
@@ -575,17 +636,20 @@ func (s *sqliteStore) replaceSubscriptionNodes(ctx context.Context, subscription
 		}
 		return err
 	}
-	if _, err := s.conn().ExecContext(ctx, "DELETE FROM subscription_nodes WHERE subscription_id=?", subscriptionID); err != nil {
-		return fmt.Errorf("clear subscription %d nodes: %w", subscriptionID, err)
-	}
+	return nil
+}
+
+func (s *sqliteStore) upsertSubscriptionNodes(ctx context.Context, subscriptionID int64, nodes []SubscriptionNodeInput) error {
 	now := formatTime(time.Now().UTC())
 	for position, node := range nodes {
 		_, err := s.conn().ExecContext(ctx, `INSERT INTO nodes
 			(uri, name, source, port, username, password, region, country, enabled, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(uri) DO UPDATE SET name=excluded.name, port=excluded.port,
-			username=excluded.username, password=excluded.password, region=excluded.region,
-			country=excluded.country, updated_at=excluded.updated_at`, node.URI, node.Name,
+			username=excluded.username, password=excluded.password,
+			region=CASE WHEN excluded.region<>'' THEN excluded.region ELSE nodes.region END,
+			country=CASE WHEN excluded.country<>'' THEN excluded.country ELSE nodes.country END,
+			updated_at=excluded.updated_at`, node.URI, node.Name,
 			NodeSourceSubscription, node.Port, node.Username, node.Password, node.Region, node.Country,
 			boolToInt(node.Enabled), now, now)
 		if err != nil {

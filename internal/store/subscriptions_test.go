@@ -91,12 +91,12 @@ func TestSubscriptionsAndSnapshots(t *testing.T) {
 		t.Fatalf("B membership changed: nodes=%+v err=%v", bNodes, err)
 	}
 	gotA, _ = db.GetSubscription(ctx, a.ID)
-	if gotA.NodeCount != 1 || gotA.ETag != "v2" || !gotA.LastSuccess.Equal(snapshotTime) {
+	if gotA.NodeCount != 2 || gotA.ETag != "v2" || !gotA.LastSuccess.Equal(snapshotTime) {
 		t.Fatalf("snapshot metadata not committed: %+v", gotA)
 	}
 
 	effective, err := db.ListEffectiveSubscriptionNodes(ctx)
-	if err != nil || len(effective) != 1 || effective[0].URI != "http://b.example:81" {
+	if err != nil || len(effective) != 2 || effective[0].URI != "http://a.example:80" || effective[1].URI != "http://b.example:81" {
 		t.Fatalf("effective nodes: got=%+v err=%v", effective, err)
 	}
 	if err := db.ReplaceSubscriptionNodes(ctx, a.ID, nil); err != nil {
@@ -114,6 +114,154 @@ func TestSubscriptionsAndSnapshots(t *testing.T) {
 	}
 	if deleted, _ := db.GetSubscription(ctx, a.ID); deleted != nil {
 		t.Fatalf("subscription was not deleted: %+v", deleted)
+	}
+}
+
+func TestCommitSnapshotMergesAndRetainsMissingNodes(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "merge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	sub := &Subscription{Name: "merge", URL: "https://merge.example/sub", Enabled: true}
+	if err := db.CreateSubscription(ctx, sub); err != nil {
+		t.Fatal(err)
+	}
+	a := SubscriptionNodeInput{URI: "http://a.example:80", Name: "A", Region: "hk", Country: "Hong Kong", Enabled: true}
+	b := SubscriptionNodeInput{URI: "http://b.example:80", Name: "B", Enabled: true}
+	first := time.Now().UTC().Add(-time.Minute).Truncate(time.Second)
+	if err := db.CommitSnapshot(ctx, sub.ID, []SubscriptionNodeInput{a, b}, SubscriptionSnapshot{Attempt: first, Success: first, ETag: "first"}); err != nil {
+		t.Fatal(err)
+	}
+	aNode, err := db.GetNodeByURI(ctx, a.URI)
+	if err != nil || aNode == nil {
+		t.Fatalf("A node=%+v err=%v", aNode, err)
+	}
+	if err := db.UpsertNodeStats(ctx, &NodeStats{NodeID: aNode.ID, SuccessCount: 9, LastLatencyMs: 37}); err != nil {
+		t.Fatal(err)
+	}
+	second := time.Now().UTC().Truncate(time.Second)
+	b.Name, b.Port = "B updated", 8080
+	c := SubscriptionNodeInput{URI: "http://c.example:80", Name: "C", Enabled: true}
+	if err := db.CommitSnapshot(ctx, sub.ID, []SubscriptionNodeInput{b, c}, SubscriptionSnapshot{Attempt: second, Success: second, ETag: "second"}); err != nil {
+		t.Fatal(err)
+	}
+	members, err := db.ListSubscriptionNodes(ctx, sub.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantOrder := []string{b.URI, c.URI, a.URI}
+	if len(members) != len(wantOrder) {
+		t.Fatalf("merged members=%+v", members)
+	}
+	for index, uri := range wantOrder {
+		if members[index].Node.URI != uri {
+			t.Fatalf("member order=%+v, want=%v", members, wantOrder)
+		}
+	}
+	reloadedA, _ := db.GetNodeByURI(ctx, a.URI)
+	stats, _ := db.GetNodeStats(ctx, aNode.ID)
+	if reloadedA == nil || reloadedA.ID != aNode.ID || reloadedA.Region != "hk" || reloadedA.Country != "Hong Kong" {
+		t.Fatalf("retained node identity/metadata changed: %+v", reloadedA)
+	}
+	if stats == nil || stats.SuccessCount != 9 || stats.LastLatencyMs != 37 {
+		t.Fatalf("retained stats changed: %+v", stats)
+	}
+	updatedSub, _ := db.GetSubscription(ctx, sub.ID)
+	if updatedSub.NodeCount != 3 || updatedSub.ETag != "second" {
+		t.Fatalf("merged snapshot metadata=%+v", updatedSub)
+	}
+	if err := db.SetSubscriptionEnabled(ctx, sub.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	effective, err := db.ListEffectiveSubscriptionNodes(ctx)
+	if err != nil || len(effective) != 0 {
+		t.Fatalf("disabled retained members remained effective: nodes=%+v err=%v", effective, err)
+	}
+	if err := db.SetSubscriptionEnabled(ctx, sub.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	effective, err = db.ListEffectiveSubscriptionNodes(ctx)
+	if err != nil || len(effective) != 3 {
+		t.Fatalf("re-enabled retained members were not restored: nodes=%+v err=%v", effective, err)
+	}
+	if err := db.CommitSnapshot(ctx, sub.ID, nil, SubscriptionSnapshot{Attempt: time.Now(), Success: time.Now(), ETag: "empty"}); err == nil {
+		t.Fatal("empty snapshot unexpectedly replaced retained members")
+	}
+	afterEmpty, _ := db.ListSubscriptionNodes(ctx, sub.ID)
+	afterEmptySub, _ := db.GetSubscription(ctx, sub.ID)
+	if len(afterEmpty) != 3 || afterEmptySub.ETag != "second" || afterEmptySub.NodeCount != 3 {
+		t.Fatalf("empty snapshot changed state: members=%+v subscription=%+v", afterEmpty, afterEmptySub)
+	}
+}
+
+func TestDeleteSubscriptionPreservesExclusiveNodesAsManual(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "delete-preserve.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	a := &Subscription{Name: "A", URL: "https://a.example/sub", Enabled: true}
+	b := &Subscription{Name: "B", URL: "https://b.example/sub", Enabled: true}
+	if err := db.CreateSubscription(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateSubscription(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	shared := SubscriptionNodeInput{URI: "http://shared.example:80", Name: "shared", Enabled: true}
+	exclusive := SubscriptionNodeInput{URI: "http://exclusive.example:80", Name: "exclusive", Enabled: true}
+	if err := db.ReplaceSubscriptionNodes(ctx, a.ID, []SubscriptionNodeInput{exclusive, shared}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReplaceSubscriptionNodes(ctx, b.ID, []SubscriptionNodeInput{shared}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DeleteSubscription(ctx, a.ID); err != nil {
+		t.Fatal(err)
+	}
+	exclusiveNode, _ := db.GetNodeByURI(ctx, exclusive.URI)
+	sharedNode, _ := db.GetNodeByURI(ctx, shared.URI)
+	if exclusiveNode == nil || exclusiveNode.Source != NodeSourceManual || !exclusiveNode.Enabled {
+		t.Fatalf("exclusive node was not preserved as manual: %+v", exclusiveNode)
+	}
+	if sharedNode == nil || sharedNode.Source != NodeSourceSubscription {
+		t.Fatalf("shared node source changed: %+v", sharedNode)
+	}
+	bMembers, err := db.ListSubscriptionNodes(ctx, b.ID)
+	if err != nil || len(bMembers) != 1 || bMembers[0].Node.ID != sharedNode.ID {
+		t.Fatalf("remaining subscription membership=%+v err=%v", bMembers, err)
+	}
+}
+
+func TestAdoptOrphanSubscriptionNodes(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "orphans.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	orphan := &Node{URI: "http://orphan.example:80", Name: "orphan", Source: NodeSourceSubscription,
+		Region: "hk", Country: "Hong Kong", Enabled: true}
+	if err := db.CreateNode(ctx, orphan); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertNodeStats(ctx, &NodeStats{NodeID: orphan.ID, SuccessCount: 4, LastLatencyMs: 51}); err != nil {
+		t.Fatal(err)
+	}
+	adopted, err := db.AdoptOrphanSubscriptionNodes(ctx)
+	if err != nil || adopted != 1 {
+		t.Fatalf("adopted=%d err=%v", adopted, err)
+	}
+	recovered, _ := db.GetNode(ctx, orphan.ID)
+	stats, _ := db.GetNodeStats(ctx, orphan.ID)
+	if recovered == nil || recovered.Source != NodeSourceManual || !recovered.Enabled || recovered.Region != "hk" || recovered.Country != "Hong Kong" {
+		t.Fatalf("recovered orphan=%+v", recovered)
+	}
+	if stats == nil || stats.SuccessCount != 4 || stats.LastLatencyMs != 51 {
+		t.Fatalf("recovered stats=%+v", stats)
 	}
 }
 
