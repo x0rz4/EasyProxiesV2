@@ -152,8 +152,8 @@ type Server struct {
 	sessionTTL time.Duration
 
 	// Concurrency control
-	probeSem        *semaphore.Weighted
-	groupMutationMu sync.Mutex
+	probeSem            *semaphore.Weighted
+	groupMutationMu     sync.Mutex
 	groupOperationLocks sync.Map // map[int64]*sync.Mutex
 
 	// Lifecycle
@@ -1612,7 +1612,8 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 //   - Clash YAML 文档（含 `proxies:` 顶级键）
 //   - Clash YAML 行内列表项（`- { name: ..., type: ss, ... }`，每行一个）
 //   - Base64 编码的 v2ray 订阅内容
-//   - 代理 URI 列表（每行一个，如 trojan://、vless:// 等）
+//   - 代理 URI 列表（每行一个，如 trojan://、vless://、http://、socks5:// 等）
+//   - Markdown 链接或尖括号自动链接形式的代理 URI
 //
 // 解析出的节点统一转成标准 URI 后入库，与导出格式互通。
 func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
@@ -1643,12 +1644,25 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 	// 统一解析为节点列表（支持 Clash YAML / Base64 / URI 列表）
 	parsedNodes, err := config.ParseImportContent(content)
 	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
 		writeJSON(w, map[string]any{"error": fmt.Sprintf("解析导入内容失败: %v", err)})
 		return
+	}
+	existingNodes, err := s.nodeMgr.ListConfigNodes(r.Context(), nil)
+	if err != nil {
+		s.respondNodeError(w, err)
+		return
+	}
+	usedNames := make(map[string]struct{}, len(existingNodes)+len(parsedNodes))
+	usedURIs := make(map[string]struct{}, len(existingNodes)+len(parsedNodes))
+	for _, existing := range existingNodes {
+		usedNames[strings.TrimSpace(existing.Name)] = struct{}{}
+		usedURIs[strings.TrimSpace(existing.URI)] = struct{}{}
 	}
 
 	var imported int
 	var errs []string
+	generatedNameIndex := 1
 
 	for i := range parsedNodes {
 		node := parsedNodes[i]
@@ -1657,7 +1671,12 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// 名称：优先用解析结果，其次从 URI fragment 提取，最后兜底
+		if _, duplicate := usedURIs[node.URI]; duplicate {
+			errs = append(errs, fmt.Sprintf("节点 URI 已存在: %s", truncateStr(node.URI, 60)))
+			continue
+		}
+
+		// 名称：优先用解析结果，其次从 URI fragment 提取，最后生成唯一名称。
 		name := strings.TrimSpace(node.Name)
 		if name == "" {
 			if parsed, perr := url.Parse(node.URI); perr == nil && parsed.Fragment != "" {
@@ -1669,8 +1688,17 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if name == "" {
-			name = fmt.Sprintf("imported-%d", imported+1)
+			for {
+				name = fmt.Sprintf("imported-%d", generatedNameIndex)
+				generatedNameIndex++
+				if _, exists := usedNames[name]; !exists {
+					break
+				}
+			}
+		} else {
+			name = uniqueImportedNodeName(name, usedNames)
 		}
+		usedNames[name] = struct{}{}
 		node.Name = name
 
 		if !config.IsProxyURI(node.URI) {
@@ -1683,6 +1711,7 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		imported++
+		usedURIs[node.URI] = struct{}{}
 	}
 
 	result := map[string]any{
@@ -1693,6 +1722,18 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		result["errors"] = errs
 	}
 	writeJSON(w, result)
+}
+
+func uniqueImportedNodeName(base string, used map[string]struct{}) string {
+	if _, exists := used[base]; !exists {
+		return base
+	}
+	for suffix := 2; ; suffix++ {
+		candidate := fmt.Sprintf("%s-%d", base, suffix)
+		if _, exists := used[candidate]; !exists {
+			return candidate
+		}
+	}
 }
 
 // truncateStr truncates a string to maxLen and appends "..." if truncated.

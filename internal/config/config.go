@@ -740,28 +740,38 @@ func ParseImportContent(content string) ([]NodeConfig, error) {
 
 	// 1. Full Clash YAML document (top-level `proxies:` key).
 	if hasProxiesKey(content) {
-		return parseClashYAML(content)
+		return requireImportedNodes(parseClashYAML(content))
 	}
 
 	// 2. Inline Clash YAML list items ("- { ... }" or "- name: ...").
 	if looksLikeInlineYAML(content) {
-		return parseClashYAML(wrapAsClashProxiesDoc(content))
+		return requireImportedNodes(parseClashYAML(wrapAsClashProxiesDoc(content)))
 	}
 
 	// 3. Base64-encoded payload (common for v2ray subscriptions).
 	if decoded, ok := tryBase64Decode(content); ok {
 		decoded = strings.TrimSpace(decoded)
 		if hasProxiesKey(decoded) {
-			return parseClashYAML(decoded)
+			return requireImportedNodes(parseClashYAML(decoded))
 		}
 		if looksLikeInlineYAML(decoded) {
-			return parseClashYAML(wrapAsClashProxiesDoc(decoded))
+			return requireImportedNodes(parseClashYAML(wrapAsClashProxiesDoc(decoded)))
 		}
-		return parseNodesFromContent(decoded)
+		return requireImportedNodes(parseNodesFromContent(decoded))
 	}
 
 	// 4. Plain proxy URI list.
-	return parseNodesFromContent(content)
+	return requireImportedNodes(parseNodesFromContent(content))
+}
+
+func requireImportedNodes(nodes []NodeConfig, err error) ([]NodeConfig, error) {
+	if err != nil {
+		return nil, err
+	}
+	if len(nodes) == 0 {
+		return nil, errors.New("未找到支持的代理 URI 或 Clash 节点")
+	}
+	return nodes, nil
 }
 
 // hasProxiesKey reports whether content looks like a Clash YAML document by
@@ -836,6 +846,7 @@ func parseNodesFromContent(content string) ([]NodeConfig, error) {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
+		line = unwrapProxyURILine(line)
 
 		// Check if it's a valid proxy URI
 		if IsProxyURI(line) {
@@ -855,6 +866,29 @@ func parseNodesFromContent(content string) ([]NodeConfig, error) {
 	}
 
 	return nodes, nil
+}
+
+// unwrapProxyURILine accepts proxy links copied from Markdown-rendered text or
+// angle-bracket autolinks in addition to ordinary raw URI lines.
+func unwrapProxyURILine(line string) string {
+	line = strings.TrimSpace(line)
+	candidates := []string{line}
+	if len(line) > 2 && strings.HasPrefix(line, "<") && strings.HasSuffix(line, ">") {
+		candidates = append(candidates, strings.TrimSpace(line[1:len(line)-1]))
+	}
+	if separator := strings.Index(line, "]("); strings.HasPrefix(line, "[") && separator > 1 && strings.HasSuffix(line, ")") {
+		candidates = append(candidates, strings.TrimSpace(line[separator+2:len(line)-1]))
+	}
+	for _, candidate := range candidates {
+		if IsProxyURI(candidate) {
+			return candidate
+		}
+		unescaped := strings.Replace(candidate, `\://`, "://", 1)
+		if IsProxyURI(unescaped) {
+			return unescaped
+		}
+	}
+	return line
 }
 
 // isBase64 checks if a string looks like base64 encoded content (optimized version)

@@ -153,7 +153,7 @@ export default function ManagePanel() {
   const { data: monitorRes, isLoading: monitorLoading } = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes().catch(() => null) })
   const { data: subRes, isLoading: subLoading } = useQuery({ queryKey: ['subscriptions'], queryFn: listSubscriptions })
 
-  const configNodes = configRes?.nodes || []
+  const configNodes = useMemo(() => configRes?.nodes || [], [configRes?.nodes])
   const monitorData = monitorRes
   const subscriptions = subRes?.subscriptions || []
   const loading = configLoading || monitorLoading || subLoading
@@ -1078,8 +1078,8 @@ export default function ManagePanel() {
               </div>
             )}
             <p className="text-sm text-base-content/60 mb-3">
-              支持代理 URI 列表（每行一个，如 trojan://、vless://、ss:// 等）、Clash 配置（含 "proxies:" 的完整 YAML 或行内项）、Base64 编码的订阅内容。
-              可以直接粘贴导出文件的内容或从文件导入。
+              支持代理 URI 列表（每行一个，如 trojan://、vless://、ss://、http://、socks5://）、Markdown 链接、Clash 配置（含 "proxies:" 的完整 YAML 或行内项）及 Base64 订阅内容。
+              匿名节点会自动生成不重复的名称；可以直接粘贴导出文件内容或从文件导入。
             </p>
             <div className="mb-3">
               <label className="btn btn-soft btn-sm">

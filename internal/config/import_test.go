@@ -95,6 +95,30 @@ vless://11111111-2222-3333-4444-555555555555@example.com:443?encryption=none#vle
 	}
 }
 
+func TestParseImportContent_HTTPProxyAndMarkdownLinks(t *testing.T) {
+	raw := "http://user:password@104.207.47.150:3129"
+	content := raw + "\n[backup](http://other:secret@198.51.100.7:8080)\n<socks5://127.0.0.1:1080>\n"
+	nodes, err := ParseImportContent(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 3 {
+		t.Fatalf("nodes=%+v", nodes)
+	}
+	want := []string{raw, "http://other:secret@198.51.100.7:8080", "socks5://127.0.0.1:1080"}
+	for index, uri := range want {
+		if nodes[index].URI != uri || !IsProxyURI(nodes[index].URI) {
+			t.Fatalf("node %d=%+v, want URI %q", index, nodes[index], uri)
+		}
+	}
+}
+
+func TestParseImportContentRejectsUnrecognizedText(t *testing.T) {
+	if _, err := ParseImportContent("this is not a proxy"); err == nil {
+		t.Fatal("unrecognized import content unexpectedly succeeded")
+	}
+}
+
 func TestParseImportContent_Base64Payload(t *testing.T) {
 	// Base64-encoded URI list, as v2ray subscriptions deliver.
 	plain := "trojan://secretpass@example.com:443?sni=example.com#trojan-node\n"
