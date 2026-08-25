@@ -44,3 +44,6 @@ coverage.html
 
 # Qodo
 .qodo/
+
+# Frontend build assets
+internal/monitor/assets/
