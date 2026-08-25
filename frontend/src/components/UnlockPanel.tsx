@@ -3,53 +3,11 @@ import type {
   NodeSnapshot,
   UnlockResult,
   UnlockSSEEvent,
-  UnlockServiceResult,
 } from '../types'
 import { fetchNodes, unlockNode, unlockAllNodes, fetchUnlockResults } from '../api/client'
 import { regionFlag } from '../utils/region'
-import { formatRelative } from '../utils/format'
 import { PageContent, PageHeader, PageLayout, surfaceClass } from './ui/PageLayout'
 import UnlockDrawer from './UnlockDrawer'
-
-// ---- Status styling ----
-
-type Status = UnlockServiceResult['status']
-
-const statusMeta: Record<
-  Status,
-  { label: string; badge: string; dot: string; emoji: string }
-> = {
-  unlocked: {
-    label: '完整解锁',
-    badge: 'badge-success',
-    dot: 'bg-success',
-    emoji: '✅',
-  },
-  originals_only: {
-    label: '仅自制',
-    badge: 'badge-warning',
-    dot: 'bg-warning',
-    emoji: '🟡',
-  },
-  locked: {
-    label: '已封锁',
-    badge: 'badge-error',
-    dot: 'bg-error',
-    emoji: '❌',
-  },
-  failed: {
-    label: '检测失败',
-    badge: 'badge-ghost',
-    dot: 'bg-base-content/40',
-    emoji: '⚠️',
-  },
-}
-
-function statusFromResult(r: UnlockResult): Status {
-  // A node-level error means every service effectively failed to probe.
-  if (r.error) return 'failed'
-  return r.services[0]?.status ?? 'failed'
-}
 
 // ---- Component ----
 
@@ -240,40 +198,11 @@ export default function UnlockPanel() {
     setDrawerOpen(true)
   }
 
-  // ---- Render helpers ----
-  
-  const renderBadges = (result: UnlockResult | undefined) => {
-    if (!result) return <span className="opacity-40 text-xs">暂无数据</span>
-    if (result.error) return <span className="badge badge-sm badge-error">检测失败</span>
-    
-    return (
-      <div className="flex flex-wrap gap-1">
-        {result.ip?.pure && <span className="badge badge-sm badge-success">原生IP</span>}
-        {(result.ip?.risk_level === 'High' || result.ip?.risk_level === 'Medium') && 
-          <span className="badge badge-sm badge-error">高风险</span>
-        }
-        {result.services?.slice(0, 3).map(svc => {
-          if (svc.status === 'unlocked') {
-            const isNetflix = svc.name === 'netflix'
-            return (
-              <span key={svc.name} className={`badge badge-sm ${isNetflix ? 'bg-[#E50914] text-white border-none' : 'badge-primary'}`}>
-                {svc.display_name}
-              </span>
-            )
-          }
-          return null
-        })}
-        {(result.services?.filter(s => s.status === 'unlocked').length || 0) > 3 && (
-           <span className="badge badge-sm badge-ghost">+{result.services.filter(s => s.status === 'unlocked').length - 3}</span>
-        )}
-      </div>
-    )
-  }
-
   return (
-    <PageLayout title="解锁检测">
-      <PageHeader>
-        <div className="flex flex-col sm:flex-row gap-4 justify-between w-full">通过节点出口发送特定请求，检测 Netflix、Disney+、ChatGPT 解锁状态及原生 IP 纯净度"
+    <PageLayout>
+      <PageHeader
+        title="解锁检测"
+        description="通过节点出口发送特定请求，检测 Netflix、Disney+、ChatGPT 解锁状态及原生 IP 纯净度"
         icon={
           <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 11V7a4 4 0 118 0m-4 8v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2z" />
@@ -425,6 +354,7 @@ export default function UnlockPanel() {
               </tbody>
             </table>
           </div>
+        </div>
         </div>
       </PageContent>
       <UnlockDrawer 
