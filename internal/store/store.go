@@ -210,6 +210,10 @@ type GroupPool struct {
 	HealthCheckSeconds   int              `json:"health_check_seconds"`
 	CurrentActiveNodeID  int64            `json:"current_active_node_id,omitempty"`
 	Enabled              bool             `json:"enabled"`
+	SubscriptionEnabled  bool             `json:"subscription_enabled"`
+	SubscriptionToken    string           `json:"subscription_token,omitempty"`
+	SubscriptionMode     string           `json:"subscription_mode"`
+	ExternalHost         string           `json:"external_host,omitempty"`
 	CreatedAt            time.Time        `json:"created_at"`
 	UpdatedAt            time.Time        `json:"updated_at"`
 	NodeStates           []GroupNodeState `json:"node_states,omitempty"`

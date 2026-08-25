@@ -203,6 +203,7 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 	mux.HandleFunc("/api/reload", s.withAuth(s.handleReload))
 	mux.HandleFunc("/api/groups", s.withAuth(s.handleGroups))
 	mux.HandleFunc("/api/groups/", s.withAuth(s.handleGroupItem))
+	mux.HandleFunc("/sub/", s.handleGroupSubscription)
 
 	// GeoIP database management
 	mux.HandleFunc("/api/geoip/status", s.withAuth(s.handleGeoipStatus))
@@ -2282,6 +2283,9 @@ type groupPoolInput struct {
 	FailureThreshold     int      `json:"failure_threshold"`
 	HealthCheckSeconds   int      `json:"health_check_seconds"`
 	Enabled              *bool    `json:"enabled"`
+	SubscriptionEnabled  *bool    `json:"subscription_enabled"`
+	SubscriptionMode     string   `json:"subscription_mode"`
+	ExternalHost         string   `json:"external_host"`
 }
 
 type groupMemberResponse struct {
@@ -2366,6 +2370,25 @@ func (s *Server) handleGroupItem(w http.ResponseWriter, r *http.Request) {
 			s.logger.Printf("restore group runtime: %v", err)
 		}
 		writeJSON(w, map[string]any{"message": "节点已恢复", "group_id": groupID, "node_id": nodeID})
+		return
+	}
+	if len(parts) == 3 && parts[1] == "subscription" && parts[2] == "reset-token" && r.Method == http.MethodPost {
+		groupPool, err := s.store.GetGroupPool(r.Context(), groupID)
+		if err != nil || groupPool == nil {
+			writeAPIError(w, http.StatusNotFound, "分组不存在")
+			return
+		}
+		token, err := s.generateSessionToken()
+		if err != nil {
+			writeAPIError(w, http.StatusInternalServerError, "生成订阅 Token 失败")
+			return
+		}
+		groupPool.SubscriptionToken = token
+		if err := s.store.UpdateGroupPool(r.Context(), groupPool); err != nil {
+			writeAPIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, map[string]any{"message": "订阅 Token 已重置", "token": token})
 		return
 	}
 	if len(parts) != 1 {
@@ -2522,10 +2545,31 @@ func (s *Server) groupFromInput(ctx context.Context, input groupPoolInput, exist
 	} else if existing != nil {
 		enabled = existing.Enabled
 	}
+	subscriptionEnabled := true
+	if input.SubscriptionEnabled != nil {
+		subscriptionEnabled = *input.SubscriptionEnabled
+	} else if existing != nil {
+		subscriptionEnabled = existing.SubscriptionEnabled
+	}
+	if input.SubscriptionMode != "members" {
+		input.SubscriptionMode = "entry"
+	}
+	subscriptionToken := ""
+	if existing != nil {
+		subscriptionToken = existing.SubscriptionToken
+	}
+	if subscriptionToken == "" {
+		subscriptionToken, err = s.generateSessionToken()
+		if err != nil {
+			return nil, fmt.Errorf("生成订阅 Token: %w", err)
+		}
+	}
 	group := &store.GroupPool{Name: input.Name, BindAddress: input.BindAddress, BindPort: input.BindPort,
 		Protocol: protocol, Username: input.Username, Password: input.Password, DispatchMode: input.DispatchMode,
 		Regions: regions, ExplicitNodeIDs: input.ExplicitNodeIDs, FailureWindowSeconds: input.FailureWindowSeconds,
-		FailureThreshold: input.FailureThreshold, HealthCheckSeconds: input.HealthCheckSeconds, Enabled: enabled}
+		FailureThreshold: input.FailureThreshold, HealthCheckSeconds: input.HealthCheckSeconds, Enabled: enabled,
+		SubscriptionEnabled: subscriptionEnabled, SubscriptionToken: subscriptionToken,
+		SubscriptionMode: input.SubscriptionMode, ExternalHost: strings.TrimSpace(input.ExternalHost)}
 	if existing != nil {
 		group.ID, group.CurrentActiveNodeID, group.CreatedAt, group.NodeStates = existing.ID, existing.CurrentActiveNodeID, existing.CreatedAt, existing.NodeStates
 	}

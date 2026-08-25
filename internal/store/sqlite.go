@@ -1149,7 +1149,8 @@ func servicesFromStatuses(netflix, disneyPlus, chatgpt string) []UnlockServiceRe
 
 const groupPoolColumns = `id, name, bind_address, bind_port, protocol, username, password,
 dispatch_mode, regions_json, explicit_node_ids_json, failure_window_seconds,
-failure_threshold, health_check_seconds, current_active_node_id, enabled, created_at, updated_at`
+failure_threshold, health_check_seconds, current_active_node_id, enabled,
+subscription_enabled, subscription_token, subscription_mode, external_host, created_at, updated_at`
 
 func (s *sqliteStore) ListGroupPools(ctx context.Context) ([]GroupPool, error) {
 	rows, err := s.conn().QueryContext(ctx, "SELECT "+groupPoolColumns+" FROM group_pools ORDER BY id")
@@ -1198,11 +1199,13 @@ func (s *sqliteStore) CreateGroupPool(ctx context.Context, g *GroupPool) error {
 	result, err := s.conn().ExecContext(ctx, `INSERT INTO group_pools
 (name, bind_address, bind_port, protocol, username, password, dispatch_mode, regions_json,
  explicit_node_ids_json, failure_window_seconds, failure_threshold, health_check_seconds,
- current_active_node_id, enabled, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+ current_active_node_id, enabled, subscription_enabled, subscription_token, subscription_mode,
+ external_host, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		g.Name, g.BindAddress, g.BindPort, g.Protocol, g.Username, g.Password, g.DispatchMode,
 		string(regions), string(nodeIDs), g.FailureWindowSeconds, g.FailureThreshold,
-		g.HealthCheckSeconds, g.CurrentActiveNodeID, boolToInt(g.Enabled), formatTime(time.Now()), formatTime(time.Now()))
+		g.HealthCheckSeconds, g.CurrentActiveNodeID, boolToInt(g.Enabled), boolToInt(g.SubscriptionEnabled),
+		g.SubscriptionToken, g.SubscriptionMode, g.ExternalHost, formatTime(time.Now()), formatTime(time.Now()))
 	if err != nil {
 		return fmt.Errorf("create group pool: %w", err)
 	}
@@ -1216,10 +1219,12 @@ func (s *sqliteStore) UpdateGroupPool(ctx context.Context, g *GroupPool) error {
 	result, err := s.conn().ExecContext(ctx, `UPDATE group_pools SET
 name=?, bind_address=?, bind_port=?, protocol=?, username=?, password=?, dispatch_mode=?,
 regions_json=?, explicit_node_ids_json=?, failure_window_seconds=?, failure_threshold=?,
-health_check_seconds=?, current_active_node_id=?, enabled=?, updated_at=? WHERE id=?`,
+health_check_seconds=?, current_active_node_id=?, enabled=?, subscription_enabled=?, subscription_token=?,
+subscription_mode=?, external_host=?, updated_at=? WHERE id=?`,
 		g.Name, g.BindAddress, g.BindPort, g.Protocol, g.Username, g.Password, g.DispatchMode,
 		string(regions), string(nodeIDs), g.FailureWindowSeconds, g.FailureThreshold,
-		g.HealthCheckSeconds, g.CurrentActiveNodeID, boolToInt(g.Enabled), formatTime(time.Now()), g.ID)
+		g.HealthCheckSeconds, g.CurrentActiveNodeID, boolToInt(g.Enabled), boolToInt(g.SubscriptionEnabled),
+		g.SubscriptionToken, g.SubscriptionMode, g.ExternalHost, formatTime(time.Now()), g.ID)
 	if err != nil {
 		return fmt.Errorf("update group pool: %w", err)
 	}
@@ -1281,16 +1286,18 @@ last_error, evicted_at, updated_at FROM group_node_states WHERE group_id = ?`, g
 func scanGroupPool(row scanner) (GroupPool, error) {
 	var g GroupPool
 	var regions, nodeIDs, createdAt, updatedAt string
-	var enabled int
+	var enabled, subscriptionEnabled int
 	err := row.Scan(&g.ID, &g.Name, &g.BindAddress, &g.BindPort, &g.Protocol, &g.Username, &g.Password,
 		&g.DispatchMode, &regions, &nodeIDs, &g.FailureWindowSeconds, &g.FailureThreshold,
-		&g.HealthCheckSeconds, &g.CurrentActiveNodeID, &enabled, &createdAt, &updatedAt)
+		&g.HealthCheckSeconds, &g.CurrentActiveNodeID, &enabled, &subscriptionEnabled,
+		&g.SubscriptionToken, &g.SubscriptionMode, &g.ExternalHost, &createdAt, &updatedAt)
 	if err != nil {
 		return g, err
 	}
 	_ = json.Unmarshal([]byte(regions), &g.Regions)
 	_ = json.Unmarshal([]byte(nodeIDs), &g.ExplicitNodeIDs)
 	g.Enabled = enabled != 0
+	g.SubscriptionEnabled = subscriptionEnabled != 0
 	g.CreatedAt, g.UpdatedAt = parseTime(createdAt), parseTime(updatedAt)
 	return g, nil
 }

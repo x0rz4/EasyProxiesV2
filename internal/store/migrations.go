@@ -214,6 +214,17 @@ CREATE TABLE group_node_states (
 CREATE INDEX idx_group_states_evicted ON group_node_states(group_id, evicted);
 `,
 		},
+		{
+			Version:     7,
+			Description: "add group subscription settings",
+			Up: `
+ALTER TABLE group_pools ADD COLUMN subscription_enabled INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE group_pools ADD COLUMN subscription_token TEXT NOT NULL DEFAULT '';
+ALTER TABLE group_pools ADD COLUMN subscription_mode TEXT NOT NULL DEFAULT 'entry';
+ALTER TABLE group_pools ADD COLUMN external_host TEXT NOT NULL DEFAULT '';
+UPDATE group_pools SET subscription_token = lower(hex(randomblob(24))) WHERE subscription_token = '';
+`,
+		},
 	}
 }
 

@@ -989,6 +989,8 @@ func groupConfigsFromStore(groups []store.GroupPool) []config.GroupPoolConfig {
 			FailureWindow:    time.Duration(group.FailureWindowSeconds) * time.Second,
 			FailureThreshold: group.FailureThreshold, HealthCheckInterval: time.Duration(group.HealthCheckSeconds) * time.Second,
 			CurrentActiveNodeID: group.CurrentActiveNodeID, Enabled: group.Enabled,
+			SubscriptionEnabled: group.SubscriptionEnabled, SubscriptionToken: group.SubscriptionToken,
+			SubscriptionMode: group.SubscriptionMode, ExternalHost: group.ExternalHost,
 			CreatedAt: group.CreatedAt, UpdatedAt: group.UpdatedAt}
 		for _, state := range group.NodeStates {
 			converted.NodeStates = append(converted.NodeStates, config.GroupNodeStateConfig{NodeID: state.NodeID,

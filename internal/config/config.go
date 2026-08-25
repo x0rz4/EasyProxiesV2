@@ -86,6 +86,10 @@ type GroupPoolConfig struct {
 	HealthCheckInterval time.Duration          `yaml:"-" json:"-"`
 	CurrentActiveNodeID int64                  `yaml:"-" json:"current_active_node_id,omitempty"`
 	Enabled             bool                   `yaml:"-" json:"enabled"`
+	SubscriptionEnabled bool                   `yaml:"-" json:"subscription_enabled"`
+	SubscriptionToken   string                 `yaml:"-" json:"subscription_token,omitempty"`
+	SubscriptionMode    string                 `yaml:"-" json:"subscription_mode"`
+	ExternalHost        string                 `yaml:"-" json:"external_host,omitempty"`
 	CreatedAt           time.Time              `yaml:"-" json:"created_at,omitempty"`
 	UpdatedAt           time.Time              `yaml:"-" json:"updated_at,omitempty"`
 	NodeStates          []GroupNodeStateConfig `yaml:"-" json:"-"`
@@ -320,6 +324,9 @@ func (c *Config) applyDefaults() error {
 		}
 		if g.HealthCheckInterval <= 0 {
 			g.HealthCheckInterval = time.Minute
+		}
+		if g.SubscriptionMode != "members" {
+			g.SubscriptionMode = "entry"
 		}
 	}
 	if c.MultiPort.Address == "" {

@@ -1,13 +1,13 @@
 import { useMemo, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  Activity, CheckCircle2, CircleAlert, Dices, Layers3, Network, Pencil,
+  Activity, CheckCircle2, CircleAlert, Copy, Dices, KeyRound, Layers3, Link2, Network, Pencil,
   Plus, Power, RefreshCw, RotateCcw, Server, ShieldOff, Trash2, X,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import type { GroupPool, GroupPoolPayload, GroupMemberStatus } from '../types'
 import {
-  createGroupPool, deleteGroupPool, listGroupPools, restoreGroupMember, updateGroupPool,
+  createGroupPool, deleteGroupPool, listGroupPools, resetGroupSubscriptionToken, restoreGroupMember, updateGroupPool,
 } from '../api/client'
 import { cn } from '../utils/cn'
 import { controlClass, PageContent, PageHeader, PageLayout, surfaceClass } from './ui/PageLayout'
@@ -16,6 +16,7 @@ const emptyPayload = (): GroupPoolPayload => ({
   name: '', bind_address: '0.0.0.0', bind_port: 0, protocol: 'mixed', username: '', password: '',
   dispatch_mode: 'fixed', regions: [], explicit_node_ids: [], failure_window_seconds: 300,
   failure_threshold: 3, health_check_seconds: 60, enabled: true,
+	subscription_enabled: true, subscription_mode: 'entry', external_host: '',
 })
 
 const statusStyle: Record<GroupMemberStatus, { label: string; badge: string; icon: typeof CheckCircle2 }> = {
@@ -32,6 +33,8 @@ function payloadFromGroup(group: GroupPool): GroupPoolPayload {
     explicit_node_ids: group.explicit_node_ids || [], failure_window_seconds: group.failure_window_seconds,
     failure_threshold: group.failure_threshold, health_check_seconds: group.health_check_seconds,
     enabled: group.enabled,
+		subscription_enabled: group.subscription_enabled, subscription_mode: group.subscription_mode || 'entry',
+		external_host: group.external_host || '',
   }
 }
 
@@ -130,6 +133,7 @@ export default function GroupPoolsPanel() {
             {groups.map((group) => <GroupCard key={group.id} group={group} busy={busy}
               onEdit={() => openEdit(group)} onDelete={() => setDeleteTarget(group)}
               onToggle={() => void run(`toggle-${group.id}`, () => updateGroupPool(group.id, { ...payloadFromGroup(group), enabled: !group.enabled }), group.enabled ? '分组已停用' : '分组已启用')}
+				onResetToken={() => void run(`token-${group.id}`, () => resetGroupSubscriptionToken(group.id), '订阅 Token 已重置，旧链接已失效')}
               onRestore={(nodeId) => void run(`restore-${group.id}-${nodeId}`, () => restoreGroupMember(group.id, nodeId), '节点已恢复入池')} />)}
           </section>
         )}
@@ -166,6 +170,12 @@ export default function GroupPoolsPanel() {
 
             <Field label="地区自动入池" hint="ISO 地区码，用逗号或空格分隔，例如 hk, jp, us"><input className={cn('input w-full font-mono', controlClass)} value={regionsText} onChange={(e) => setRegionsText(e.target.value)} placeholder="hk, jp" /></Field>
 
+			<div className="rounded-2xl border border-primary/20 bg-primary/5 p-4 sm:p-5">
+				<div className="flex items-start gap-3"><div className="rounded-xl bg-primary/10 p-2 text-primary"><Link2 className="h-4 w-4" /></div><div className="min-w-0 flex-1"><div className="flex items-center justify-between gap-3"><div><h4 className="font-bold">对外订阅</h4><p className="mt-0.5 text-xs leading-5 text-base-content/55">独立 Token 鉴权；members 会暴露真实上游地址</p></div><input type="checkbox" className="toggle toggle-primary" checked={form.subscription_enabled} onChange={(e) => setForm({ ...form, subscription_enabled: e.target.checked })} aria-label="启用分组订阅" /></div>
+				{form.subscription_enabled && <div className="mt-4 grid gap-4 sm:grid-cols-2"><Field label="默认输出模式"><select className={cn('select w-full', controlClass)} value={form.subscription_mode} onChange={(e) => setForm({ ...form, subscription_mode: e.target.value as 'members' | 'entry' })}><option value="entry">组入口（推荐中转）</option><option value="members">健康成员（暴露上游）</option></select></Field><Field label="外部主机覆盖" hint="留空使用系统 external_ip 或请求域名"><input className={cn('input w-full font-mono', controlClass)} value={form.external_host} onChange={(e) => setForm({ ...form, external_host: e.target.value })} placeholder="ep.example.com" /></Field></div>}
+				</div></div>
+			</div>
+
             <div className="rounded-2xl border border-base-300 bg-base-200/25 p-4">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"><div><h4 className="font-bold">手动指定节点</h4><p className="mt-0.5 text-xs text-base-content/50">已选择 {form.explicit_node_ids.length} 个；可与地区规则同时使用</p></div><input className="input input-sm w-full sm:w-64" value={nodeSearch} onChange={(e) => setNodeSearch(e.target.value)} placeholder="搜索节点或地区" /></div>
               <div className="mt-3 max-h-52 space-y-1 overflow-y-auto pr-1">
@@ -196,13 +206,25 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
   return <fieldset className="fieldset"><legend className="fieldset-legend font-semibold text-base-content/80">{label}</legend>{children}{hint && <p className="mt-1 text-xs text-base-content/45">{hint}</p>}</fieldset>
 }
 
-function GroupCard({ group, busy, onEdit, onDelete, onToggle, onRestore }: { group: GroupPool; busy: string | null; onEdit: () => void; onDelete: () => void; onToggle: () => void; onRestore: (nodeId: number) => void }) {
+function GroupCard({ group, busy, onEdit, onDelete, onToggle, onResetToken, onRestore }: { group: GroupPool; busy: string | null; onEdit: () => void; onDelete: () => void; onToggle: () => void; onResetToken: () => void; onRestore: (nodeId: number) => void }) {
   const active = group.members.find((member) => member.is_active)
+	const copySubscription = async (format: 'clash' | 'base64', mode: 'members' | 'entry') => {
+		if (!group.subscription_token) { toast.error('当前分组没有可用的订阅 Token'); return }
+		const query = new URLSearchParams({ token: group.subscription_token, format, mode })
+		const link = `${window.location.origin}/sub/${group.id}?${query.toString()}`
+		try { await navigator.clipboard.writeText(link); toast.success(`已复制 ${format === 'clash' ? 'Clash' : 'Base64'} ${mode === 'entry' ? '入口' : '成员'}订阅`) }
+		catch { toast.error('复制失败，请检查浏览器剪贴板权限') }
+	}
   return <article className={cn(surfaceClass, 'overflow-hidden transition-colors', !group.enabled && 'opacity-70')}>
     <div className="border-b border-base-200 p-5">
       <div className="flex items-start gap-3"><div className={cn('flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl', group.enabled ? 'bg-primary/10 text-primary' : 'bg-base-200 text-base-content/40')}><Layers3 className="h-5 w-5" /></div><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><h3 className="truncate text-lg font-bold">{group.name}</h3><span className={cn('badge badge-sm', group.enabled ? 'badge-success' : 'badge-ghost')}>{group.enabled ? '运行中' : '已停用'}</span><span className="badge badge-outline badge-sm">{group.dispatch_mode === 'fixed' ? '固定出口' : '随机出口'}</span></div><div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-base-content/55"><code className="font-semibold text-primary">{group.bind_address}:{group.bind_port}</code><span className="uppercase">{group.protocol}</span><span>{group.failure_window_seconds / 60} 分钟 / {group.failure_threshold} 次踢出</span></div></div><div className="dropdown dropdown-end"><button tabIndex={0} className="btn btn-ghost btn-sm btn-square" aria-label="分组操作"><Pencil className="h-4 w-4" /></button><ul tabIndex={0} className="dropdown-content z-20 mt-1 w-36 rounded-box border border-base-300 bg-base-100 p-1.5 shadow-xl"><li><button className="flex w-full cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-sm hover:bg-base-200" onClick={onEdit}><Pencil className="h-4 w-4" />编辑</button></li><li><button className="flex w-full cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-sm hover:bg-base-200" onClick={onToggle}><Power className="h-4 w-4" />{group.enabled ? '停用' : '启用'}</button></li><li><button className="flex w-full cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-sm text-error hover:bg-error/10" onClick={onDelete}><Trash2 className="h-4 w-4" />删除</button></li></ul></div></div>
       <div className="mt-4 grid grid-cols-3 gap-2"><MiniMetric label="成员" value={group.member_count} /><MiniMetric label="健康" value={group.alive_count} tone="text-success" /><MiniMetric label="踢出" value={group.evicted_count} tone={group.evicted_count ? 'text-error' : ''} /></div>
       {(group.regions?.length > 0 || group.explicit_node_ids?.length > 0) && <div className="mt-4 flex flex-wrap gap-1.5">{group.regions?.map((region) => <span key={region} className="badge badge-primary badge-outline badge-sm uppercase">{region}</span>)}{group.explicit_node_ids?.length > 0 && <span className="badge badge-ghost badge-sm">手动 {group.explicit_node_ids.length} 个</span>}</div>}
+		<div className={cn('mt-4 rounded-xl border p-3', group.subscription_enabled ? 'border-info/20 bg-info/5' : 'border-base-200 bg-base-200/25')}>
+			<div className="flex items-center gap-2"><Link2 className={cn('h-4 w-4', group.subscription_enabled ? 'text-info' : 'text-base-content/35')} /><span className="text-xs font-bold">订阅输出</span><span className={cn('badge badge-xs', group.subscription_enabled ? 'badge-info' : 'badge-ghost')}>{group.subscription_enabled ? '已启用' : '已关闭'}</span>{group.subscription_enabled && <span className="ml-auto flex items-center gap-1 font-mono text-[10px] text-base-content/40"><KeyRound className="h-3 w-3" />••••{group.subscription_token?.slice(-6)}</span>}</div>
+			{group.subscription_enabled && <div className="mt-3 grid grid-cols-3 gap-1.5"><button className="btn btn-ghost btn-xs h-8 min-h-0 gap-1 border border-base-300 bg-base-100" onClick={() => void copySubscription('clash', 'entry')}><Copy className="h-3 w-3" />入口</button><button className="btn btn-ghost btn-xs h-8 min-h-0 gap-1 border border-base-300 bg-base-100" onClick={() => void copySubscription('clash', 'members')}><Copy className="h-3 w-3" />成员</button><button className="btn btn-ghost btn-xs h-8 min-h-0 gap-1 border border-base-300 bg-base-100" onClick={() => void copySubscription('base64', 'members')}><Copy className="h-3 w-3" />Base64</button></div>}
+			{group.subscription_enabled && <button className="mt-2 flex cursor-pointer items-center gap-1 text-[11px] text-base-content/45 transition-colors hover:text-error" disabled={busy === `token-${group.id}`} onClick={onResetToken}><RotateCcw className={cn('h-3 w-3', busy === `token-${group.id}` && 'animate-spin')} />重置 Token（旧链接立即失效）</button>}
+		</div>
     </div>
     <div className="p-4 sm:p-5">
       {group.dispatch_mode === 'fixed' && <div className={cn('mb-3 flex items-center gap-3 rounded-xl border px-3 py-2.5', active ? 'border-success/25 bg-success/5' : 'border-warning/25 bg-warning/5')}><Activity className={cn('h-4 w-4 shrink-0', active ? 'text-success' : 'text-warning')} /><div className="min-w-0 flex-1"><p className="text-[11px] font-semibold uppercase tracking-wider text-base-content/45">当前主出口</p><p className="truncate text-sm font-semibold">{active?.name || '等待首个连接选择'}</p></div>{active?.latency_ms && active.latency_ms > 0 ? <span className="text-xs font-mono text-base-content/55">{active.latency_ms} ms</span> : null}</div>}

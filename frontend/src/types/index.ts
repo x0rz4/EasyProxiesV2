@@ -96,6 +96,10 @@ export interface GroupPool {
   health_check_seconds: number
   current_active_node_id?: number
   enabled: boolean
+  subscription_enabled: boolean
+  subscription_token?: string
+  subscription_mode: 'members' | 'entry'
+  external_host?: string
   current_active_tag?: string
   members: GroupMember[]
   member_count: number
@@ -125,6 +129,9 @@ export interface GroupPoolPayload {
   failure_threshold: number
   health_check_seconds: number
   enabled: boolean
+  subscription_enabled: boolean
+  subscription_mode: 'members' | 'entry'
+  external_host: string
 }
 
 export interface DebugNode {

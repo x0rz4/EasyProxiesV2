@@ -160,6 +160,10 @@ export async function restoreGroupMember(groupId: number, nodeId: number) {
   return request(`/api/groups/${groupId}/members/${nodeId}/restore`, { method: 'POST' })
 }
 
+export async function resetGroupSubscriptionToken(groupId: number): Promise<{ message: string; token: string }> {
+  return request(`/api/groups/${groupId}/subscription/reset-token`, { method: 'POST' })
+}
+
 export async function probeNode(tag: string): Promise<{ message: string; latency_ms: number }> {
   return request(`/api/nodes/${encodeURIComponent(tag)}/probe`, { method: 'POST' })
 }
