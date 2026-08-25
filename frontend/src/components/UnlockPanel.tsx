@@ -8,13 +8,15 @@ import { fetchNodes, unlockNode, unlockAllNodes, fetchUnlockResults } from '../a
 import { regionFlag } from '../utils/region'
 import { PageContent, PageHeader, PageLayout, surfaceClass } from './ui/PageLayout'
 import UnlockDrawer from './UnlockDrawer'
+import { ShieldCheck, X, Play, RefreshCw } from 'lucide-react'
+import { toast } from 'sonner'
+import { cn } from '../utils/cn'
 
 // ---- Component ----
 
 export default function UnlockPanel() {
   const [nodes, setNodes] = useState<NodeSnapshot[]>([])
   const [loading, setLoading] = useState(true)
-  const [error, setError] = useState('')
 
   // tag -> result. Results are kept across batch runs and single runs alike.
   const [results, setResults] = useState<Record<string, UnlockResult>>({})
@@ -38,7 +40,6 @@ export default function UnlockPanel() {
   // ---- Node list ----
   const loadNodes = useCallback(async () => {
     try {
-      setError('')
       const res = await fetchNodes()
       // Only nodes that are actually wired up (have a tag + available) can be
       // unlock-checked; the dialer is registered per member tag.
@@ -56,7 +57,7 @@ export default function UnlockPanel() {
         /* persisted results are optional */
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : '加载节点失败')
+      toast.error(err instanceof Error ? err.message : '加载节点失败')
     } finally {
       setLoading(false)
     }
@@ -85,6 +86,7 @@ export default function UnlockPanel() {
     try {
       const res = await unlockNode(tag)
       setResults((s) => ({ ...s, [tag]: res }))
+      toast.success(`节点 ${tag} 检测完成`)
     } catch (err) {
       setErrors((s) => ({ ...s, [tag]: err instanceof Error ? err.message : '检测失败' }))
     } finally {
@@ -127,6 +129,7 @@ export default function UnlockPanel() {
         } else if (ev.type === 'complete') {
           setBatchRunning(false)
           setChecking({})
+          toast.success('批量检测完成')
         }
       },
       () => {
@@ -203,18 +206,12 @@ export default function UnlockPanel() {
       <PageHeader
         title="解锁检测"
         description="通过节点出口发送特定请求，检测 Netflix、Disney+、ChatGPT 解锁状态及原生 IP 纯净度"
-        icon={
-          <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 11V7a4 4 0 118 0m-4 8v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2z" />
-          </svg>
-        }
+        icon={<ShieldCheck className="h-5 w-5" />}
         actions={
           <>
             {batchRunning ? (
               <button className="btn btn-error btn-sm gap-2" onClick={stopBatch}>
-                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
-                </svg>
+                <X className="h-4 w-4" />
                 停止
               </button>
             ) : (
@@ -223,9 +220,7 @@ export default function UnlockPanel() {
                 onClick={runBatch}
                 disabled={loading || nodes.length === 0}
               >
-                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
-                </svg>
+                <Play className="h-4 w-4" />
                 全部检测
               </button>
             )}
@@ -234,9 +229,7 @@ export default function UnlockPanel() {
               onClick={() => void loadNodes()}
               disabled={loading}
             >
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-              </svg>
+              <RefreshCw className="h-4 w-4" />
               刷新节点
             </button>
           </>
@@ -298,12 +291,6 @@ export default function UnlockPanel() {
             ))}
           </div>
         </div>
-
-        {error && (
-          <div className="alert alert-error mb-4 py-2 text-sm">
-            <span>{error}</span>
-          </div>
-        )}
 
         {/* ---- Results table ---- */}
         <div className={`${surfaceClass} flex-1 min-h-0 flex flex-col`}>
@@ -437,7 +424,7 @@ function UnlockRow({
   const err = nodeError || result?.error
 
   return (
-    <tr className={`${rowTint} hover:bg-base-200/50 cursor-pointer transition-colors`} onClick={onClick}>
+    <tr className={cn("hover:bg-base-200/50 cursor-pointer transition-colors", rowTint)} onClick={onClick}>
       <td className="text-base-content/40 text-xs">
         {checking ? (
           <span className="loading loading-spinner loading-xs text-primary" />

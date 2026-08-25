@@ -1,4 +1,8 @@
 import React, { useState, useEffect, useCallback } from 'react'
+import { 
+  Activity, Cloud, Server, ShieldCheck, TerminalSquare, Settings, 
+  Menu, Hexagon, Palette, ChevronDown, Check, LogOut 
+} from 'lucide-react'
 import MonitorPanel from './components/MonitorPanel'
 import ManagePanel from './components/ManagePanel'
 import DebugPanel from './components/DebugPanel'
@@ -26,62 +30,37 @@ const MENU_ITEMS: { id: TabId; label: string; icon: React.ReactNode; desc: strin
     id: 'monitor',
     label: '节点监控',
     desc: '数据仪表盘',
-    icon: (
-      <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
-      </svg>
-    ),
+    icon: <Activity className="h-5 w-5" />,
   },
   {
     id: 'subscriptions',
     label: '订阅管理',
     desc: '订阅源与同步',
-    icon: (
-      <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
-      </svg>
-    ),
+    icon: <Cloud className="h-5 w-5" />,
   },
   {
     id: 'manage',
     label: '节点管理',
     desc: '操作与配置',
-    icon: (
-      <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 6h16M4 10h16M4 14h16M4 18h16" />
-      </svg>
-    ),
+    icon: <Server className="h-5 w-5" />,
   },
   {
     id: 'unlock',
     label: '解锁检测',
     desc: '流媒体/AI 鉴定',
-    icon: (
-      <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 11V7a4 4 0 118 0m-4 8v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2z" />
-      </svg>
-    ),
+    icon: <ShieldCheck className="h-5 w-5" />,
   },
   {
     id: 'debug',
     label: '调试面板',
     desc: '运行时信息',
-    icon: (
-      <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" />
-      </svg>
-    ),
+    icon: <TerminalSquare className="h-5 w-5" />,
   },
   {
     id: 'settings',
     label: '系统设置',
     desc: '系统运行配置',
-    icon: (
-      <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-      </svg>
-    ),
+    icon: <Settings className="h-5 w-5" />,
   },
 ]
 
@@ -226,18 +205,14 @@ function App() {
             onClick={() => setSidebarOpen(!sidebarOpen)}
             aria-label="toggle sidebar"
           >
-            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" className="inline-block w-5 h-5 stroke-current">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M4 6h16M4 12h16M4 18h16" />
-            </svg>
+            <Menu className="w-5 h-5" />
           </button>
         </div>
 
         {/* Logo Area */}
         <div className="flex-1 lg:flex-none lg:w-64 px-2 flex items-center gap-3.5 border-r-0 lg:border-r border-base-300/30">
           <div className="w-10 h-10 rounded-2xl bg-gradient-to-br from-primary/20 to-primary/5 flex items-center justify-center shadow-sm border border-primary/10">
-            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 text-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M13 10V3L4 14h7v7l9-11h-7z" />
-            </svg>
+            <Hexagon className="h-5 w-5 text-primary" />
           </div>
           <div>
             <div className="font-black text-lg text-base-content tracking-tight leading-none mb-1">
@@ -254,16 +229,12 @@ function App() {
           {/* Theme Selector */}
           <div className="dropdown dropdown-end">
             <div tabIndex={0} role="button" className="btn btn-ghost btn-sm h-9 px-3 gap-2 normal-case rounded-lg border border-base-300/50 hover:border-primary/30 hover:bg-primary/5 transition-all">
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 21a4 4 0 01-4-4V5a2 2 0 012-2h4a2 2 0 012 2v12a4 4 0 01-4 4zm0 0h12a2 2 0 002-2v-4a2 2 0 00-2-2h-2.343M11 7.343l1.657-1.657a2 2 0 012.828 0l2.829 2.829a2 2 0 010 2.828l-8.486 8.485M7 17h.01" />
-              </svg>
+              <Palette className="h-4 w-4 shrink-0" />
               <div className="hidden sm:flex items-center gap-1.5">
                 <span className="text-xs capitalize font-medium">{theme}</span>
                 <span className="badge badge-ghost badge-xs">{getThemeProfile(theme).tag}</span>
               </div>
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3 opacity-60" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7" />
-              </svg>
+              <ChevronDown className="h-3 w-3 opacity-60" />
             </div>
             <ul tabIndex={0} className="dropdown-content bg-base-200 border border-base-300/50 rounded-box shadow-2xl mt-2 p-2.5 w-80 max-h-96 overflow-y-auto z-[100] space-y-1">
               {ALL_THEMES.map((t) => {
@@ -307,9 +278,7 @@ function App() {
                         </div>
 
                         {isActive && (
-                          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 text-primary shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M5 13l4 4L19 7" />
-                          </svg>
+                          <Check className="h-4 w-4 text-primary shrink-0" strokeWidth={3} />
                         )}
                       </div>
                     </button>
@@ -326,9 +295,7 @@ function App() {
             onClick={handleLogout}
             title="退出登录"
           >
-            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
-            </svg>
+            <LogOut className="h-4 w-4" />
           </button>
         </div>
       </div>
