@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -14,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/oschwald/geoip2-golang"
+	"github.com/oschwald/geoip2-golang/v2"
 )
 
 // Region codes
@@ -495,21 +496,33 @@ func (l *Lookup) LookupIP(ipStr string) RegionInfo {
 	defer l.mu.RUnlock()
 
 	if l.db == nil {
-		return RegionInfo{Code: RegionOther, Country: "Unknown", ISOCode: ""}
+		return unknownRegionInfo()
 	}
 
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		return RegionInfo{Code: RegionOther, Country: "Unknown", ISOCode: ""}
+	ip, ok := parseLookupAddress(ipStr)
+	if !ok {
+		return unknownRegionInfo()
 	}
 
 	record, err := l.db.Country(ip)
 	if err != nil {
-		return RegionInfo{Code: RegionOther, Country: "Unknown", ISOCode: ""}
+		return unknownRegionInfo()
+	}
+	return regionInfoFromCountry(record)
+}
+
+func parseLookupAddress(ipStr string) (netip.Addr, bool) {
+	ip, err := netip.ParseAddr(ipStr)
+	return ip, err == nil
+}
+
+func regionInfoFromCountry(record *geoip2.Country) RegionInfo {
+	if record == nil || !record.HasData() || !record.Country.HasData() {
+		return unknownRegionInfo()
 	}
 
-	isoCode := record.Country.IsoCode
-	country := record.Country.Names["en"]
+	isoCode := record.Country.ISOCode
+	country := record.Country.Names.English
 	if country == "" {
 		country = isoCode
 	}
@@ -519,6 +532,10 @@ func (l *Lookup) LookupIP(ipStr string) RegionInfo {
 		Country: country,
 		ISOCode: isoCode,
 	}
+}
+
+func unknownRegionInfo() RegionInfo {
+	return RegionInfo{Code: RegionOther, Country: "Unknown", ISOCode: ""}
 }
 
 // LookupURI extracts server from URI and returns region info

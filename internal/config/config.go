@@ -22,7 +22,7 @@ import (
 	"easy_proxies/internal/nodecodec"
 
 	"github.com/tailscale/hujson"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // Config describes the high level settings for the proxy pool server.
