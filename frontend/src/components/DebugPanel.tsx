@@ -1,7 +1,9 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { fetchDebug, streamDebugLogs } from '../api/client'
 import type { DebugLogEvent, DebugNode, TimelineEvent } from '../types'
 import { controlClass, PageContent, PageHeader, PageLayout } from './ui/PageLayout'
+import { useQuery } from '@tanstack/react-query'
+import { Terminal, RefreshCw } from 'lucide-react'
 
 interface LogEntry {
   nodeTag: string
@@ -42,42 +44,37 @@ function LogMessage({ event }: { event: TimelineEvent }) {
 export default function DebugPanel() {
   const [nodes, setNodes] = useState<DebugNode[]>([])
   const [logs, setLogs] = useState<LogEntry[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState('')
   const [connected, setConnected] = useState(false)
   const [selectedNode, setSelectedNode] = useState('all')
 
-  const loadHistory = useCallback(async () => {
-    setLoading(true)
-    try {
-      setError('')
-      const data = await fetchDebug()
-      setNodes(data.nodes)
-      const history = data.nodes.flatMap((node) => (node.timeline ?? []).map((event) => ({
+  const { data: debugData, refetch: loadHistory, isFetching, error: queryError } = useQuery({
+    queryKey: ['debugHistory'],
+    queryFn: fetchDebug,
+    refetchOnWindowFocus: false
+  })
+
+  useEffect(() => {
+    if (debugData) {
+      setNodes(debugData.nodes)
+      const history = debugData.nodes.flatMap((node) => (node.timeline ?? []).map((event) => ({
         nodeTag: node.tag,
         nodeName: node.name || node.tag,
         event,
       })))
       setLogs((current) => mergeLogs(current, history))
-    } catch (err) {
-      setError(err instanceof Error ? err.message : '加载失败')
-    } finally {
-      setLoading(false)
     }
-  }, [])
+  }, [debugData])
 
   useEffect(() => {
-    const initialLoad = setTimeout(loadHistory, 0)
     const stream = streamDebugLogs((message: DebugLogEvent) => {
       const log = { nodeTag: message.node_tag, nodeName: message.node_name || message.node_tag, event: message.event }
       setLogs((current) => mergeLogs(current, [log]))
     }, setConnected)
-    return () => {
-      clearTimeout(initialLoad)
-      stream.abort()
-    }
-  }, [loadHistory])
+    return () => stream.abort()
+  }, [])
 
+  const error = (queryError as Error)?.message || ''
+  const loading = isFetching && logs.length === 0
   const visibleLogs = selectedNode === 'all' ? logs : logs.filter((log) => log.nodeTag === selectedNode)
 
   return (
@@ -86,14 +83,14 @@ export default function DebugPanel() {
         sticky={false}
         title="调试面板"
         description="实时查看所有节点的运行日志"
-        icon={<svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M8 9l3 3-3 3m5 0h3M5 4h14a2 2 0 012 2v12a2 2 0 01-2 2H5a2 2 0 01-2-2V6a2 2 0 012-2z" /></svg>}
+        icon={<Terminal className="h-5 w-5" />}
         actions={<>
             <select className={`select select-sm w-28 sm:w-44 lg:select-md ${controlClass}`} value={selectedNode} onChange={(event) => setSelectedNode(event.target.value)} aria-label="筛选日志节点">
               <option value="all">全部节点 ({nodes.length})</option>
               {nodes.map((node) => <option key={node.tag} value={node.tag}>{node.name || node.tag}</option>)}
             </select>
-            <button className="btn btn-primary btn-sm gap-2 lg:btn-md" onClick={() => void loadHistory()} disabled={loading} title="刷新历史日志" aria-label="刷新历史日志">
-              {loading ? <span className="loading loading-spinner loading-xs" /> : <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h5M20 20v-5h-5M5.5 15a7 7 0 0012 2M18.5 9a7 7 0 00-12-2" /></svg>}
+            <button className="btn btn-primary btn-sm gap-2 lg:btn-md" onClick={() => void loadHistory()} disabled={isFetching} title="刷新历史日志" aria-label="刷新历史日志">
+              {isFetching ? <span className="loading loading-spinner loading-xs" /> : <RefreshCw className="h-4 w-4" />}
               <span className="hidden sm:inline">刷新历史</span>
             </button>
           </>}
@@ -107,7 +104,7 @@ export default function DebugPanel() {
             <span>{visibleLogs.length} 条日志</span>
           </div>
           <div className="flex-1 overflow-auto p-4 font-mono text-xs leading-6 sm:text-sm">
-            {loading && logs.length === 0 ? <div className="flex h-full items-center justify-center"><span className="loading loading-spinner text-primary" /></div> : visibleLogs.length === 0 ? <div className="flex h-full items-center justify-center text-slate-500">{selectedNode === 'all' ? '暂无运行日志' : '该节点暂无运行日志'}</div> : visibleLogs.map((log) => (
+            {loading ? <div className="flex h-full items-center justify-center"><span className="loading loading-spinner text-primary" /></div> : visibleLogs.length === 0 ? <div className="flex h-full items-center justify-center text-slate-500">{selectedNode === 'all' ? '暂无运行日志' : '该节点暂无运行日志'}</div> : visibleLogs.map((log) => (
               <div key={logKey(log)} className="flex min-w-max gap-3 rounded px-1 hover:bg-white/5">
                 <span className="select-none text-slate-600">{formatLogTime(log.event.time)}</span>
                 <span className={log.event.success ? 'w-12 text-emerald-400' : 'w-12 text-red-400'}>{log.event.success ? 'INFO' : 'ERROR'}</span>

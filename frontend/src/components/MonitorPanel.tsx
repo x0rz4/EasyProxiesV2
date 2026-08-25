@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
-import type { NodeSnapshot, NodesResponse, ConfigNodeConfig, ConfigNodesResponse, TrafficStreamEvent } from '../types'
+import { useState, useEffect, useMemo, useRef } from 'react'
+import type { NodeSnapshot, ConfigNodeConfig, TrafficStreamEvent } from '../types'
 import { fetchNodes, fetchConfigNodes, streamTraffic } from '../api/client'
 import { formatBytes, formatSpeed } from '../utils/format'
 import DonutChart from './charts/DonutChart'
@@ -8,6 +8,10 @@ import LatencyRanking from './charts/LatencyRanking'
 import TrafficRanking from './charts/TrafficRanking'
 import RegionCards from './charts/RegionCards'
 import { PageContent, PageHeader, PageLayout, surfaceClass } from './ui/PageLayout'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  Activity, RefreshCw, AlertTriangle, Server, Heart, Zap, Link2, ArrowUpRight, ArrowDownRight, CloudUpload, CloudDownload
+} from 'lucide-react'
 
 function latencyColor(ms: number): string {
   if (ms < 0) return 'text-base-content/50'
@@ -19,12 +23,23 @@ function latencyColor(ms: number): string {
 type AutoRefreshInterval = 0 | 5 | 10 | 30 | 60
 
 export default function MonitorPanel() {
-  const [data, setData] = useState<NodesResponse | null>(null)
-  const [configData, setConfigData] = useState<ConfigNodesResponse | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState('')
+  const queryClient = useQueryClient()
   const [autoRefresh, setAutoRefresh] = useState<AutoRefreshInterval>(5)
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  
+  const { data, refetch: refetchNodes, error: monitorError, isLoading: loadingNodes, isRefetching } = useQuery({
+    queryKey: ['nodes'],
+    queryFn: fetchNodes,
+    refetchInterval: autoRefresh > 0 ? autoRefresh * 1000 : false
+  })
+  
+  const { data: configData, error: configError } = useQuery({
+    queryKey: ['configNodes'],
+    queryFn: () => fetchConfigNodes().catch(() => null)
+  })
+
+  const loading = loadingNodes && !data
+  const isRefreshing = isRefetching
+  const error = (monitorError as Error)?.message || (configError as Error)?.message || ''
   const trafficAbortRef = useRef<AbortController | null>(null)
   const [trafficRealtime, setTrafficRealtime] = useState<{
     connected: boolean
@@ -38,49 +53,9 @@ export default function MonitorPanel() {
     sampledAt: '',
   })
 
-  const loadData = useCallback(async () => {
-    try {
-      setError('')
-      const [monitorRes, configRes] = await Promise.all([
-        fetchNodes(),
-        fetchConfigNodes().catch(() => null),
-      ])
-
-      setData(monitorRes)
-      if (configRes) setConfigData(configRes)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : '加载失败')
-    } finally {
-      setLoading(false)
-    }
-  }, [])
-
-  useEffect(() => {
-    const initialLoad = setTimeout(loadData, 0)
-    return () => clearTimeout(initialLoad)
-  }, [loadData])
-
-  // Auto-refresh timer
-  useEffect(() => {
-    if (timerRef.current) {
-      clearInterval(timerRef.current)
-      timerRef.current = null
-    }
-    if (autoRefresh > 0) {
-      timerRef.current = setInterval(() => {
-        loadData()
-      }, autoRefresh * 1000)
-    }
-    return () => {
-      if (timerRef.current) {
-        clearInterval(timerRef.current)
-      }
-    }
-  }, [autoRefresh, loadData])
-
   const handleRefresh = async () => {
-    setLoading(true)
-    await loadData()
+    await refetchNodes()
+    await queryClient.invalidateQueries({ queryKey: ['configNodes'] })
   }
 
   // Real-time speed stream (SSE): reconnect automatically on disconnect.
@@ -295,7 +270,7 @@ export default function MonitorPanel() {
       <PageHeader
         title="节点监控"
         description="实时数据仪表盘 · 可视化节点健康与流量状况"
-        icon={<svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>}
+        icon={<Activity className="h-5 w-5" />}
         actions={<>
             {/* Auto refresh selector */}
             <div className="flex items-center gap-2 bg-base-200/50 px-2 py-1 lg:py-1.5 rounded-lg border border-base-300/50 transition-colors">
@@ -319,11 +294,11 @@ export default function MonitorPanel() {
                 <option value={60}>每 60 秒</option>
               </select>
             </div>
-            <button className="btn btn-primary btn-sm gap-2 shadow-sm lg:btn-md" onClick={handleRefresh} disabled={loading} title="刷新监控数据" aria-label="刷新监控数据">
-              {loading ? (
+            <button className="btn btn-primary btn-sm gap-2 shadow-sm lg:btn-md" onClick={() => void handleRefresh()} disabled={loading || isRefreshing} title="刷新监控数据" aria-label="刷新监控数据">
+              {isRefreshing || loading ? (
                 <span className="loading loading-spinner loading-sm"></span>
               ) : (
-                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
+                <RefreshCw className="h-4 w-4" />
               )}
               <span className="hidden sm:inline">刷新</span>
             </button>
@@ -334,7 +309,7 @@ export default function MonitorPanel() {
         {/* Error */}
         {error && (
         <div role="alert" className="alert alert-error alert-soft">
-          <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+          <AlertTriangle className="h-5 w-5 shrink-0" />
           <span>{error}</span>
         </div>
       )}
@@ -346,7 +321,7 @@ export default function MonitorPanel() {
           <div className="absolute -right-4 -top-4 w-24 h-24 bg-primary/5 rounded-full blur-2xl group-hover:bg-primary/10 transition-colors"></div>
           <div className="flex items-center gap-3 mb-2 relative z-10">
             <div className="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center text-primary">
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2" /></svg>
+              <Server className="h-4 w-4" />
             </div>
             <div className="text-sm font-medium text-base-content/60">总节点</div>
           </div>
@@ -365,7 +340,7 @@ export default function MonitorPanel() {
           <div className="absolute -right-4 -top-4 w-24 h-24 bg-success/5 rounded-full blur-2xl group-hover:bg-success/10 transition-colors"></div>
           <div className="flex items-center gap-3 mb-2 relative z-10">
             <div className="w-8 h-8 rounded-lg bg-success/10 flex items-center justify-center text-success">
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+              <Heart className="h-4 w-4" />
             </div>
             <div className="text-sm font-medium text-base-content/60">健康率</div>
           </div>
@@ -386,7 +361,7 @@ export default function MonitorPanel() {
           <div className="absolute -right-4 -top-4 w-24 h-24 bg-warning/5 rounded-full blur-2xl group-hover:bg-warning/10 transition-colors"></div>
           <div className="flex items-center gap-3 mb-2 relative z-10">
             <div className="w-8 h-8 rounded-lg bg-warning/10 flex items-center justify-center text-warning">
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+              <Zap className="h-4 w-4" />
             </div>
             <div className="text-sm font-medium text-base-content/60">平均延迟</div>
           </div>
@@ -403,7 +378,7 @@ export default function MonitorPanel() {
           <div className="absolute -right-4 -top-4 w-24 h-24 bg-info/5 rounded-full blur-2xl group-hover:bg-info/10 transition-colors"></div>
           <div className="flex items-center gap-3 mb-2 relative z-10">
             <div className="w-8 h-8 rounded-lg bg-info/10 flex items-center justify-center text-info">
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" /></svg>
+              <Link2 className="h-4 w-4" />
             </div>
             <div className="text-sm font-medium text-base-content/60">活跃连接</div>
           </div>
@@ -418,7 +393,7 @@ export default function MonitorPanel() {
           <div className="absolute -right-4 -top-4 w-24 h-24 bg-blue-500/5 rounded-full blur-2xl group-hover:bg-blue-500/10 transition-colors"></div>
           <div className="flex items-center gap-3 mb-2 relative z-10">
             <div className="w-8 h-8 rounded-lg bg-blue-500/10 flex items-center justify-center text-blue-500">
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 11l5-5m0 0l5 5m-5-5v12" /></svg>
+              <ArrowUpRight className="h-4 w-4" />
             </div>
             <div className="text-sm font-medium text-base-content/60">上传速度</div>
           </div>
@@ -433,7 +408,7 @@ export default function MonitorPanel() {
           <div className="absolute -right-4 -top-4 w-24 h-24 bg-emerald-500/5 rounded-full blur-2xl group-hover:bg-emerald-500/10 transition-colors"></div>
           <div className="flex items-center gap-3 mb-2 relative z-10">
             <div className="w-8 h-8 rounded-lg bg-emerald-500/10 flex items-center justify-center text-emerald-500">
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17 13l-5 5m0 0l-5-5m5 5V6" /></svg>
+              <ArrowDownRight className="h-4 w-4" />
             </div>
             <div className="text-sm font-medium text-base-content/60">下载速度</div>
           </div>
@@ -448,7 +423,7 @@ export default function MonitorPanel() {
           <div className="absolute -right-4 -top-4 w-24 h-24 bg-blue-500/5 rounded-full blur-2xl group-hover:bg-blue-500/10 transition-colors"></div>
           <div className="flex items-center gap-3 mb-2 relative z-10">
             <div className="w-8 h-8 rounded-lg bg-blue-500/10 flex items-center justify-center text-blue-500">
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z" /></svg>
+              <CloudUpload className="h-4 w-4" />
             </div>
             <div className="text-sm font-medium text-base-content/60">总上传</div>
           </div>
@@ -461,7 +436,7 @@ export default function MonitorPanel() {
           <div className="absolute -right-4 -top-4 w-24 h-24 bg-emerald-500/5 rounded-full blur-2xl group-hover:bg-emerald-500/10 transition-colors"></div>
           <div className="flex items-center gap-3 mb-2 relative z-10">
             <div className="w-8 h-8 rounded-lg bg-emerald-500/10 flex items-center justify-center text-emerald-500">
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z" /></svg>
+              <CloudDownload className="h-4 w-4" />
             </div>
             <div className="text-sm font-medium text-base-content/60">总下载</div>
           </div>

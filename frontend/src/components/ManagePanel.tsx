@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback, useMemo } from 'react'
-import type { ConfigNodeConfig, ConfigNodePayload, NodeSnapshot, NodesResponse, Subscription } from '../types'
+import { useState, useMemo } from 'react'
+import type { ConfigNodeConfig, ConfigNodePayload, NodeSnapshot } from '../types'
 import {
   fetchConfigNodes, createConfigNode, updateConfigNode, deleteConfigNode,
   toggleConfigNode, batchToggleConfigNodes, batchDeleteConfigNodes, triggerReload,
@@ -8,6 +8,14 @@ import {
 } from '../api/client'
 import { regionFlag } from '../utils/region'
 import { PageContent, PageHeader, PageLayout } from './ui/PageLayout'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { toast } from 'sonner'
+import { cn } from '../utils/cn'
+import {
+  ArrowDown, ArrowUp, ArrowUpDown, Ban, Server, SlidersHorizontal, ChevronDown,
+  Download, Upload, RefreshCw, Plus, Search, Activity, FolderX, ShieldCheck,
+  Check, Edit2, Trash2, FileUp, AlertTriangle
+} from 'lucide-react'
 
 // ---- Merged node type ----
 interface MergedNode extends ConfigNodeConfig {
@@ -104,37 +112,27 @@ function typeLabel(t: string): string {
 
 function SortIcon({ active, dir }: { active: boolean; dir: SortDir }) {
   if (!active) {
-    return (
-      <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3 opacity-30 ml-0.5 inline" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 16V4m0 0L3 8m4-4l4 4m6 0v12m0 0l4-4m-4 4l-4-4" />
-      </svg>
-    )
+    return <ArrowUpDown className="h-3 w-3 opacity-30 ml-0.5 inline" />
   }
-  return dir === 'asc' ? (
-    <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3 opacity-70 ml-0.5 inline" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 15l7-7 7 7" />
-    </svg>
-  ) : (
-    <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3 opacity-70 ml-0.5 inline" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7" />
-    </svg>
-  )
+  return dir === 'asc' 
+    ? <ArrowUp className="h-3 w-3 opacity-70 ml-0.5 inline" />
+    : <ArrowDown className="h-3 w-3 opacity-70 ml-0.5 inline" />
 }
 
 function StatusBadge({ status }: { status: MergedNode['runtimeStatus'] }) {
   switch (status) {
     case 'normal':
-      return <span className="badge badge-success badge-sm border-none bg-success/15 text-success font-medium flex gap-1 items-center px-2 py-3.5"><div className="w-1.5 h-1.5 rounded-full bg-success"></div>正常</span>
+      return <span className={cn("badge badge-success badge-sm border-none bg-success/15 text-success font-medium flex gap-1 items-center px-2 py-3.5")}><div className="w-1.5 h-1.5 rounded-full bg-success"></div>正常</span>
     case 'unavailable':
-      return <span className="badge badge-error badge-sm border-none bg-error/15 text-error font-medium flex gap-1 items-center px-2 py-3.5"><div className="w-1.5 h-1.5 rounded-full bg-error"></div>不可用</span>
+      return <span className={cn("badge badge-error badge-sm border-none bg-error/15 text-error font-medium flex gap-1 items-center px-2 py-3.5")}><div className="w-1.5 h-1.5 rounded-full bg-error"></div>不可用</span>
     case 'blacklisted':
-      return <span className="badge badge-error badge-sm border-none bg-error/30 text-error font-bold flex gap-1 items-center px-2 py-3.5"><svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" /></svg>黑名单</span>
+      return <span className={cn("badge badge-error badge-sm border-none bg-error/30 text-error font-bold flex gap-1 items-center px-2 py-3.5")}><Ban className="h-3 w-3" />黑名单</span>
     case 'pending':
-      return <span className="badge badge-warning badge-sm border-none bg-warning/15 text-warning-content font-medium flex gap-1 items-center px-2 py-3.5"><div className="w-1.5 h-1.5 rounded-full bg-warning animate-pulse"></div>待检查</span>
+      return <span className={cn("badge badge-warning badge-sm border-none bg-warning/15 text-warning-content font-medium flex gap-1 items-center px-2 py-3.5")}><div className="w-1.5 h-1.5 rounded-full bg-warning animate-pulse"></div>待检查</span>
     case 'disabled':
-      return <span className="badge badge-ghost badge-sm border-none bg-base-300/50 text-base-content/50 font-medium px-2 py-3.5">已禁用</span>
+      return <span className={cn("badge badge-ghost badge-sm border-none bg-base-300/50 text-base-content/50 font-medium px-2 py-3.5")}>已禁用</span>
     default:
-      return <span className="badge badge-ghost badge-sm border-none px-2 py-3.5">未知</span>
+      return <span className={cn("badge badge-ghost badge-sm border-none px-2 py-3.5")}>未知</span>
   }
 }
 
@@ -149,12 +147,17 @@ const emptyPayload: ConfigNodePayload = {
 // ---- Component ----
 
 export default function ManagePanel() {
-  const [configNodes, setConfigNodes] = useState<ConfigNodeConfig[]>([])
-  const [monitorData, setMonitorData] = useState<NodesResponse | null>(null)
-  const [subscriptions, setSubscriptions] = useState<Subscription[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState('')
-  const [success, setSuccess] = useState('')
+  const queryClient = useQueryClient()
+
+  const { data: configRes, isLoading: configLoading } = useQuery({ queryKey: ['configNodes'], queryFn: () => fetchConfigNodes() })
+  const { data: monitorRes, isLoading: monitorLoading } = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes().catch(() => null) })
+  const { data: subRes, isLoading: subLoading } = useQuery({ queryKey: ['subscriptions'], queryFn: listSubscriptions })
+
+  const configNodes = configRes?.nodes || []
+  const monitorData = monitorRes
+  const subscriptions = subRes?.subscriptions || []
+  const loading = configLoading || monitorLoading || subLoading
+
   const [needReload, setNeedReload] = useState(false)
 
   // Modal state
@@ -199,38 +202,6 @@ export default function ManagePanel() {
   const [importError, setImportError] = useState('')
   const [importResult, setImportResult] = useState<{ message: string; imported: number; errors?: string[] } | null>(null)
 
-  // ---- Data loading ----
-
-  const loadData = useCallback(async () => {
-    try {
-      setError('')
-      const [configRes, monitorRes, subscriptionsRes] = await Promise.all([
-        fetchConfigNodes(),
-        fetchNodes().catch(() => null), // monitor data is optional
-        listSubscriptions(),
-      ])
-      setConfigNodes(configRes.nodes || [])
-      setSubscriptions(subscriptionsRes.subscriptions || [])
-      if (monitorRes) setMonitorData(monitorRes)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : '加载节点失败')
-    } finally {
-      setLoading(false)
-    }
-  }, [])
-
-  useEffect(() => {
-    const timer = setTimeout(() => void loadData(), 0)
-    return () => clearTimeout(timer)
-  }, [loadData])
-
-  useEffect(() => {
-    if (success) {
-      const timer = setTimeout(() => setSuccess(''), 5000)
-      return () => clearTimeout(timer)
-    }
-  }, [success])
-
   // ---- Merge config + monitor data ----
 
   const mergedNodes = useMemo((): MergedNode[] => {
@@ -242,7 +213,7 @@ export default function ManagePanel() {
       snapByName.set(s.name, s)
     }
 
-    return configNodes.map((cfg): MergedNode => {
+    return configNodes.map((cfg: ConfigNodeConfig): MergedNode => {
       const snap = snapByURI.get(cfg.uri) || snapByName.get(cfg.name)
 
       if (cfg.disabled) {
@@ -410,14 +381,14 @@ export default function ManagePanel() {
     try {
       if (editingNode) {
         const res = await updateConfigNode(editingNode, form)
-        setSuccess(res.message || '节点已更新')
+        toast.success(res.message || '节点已更新')
       } else {
         const res = await createConfigNode(form)
-        setSuccess(res.message || '节点已添加')
+        toast.success(res.message || '节点已添加')
       }
       setNeedReload(true)
       setModalOpen(false)
-      await loadData()
+      queryClient.invalidateQueries({ queryKey: ['configNodes'] })
     } catch (err) {
       setFormError(err instanceof Error ? err.message : '操作失败')
     } finally {
@@ -430,12 +401,12 @@ export default function ManagePanel() {
     setDeleting(true)
     try {
       const res = await deleteConfigNode(deleteTarget)
-      setSuccess(res.message || '节点已删除')
+      toast.success(res.message || '节点已删除')
       setNeedReload(true)
       setDeleteTarget(null)
-      await loadData()
+      queryClient.invalidateQueries({ queryKey: ['configNodes'] })
     } catch (err) {
-      setError(err instanceof Error ? err.message : '删除失败')
+      toast.error(err instanceof Error ? err.message : '删除失败')
     } finally {
       setDeleting(false)
     }
@@ -446,10 +417,10 @@ export default function ManagePanel() {
     setToggling(node.name)
     try {
       const res = await toggleConfigNode(node.name, newEnabled)
-      setSuccess(res.message || (newEnabled ? '节点已启用' : '节点已禁用'))
-      await loadData()
+      toast.success(res.message || (newEnabled ? '节点已启用' : '节点已禁用'))
+      queryClient.invalidateQueries({ queryKey: ['configNodes'] })
     } catch (err) {
-      setError(err instanceof Error ? err.message : '操作失败')
+      toast.error(err instanceof Error ? err.message : '操作失败')
     } finally {
       setToggling(null)
     }
@@ -459,9 +430,9 @@ export default function ManagePanel() {
     setProbingTag(tag)
     try {
       await probeNode(tag)
-      await loadData()
+      queryClient.invalidateQueries({ queryKey: ['nodes'] })
     } catch (err) {
-      setError(err instanceof Error ? err.message : '探测失败')
+      toast.error(err instanceof Error ? err.message : '探测失败')
     } finally {
       setProbingTag(null)
     }
@@ -470,10 +441,10 @@ export default function ManagePanel() {
   const handleRelease = async (tag: string) => {
     try {
       await releaseNode(tag)
-      setSuccess('已解除黑名单')
-      await loadData()
+      toast.success('已解除黑名单')
+      queryClient.invalidateQueries({ queryKey: ['nodes'] })
     } catch (err) {
-      setError(err instanceof Error ? err.message : '解除失败')
+      toast.error(err instanceof Error ? err.message : '解除失败')
     }
   }
 
@@ -501,11 +472,11 @@ export default function ManagePanel() {
     setBatchProcessing(true)
     try {
       const res = await batchToggleConfigNodes(visibleSelectedNames, enabled)
-      setSuccess(res.message || '批量操作完成')
+      toast.success(res.message || '批量操作完成')
       setSelectedNodes(new Set())
-      await loadData()
+      queryClient.invalidateQueries({ queryKey: ['configNodes'] })
     } catch (err) {
-      setError(err instanceof Error ? err.message : '批量操作失败')
+      toast.error(err instanceof Error ? err.message : '批量操作失败')
     } finally {
       setBatchProcessing(false)
     }
@@ -514,7 +485,7 @@ export default function ManagePanel() {
   const handleBatchProbe = async () => {
     const nodesToProbe = sortedNodes.filter(n => selectedNodes.has(n.name) && !n.disabled && n.tag)
     if (nodesToProbe.length === 0) {
-      setError('所选节点中没有可探测的节点（已禁用或无运行时标识的节点将被跳过）')
+      toast.error('所选节点中没有可探测的节点（已禁用或无运行时标识的节点将被跳过）')
       return
     }
 
@@ -545,8 +516,8 @@ export default function ManagePanel() {
 
     setBatchProbeProgress(null)
     setBatchProcessing(false)
-    setSuccess(`批量探测完成：${successCount} 成功，${failCount} 失败`)
-    await loadData()
+    toast.success(`批量探测完成：${successCount} 成功，${failCount} 失败`)
+    queryClient.invalidateQueries({ queryKey: ['nodes'] })
   }
 
   const handleBatchDelete = async () => {
@@ -555,11 +526,11 @@ export default function ManagePanel() {
     setBatchDeleteConfirm(false)
     try {
       const res = await batchDeleteConfigNodes(visibleSelectedNames)
-      setSuccess(res.message || '批量删除完成')
+      toast.success(res.message || '批量删除完成')
       setSelectedNodes(new Set())
-      await loadData()
+      queryClient.invalidateQueries({ queryKey: ['configNodes'] })
     } catch (err) {
-      setError(err instanceof Error ? err.message : '批量删除失败')
+      toast.error(err instanceof Error ? err.message : '批量删除失败')
     } finally {
       setBatchProcessing(false)
     }
@@ -596,8 +567,8 @@ export default function ManagePanel() {
       setImportResult(res)
       if (res.imported > 0) {
         setNeedReload(true)
-        setSuccess(res.message)
-        await loadData()
+        toast.success(res.message)
+        queryClient.invalidateQueries({ queryKey: ['configNodes'] })
       }
     } catch (err) {
       setImportError(err instanceof Error ? err.message : '导入失败')
@@ -609,7 +580,7 @@ export default function ManagePanel() {
   const handleExport = async () => {
     try {
       const text = await exportProxies()
-      if (!text.trim()) { setError('没有可导出的节点'); return }
+      if (!text.trim()) { toast.error('没有可导出的节点'); return }
       const blob = new Blob([text], { type: 'text/plain' })
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
@@ -617,21 +588,21 @@ export default function ManagePanel() {
       a.download = 'nodes_export.txt'
       a.click()
       URL.revokeObjectURL(url)
-      setSuccess('节点已导出')
+      toast.success('节点已导出')
     } catch (err) {
-      setError(err instanceof Error ? err.message : '导出失败')
+      toast.error(err instanceof Error ? err.message : '导出失败')
     }
   }
 
   const handleReload = async () => {
     try {
-      setError('')
       const res = await triggerReload()
-      setSuccess(res.message || '重载成功')
+      toast.success(res.message || '重载成功')
       setNeedReload(false)
-      await loadData()
+      queryClient.invalidateQueries({ queryKey: ['configNodes'] })
+      queryClient.invalidateQueries({ queryKey: ['nodes'] })
     } catch (err) {
-      setError(err instanceof Error ? err.message : '重载失败')
+      toast.error(err instanceof Error ? err.message : '重载失败')
     }
   }
 
@@ -673,29 +644,27 @@ export default function ManagePanel() {
               {blacklistedCount > 0 && <span className="badge badge-error badge-xs border-none bg-error/15 text-error">黑名单 {blacklistedCount}</span>}
               {disabledCount > 0 && <span className="badge badge-ghost badge-xs bg-base-200 text-base-content/50">禁用 {disabledCount}</span>}
             </div>}
-        icon={<svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M4 6h16M4 10h16M4 14h16M4 18h16" />
-                </svg>}
+        icon={<Server className="h-5 w-5" />}
         actions={<>
             <div className="dropdown dropdown-end">
               <div tabIndex={0} role="button" className="btn btn-ghost btn-sm gap-2 border border-base-300 shadow-sm lg:btn-md" title="管理操作" aria-label="管理操作">
-                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 6h16M4 12h16M4 18h16" /></svg>
+                <SlidersHorizontal className="h-4 w-4" />
                 <span className="hidden sm:inline">管理操作</span>
-                <svg xmlns="http://www.w3.org/2000/svg" className="hidden h-4 w-4 opacity-50 sm:block" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7" /></svg>
+                <ChevronDown className="hidden h-4 w-4 opacity-50 sm:block" />
               </div>
               <ul tabIndex={0} className="dropdown-content menu bg-base-100 border border-base-200 rounded-xl z-20 w-48 p-2 shadow-xl mt-2">
-                <li><a onClick={openImportModal} className="hover:bg-primary/10 hover:text-primary gap-3"><svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg> 导入节点配置</a></li>
-                <li><a onClick={handleExport} className="hover:bg-primary/10 hover:text-primary gap-3"><svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg> 导出所有节点</a></li>
+                <li><a onClick={openImportModal} className="hover:bg-primary/10 hover:text-primary gap-3"><Download className="h-4 w-4" /> 导入节点配置</a></li>
+                <li><a onClick={handleExport} className="hover:bg-primary/10 hover:text-primary gap-3"><Upload className="h-4 w-4" /> 导出所有节点</a></li>
               </ul>
             </div>
             {needReload && (
               <button className="btn btn-warning btn-sm gap-2 shadow-sm animate-pulse lg:btn-md" onClick={handleReload} title="重载配置" aria-label="重载配置">
-                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
+                <RefreshCw className="h-4 w-4" />
                 <span className="hidden sm:inline">重载生效</span>
               </button>
             )}
             <button className="btn btn-primary btn-sm gap-2 shadow-sm lg:btn-md" onClick={openCreateModal} title="添加节点" aria-label="添加节点">
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M12 4v16m8-8H4" /></svg>
+              <Plus className="h-4 w-4" />
               <span className="hidden sm:inline">添加节点</span>
             </button>
           </>}
@@ -703,22 +672,9 @@ export default function ManagePanel() {
 
       <PageContent>
         {/* Alerts */}
-        {error && (
-        <div role="alert" className="alert alert-error alert-soft text-sm">
-          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-          <span>{error}</span>
-          <button className="btn btn-ghost btn-xs" onClick={() => setError('')}>✕</button>
-        </div>
-      )}
-      {success && (
-        <div role="alert" className="alert alert-success alert-soft text-sm">
-          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-          <span>{success}</span>
-        </div>
-      )}
       {needReload && (
         <div role="alert" className="alert alert-warning alert-soft text-sm">
-          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z" /></svg>
+          <AlertTriangle className="h-4 w-4 shrink-0" />
           <span>配置已变更，请点击「重载配置」使其生效</span>
         </div>
       )}
@@ -728,7 +684,7 @@ export default function ManagePanel() {
         <div className="flex flex-col lg:flex-row gap-4 items-center">
           <div className="relative w-full lg:w-80 shrink-0">
             <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-base-content/40">
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
+              <Search className="h-5 w-5" />
             </div>
             <input
               type="text"
@@ -794,7 +750,7 @@ export default function ManagePanel() {
               >
                 {batchProbeProgress
                   ? <><span className="loading loading-spinner loading-xs"></span> {batchProbeProgress.current}/{batchProbeProgress.total}</>
-                  : <><svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg> 批量探测</>}
+                  : <><Activity className="h-4 w-4" /> 批量探测</>}
               </button>
               <div className="w-px h-6 bg-base-300 mx-1 self-center"></div>
               <button
@@ -882,9 +838,7 @@ export default function ManagePanel() {
                   <td colSpan={8} className="h-[300px] p-0">
                     <div className="flex flex-col items-center justify-center h-full w-full opacity-60">
                       <div className="w-16 h-16 bg-base-200 rounded-full flex items-center justify-center mb-4">
-                        <svg xmlns="http://www.w3.org/2000/svg" className="h-8 w-8 text-base-content/40" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2.586a1 1 0 00-.707.293l-2.414 2.414a1 1 0 01-.707.293h-3.172a1 1 0 01-.707-.293l-2.414-2.414A1 1 0 006.586 13H4" />
-                        </svg>
+                        <FolderX className="h-8 w-8 text-base-content/40" />
                       </div>
                       <p className="text-base font-medium text-base-content">
                         {filter || statusFilter || regionFilter || sourceFilter || typeFilter || subscriptionFilter !== 'all'
@@ -957,7 +911,7 @@ export default function ManagePanel() {
                           >
                             {probingTag === node.tag
                               ? <span className="loading loading-spinner loading-xs"></span>
-                              : <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>}
+                              : <Activity className="h-4 w-4" />}
                           </button>
                         )}
                         {/* Release from blacklist */}
@@ -967,7 +921,7 @@ export default function ManagePanel() {
                             onClick={() => handleRelease(node.tag!)}
                             title="解除黑名单"
                           >
-                            <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 11V7a4 4 0 118 0m-4 8v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2z" /></svg>
+                            <ShieldCheck className="h-4 w-4" />
                           </button>
                         )}
                         {/* Toggle enable/disable */}
@@ -980,8 +934,8 @@ export default function ManagePanel() {
                           {toggling === node.name
                             ? <span className="loading loading-spinner loading-xs"></span>
                             : node.disabled
-                                ? <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7" /></svg>
-                                : <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" /></svg>
+                                ? <Check className="h-4 w-4" />
+                                : <Ban className="h-4 w-4" />
                           }
                         </button>
                         {/* Edit */}
@@ -990,7 +944,7 @@ export default function ManagePanel() {
                           onClick={() => openEditModal(node)}
                           title="编辑节点配置"
                         >
-                          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" /></svg>
+                          <Edit2 className="h-4 w-4" />
                         </button>
                         {/* Delete */}
                         <button
@@ -998,7 +952,7 @@ export default function ManagePanel() {
                           onClick={() => setDeleteTarget(node.name)}
                           title="删除节点"
                         >
-                          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                          <Trash2 className="h-4 w-4" />
                         </button>
                       </div>
                     </td>
@@ -1116,7 +1070,7 @@ export default function ManagePanel() {
             </p>
             <div className="mb-3">
               <label className="btn btn-soft btn-sm">
-                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" /></svg>
+                <FileUp className="h-4 w-4" />
                 选择文件
                 <input type="file" accept=".txt,.conf,.list,.yaml,.yml" className="hidden" onChange={handleFileImport} />
               </label>

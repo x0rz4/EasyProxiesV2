@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import type { SettingsData, GeoipStatus } from '../types'
+import type { SettingsData } from '../types'
 import {
   fetchSettings,
   triggerReload,
@@ -9,6 +9,11 @@ import {
   updateGeoipDatabase,
 } from '../api/client'
 import { PageContent, PageHeader, PageLayout } from './ui/PageLayout'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { toast } from 'sonner'
+import {
+  Settings, RefreshCw, Save, Check, AlertTriangle, Globe, Wifi, Network, Layers, Monitor, Map as MapIcon, RefreshCcw
+} from 'lucide-react'
 
 const settingResultLabels: Record<string, string> = {
   runtime_config: '运行时配置',
@@ -83,56 +88,41 @@ const defaultSettings: SettingsData = {
 }
 
 export default function SettingsPanel() {
+  const queryClient = useQueryClient()
+  const { data: fetchedSettings, isLoading: loading } = useQuery({ queryKey: ['settings'], queryFn: fetchSettings })
+
   const [settings, setSettings] = useState<SettingsData>(defaultSettings)
   const [savedSettings, setSavedSettings] = useState<SettingsData>(defaultSettings)
-  const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [reloading, setReloading] = useState(false)
-  const [error, setError] = useState('')
   const [reloadWarning, setReloadWarning] = useState('')
-  const [success, setSuccess] = useState('')
   const [needReload, setNeedReload] = useState(false)
   const [needRestart, setNeedRestart] = useState(false)
   const [applied, setApplied] = useState<string[]>([])
   const [pending, setPending] = useState<string[]>([])
   const [isDirty, setIsDirty] = useState(false)
 
+  useEffect(() => {
+    if (fetchedSettings) {
+      const merged = { ...defaultSettings, ...fetchedSettings }
+      // Only set initial state if not dirty to avoid overriding user's unsaved changes
+      setSettings(prev => isDirty ? prev : merged)
+      setSavedSettings(merged)
+    }
+  }, [fetchedSettings, isDirty])
+
   // GeoIP database management state
-  const [geoipStatus, setGeoipStatus] = useState<GeoipStatus | null>(null)
+  const { data: geoipStatus, refetch: refetchGeoip } = useQuery({ queryKey: ['geoipStatus'], queryFn: fetchGeoipStatus })
   const [geoipLoading, setGeoipLoading] = useState(false)
-  const [geoipError, setGeoipError] = useState('')
-  const [geoipSuccess, setGeoipSuccess] = useState('')
-
-  const loadGeoipStatus = async () => {
-    try {
-      const status = await fetchGeoipStatus()
-      setGeoipStatus(status)
-    } catch (err) {
-      setGeoipError(err instanceof Error ? err.message : '获取 IP 库状态失败')
-    }
-  }
-
-  useEffect(() => {
-    void loadGeoipStatus()
-  }, [])
-
-  useEffect(() => {
-    if (geoipSuccess) {
-      const timer = setTimeout(() => setGeoipSuccess(''), 5000)
-      return () => clearTimeout(timer)
-    }
-  }, [geoipSuccess])
 
   const handleGeoipDownload = async () => {
     setGeoipLoading(true)
-    setGeoipError('')
-    setGeoipSuccess('')
     try {
       const res = await downloadGeoipDatabase()
-      setGeoipStatus(res)
-      setGeoipSuccess(res.message || 'IP 库下载完成')
+      toast.success(res.message || 'IP 库下载完成')
+      refetchGeoip()
     } catch (err) {
-      setGeoipError(err instanceof Error ? err.message : '下载 IP 库失败')
+      toast.error(err instanceof Error ? err.message : '下载 IP 库失败')
     } finally {
       setGeoipLoading(false)
     }
@@ -140,61 +130,32 @@ export default function SettingsPanel() {
 
   const handleGeoipUpdate = async () => {
     setGeoipLoading(true)
-    setGeoipError('')
-    setGeoipSuccess('')
     try {
       const res = await updateGeoipDatabase()
-      setGeoipStatus(res)
-      setGeoipSuccess(res.message || 'IP 库更新完成')
+      toast.success(res.message || 'IP 库更新完成')
       if (res.reload_hint) {
         setNeedReload(true)
         if (!pending.includes('runtime_config')) {
           setPending([...pending, 'runtime_config'])
         }
       }
+      refetchGeoip()
     } catch (err) {
-      setGeoipError(err instanceof Error ? err.message : '更新 IP 库失败')
+      toast.error(err instanceof Error ? err.message : '更新 IP 库失败')
     } finally {
       setGeoipLoading(false)
     }
   }
 
-  useEffect(() => {
-    const load = async () => {
-      try {
-        const settingsData = await fetchSettings()
-        const subscriptions = settingsData.subscriptions || []
-        const merged = { ...defaultSettings, ...settingsData, subscriptions }
-        setSettings(merged)
-        setSavedSettings(merged)
-        setIsDirty(false)
-      } catch (err) {
-        setError(err instanceof Error ? err.message : '加载设置失败')
-      } finally {
-        setLoading(false)
-      }
-    }
-    load()
-  }, [])
-
-  useEffect(() => {
-    if (success) {
-      const timer = setTimeout(() => setSuccess(''), 5000)
-      return () => clearTimeout(timer)
-    }
-  }, [success])
-
   const handleSave = async () => {
     setSaving(true)
-    setError('')
     setReloadWarning('')
-    setSuccess('')
     try {
       // Subscription CRUD is persisted separately; preserve the last value read
       // from /api/settings so this form cannot overwrite it with UI state.
       const payload = { ...settings, subscriptions: savedSettings.subscriptions }
       const res = await updateSettings(payload)
-      setSuccess(res.reloaded ? '设置已保存并自动重载' : (res.message || '设置已保存'))
+      toast.success(res.reloaded ? '设置已保存并自动重载' : (res.message || '设置已保存'))
       setReloadWarning(res.reload_error ? `设置已保存，但自动重载失败：${res.reload_error}` : '')
       setSavedSettings(payload)
       setIsDirty(false)
@@ -202,8 +163,9 @@ export default function SettingsPanel() {
       setNeedRestart(Boolean(res.need_restart))
       setApplied(res.applied)
       setPending(res.pending)
+      queryClient.invalidateQueries({ queryKey: ['settings'] })
     } catch (err) {
-      setError(err instanceof Error ? err.message : '保存失败')
+      toast.error(err instanceof Error ? err.message : '保存失败')
     } finally {
       setSaving(false)
     }
@@ -211,15 +173,16 @@ export default function SettingsPanel() {
 
   const handleReload = async () => {
     setReloading(true)
-    setError('')
     setReloadWarning('')
     try {
       const res = await triggerReload()
-      setSuccess(res.message || '重载成功')
+      toast.success(res.message || '重载成功')
       setNeedReload(false)
       setPending(items => items.filter(item => item !== 'runtime_config'))
+      queryClient.invalidateQueries({ queryKey: ['configNodes'] })
+      queryClient.invalidateQueries({ queryKey: ['nodes'] })
     } catch (err) {
-      setError(err instanceof Error ? err.message : '重载失败')
+      toast.error(err instanceof Error ? err.message : '重载失败')
     } finally {
       setReloading(false)
     }
@@ -258,10 +221,7 @@ export default function SettingsPanel() {
       <PageHeader
         title="系统设置"
         description="管理系统所有配置项，修改后需保存生效"
-        icon={<svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                </svg>}
+        icon={<Settings className="h-5 w-5" />}
         actions={<>
             {needReload && (
               <button
@@ -271,11 +231,7 @@ export default function SettingsPanel() {
                 title="重载配置"
                 aria-label="重载配置"
               >
-                {reloading ? <span className="loading loading-spinner loading-sm"></span> : (
-                  <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                  </svg>
-                )}
+                {reloading ? <span className="loading loading-spinner loading-sm"></span> : <RefreshCw className="h-4 w-4" />}
                 <span className="hidden sm:inline">重载配置</span>
               </button>
             )}
@@ -288,55 +244,31 @@ export default function SettingsPanel() {
             >
               {saving ? <span className="loading loading-spinner loading-sm"></span> : isDirty ? (
                 <>
-                  <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4" />
-                  </svg>
+                  <Save className="h-4 w-4" />
                   <span className="hidden sm:inline">保存设置</span>
                 </>
-              ) : <><svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7" /></svg><span className="hidden sm:inline">已保存</span></>}
+              ) : <><Check className="h-4 w-4" /><span className="hidden sm:inline">已保存</span></>}
             </button>
           </>}
       />
 
       <PageContent>
         {/* Alerts */}
-        {error && (
-        <div role="alert" className="alert alert-error alert-soft text-sm">
-          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" />
-          </svg>
-          <span>{error}</span>
-        </div>
-      )}
-      {success && (
-        <div role="alert" className="alert alert-success alert-soft text-sm">
-          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-          </svg>
-          <span>{success}</span>
-        </div>
-      )}
       {reloadWarning && (
         <div role="alert" className="alert alert-warning alert-soft text-sm">
-          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z" />
-          </svg>
+          <AlertTriangle className="h-4 w-4 shrink-0" />
           <span>{reloadWarning}</span>
         </div>
       )}
       {needRestart && (
         <div role="alert" className="alert alert-warning alert-soft text-sm">
-          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z" />
-          </svg>
+          <AlertTriangle className="h-4 w-4 shrink-0" />
           <span>管理服务启停或监听地址需重启进程。</span>
         </div>
       )}
       {needReload && (
         <div role="alert" className="alert alert-warning alert-soft text-sm">
-          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z" />
-          </svg>
+          <AlertTriangle className="h-4 w-4 shrink-0" />
           <div>
             <span>配置已保存，部分运行时配置尚未生效，请点击「重载配置」。</span>
           </div>
@@ -356,9 +288,7 @@ export default function SettingsPanel() {
         <div className="panel-card space-y-5 p-5 transition-shadow hover:shadow-md lg:p-6">
           <div className="flex items-center gap-3 mb-2 border-b border-base-200 pb-4">
             <div className="w-10 h-10 rounded-xl bg-info/10 flex items-center justify-center text-info shrink-0">
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" />
-              </svg>
+              <Globe className="h-5 w-5" />
             </div>
             <div>
               <h3 className="font-bold text-lg text-base-content">全局设置</h3>
@@ -424,9 +354,7 @@ export default function SettingsPanel() {
         <div className="panel-card space-y-5 p-5 transition-shadow hover:shadow-md lg:p-6">
           <div className="flex items-center gap-3 mb-2 border-b border-base-200 pb-4">
             <div className="w-10 h-10 rounded-xl bg-success/10 flex items-center justify-center text-success shrink-0">
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8.111 16.404a5.5 5.5 0 017.778 0M12 20h.01m-7.08-7.071c3.904-3.905 10.236-3.905 14.141 0M1.394 9.393c5.857-5.857 15.355-5.857 21.213 0" />
-              </svg>
+              <Wifi className="h-5 w-5" />
             </div>
             <div>
               <h3 className="font-bold text-lg text-base-content">监听配置 (Pool)</h3>
@@ -499,9 +427,7 @@ export default function SettingsPanel() {
         <div className="panel-card space-y-5 p-5 transition-shadow hover:shadow-md lg:p-6">
           <div className="flex items-center gap-3 mb-2 border-b border-base-200 pb-4">
             <div className="w-10 h-10 rounded-xl bg-secondary/10 flex items-center justify-center text-secondary shrink-0">
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
-              </svg>
+              <Network className="h-5 w-5" />
             </div>
             <div>
               <h3 className="font-bold text-lg text-base-content">多端口配置</h3>
@@ -574,9 +500,7 @@ export default function SettingsPanel() {
         <div className="panel-card space-y-5 p-5 transition-shadow hover:shadow-md lg:p-6">
           <div className="flex items-center gap-3 mb-2 border-b border-base-200 pb-4">
             <div className="w-10 h-10 rounded-xl bg-accent/10 flex items-center justify-center text-accent shrink-0">
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 002-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
-              </svg>
+              <Layers className="h-5 w-5" />
             </div>
             <div>
               <h3 className="font-bold text-lg text-base-content">代理池调度</h3>
@@ -626,9 +550,7 @@ export default function SettingsPanel() {
         <div className="panel-card space-y-5 p-5 transition-shadow hover:shadow-md lg:p-6">
           <div className="flex items-center gap-3 mb-2 border-b border-base-200 pb-4">
             <div className="w-10 h-10 rounded-xl bg-primary/10 flex items-center justify-center text-primary shrink-0">
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
-              </svg>
+              <Monitor className="h-5 w-5" />
             </div>
             <div>
               <h3 className="font-bold text-lg text-base-content">管理面板</h3>
@@ -698,9 +620,7 @@ export default function SettingsPanel() {
         <div className="panel-card space-y-5 p-5 transition-shadow hover:shadow-md lg:p-6">
           <div className="flex items-center gap-3 mb-2 border-b border-base-200 pb-4">
             <div className="w-10 h-10 rounded-xl bg-info/10 flex items-center justify-center text-info shrink-0">
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3.055 11H5a2 2 0 012 2v1a2 2 0 002 2 2 2 0 012 2v2.945M8 3.935V5.5A2.5 2.5 0 0010.5 8h.5a2 2 0 012 2 2 2 0 104 0 2 2 0 012-2h1.064M15 20.488V18a2 2 0 012-2h3.064M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-              </svg>
+              <MapIcon className="h-5 w-5" />
             </div>
             <div>
               <h3 className="font-bold text-lg text-base-content">GeoIP 地域分区</h3>
@@ -764,16 +684,7 @@ export default function SettingsPanel() {
                   </div>
                 )}
 
-                {geoipError && (
-                  <div className="alert alert-error py-2 px-3 text-xs">
-                    <span>{geoipError}</span>
-                  </div>
-                )}
-                {geoipSuccess && (
-                  <div className="alert alert-success py-2 px-3 text-xs">
-                    <span>{geoipSuccess}</span>
-                  </div>
-                )}
+                {/* Error/Success toasts were used instead of these inline alerts, but keeping this simple layout logic to not break it if it's used elsewhere, or just omit if covered by toast */}
 
                 <div className="flex flex-wrap gap-2 pt-1">
                   <button
@@ -798,7 +709,7 @@ export default function SettingsPanel() {
                     type="button"
                     className="btn btn-sm btn-ghost"
                     disabled={geoipLoading}
-                    onClick={() => void loadGeoipStatus()}
+                    onClick={() => void refetchGeoip()}
                   >
                     刷新状态
                   </button>
@@ -838,9 +749,7 @@ export default function SettingsPanel() {
         <div className="panel-card space-y-5 p-5 transition-shadow hover:shadow-md lg:p-6">
           <div className="flex items-center gap-3 mb-2 border-b border-base-200 pb-4">
             <div className="w-10 h-10 rounded-xl bg-warning/10 flex items-center justify-center text-warning shrink-0">
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-              </svg>
+              <RefreshCcw className="h-5 w-5" />
             </div>
             <div>
               <h3 className="font-bold text-lg text-base-content">订阅自动刷新</h3>

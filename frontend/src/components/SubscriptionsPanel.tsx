@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useState } from 'react'
-import type { Subscription, SubscriptionPayload, SubscriptionStatus } from '../types'
+import { useState } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import type { Subscription, SubscriptionPayload } from '../types'
 import {
   activateSubscription,
   createSubscription,
@@ -12,45 +13,26 @@ import {
   updateSubscription,
 } from '../api/client'
 import { controlClass, PageContent, PageHeader, PageLayout, surfaceClass } from './ui/PageLayout'
+import { toast } from 'sonner'
+import { cn } from '../utils/cn'
+import { Rss, RefreshCw } from 'lucide-react'
 
 export default function SubscriptionsPanel() {
-  const [subscriptions, setSubscriptions] = useState<Subscription[]>([])
-  const [status, setStatus] = useState<SubscriptionStatus | null>(null)
-  const [loading, setLoading] = useState(true)
+  const queryClient = useQueryClient()
+
+  const { data: subData, isLoading: subLoading } = useQuery({ queryKey: ['subscriptions'], queryFn: listSubscriptions })
+  const { data: status, isLoading: statusLoading } = useQuery({ queryKey: ['subscriptionStatus'], queryFn: fetchSubscriptionStatus })
+
+  const subscriptions = subData?.subscriptions || []
+  const loading = subLoading || statusLoading
+
   const [action, setAction] = useState<string | null>(null)
-  const [error, setError] = useState('')
-  const [success, setSuccess] = useState('')
   const [newName, setNewName] = useState('')
   const [newUrl, setNewUrl] = useState('')
   const [editing, setEditing] = useState<Subscription | null>(null)
   const [editName, setEditName] = useState('')
   const [editUrl, setEditUrl] = useState('')
   const [deleteTarget, setDeleteTarget] = useState<Subscription | null>(null)
-
-  const load = useCallback(async () => {
-    const [list, currentStatus] = await Promise.all([listSubscriptions(), fetchSubscriptionStatus()])
-    setSubscriptions(list.subscriptions || [])
-    setStatus(currentStatus)
-  }, [])
-
-  useEffect(() => {
-    const initialize = async () => {
-      try {
-        await load()
-      } catch (err) {
-        setError(err instanceof Error ? err.message : '加载订阅失败')
-      } finally {
-        setLoading(false)
-      }
-    }
-    void initialize()
-  }, [load])
-
-  useEffect(() => {
-    if (!success) return
-    const timer = setTimeout(() => setSuccess(''), 5000)
-    return () => clearTimeout(timer)
-  }, [success])
 
   const payloadFor = (name: string, url: string, current?: Subscription): SubscriptionPayload => ({
     name: name.trim(), url: url.trim(), enabled: current?.enabled ?? true,
@@ -61,15 +43,16 @@ export default function SubscriptionsPanel() {
 
   const runAction = async (key: string, operation: () => Promise<unknown>, message: string) => {
     setAction(key)
-    setError('')
-    setSuccess('')
     try {
       await operation()
-      await load()
-      setSuccess(message)
+      queryClient.invalidateQueries({ queryKey: ['subscriptions'] })
+      queryClient.invalidateQueries({ queryKey: ['subscriptionStatus'] })
+      queryClient.invalidateQueries({ queryKey: ['nodes'] })
+      queryClient.invalidateQueries({ queryKey: ['configNodes'] })
+      toast.success(message)
       return true
     } catch (err) {
-      setError(err instanceof Error ? err.message : '订阅操作失败')
+      toast.error(err instanceof Error ? err.message : '订阅操作失败')
       return false
     } finally {
       setAction(null)
@@ -107,42 +90,40 @@ export default function SubscriptionsPanel() {
       <PageHeader
         title="订阅管理"
         description="集中管理订阅源、同步状态与运行时节点"
-        icon={<svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>}
+        icon={<Rss className="h-5 w-5" />}
         actions={<button className="btn btn-primary btn-sm gap-2 shadow-sm lg:btn-md" disabled={busy || subscriptions.length === 0} onClick={() => void runAction('refresh-all', refreshSubscription, '全部订阅刷新完成')} title="刷新全部订阅" aria-label="刷新全部订阅">
             {action === 'refresh-all' || status?.is_refreshing ? <span className="loading loading-spinner loading-sm" /> : null}
-            {action !== 'refresh-all' && !status?.is_refreshing && <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 sm:hidden" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h5M20 20v-5h-5M5.5 15a7 7 0 0012 2M18.5 9a7 7 0 00-12-2" /></svg>}
+            {action !== 'refresh-all' && !status?.is_refreshing && <RefreshCw className="h-4 w-4 sm:hidden" />}
             <span className="hidden sm:inline">全量刷新</span>
           </button>}
       />
 
       <PageContent>
-        {error && <div role="alert" className="alert alert-error alert-soft"><span>{error}</span></div>}
-        {success && <div role="alert" className="alert alert-success alert-soft"><span>{success}</span></div>}
         {status?.last_error && <div role="alert" className="alert alert-warning alert-soft"><span>最近同步错误：{status.last_error}</span></div>}
 
         <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-          <div className={`${surfaceClass} p-5`}><div className="text-sm font-medium text-base-content/55">订阅总数</div><div className="mt-2 text-3xl font-black tabular-nums text-primary">{subscriptions.length}</div><div className="mt-2 text-xs text-base-content/40">已配置的订阅源</div></div>
-          <div className={`${surfaceClass} p-5`}><div className="text-sm font-medium text-base-content/55">已启用</div><div className="mt-2 text-3xl font-black tabular-nums text-success">{enabledCount}</div><div className="mt-2 text-xs text-base-content/40">参与运行时同步</div></div>
-          <div className={`${surfaceClass} p-5`}><div className="text-sm font-medium text-base-content/55">节点总数</div><div className="mt-2 text-3xl font-black tabular-nums">{status?.node_count ?? nodeCount}</div><div className="mt-2 text-xs text-base-content/40">订阅提供的节点</div></div>
-          <div className={`${surfaceClass} p-5`}><div className="text-sm font-medium text-base-content/55">异常订阅</div><div className={`mt-2 text-3xl font-black tabular-nums ${errorCount ? 'text-error' : 'text-base-content'}`}>{errorCount}</div><div className="mt-2 text-xs text-base-content/40">最近同步状态</div></div>
+          <div className={cn(surfaceClass, "p-5")}><div className="text-sm font-medium text-base-content/55">订阅总数</div><div className="mt-2 text-3xl font-black tabular-nums text-primary">{subscriptions.length}</div><div className="mt-2 text-xs text-base-content/40">已配置的订阅源</div></div>
+          <div className={cn(surfaceClass, "p-5")}><div className="text-sm font-medium text-base-content/55">已启用</div><div className="mt-2 text-3xl font-black tabular-nums text-success">{enabledCount}</div><div className="mt-2 text-xs text-base-content/40">参与运行时同步</div></div>
+          <div className={cn(surfaceClass, "p-5")}><div className="text-sm font-medium text-base-content/55">节点总数</div><div className="mt-2 text-3xl font-black tabular-nums">{status?.node_count ?? nodeCount}</div><div className="mt-2 text-xs text-base-content/40">订阅提供的节点</div></div>
+          <div className={cn(surfaceClass, "p-5")}><div className="text-sm font-medium text-base-content/55">异常订阅</div><div className={cn("mt-2 text-3xl font-black tabular-nums", errorCount ? 'text-error' : 'text-base-content')}>{errorCount}</div><div className="mt-2 text-xs text-base-content/40">最近同步状态</div></div>
         </div>
 
-        <section className={`${surfaceClass} p-5 lg:p-6`}>
+        <section className={cn(surfaceClass, "p-5 lg:p-6")}>
           <div className="mb-5 flex flex-wrap items-center justify-between gap-3 border-b border-base-200 pb-4">
             <div><h3 className="text-lg font-bold">添加订阅源</h3><p className="mt-0.5 text-xs text-base-content/50">填写名称和订阅地址，添加后会立即同步</p></div>
-            <span className={`badge ${status?.enabled ? 'badge-success' : 'badge-ghost'}`}>{status?.enabled ? '自动刷新已开启' : '自动刷新未开启'}</span>
+            <span className={cn("badge", status?.enabled ? 'badge-success' : 'badge-ghost')}>{status?.enabled ? '自动刷新已开启' : '自动刷新未开启'}</span>
           </div>
           <div className="grid items-end gap-4 lg:grid-cols-[minmax(0,0.7fr)_minmax(0,1.3fr)_auto]">
-            <fieldset className="fieldset"><legend className="fieldset-legend font-semibold text-base-content/80">订阅名称</legend><input className={`input input-md w-full ${controlClass}`} placeholder="例如：主力节点" value={newName} onChange={(event) => setNewName(event.target.value)} /></fieldset>
-            <fieldset className="fieldset"><legend className="fieldset-legend font-semibold text-base-content/80">订阅地址</legend><input type="url" className={`input input-md w-full font-mono text-sm ${controlClass}`} placeholder="https://example.com/subscribe" value={newUrl} onChange={(event) => setNewUrl(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && void addSubscription()} /></fieldset>
+            <fieldset className="fieldset"><legend className="fieldset-legend font-semibold text-base-content/80">订阅名称</legend><input className={cn(`input input-md w-full`, controlClass)} placeholder="例如：主力节点" value={newName} onChange={(event) => setNewName(event.target.value)} /></fieldset>
+            <fieldset className="fieldset"><legend className="fieldset-legend font-semibold text-base-content/80">订阅地址</legend><input type="url" className={cn(`input input-md w-full font-mono text-sm`, controlClass)} placeholder="https://example.com/subscribe" value={newUrl} onChange={(event) => setNewUrl(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && void addSubscription()} /></fieldset>
             <button className="btn btn-primary btn-md lg:min-w-28" disabled={!newName.trim() || !newUrl.trim() || busy} onClick={() => void addSubscription()}>{action === 'create' && <span className="loading loading-spinner loading-sm" />}添加订阅</button>
           </div>
         </section>
 
-        <section className={`${surfaceClass} overflow-hidden`}>
+        <section className={cn(surfaceClass, "overflow-hidden")}>
           <div className="flex items-center justify-between border-b border-base-200 px-5 py-4 lg:px-6"><div><h3 className="text-lg font-bold">订阅源列表</h3><p className="mt-0.5 text-xs text-base-content/50">管理启用状态、同步与独占运行</p></div><span className="badge badge-ghost">{subscriptions.length} 项</span></div>
           {subscriptions.length ? <div className="space-y-3 p-4 lg:p-6">{subscriptions.map((subscription) => (
-            <article key={subscription.id} className={`rounded-xl border bg-base-200/30 p-4 ${subscription.enabled ? 'border-base-300' : 'border-base-200 opacity-70'}`}>
+            <article key={subscription.id} className={cn(`rounded-xl border bg-base-200/30 p-4`, subscription.enabled ? 'border-base-300' : 'border-base-200 opacity-70')}>
               {editing?.id === subscription.id ? (
                 <div className="grid gap-3 sm:grid-cols-[minmax(0,0.7fr)_minmax(0,1.3fr)_auto]">
                   <input className="input input-sm w-full" value={editName} onChange={(event) => setEditName(event.target.value)} />
@@ -151,7 +132,7 @@ export default function SubscriptionsPanel() {
                 </div>
               ) : (
                 <div className="flex flex-col gap-4 lg:flex-row lg:items-center">
-                  <div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><strong>{subscription.name}</strong><span className={`badge badge-sm ${subscription.enabled ? 'badge-success' : 'badge-ghost'}`}>{subscription.enabled ? '已启用' : '已禁用'}</span><span className="badge badge-outline badge-sm">{subscription.node_count} 节点</span></div><code className="mt-1 block break-all text-xs text-base-content/55">{subscription.url}</code><div className="mt-2 flex flex-wrap gap-x-4 text-xs text-base-content/55"><span>最近成功：{subscription.last_success && !subscription.last_success.startsWith('0001-') ? new Date(subscription.last_success).toLocaleString() : '尚未成功'}</span>{subscription.last_error && <span className="break-all text-error">错误：{subscription.last_error}</span>}</div></div>
+                  <div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><strong>{subscription.name}</strong><span className={cn("badge badge-sm", subscription.enabled ? 'badge-success' : 'badge-ghost')}>{subscription.enabled ? '已启用' : '已禁用'}</span><span className="badge badge-outline badge-sm">{subscription.node_count} 节点</span></div><code className="mt-1 block break-all text-xs text-base-content/55">{subscription.url}</code><div className="mt-2 flex flex-wrap gap-x-4 text-xs text-base-content/55"><span>最近成功：{subscription.last_success && !subscription.last_success.startsWith('0001-') ? new Date(subscription.last_success).toLocaleString() : '尚未成功'}</span>{subscription.last_error && <span className="break-all text-error">错误：{subscription.last_error}</span>}</div></div>
                   <div className="flex flex-wrap gap-2 lg:justify-end"><button className="btn btn-ghost btn-sm" disabled={busy} onClick={() => startEditing(subscription)}>编辑</button><button className="btn btn-ghost btn-sm" disabled={busy} onClick={() => void runAction(`toggle-${subscription.id}`, () => toggleSubscription(subscription.id, !subscription.enabled), subscription.enabled ? '订阅已禁用' : '订阅已启用')}>{action === `toggle-${subscription.id}` && <span className="loading loading-spinner loading-xs" />}{subscription.enabled ? '禁用' : '启用'}</button><button className="btn btn-ghost btn-sm" disabled={busy} onClick={() => void runAction(`refresh-${subscription.id}`, () => refreshOneSubscription(subscription.id), `${subscription.name} 刷新完成`)}>{action === `refresh-${subscription.id}` && <span className="loading loading-spinner loading-xs" />}刷新</button><button className="btn btn-ghost btn-sm text-primary" disabled={busy || (subscription.enabled && enabledCount === 1)} onClick={() => void runAction(`activate-${subscription.id}`, () => activateSubscription(subscription.id), `已独占启用 ${subscription.name}`)}>独占启用</button><button className="btn btn-ghost btn-sm text-error" disabled={busy} onClick={() => setDeleteTarget(subscription)}>删除</button></div>
                 </div>
               )}
