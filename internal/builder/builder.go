@@ -529,7 +529,6 @@ func buildVLESSOptions(u *url.URL, skipCertVerify bool) (option.VLESSOutboundOpt
 	opts := option.VLESSOutboundOptions{
 		UUID:          uuid,
 		ServerOptions: option.ServerOptions{Server: server, ServerPort: uint16(port)},
-		Network:       option.NetworkList(""),
 	}
 	if flow := query.Get("flow"); flow != "" {
 		opts.Flow = flow
@@ -634,7 +633,14 @@ func buildTLSOptions(query url.Values, skipCertVerify bool) (*option.OutboundTLS
 
 func buildV2RayTransport(query url.Values) (*option.V2RayTransportOptions, error) {
 	transportType := strings.ToLower(query.Get("type"))
-	if transportType == "" || transportType == "tcp" {
+	if transportType == "" {
+		if query.Get("path") != "" {
+			transportType = "ws"
+		} else {
+			transportType = "tcp"
+		}
+	}
+	if transportType == "tcp" {
 		return nil, nil
 	}
 	options := &option.V2RayTransportOptions{Type: transportType}
@@ -737,7 +743,6 @@ func buildTrojanOptions(u *url.URL, skipCertVerify bool) (option.TrojanOutboundO
 	opts := option.TrojanOutboundOptions{
 		ServerOptions: option.ServerOptions{Server: server, ServerPort: uint16(port)},
 		Password:      password,
-		Network:       option.NetworkList(""),
 	}
 
 	// Parse TLS options
