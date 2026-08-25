@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Activity, CheckCircle2, ChevronDown, CircleAlert, Copy, Dices, KeyRound, Layers3, Link2, Network, Pencil,
-  Plus, Power, RefreshCw, RotateCcw, Search, Server, ShieldOff, Trash2, X,
+  Plus, Power, RefreshCw, RotateCcw, Search, Server, ShieldOff, Trash2, X, Crosshair,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import type { GroupMember, GroupNodeOption, GroupPool, GroupPoolPayload, GroupMemberStatus } from '../types'
@@ -285,7 +285,7 @@ export default function GroupPoolsPanel() {
           <div className="space-y-6 p-5 sm:p-6">
             <div className="grid gap-4 sm:grid-cols-2">
               <Field label="分组名称"><input autoFocus className={cn('input w-full', controlClass)} value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="例如：香港 VIP 专线" /></Field>
-              <Field label="监听端口" hint="填 0 自动从 10000–19999 分配"><input type="number" min={0} max={65535} className={cn('input w-full font-mono', controlClass)} value={form.bind_port} onChange={(e) => setForm({ ...form, bind_port: Number(e.target.value) || 0 })} /></Field>
+              <Field label="监听端口" hint={`填 0 自动从 ${data?.port_range?.start ?? 10000}–${data?.port_range?.end ?? 19999} 分配`}><input type="number" min={0} max={65535} className={cn('input w-full font-mono', controlClass)} value={form.bind_port} onChange={(e) => setForm({ ...form, bind_port: Number(e.target.value) || 0 })} /></Field>
               <Field label="监听地址"><input className={cn('input w-full font-mono', controlClass)} value={form.bind_address} onChange={(e) => setForm({ ...form, bind_address: e.target.value })} /></Field>
               <Field label="入口协议"><select className={cn('select w-full', controlClass)} value={form.protocol} onChange={(e) => setForm({ ...form, protocol: e.target.value })}><option value="mixed">Mixed (HTTP + SOCKS5)</option><option value="http">HTTP</option><option value="socks5">SOCKS5</option></select></Field>
             </div>
@@ -347,12 +347,12 @@ export default function GroupPoolsPanel() {
               </div>
 
               {editing && <div className="mt-4 rounded-2xl border border-base-300 bg-base-200/15 p-4">
-                <div><h5 className="text-sm font-bold">当前运行成员</h5><p className="mt-0.5 text-xs text-base-content/50">来自已保存的地区与手动规则；修改将在保存并重载后生效</p></div>
+                <div><h5 className="text-sm font-bold">当前运行成员</h5><p className="mt-0.5 text-xs text-base-content/50">来自已保存的地区与手动规则；修改将在保存后自动热更新生效</p></div>
                 <div className="mt-3 grid max-h-80 gap-2 overflow-y-auto pr-1 md:grid-cols-2">
-                  {editing.members.map((member) => <RuntimeMemberRow key={member.node_id} member={member} manual={form.explicit_node_ids.includes(member.node_id)}
+                  {editing.members.filter(member => !form.excluded_node_ids.includes(member.node_id)).map((member) => <RuntimeMemberRow key={member.node_id} member={member} manual={form.explicit_node_ids.includes(member.node_id)}
                     regional={Boolean(member.region && regionsText.split(/[,，\s]+/).some((region) => region.toLowerCase() === member.region?.toLowerCase()))}
-                    latency={latencyOverrides[member.node_id] ?? member.latency_ms} probing={probingNodeIDs.has(member.node_id)} onProbe={() => void probeOption({ id: member.node_id, name: member.name || member.tag, tag: member.tag })} />)}
-                  {editing.members.length === 0 && <div className="md:col-span-2"><EmptyMemberList message="当前没有运行成员" /></div>}
+                    latency={latencyOverrides[member.node_id] ?? member.latency_ms} probing={probingNodeIDs.has(member.node_id)} onProbe={() => void probeOption({ id: member.node_id, name: member.name || member.tag, tag: member.tag })} onExclude={() => { setForm((current) => ({ ...current, explicit_node_ids: current.explicit_node_ids.filter((id) => id !== member.node_id), excluded_node_ids: [...new Set([...current.excluded_node_ids, member.node_id])] })); toast.success(`已排除节点 ${member.name || member.tag}`, { description: '保存后生效' }) }} onActivate={() => { void run(`activate-${editing.id}-${member.node_id}`, () => activateGroupMember(editing.id, member.node_id), '当前出口已立即切换').then(() => { setEditing((current) => current ? { ...current, members: current.members.map(m => ({ ...m, is_active: m.node_id === member.node_id })) } : null) }) }} isActivateBusy={busy === `activate-${editing.id}-${member.node_id}`} />)}
+                  {editing.members.filter(member => !form.excluded_node_ids.includes(member.node_id)).length === 0 && <div className="md:col-span-2"><EmptyMemberList message="当前没有运行成员" /></div>}
                 </div>
               </div>}
             </section>
@@ -402,18 +402,27 @@ function NodeOptionRow({ node, latency, probing, action, onAction, onProbe }: {
   </div>
 }
 
-function RuntimeMemberRow({ member, manual, regional, latency, probing, onProbe }: {
+function RuntimeMemberRow({ member, manual, regional, latency, probing, onProbe, onExclude, onActivate, isActivateBusy }: {
   member: GroupMember
   manual: boolean
   regional: boolean
   latency: number
   probing: boolean
   onProbe: () => void
+  onExclude: () => void
+  onActivate?: () => void
+  isActivateBusy?: boolean
 }) {
   const style = statusStyle[member.status]
   return <div className="flex min-w-0 items-center gap-2 rounded-xl border border-base-200 bg-base-100/70 px-3 py-2.5">
-    <div className="min-w-0 flex-1"><div className="flex min-w-0 items-center gap-2"><span className="truncate text-sm font-medium">{member.name || member.tag}</span>{member.region && <span className="shrink-0 text-[10px] font-bold uppercase text-base-content/45">{member.region}</span>}</div><div className="mt-1 flex flex-wrap items-center gap-1.5"><span className={cn('badge badge-xs', style.badge)}>{style.label}</span>{manual && <span className="badge badge-outline badge-xs">手动</span>}{regional && <span className="badge badge-ghost badge-xs">地区</span>}<LatencyValue value={latency} /></div></div>
+    <div className="min-w-0 flex-1"><div className="flex min-w-0 items-center gap-2"><span className="truncate text-sm font-medium">{member.name || member.tag}</span>{member.region && <span className="shrink-0 text-[10px] font-bold uppercase text-base-content/45">{member.region}</span>}</div><div className="mt-1 flex flex-wrap items-center gap-1.5"><span className={cn('badge badge-xs', style.badge)}>{style.label}</span>{manual && <span className="badge badge-outline badge-xs">手动</span>}{regional && <span className="badge badge-ghost badge-xs">地区</span>}{member.is_active && <span className="badge badge-success badge-outline badge-xs">当前出口</span>}<LatencyValue value={latency} /></div></div>
+    {onActivate && member.status === 'ALIVE' && !member.is_active && (
+      <button type="button" className="btn btn-ghost btn-xs btn-square text-primary" onClick={onActivate} disabled={isActivateBusy} title="强制设为当前出口" aria-label={`将 ${member.name || member.tag} 设为当前出口`}>
+        <Crosshair className="h-3.5 w-3.5" />
+      </button>
+    )}
     <button type="button" className="btn btn-ghost btn-xs btn-square text-primary" onClick={onProbe} disabled={!member.tag || probing} aria-label={`测试 ${member.name || member.tag} 延迟`} title="测试延迟">{probing ? <span className="loading loading-spinner loading-xs" /> : <Activity className="h-3.5 w-3.5" />}</button>
+    <button type="button" className="btn btn-ghost btn-xs btn-square text-error" onClick={onExclude} aria-label={`排除节点 ${member.name || member.tag}`} title="排除此节点"><Trash2 className="h-3.5 w-3.5" /></button>
   </div>
 }
 
@@ -443,7 +452,7 @@ function GroupCard({ group, busy, expanded, onToggleExpanded, onEdit, onDelete, 
     </div>
     <div className="p-4 sm:p-5">
       {group.dispatch_mode === 'fixed' && <div className={cn('mb-3 flex items-center gap-3 rounded-xl border px-3 py-2.5', active ? 'border-success/25 bg-success/5' : 'border-warning/25 bg-warning/5')}><Activity className={cn('h-4 w-4 shrink-0', active ? 'text-success' : 'text-warning')} /><div className="min-w-0 flex-1"><p className="text-[11px] font-semibold uppercase tracking-wider text-base-content/45">当前主出口</p><p className="truncate text-sm font-semibold">{active?.name || '等待首个连接选择'}</p></div>{active?.latency_ms && active.latency_ms > 0 ? <span className="text-xs font-mono text-base-content/55">{active.latency_ms} ms</span> : null}</div>}
-      <div className="space-y-2">{(expanded ? group.members : group.members.slice(0, 8)).map((member) => { const style = statusStyle[member.status]; const StatusIcon = style.icon; return <div key={member.node_id} className="flex min-w-0 items-center gap-2 rounded-xl border border-base-200 bg-base-200/20 px-3 py-2.5"><StatusIcon className={cn('h-4 w-4 shrink-0', member.status === 'ALIVE' ? 'text-success' : member.status === 'SUSPECT' ? 'text-warning' : 'text-error')} /><div className="min-w-0 flex-1"><div className="flex items-center gap-2"><span className="truncate text-sm font-medium">{member.name || member.tag}</span>{member.region && <span className="text-[10px] font-bold uppercase text-base-content/40">{member.region}</span>}</div>{member.last_error && <p className="mt-0.5 truncate text-[11px] text-error/75" title={member.last_error}>{member.last_error}</p>}</div><span className={cn('badge badge-sm', style.badge)}>{style.label}</span>{member.latency_ms > 0 && <span className="hidden w-14 text-right font-mono text-xs text-base-content/45 sm:block">{member.latency_ms} ms</span>}<div className="flex shrink-0 items-center gap-1">{member.status === 'ALIVE' && !member.is_active && <button className="btn btn-ghost btn-xs btn-square text-primary" disabled={busy === `activate-${group.id}-${member.node_id}`} onClick={() => onActivate(member.node_id)} title={group.dispatch_mode === 'random' ? '立即切换；random 模式下后续连接仍会随机选择' : '强制设为当前出口'} aria-label={`将 ${member.name || member.tag} 设为当前出口`}><Dices className="h-3.5 w-3.5" /></button>}{member.status === 'EVICTED' && <button className="btn btn-ghost btn-xs gap-1 text-primary" disabled={busy === `restore-${group.id}-${member.node_id}`} onClick={() => onRestore(member.node_id)} title="恢复入池"><RotateCcw className="h-3 w-3" /><span className="hidden sm:inline">恢复</span></button>}<button className="btn btn-ghost btn-xs btn-square text-error" disabled={busy === `remove-member-${group.id}-${member.node_id}`} onClick={() => onRemoveMember(member)} title="从此分组移除" aria-label={`从分组移除 ${member.name || member.tag}`}><Trash2 className="h-3.5 w-3.5" /></button></div></div> })}</div>
+      <div className="space-y-2">{(expanded ? group.members : group.members.slice(0, 8)).map((member) => { const style = statusStyle[member.status]; const StatusIcon = style.icon; return <div key={member.node_id} className="flex min-w-0 items-center gap-2 rounded-xl border border-base-200 bg-base-200/20 px-3 py-2.5"><StatusIcon className={cn('h-4 w-4 shrink-0', member.status === 'ALIVE' ? 'text-success' : member.status === 'SUSPECT' ? 'text-warning' : 'text-error')} /><div className="min-w-0 flex-1"><div className="flex items-center gap-2"><span className="truncate text-sm font-medium">{member.name || member.tag}</span>{member.region && <span className="text-[10px] font-bold uppercase text-base-content/40">{member.region}</span>}</div>{member.last_error && <p className="mt-0.5 truncate text-[11px] text-error/75" title={member.last_error}>{member.last_error}</p>}</div><span className={cn('badge badge-sm', style.badge)}>{style.label}</span>{member.latency_ms > 0 && <span className="hidden w-14 text-right font-mono text-xs text-base-content/45 sm:block">{member.latency_ms} ms</span>}<div className="flex shrink-0 items-center gap-1">{member.status === 'ALIVE' && !member.is_active && <button className="btn btn-ghost btn-xs btn-square text-primary" disabled={busy === `activate-${group.id}-${member.node_id}`} onClick={() => onActivate(member.node_id)} title={group.dispatch_mode === 'random' ? '立即切换；random 模式下后续连接仍会随机选择' : '强制设为当前出口'} aria-label={`将 ${member.name || member.tag} 设为当前出口`}><Crosshair className="h-3.5 w-3.5" /></button>}{member.status === 'EVICTED' && <button className="btn btn-ghost btn-xs gap-1 text-primary" disabled={busy === `restore-${group.id}-${member.node_id}`} onClick={() => onRestore(member.node_id)} title="恢复入池"><RotateCcw className="h-3 w-3" /><span className="hidden sm:inline">恢复</span></button>}<button className="btn btn-ghost btn-xs btn-square text-error" disabled={busy === `remove-member-${group.id}-${member.node_id}`} onClick={() => onRemoveMember(member)} title="从此分组移除" aria-label={`从分组移除 ${member.name || member.tag}`}><Trash2 className="h-3.5 w-3.5" /></button></div></div> })}</div>
       {group.member_count === 0 && <div className="rounded-xl border border-dashed border-warning/40 bg-warning/5 px-4 py-8 text-center"><CircleAlert className="mx-auto h-6 w-6 text-warning" /><p className="mt-2 text-sm font-medium">当前没有匹配的有效节点</p><p className="mt-1 text-xs text-base-content/45">检查地区码、手动成员或节点启用状态</p></div>}
       {group.member_count > 8 && <button type="button" className="mt-3 flex min-h-9 w-full cursor-pointer items-center justify-center gap-1.5 rounded-lg text-xs font-medium text-base-content/55 transition-colors hover:bg-base-200/60 hover:text-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary" onClick={onToggleExpanded} aria-expanded={expanded}>
         <ChevronDown className={cn('h-3.5 w-3.5 transition-transform duration-200', expanded && 'rotate-180')} />{expanded ? '收起成员' : `展开其余 ${group.member_count - 8} 个成员`}
