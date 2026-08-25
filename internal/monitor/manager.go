@@ -56,6 +56,17 @@ type DebugLogEvent struct {
 	Event    TimelineEvent `json:"event"`
 }
 
+// HealthResultEvent is emitted for every completed automatic, startup, or
+// manual probe. Subscribers are invoked synchronously after node state is
+// committed so health transitions cannot be dropped.
+type HealthResultEvent struct {
+	Tag       string
+	Success   bool
+	Latency   time.Duration
+	Error     string
+	CheckedAt time.Time
+}
+
 const maxTimelineSize = 20
 
 // Snapshot is a runtime view of a proxy node.
@@ -121,6 +132,7 @@ type entry struct {
 	lastFail         time.Time
 	lastOK           time.Time
 	lastProbe        time.Duration
+	lastHealthCheck  time.Time
 	active           atomic.Int32
 	totalUpload      atomic.Int64
 	totalDownload    atomic.Int64
@@ -152,14 +164,26 @@ type Manager struct {
 	logger     Logger
 
 	// periodic health check control
-	healthMu         sync.Mutex
-	healthInterval   time.Duration
-	healthTimeout    time.Duration
-	healthTicker     *time.Ticker
-	healthIntervalC  chan time.Duration
-	probeAllInFlight atomic.Bool
-	debugSubMu       sync.RWMutex
-	debugSubscribers map[chan DebugLogEvent]struct{}
+	healthMu          sync.Mutex
+	healthInterval    time.Duration
+	healthTimeout     time.Duration
+	healthTicker      *time.Ticker
+	healthIntervalC   chan time.Duration
+	probeAllInFlight  atomic.Bool
+	probeTagMu        sync.Mutex
+	probeTagsInFlight map[string]struct{}
+	debugSubMu        sync.RWMutex
+	debugSubscribers  map[chan DebugLogEvent]struct{}
+	healthSubMu       sync.RWMutex
+	healthSubNextID   atomic.Uint64
+	healthSubscribers map[uint64]func(HealthResultEvent)
+	groupScheduleMu   sync.RWMutex
+	groupSchedules    map[int64]groupHealthSchedule
+}
+
+type groupHealthSchedule struct {
+	tags     map[string]struct{}
+	interval time.Duration
 }
 
 // Logger interface for logging
@@ -172,11 +196,14 @@ type Logger interface {
 func NewManager(cfg Config) (*Manager, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Manager{
-		cfg:              cfg,
-		nodes:            make(map[string]*entry),
-		ctx:              ctx,
-		cancel:           cancel,
-		debugSubscribers: make(map[chan DebugLogEvent]struct{}),
+		cfg:               cfg,
+		nodes:             make(map[string]*entry),
+		ctx:               ctx,
+		cancel:            cancel,
+		debugSubscribers:  make(map[chan DebugLogEvent]struct{}),
+		probeTagsInFlight: make(map[string]struct{}),
+		healthSubscribers: make(map[uint64]func(HealthResultEvent)),
+		groupSchedules:    make(map[int64]groupHealthSchedule),
 	}
 	if cfg.ProbeTarget != "" {
 		target := cfg.ProbeTarget
@@ -240,7 +267,7 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 	if m.healthTicker != nil {
 		m.healthTicker.Stop()
 	}
-	m.healthTicker = time.NewTicker(interval)
+	m.healthTicker = time.NewTicker(time.Second)
 	ticker := m.healthTicker
 	intervalC := m.healthIntervalC
 	m.healthMu.Unlock()
@@ -257,20 +284,14 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 				if newInterval <= 0 {
 					newInterval = 2 * time.Hour
 				}
-				// 重置 ticker
 				m.healthMu.Lock()
 				m.healthInterval = newInterval
-				if m.healthTicker != nil {
-					m.healthTicker.Stop()
-				}
-				m.healthTicker = time.NewTicker(newInterval)
-				ticker = m.healthTicker
 				m.healthMu.Unlock()
 				if m.logger != nil {
 					m.logger.Info("periodic health check interval updated: ", newInterval)
 				}
 			case <-ticker.C:
-				m.RequestProbeAllOnce(timeout)
+				m.RequestDueProbesOnce(timeout)
 			}
 		}
 	}()
@@ -300,6 +321,53 @@ func (m *Manager) SetHealthCheckInterval(d time.Duration) {
 	}
 }
 
+// RegisterGroupHealthSchedule sets the member set and requested interval for
+// one group. A shared node is probed at the shortest interval requested by
+// management or any enabled group that contains it.
+func (m *Manager) RegisterGroupHealthSchedule(groupID int64, tags []string, interval time.Duration) {
+	if groupID == 0 || interval <= 0 {
+		return
+	}
+	tagSet := make(map[string]struct{}, len(tags))
+	for _, tag := range tags {
+		if tag != "" {
+			tagSet[tag] = struct{}{}
+		}
+	}
+	m.groupScheduleMu.Lock()
+	m.groupSchedules[groupID] = groupHealthSchedule{tags: tagSet, interval: interval}
+	m.groupScheduleMu.Unlock()
+}
+
+func (m *Manager) UnregisterGroupHealthSchedule(groupID int64) {
+	if groupID == 0 {
+		return
+	}
+	m.groupScheduleMu.Lock()
+	delete(m.groupSchedules, groupID)
+	m.groupScheduleMu.Unlock()
+}
+
+func (m *Manager) probeDue(tag string, lastCheck, now time.Time) bool {
+	if lastCheck.IsZero() {
+		return true
+	}
+	m.healthMu.Lock()
+	interval := m.healthInterval
+	m.healthMu.Unlock()
+	if interval <= 0 {
+		interval = 2 * time.Hour
+	}
+	m.groupScheduleMu.RLock()
+	for _, schedule := range m.groupSchedules {
+		if _, contains := schedule.tags[tag]; contains && schedule.interval > 0 && schedule.interval < interval {
+			interval = schedule.interval
+		}
+	}
+	m.groupScheduleMu.RUnlock()
+	return !now.Before(lastCheck.Add(interval))
+}
+
 // RequestProbeAllOnce triggers a full probe round at most once concurrently.
 // If another full probe is already running, it returns immediately.
 func (m *Manager) RequestProbeAllOnce(timeout time.Duration) {
@@ -315,8 +383,27 @@ func (m *Manager) RequestProbeAllOnce(timeout time.Duration) {
 	}()
 }
 
+// RequestDueProbesOnce checks only nodes whose effective management/group
+// interval has elapsed. A full and a due round never overlap.
+func (m *Manager) RequestDueProbesOnce(timeout time.Duration) {
+	if !m.probeReady {
+		return
+	}
+	if m.probeAllInFlight.Swap(true) {
+		return
+	}
+	go func() {
+		defer m.probeAllInFlight.Store(false)
+		m.probeNodes(timeout, true)
+	}()
+}
+
 // probeAllNodes checks all registered nodes concurrently.
 func (m *Manager) probeAllNodes(timeout time.Duration) {
+	m.probeNodes(timeout, false)
+}
+
+func (m *Manager) probeNodes(timeout time.Duration, dueOnly bool) {
 	m.mu.RLock()
 	entries := make([]*entry, 0, len(m.nodes))
 	for _, e := range m.nodes {
@@ -345,9 +432,16 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 		e.mu.RLock()
 		probeFn := e.probe
 		tag := e.info.Tag
+		lastHealthCheck := e.lastHealthCheck
 		e.mu.RUnlock()
 
 		if probeFn == nil {
+			continue
+		}
+		if dueOnly && !m.probeDue(tag, lastHealthCheck, time.Now()) {
+			continue
+		}
+		if !m.beginTagProbe(tag) {
 			continue
 		}
 
@@ -356,27 +450,17 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 		go func(entry *entry, probe probeFunc, tag string) {
 			defer wg.Done()
 			defer func() { <-sem }()
+			defer m.endTagProbe(tag)
 
 			ctx, cancel := context.WithTimeout(m.ctx, timeout)
 			latency, err := probe(ctx)
 			cancel()
-
-			entry.mu.Lock()
+			m.applyHealthResult(entry, latency, err, time.Now())
 			if err != nil {
 				failedCount.Add(1)
-				entry.lastError = err.Error()
-				entry.lastFail = time.Now()
-				entry.lastProbe = 0
-				entry.available = false
-				entry.initialCheckDone = true
 			} else {
 				availableCount.Add(1)
-				entry.lastOK = time.Now()
-				entry.lastProbe = latency
-				entry.available = true
-				entry.initialCheckDone = true
 			}
-			entry.mu.Unlock()
 
 			if err != nil && m.logger != nil {
 				m.logger.Warn("probe failed for ", tag, ": ", err)
@@ -437,8 +521,11 @@ func parsePort(value string) uint16 {
 // to remove nodes that were not re-registered (disabled/deleted nodes).
 func (m *Manager) BeginReload() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.reloadGen++
+	m.mu.Unlock()
+	m.groupScheduleMu.Lock()
+	m.groupSchedules = make(map[int64]groupHealthSchedule)
+	m.groupScheduleMu.Unlock()
 }
 
 // SweepStaleNodes removes nodes that were not re-registered during the current
@@ -651,24 +738,87 @@ func (m *Manager) Probe(ctx context.Context, tag string) (time.Duration, error) 
 	if err != nil {
 		return 0, err
 	}
-	if e.probe == nil {
+	e.mu.RLock()
+	probe := e.probe
+	e.mu.RUnlock()
+	if probe == nil {
 		return 0, errors.New("probe not available for this node")
 	}
-	latency, err := e.probe(ctx)
+	if !m.beginTagProbe(tag) {
+		return 0, errors.New("probe already in progress for this node")
+	}
+	defer m.endTagProbe(tag)
+	latency, err := probe(ctx)
+	m.applyHealthResult(e, latency, err, time.Now())
 	if err != nil {
-		// 探测失败：标记节点为不可用，清除旧延迟数据
+		return 0, err
+	}
+	return latency, nil
+}
+
+func (m *Manager) beginTagProbe(tag string) bool {
+	m.probeTagMu.Lock()
+	defer m.probeTagMu.Unlock()
+	if _, exists := m.probeTagsInFlight[tag]; exists {
+		return false
+	}
+	m.probeTagsInFlight[tag] = struct{}{}
+	return true
+}
+
+func (m *Manager) endTagProbe(tag string) {
+	m.probeTagMu.Lock()
+	delete(m.probeTagsInFlight, tag)
+	m.probeTagMu.Unlock()
+}
+
+func (m *Manager) applyHealthResult(e *entry, latency time.Duration, probeErr error, checkedAt time.Time) {
+	if checkedAt.IsZero() {
+		checkedAt = time.Now()
+	}
+	destination := ""
+	if dst, ok := m.DestinationForProbe(); ok {
+		destination = dst.String()
+	}
+	if probeErr != nil {
+		e.recordFailure(probeErr, destination)
 		e.mu.Lock()
 		e.available = false
 		e.initialCheckDone = true
-		e.lastProbe = 0 // 清除延迟，前端显示"未测试"
-		e.lastError = err.Error()
-		e.lastFail = time.Now()
+		e.lastProbe = 0
+		e.lastHealthCheck = checkedAt
 		e.mu.Unlock()
-		return 0, err
+	} else {
+		e.recordSuccessWithLatency(latency)
+		e.mu.Lock()
+		e.lastHealthCheck = checkedAt
+		e.mu.Unlock()
 	}
-	// 探测成功：recordSuccessWithLatency 已在 probe 函数内更新 available=true
-	e.recordProbeLatency(latency)
-	return latency, nil
+	e.mu.RLock()
+	tag := e.info.Tag
+	e.mu.RUnlock()
+	event := HealthResultEvent{Tag: tag, Success: probeErr == nil, Latency: latency, CheckedAt: checkedAt}
+	if probeErr != nil {
+		event.Error = probeErr.Error()
+	}
+	m.publishHealthResult(event)
+}
+
+// MarkAvailableWithoutProbe keeps the existing compatibility behavior used
+// when no probe target is configured while still notifying group schedulers.
+func (m *Manager) MarkAvailableWithoutProbe(tag string) error {
+	e, err := m.entry(tag)
+	if err != nil {
+		return err
+	}
+	e.mu.RLock()
+	alreadyAvailable := e.initialCheckDone && e.available
+	e.mu.RUnlock()
+	if alreadyAvailable {
+		return nil
+	}
+	m.applyHealthResult(e, 0, nil, time.Now())
+	return nil
 }
 
 // Release clears blacklist state for the given node.
@@ -830,6 +980,35 @@ func (m *Manager) publishDebugLog(event DebugLogEvent) {
 		case subscriber <- event:
 		default:
 		}
+	}
+}
+
+// SubscribeHealthResults installs a lossless in-process health observer.
+// Callbacks run outside manager and entry locks and must remain lightweight.
+func (m *Manager) SubscribeHealthResults(callback func(HealthResultEvent)) func() {
+	if callback == nil {
+		return func() {}
+	}
+	id := m.healthSubNextID.Add(1)
+	m.healthSubMu.Lock()
+	m.healthSubscribers[id] = callback
+	m.healthSubMu.Unlock()
+	return func() {
+		m.healthSubMu.Lock()
+		delete(m.healthSubscribers, id)
+		m.healthSubMu.Unlock()
+	}
+}
+
+func (m *Manager) publishHealthResult(event HealthResultEvent) {
+	m.healthSubMu.RLock()
+	callbacks := make([]func(HealthResultEvent), 0, len(m.healthSubscribers))
+	for _, callback := range m.healthSubscribers {
+		callbacks = append(callbacks, callback)
+	}
+	m.healthSubMu.RUnlock()
+	for _, callback := range callbacks {
+		callback(event)
 	}
 }
 

@@ -257,10 +257,17 @@ func Build(cfg *config.Config) (option.Options, error) {
 		for _, nodeID := range group.ExplicitNodeIDs {
 			explicitSet[nodeID] = struct{}{}
 		}
+		excludedSet := make(map[int64]struct{}, len(group.ExcludedNodeIDs))
+		for _, nodeID := range group.ExcludedNodeIDs {
+			excludedSet[nodeID] = struct{}{}
+		}
 		members := make([]string, 0)
 		groupMeta := make(map[string]poolout.MemberMeta)
 		for _, tag := range memberTags {
 			meta := metadata[tag]
+			if _, excluded := excludedSet[meta.NodeID]; excluded {
+				continue
+			}
 			_, explicit := explicitSet[meta.NodeID]
 			_, regional := regionSet[strings.ToLower(meta.Region)]
 			if !explicit && !regional {
@@ -300,7 +307,8 @@ func Build(cfg *config.Config) (option.Options, error) {
 			Options: &option.SelectorOutboundOptions{Outbounds: members, Default: preferredTag, InterruptExistConnections: false}})
 		groupOptions := poolout.Options{Mode: group.DispatchMode, Members: members,
 			FailureThreshold: group.FailureThreshold, FailureWindow: group.FailureWindow,
-			BlacklistDuration: 100 * 365 * 24 * time.Hour, Metadata: groupMeta,
+			HealthCheckInterval: group.HealthCheckInterval,
+			BlacklistDuration:   100 * 365 * 24 * time.Hour, Metadata: groupMeta,
 			GroupID: group.ID, PreferredMember: preferredTag, InitialGroupState: stateByTag, SelectorTag: selectorTag}
 		outbounds = append(outbounds, option.Outbound{Type: poolout.Type, Tag: groupOutboundTag, Options: &groupOptions})
 

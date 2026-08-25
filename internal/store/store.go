@@ -205,6 +205,7 @@ type GroupPool struct {
 	DispatchMode         string           `json:"dispatch_mode"`
 	Regions              []string         `json:"regions"`
 	ExplicitNodeIDs      []int64          `json:"explicit_node_ids"`
+	ExcludedNodeIDs      []int64          `json:"excluded_node_ids"`
 	FailureWindowSeconds int              `json:"failure_window_seconds"`
 	FailureThreshold     int              `json:"failure_threshold"`
 	HealthCheckSeconds   int              `json:"health_check_seconds"`

@@ -381,12 +381,21 @@ export default function ManagePanel() {
     try {
       if (editingNode) {
         const res = await updateConfigNode(editingNode, form)
-        toast.success(res.message || '节点已更新')
+        if (res.reload_error) {
+          toast.warning(`${res.message || '节点已更新'}，但自动重载失败：${res.reload_error}`)
+          setNeedReload(true)
+        } else {
+          toast.success(`${res.message || '节点已更新'}${res.reloaded ? '，已自动重载' : ''}`)
+        }
       } else {
         const res = await createConfigNode(form)
-        toast.success(res.message || '节点已添加')
+        if (res.reload_error) {
+          toast.warning(`${res.message || '节点已添加'}，但自动重载失败：${res.reload_error}`)
+          setNeedReload(true)
+        } else {
+          toast.success(`${res.message || '节点已添加'}${res.reloaded ? '，已自动重载' : ''}`)
+        }
       }
-      setNeedReload(true)
       setModalOpen(false)
       queryClient.invalidateQueries({ queryKey: ['configNodes'] })
     } catch (err) {
@@ -401,8 +410,12 @@ export default function ManagePanel() {
     setDeleting(true)
     try {
       const res = await deleteConfigNode(deleteTarget)
-      toast.success(res.message || '节点已删除')
-      setNeedReload(true)
+      if (res.reload_error) {
+        toast.warning(`${res.message || '节点已删除'}，但自动重载失败：${res.reload_error}`)
+        setNeedReload(true)
+      } else {
+        toast.success(`${res.message || '节点已删除'}${res.reloaded ? '，已自动重载' : ''}`)
+      }
       setDeleteTarget(null)
       queryClient.invalidateQueries({ queryKey: ['configNodes'] })
     } catch (err) {

@@ -1148,7 +1148,7 @@ func servicesFromStatuses(netflix, disneyPlus, chatgpt string) []UnlockServiceRe
 // ===================== Group pool operations =====================
 
 const groupPoolColumns = `id, name, bind_address, bind_port, protocol, username, password,
-dispatch_mode, regions_json, explicit_node_ids_json, failure_window_seconds,
+dispatch_mode, regions_json, explicit_node_ids_json, excluded_node_ids_json, failure_window_seconds,
 failure_threshold, health_check_seconds, current_active_node_id, enabled,
 subscription_enabled, subscription_token, subscription_mode, external_host, created_at, updated_at`
 
@@ -1196,14 +1196,15 @@ func (s *sqliteStore) GetGroupPool(ctx context.Context, id int64) (*GroupPool, e
 func (s *sqliteStore) CreateGroupPool(ctx context.Context, g *GroupPool) error {
 	regions, _ := json.Marshal(g.Regions)
 	nodeIDs, _ := json.Marshal(g.ExplicitNodeIDs)
+	excludedNodeIDs, _ := json.Marshal(g.ExcludedNodeIDs)
 	result, err := s.conn().ExecContext(ctx, `INSERT INTO group_pools
 (name, bind_address, bind_port, protocol, username, password, dispatch_mode, regions_json,
- explicit_node_ids_json, failure_window_seconds, failure_threshold, health_check_seconds,
+ explicit_node_ids_json, excluded_node_ids_json, failure_window_seconds, failure_threshold, health_check_seconds,
  current_active_node_id, enabled, subscription_enabled, subscription_token, subscription_mode,
  external_host, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		g.Name, g.BindAddress, g.BindPort, g.Protocol, g.Username, g.Password, g.DispatchMode,
-		string(regions), string(nodeIDs), g.FailureWindowSeconds, g.FailureThreshold,
+		string(regions), string(nodeIDs), string(excludedNodeIDs), g.FailureWindowSeconds, g.FailureThreshold,
 		g.HealthCheckSeconds, g.CurrentActiveNodeID, boolToInt(g.Enabled), boolToInt(g.SubscriptionEnabled),
 		g.SubscriptionToken, g.SubscriptionMode, g.ExternalHost, formatTime(time.Now()), formatTime(time.Now()))
 	if err != nil {
@@ -1216,13 +1217,14 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 func (s *sqliteStore) UpdateGroupPool(ctx context.Context, g *GroupPool) error {
 	regions, _ := json.Marshal(g.Regions)
 	nodeIDs, _ := json.Marshal(g.ExplicitNodeIDs)
+	excludedNodeIDs, _ := json.Marshal(g.ExcludedNodeIDs)
 	result, err := s.conn().ExecContext(ctx, `UPDATE group_pools SET
 name=?, bind_address=?, bind_port=?, protocol=?, username=?, password=?, dispatch_mode=?,
-regions_json=?, explicit_node_ids_json=?, failure_window_seconds=?, failure_threshold=?,
+regions_json=?, explicit_node_ids_json=?, excluded_node_ids_json=?, failure_window_seconds=?, failure_threshold=?,
 health_check_seconds=?, current_active_node_id=?, enabled=?, subscription_enabled=?, subscription_token=?,
 subscription_mode=?, external_host=?, updated_at=? WHERE id=?`,
 		g.Name, g.BindAddress, g.BindPort, g.Protocol, g.Username, g.Password, g.DispatchMode,
-		string(regions), string(nodeIDs), g.FailureWindowSeconds, g.FailureThreshold,
+		string(regions), string(nodeIDs), string(excludedNodeIDs), g.FailureWindowSeconds, g.FailureThreshold,
 		g.HealthCheckSeconds, g.CurrentActiveNodeID, boolToInt(g.Enabled), boolToInt(g.SubscriptionEnabled),
 		g.SubscriptionToken, g.SubscriptionMode, g.ExternalHost, formatTime(time.Now()), g.ID)
 	if err != nil {
@@ -1285,10 +1287,10 @@ last_error, evicted_at, updated_at FROM group_node_states WHERE group_id = ?`, g
 
 func scanGroupPool(row scanner) (GroupPool, error) {
 	var g GroupPool
-	var regions, nodeIDs, createdAt, updatedAt string
+	var regions, nodeIDs, excludedNodeIDs, createdAt, updatedAt string
 	var enabled, subscriptionEnabled int
 	err := row.Scan(&g.ID, &g.Name, &g.BindAddress, &g.BindPort, &g.Protocol, &g.Username, &g.Password,
-		&g.DispatchMode, &regions, &nodeIDs, &g.FailureWindowSeconds, &g.FailureThreshold,
+		&g.DispatchMode, &regions, &nodeIDs, &excludedNodeIDs, &g.FailureWindowSeconds, &g.FailureThreshold,
 		&g.HealthCheckSeconds, &g.CurrentActiveNodeID, &enabled, &subscriptionEnabled,
 		&g.SubscriptionToken, &g.SubscriptionMode, &g.ExternalHost, &createdAt, &updatedAt)
 	if err != nil {
@@ -1296,6 +1298,7 @@ func scanGroupPool(row scanner) (GroupPool, error) {
 	}
 	_ = json.Unmarshal([]byte(regions), &g.Regions)
 	_ = json.Unmarshal([]byte(nodeIDs), &g.ExplicitNodeIDs)
+	_ = json.Unmarshal([]byte(excludedNodeIDs), &g.ExcludedNodeIDs)
 	g.Enabled = enabled != 0
 	g.SubscriptionEnabled = subscriptionEnabled != 0
 	g.CreatedAt, g.UpdatedAt = parseTime(createdAt), parseTime(updatedAt)

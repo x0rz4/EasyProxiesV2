@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/group"
 	"easy_proxies/internal/store"
 )
 
@@ -35,6 +36,31 @@ func TestLoadNodesFromStoreKeepsFreshNodesDuringSubscriptionMigration(t *testing
 	}
 	if len(cfg.Nodes) != 1 || cfg.Nodes[0].URI != "ss://fresh" {
 		t.Fatalf("expected freshly fetched bootstrap node, got %#v", cfg.Nodes)
+	}
+}
+
+func TestGroupStatePersisterFlushesClearedCurrent(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "group-state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	groupPool := &store.GroupPool{Name: "group", BindAddress: "127.0.0.1", BindPort: 12095,
+		Protocol: "mixed", DispatchMode: "fixed", FailureWindowSeconds: 300, FailureThreshold: 3,
+		HealthCheckSeconds: 60, CurrentActiveNodeID: 99, Enabled: true}
+	if err := db.CreateGroupPool(ctx, groupPool); err != nil {
+		t.Fatal(err)
+	}
+	persister := newGroupStatePersister(db)
+	persister.Observe(group.GroupStateEvent{GroupID: groupPool.ID, CurrentChanged: true, CurrentNodeID: 0})
+	persister.Close()
+	updated, err := db.GetGroupPool(ctx, groupPool.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.CurrentActiveNodeID != 0 {
+		t.Fatalf("current node ID = %d, want 0", updated.CurrentActiveNodeID)
 	}
 }
 

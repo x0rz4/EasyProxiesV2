@@ -138,7 +138,8 @@ type Server struct {
 	sessionTTL time.Duration
 
 	// Concurrency control
-	probeSem *semaphore.Weighted
+	probeSem        *semaphore.Weighted
+	groupMutationMu sync.Mutex
 
 	// Lifecycle
 	done chan struct{} // closed on Shutdown to stop background goroutines
@@ -2001,7 +2002,8 @@ func (s *Server) handleConfigNodes(w http.ResponseWriter, r *http.Request) {
 			s.respondNodeError(w, err)
 			return
 		}
-		writeJSON(w, map[string]any{"node": node, "message": "节点已添加，请点击重载使配置生效"})
+		reloadError := s.reloadAfterGroupMutation(r.Context())
+		writeJSON(w, map[string]any{"node": node, "message": "节点已添加", "reloaded": reloadError == "", "reload_error": reloadError})
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -2034,7 +2036,8 @@ func (s *Server) handleConfigNodeItem(w http.ResponseWriter, r *http.Request) {
 			s.respondNodeError(w, err)
 			return
 		}
-		writeJSON(w, map[string]any{"node": node, "message": "节点已更新，请点击重载使配置生效"})
+		reloadError := s.reloadAfterGroupMutation(r.Context())
+		writeJSON(w, map[string]any{"node": node, "message": "节点已更新", "reloaded": reloadError == "", "reload_error": reloadError})
 	case http.MethodPatch:
 		var body struct {
 			Enabled *bool `json:"enabled"`
@@ -2071,7 +2074,8 @@ func (s *Server) handleConfigNodeItem(w http.ResponseWriter, r *http.Request) {
 			s.respondNodeError(w, err)
 			return
 		}
-		writeJSON(w, map[string]any{"message": "节点已删除，请点击重载使配置生效"})
+		reloadError := s.reloadAfterGroupMutation(r.Context())
+		writeJSON(w, map[string]any{"message": "节点已删除", "reloaded": reloadError == "", "reload_error": reloadError})
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -2279,6 +2283,7 @@ type groupPoolInput struct {
 	DispatchMode         string   `json:"dispatch_mode"`
 	Regions              []string `json:"regions"`
 	ExplicitNodeIDs      []int64  `json:"explicit_node_ids"`
+	ExcludedNodeIDs      *[]int64 `json:"excluded_node_ids"`
 	FailureWindowSeconds int      `json:"failure_window_seconds"`
 	FailureThreshold     int      `json:"failure_threshold"`
 	HealthCheckSeconds   int      `json:"health_check_seconds"`
@@ -2341,15 +2346,19 @@ func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, http.StatusBadRequest, "无效的请求数据")
 			return
 		}
+		s.groupMutationMu.Lock()
 		group, removedNodeIDs, err := s.groupFromInput(r.Context(), input, nil)
 		if err != nil {
+			s.groupMutationMu.Unlock()
 			writeAPIError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if err := s.store.CreateGroupPool(r.Context(), group); err != nil {
+			s.groupMutationMu.Unlock()
 			writeAPIError(w, http.StatusConflict, err.Error())
 			return
 		}
+		s.groupMutationMu.Unlock()
 		reloadError := s.reloadAfterGroupMutation(r.Context())
 		w.WriteHeader(http.StatusCreated)
 		writeJSON(w, map[string]any{"group": group, "reloaded": reloadError == "", "reload_error": reloadError,
@@ -2370,6 +2379,19 @@ func (s *Server) handleGroupItem(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "无效的分组 ID")
 		return
 	}
+	if len(parts) == 4 && parts[1] == "members" && parts[3] == "activate" && r.Method == http.MethodPost {
+		nodeID, err := strconv.ParseInt(parts[2], 10, 64)
+		if err != nil || nodeID <= 0 {
+			writeAPIError(w, http.StatusBadRequest, "无效的节点 ID")
+			return
+		}
+		if err := group.ActivateMember(groupID, nodeID); err != nil {
+			writeAPIError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeJSON(w, map[string]any{"message": "当前出口已切换", "group_id": groupID, "node_id": nodeID})
+		return
+	}
 	if len(parts) == 4 && parts[1] == "members" && parts[3] == "restore" && r.Method == http.MethodPost {
 		nodeID, err := strconv.ParseInt(parts[2], 10, 64)
 		if err != nil || nodeID <= 0 {
@@ -2386,6 +2408,53 @@ func (s *Server) handleGroupItem(w http.ResponseWriter, r *http.Request) {
 			s.logger.Printf("restore group runtime: %v", err)
 		}
 		writeJSON(w, map[string]any{"message": "节点已恢复", "group_id": groupID, "node_id": nodeID})
+		return
+	}
+	if len(parts) == 3 && parts[1] == "members" && r.Method == http.MethodDelete {
+		nodeID, err := strconv.ParseInt(parts[2], 10, 64)
+		if err != nil || nodeID <= 0 {
+			writeAPIError(w, http.StatusBadRequest, "无效的节点 ID")
+			return
+		}
+		runtimeState, ok := group.GroupRuntimeSnapshots()[groupID]
+		if !ok {
+			writeAPIError(w, http.StatusConflict, "分组当前未运行")
+			return
+		}
+		isMember := false
+		for _, member := range runtimeState.Members {
+			if member.NodeID == nodeID {
+				isMember = true
+				break
+			}
+		}
+		if !isMember {
+			writeAPIError(w, http.StatusNotFound, "节点不是当前运行成员")
+			return
+		}
+		s.groupMutationMu.Lock()
+		groupPool, err := s.store.GetGroupPool(r.Context(), groupID)
+		if err != nil || groupPool == nil {
+			s.groupMutationMu.Unlock()
+			writeAPIError(w, http.StatusNotFound, "分组不存在")
+			return
+		}
+		groupPool.ExplicitNodeIDs = removeInt64(groupPool.ExplicitNodeIDs, nodeID)
+		if !containsInt64(groupPool.ExcludedNodeIDs, nodeID) {
+			groupPool.ExcludedNodeIDs = append(groupPool.ExcludedNodeIDs, nodeID)
+		}
+		if groupPool.CurrentActiveNodeID == nodeID || runtimeState.CurrentNodeID == nodeID {
+			groupPool.CurrentActiveNodeID = 0
+		}
+		err = s.store.UpdateGroupPool(r.Context(), groupPool)
+		s.groupMutationMu.Unlock()
+		if err != nil {
+			writeAPIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		reloadError := s.reloadAfterGroupMutation(r.Context())
+		writeJSON(w, map[string]any{"message": "节点已从当前分组移除", "group_id": groupID, "node_id": nodeID,
+			"reloaded": reloadError == "", "reload_error": reloadError})
 		return
 	}
 	if len(parts) == 3 && parts[1] == "subscription" && parts[2] == "reset-token" && r.Method == http.MethodPost {
@@ -2650,6 +2719,31 @@ func (s *Server) groupFromInput(ctx context.Context, input groupPoolInput, exist
 		}
 		keptNodeIDs = append(keptNodeIDs, nodeID)
 	}
+	excludedInput := []int64(nil)
+	if input.ExcludedNodeIDs != nil {
+		excludedInput = *input.ExcludedNodeIDs
+	} else if existing != nil {
+		excludedInput = existing.ExcludedNodeIDs
+	}
+	keptSet := make(map[int64]struct{}, len(keptNodeIDs))
+	for _, nodeID := range keptNodeIDs {
+		keptSet[nodeID] = struct{}{}
+	}
+	excludedNodeIDs := make([]int64, 0, len(excludedInput))
+	seenExcluded := make(map[int64]struct{}, len(excludedInput))
+	for _, nodeID := range excludedInput {
+		if nodeID <= 0 {
+			continue
+		}
+		if _, manuallyAdded := keptSet[nodeID]; manuallyAdded {
+			continue
+		}
+		if _, duplicate := seenExcluded[nodeID]; duplicate {
+			continue
+		}
+		seenExcluded[nodeID] = struct{}{}
+		excludedNodeIDs = append(excludedNodeIDs, nodeID)
+	}
 	regions := make([]string, 0, len(input.Regions))
 	seenRegions := make(map[string]struct{})
 	for _, value := range input.Regions {
@@ -2689,7 +2783,7 @@ func (s *Server) groupFromInput(ctx context.Context, input groupPoolInput, exist
 	}
 	group := &store.GroupPool{Name: input.Name, BindAddress: input.BindAddress, BindPort: input.BindPort,
 		Protocol: protocol, Username: input.Username, Password: input.Password, DispatchMode: input.DispatchMode,
-		Regions: regions, ExplicitNodeIDs: keptNodeIDs, FailureWindowSeconds: input.FailureWindowSeconds,
+		Regions: regions, ExplicitNodeIDs: keptNodeIDs, ExcludedNodeIDs: excludedNodeIDs, FailureWindowSeconds: input.FailureWindowSeconds,
 		FailureThreshold: input.FailureThreshold, HealthCheckSeconds: input.HealthCheckSeconds, Enabled: enabled,
 		SubscriptionEnabled: subscriptionEnabled, SubscriptionToken: subscriptionToken,
 		SubscriptionMode: input.SubscriptionMode, ExternalHost: strings.TrimSpace(input.ExternalHost)}
@@ -2781,6 +2875,25 @@ func (s *Server) reloadAfterGroupMutation(ctx context.Context) string {
 		return err.Error()
 	}
 	return ""
+}
+
+func containsInt64(values []int64, target int64) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func removeInt64(values []int64, target int64) []int64 {
+	result := values[:0]
+	for _, value := range values {
+		if value != target {
+			result = append(result, value)
+		}
+	}
+	return result
 }
 
 // handleGeoipStatus reports the on-disk state of the GeoIP database.

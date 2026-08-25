@@ -47,3 +47,46 @@ func TestSlidingWindowDropsExpiredFailures(t *testing.T) {
 		t.Fatalf("expired failure was not pruned: %+v", snapshot.Members)
 	}
 }
+
+func TestSuccessfulHealthCheckClearsConsecutiveFailures(t *testing.T) {
+	Reset()
+	defer Reset()
+	now := time.Now()
+	Register(10, 5*time.Minute, 3, "node-a", map[string]GroupInitialState{"node-a": {NodeID: 10}})
+
+	RecordFailure(10, "node-a", errors.New("first"), now)
+	RecordFailure(10, "node-a", errors.New("second"), now.Add(time.Minute))
+	if MemberAvailable(10, "node-a") {
+		t.Fatal("suspect member remained available")
+	}
+	if !RecordHealthSuccess(10, "node-a") {
+		t.Fatal("successful probe did not restore suspect member")
+	}
+	if !MemberAvailable(10, "node-a") {
+		t.Fatal("member did not become available after a successful probe")
+	}
+	RecordFailure(10, "node-a", errors.New("third"), now.Add(2*time.Minute))
+	RecordFailure(10, "node-a", errors.New("fourth"), now.Add(3*time.Minute))
+	if GroupRuntimeSnapshots()[10].Members[0].Status == "EVICTED" {
+		t.Fatal("failures before a successful probe were not cleared")
+	}
+}
+
+func TestCurrentClearEmitsExplicitChange(t *testing.T) {
+	Reset()
+	defer Reset()
+	events := make(chan GroupStateEvent, 4)
+	SetGroupStateObserver(func(event GroupStateEvent) { events <- event })
+	defer SetGroupStateObserver(nil)
+	Register(11, 5*time.Minute, 3, "node-a", map[string]GroupInitialState{"node-a": {NodeID: 11}})
+	<-events // initial current
+
+	RecordFailure(11, "node-a", errors.New("down"), time.Now())
+	event := <-events
+	if !event.CurrentChanged || event.CurrentNodeID != 0 {
+		t.Fatalf("clear event = %+v, want CurrentChanged with node ID 0", event)
+	}
+	if got := CurrentTag(11); got != "" {
+		t.Fatalf("current tag = %q, want empty", got)
+	}
+}

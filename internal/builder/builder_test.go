@@ -48,7 +48,8 @@ func TestBuildCreatesIndependentGroupListenerSelectorAndPool(t *testing.T) {
 			{ID: 2, Name: "jp", URI: "http://jp.example:80", Region: "jp"}},
 		Groups: []config.GroupPoolConfig{{ID: 7, Name: "mixed", BindAddress: "127.0.0.1", BindPort: 10007,
 			Protocol: "mixed", DispatchMode: "fixed", Regions: []string{"hk"}, ExplicitNodeIDs: []int64{2},
-			FailureWindow: 5 * time.Minute, FailureThreshold: 3, Enabled: true}}}
+			ExcludedNodeIDs: []int64{2},
+			FailureWindow:   5 * time.Minute, FailureThreshold: 3, Enabled: true}}}
 	opts, err := Build(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -65,7 +66,7 @@ func TestBuildCreatesIndependentGroupListenerSelectorAndPool(t *testing.T) {
 			foundSelector = outbound.Type == C.TypeSelector
 		case "group-pool-7":
 			options, ok := outbound.Options.(*poolout.Options)
-			foundPool = ok && options.SelectorTag == "group-selector-7" && len(options.Members) == 2
+			foundPool = ok && options.SelectorTag == "group-selector-7" && len(options.Members) == 1
 		}
 	}
 	if !foundInbound || !foundSelector || !foundPool {

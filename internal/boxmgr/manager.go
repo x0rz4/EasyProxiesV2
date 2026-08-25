@@ -318,11 +318,6 @@ func effectiveHealthCheckInterval(cfg *config.Config) time.Duration {
 	if interval <= 0 {
 		interval = 2 * time.Hour
 	}
-	for _, group := range cfg.Groups {
-		if group.Enabled && group.HealthCheckInterval > 0 && group.HealthCheckInterval < interval {
-			interval = group.HealthCheckInterval
-		}
-	}
 	return interval
 }
 

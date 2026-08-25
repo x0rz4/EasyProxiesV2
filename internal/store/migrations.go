@@ -225,6 +225,13 @@ ALTER TABLE group_pools ADD COLUMN external_host TEXT NOT NULL DEFAULT '';
 UPDATE group_pools SET subscription_token = lower(hex(randomblob(24))) WHERE subscription_token = '';
 `,
 		},
+		{
+			Version:     8,
+			Description: "add group member exclusions",
+			Up: `
+ALTER TABLE group_pools ADD COLUMN excluded_node_ids_json TEXT NOT NULL DEFAULT '[]';
+`,
+		},
 	}
 }
 

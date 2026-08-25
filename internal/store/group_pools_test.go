@@ -20,6 +20,7 @@ func TestGroupPoolCRUDAndState(t *testing.T) {
 
 	group := &GroupPool{Name: "HK", BindAddress: "0.0.0.0", BindPort: 10001, Protocol: "mixed",
 		DispatchMode: "fixed", Regions: []string{"hk"}, ExplicitNodeIDs: []int64{node.ID},
+		ExcludedNodeIDs:      []int64{999},
 		FailureWindowSeconds: 300, FailureThreshold: 3, HealthCheckSeconds: 60, Enabled: true}
 	group.SubscriptionEnabled, group.SubscriptionToken, group.SubscriptionMode = true, "token", "entry"
 	if err := db.CreateGroupPool(ctx, group); err != nil {
@@ -42,6 +43,9 @@ func TestGroupPoolCRUDAndState(t *testing.T) {
 	}
 	if !loaded.SubscriptionEnabled || loaded.SubscriptionToken != "token" || loaded.SubscriptionMode != "entry" {
 		t.Fatalf("subscription settings not persisted: %+v", loaded)
+	}
+	if len(loaded.ExcludedNodeIDs) != 1 || loaded.ExcludedNodeIDs[0] != 999 {
+		t.Fatalf("member exclusions not persisted: %+v", loaded.ExcludedNodeIDs)
 	}
 	loaded.Name = "HK VIP"
 	loaded.DispatchMode = "random"

@@ -161,6 +161,14 @@ export async function restoreGroupMember(groupId: number, nodeId: number) {
   return request(`/api/groups/${groupId}/members/${nodeId}/restore`, { method: 'POST' })
 }
 
+export async function activateGroupMember(groupId: number, nodeId: number) {
+  return request(`/api/groups/${groupId}/members/${nodeId}/activate`, { method: 'POST' })
+}
+
+export async function removeGroupMember(groupId: number, nodeId: number) {
+  return request(`/api/groups/${groupId}/members/${nodeId}`, { method: 'DELETE' })
+}
+
 export async function resetGroupSubscriptionToken(groupId: number): Promise<{ message: string; token: string }> {
   return request(`/api/groups/${groupId}/subscription/reset-token`, { method: 'POST' })
 }

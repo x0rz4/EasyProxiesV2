@@ -81,6 +81,7 @@ type GroupPoolConfig struct {
 	DispatchMode        string                 `yaml:"-" json:"dispatch_mode"`
 	Regions             []string               `yaml:"-" json:"regions"`
 	ExplicitNodeIDs     []int64                `yaml:"-" json:"explicit_node_ids"`
+	ExcludedNodeIDs     []int64                `yaml:"-" json:"excluded_node_ids"`
 	FailureWindow       time.Duration          `yaml:"-" json:"-"`
 	FailureThreshold    int                    `yaml:"-" json:"failure_threshold"`
 	HealthCheckInterval time.Duration          `yaml:"-" json:"-"`

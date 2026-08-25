@@ -9,6 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"easy_proxies/internal/group"
+	"easy_proxies/internal/monitor"
+
 	"github.com/sagernet/sing-box/adapter"
 	boxlog "github.com/sagernet/sing-box/log"
 	M "github.com/sagernet/sing/common/metadata"
@@ -25,6 +28,14 @@ type fakeOutbound struct {
 	adapter.Outbound
 	dial func(context.Context, string, M.Socksaddr) (net.Conn, error)
 }
+
+type fakeSelector struct {
+	adapter.Outbound
+	selected string
+}
+
+func (s *fakeSelector) SelectOutbound(tag string) bool { s.selected = tag; return true }
+func (s *fakeSelector) Now() string                    { return s.selected }
 
 func (o *fakeOutbound) Network() []string { return []string{N.NetworkTCP} }
 
@@ -156,6 +167,132 @@ func TestActiveConnections(t *testing.T) {
 	first.decActive()
 	second.decActive()
 	first.decActive()
+}
+
+func TestFixedSelectionKeepsHealthyCurrentThenUsesLowestLatency(t *testing.T) {
+	group.Reset()
+	defer group.Reset()
+	mgr, err := monitor.NewManager(monitor.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	aEntry := mgr.Register(monitor.NodeInfo{Tag: "a"})
+	bEntry := mgr.Register(monitor.NodeInfo{Tag: "b"})
+	aEntry.RecordSuccessWithLatency(80 * time.Millisecond)
+	bEntry.RecordSuccessWithLatency(10 * time.Millisecond)
+	group.Register(20, 5*time.Minute, 3, "a", map[string]group.GroupInitialState{
+		"a": {NodeID: 1}, "b": {NodeID: 2},
+	})
+	a := &memberState{tag: "a", shared: acquireSharedState("a")}
+	b := &memberState{tag: "b", shared: acquireSharedState("b")}
+	p := &poolOutbound{mode: modeFixed, monitor: mgr, options: Options{GroupID: 20,
+		Metadata: map[string]MemberMeta{"a": {NodeID: 1}, "b": {NodeID: 2}}}}
+	if selected := p.selectMember([]*memberState{a, b}); selected != a {
+		t.Fatalf("healthy current changed to %s", selected.tag)
+	}
+	group.SetCurrentTag(20, "")
+	if selected := p.selectMember([]*memberState{a, b}); selected != b {
+		t.Fatalf("replacement = %s, want lowest-latency b", selected.tag)
+	}
+}
+
+func TestHealthFailureHotSwitchesSelector(t *testing.T) {
+	group.Reset()
+	defer group.Reset()
+	mgr, err := monitor.NewManager(monitor.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	aEntry := mgr.Register(monitor.NodeInfo{Tag: "a"})
+	bEntry := mgr.Register(monitor.NodeInfo{Tag: "b"})
+	aEntry.MarkInitialCheckDone(false)
+	bEntry.RecordSuccessWithLatency(15 * time.Millisecond)
+	group.Register(21, 5*time.Minute, 3, "a", map[string]group.GroupInitialState{
+		"a": {NodeID: 1}, "b": {NodeID: 2},
+	})
+	selector := &fakeSelector{selected: "a"}
+	p := &poolOutbound{
+		logger: boxlog.NewNOPFactory().Logger(), mode: modeFixed, monitor: mgr, selector: selector,
+		options: Options{GroupID: 21, Metadata: map[string]MemberMeta{"a": {NodeID: 1}, "b": {NodeID: 2}}},
+		members: []*memberState{{tag: "a", shared: acquireSharedState("a")}, {tag: "b", shared: acquireSharedState("b")}},
+	}
+	p.handleHealthResult(monitor.HealthResultEvent{Tag: "a", Error: "down", CheckedAt: time.Now()})
+	if selector.selected != "b" || group.CurrentTag(21) != "b" {
+		t.Fatalf("selector=%q current=%q, want b", selector.selected, group.CurrentTag(21))
+	}
+}
+
+func TestRandomHealthSuccessDoesNotRotateHealthyCurrent(t *testing.T) {
+	group.Reset()
+	defer group.Reset()
+	mgr, err := monitor.NewManager(monitor.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	mgr.Register(monitor.NodeInfo{Tag: "a"}).RecordSuccessWithLatency(20 * time.Millisecond)
+	mgr.Register(monitor.NodeInfo{Tag: "b"}).RecordSuccessWithLatency(10 * time.Millisecond)
+	group.Register(23, 5*time.Minute, 3, "a", map[string]group.GroupInitialState{
+		"a": {NodeID: 1}, "b": {NodeID: 2},
+	})
+	selector := &fakeSelector{selected: "a"}
+	p := &poolOutbound{
+		logger: boxlog.NewNOPFactory().Logger(), mode: modeRandom, monitor: mgr, selector: selector,
+		options: Options{GroupID: 23},
+		members: []*memberState{{tag: "a", shared: acquireSharedState("a")}, {tag: "b", shared: acquireSharedState("b")}},
+	}
+	p.handleHealthResult(monitor.HealthResultEvent{Tag: "b", Success: true, CheckedAt: time.Now()})
+	if selector.selected != "a" || group.CurrentTag(23) != "a" {
+		t.Fatalf("healthy random current rotated: selector=%q current=%q", selector.selected, group.CurrentTag(23))
+	}
+}
+
+func TestManualActivationUsesSelectorAndRejectsUnhealthyMember(t *testing.T) {
+	group.Reset()
+	defer group.Reset()
+	mgr, err := monitor.NewManager(monitor.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	mgr.Register(monitor.NodeInfo{Tag: "a"}).RecordSuccessWithLatency(20 * time.Millisecond)
+	bEntry := mgr.Register(monitor.NodeInfo{Tag: "b"})
+	bEntry.RecordSuccessWithLatency(10 * time.Millisecond)
+	group.Register(24, 5*time.Minute, 3, "a", map[string]group.GroupInitialState{
+		"a": {NodeID: 1}, "b": {NodeID: 2},
+	})
+	selector := &fakeSelector{selected: "a"}
+	p := &poolOutbound{
+		logger: boxlog.NewNOPFactory().Logger(), mode: modeFixed, monitor: mgr, selector: selector,
+		options: Options{GroupID: 24, Metadata: map[string]MemberMeta{"a": {NodeID: 1}, "b": {NodeID: 2}}},
+		members: []*memberState{{tag: "a", shared: acquireSharedState("a")}, {tag: "b", shared: acquireSharedState("b")}},
+	}
+	unregister := group.RegisterActivationHandler(24, p.activateNodeID)
+	defer unregister()
+	if err := group.ActivateMember(24, 2); err != nil {
+		t.Fatal(err)
+	}
+	if selector.selected != "b" || group.CurrentTag(24) != "b" {
+		t.Fatalf("selector=%q current=%q, want b", selector.selected, group.CurrentTag(24))
+	}
+	bEntry.MarkInitialCheckDone(false)
+	if err := group.ActivateMember(24, 2); err == nil {
+		t.Fatal("unhealthy member was manually activated")
+	}
+}
+
+func TestEstablishedIOErrorDoesNotEvictGroupMember(t *testing.T) {
+	group.Reset()
+	defer group.Reset()
+	group.Register(22, 5*time.Minute, 1, "a", map[string]group.GroupInitialState{"a": {NodeID: 1}})
+	p := &poolOutbound{logger: boxlog.NewNOPFactory().Logger(), options: Options{GroupID: 22}}
+	p.recordEstablishedIOError(&memberState{tag: "a", shared: acquireSharedState("a")}, errors.New("remote reset"), "example.com:443")
+	member := group.GroupRuntimeSnapshots()[22].Members[0]
+	if member.Status != "ALIVE" || member.FailureCount != 0 {
+		t.Fatalf("established I/O error changed group state: %+v", member)
+	}
 }
 
 var _ net.Conn = (*halfCloseConn)(nil)

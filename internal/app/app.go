@@ -2,12 +2,12 @@ package app
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -68,20 +68,12 @@ func Run(ctx context.Context, cfg *config.Config) error {
 
 	// ── 4. Create and start BoxManager ──
 	boxMgr := boxmgr.New(cfg, monitorCfg, boxmgr.WithStore(dataStore))
-	group.SetGroupStateObserver(func(event group.GroupStateEvent) {
-		if event.StateChanged && event.NodeID != 0 {
-			_ = dataStore.UpsertGroupNodeState(context.Background(), &store.GroupNodeState{
-				GroupID: event.GroupID, NodeID: event.NodeID, FailureHistory: event.FailureHistory,
-				Evicted: event.Evicted, LastError: event.LastError, EvictedAt: event.EvictedAt})
-		}
-		if event.CurrentNodeID != 0 {
-			if group, err := dataStore.GetGroupPool(context.Background(), event.GroupID); err == nil && group != nil {
-				group.CurrentActiveNodeID = event.CurrentNodeID
-				_ = dataStore.UpdateGroupPool(context.Background(), group)
-			}
-		}
-	})
-	defer group.SetGroupStateObserver(nil)
+	groupPersister := newGroupStatePersister(dataStore)
+	group.SetGroupStateObserver(groupPersister.Observe)
+	defer func() {
+		group.SetGroupStateObserver(nil)
+		groupPersister.Close()
+	}()
 	if err := boxMgr.Start(ctx); err != nil {
 		return fmt.Errorf("start box manager: %w", err)
 	}
@@ -112,7 +104,6 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	statsCtx, statsCancel := context.WithCancel(ctx)
 	defer statsCancel()
 	go periodicStatsFlush(statsCtx, boxMgr, dataStore)
-	go syncGroupHealthFailures(statsCtx, boxMgr)
 
 	// ── 7. Wait for shutdown signal ──
 	sigCh := make(chan os.Signal, 1)
@@ -152,6 +143,87 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	}
 
 	return nil
+}
+
+type groupStatePersister struct {
+	store  store.Store
+	events chan group.GroupStateEvent
+	mu     sync.RWMutex
+	closed bool
+	wg     sync.WaitGroup
+}
+
+func newGroupStatePersister(dataStore store.Store) *groupStatePersister {
+	p := &groupStatePersister{store: dataStore, events: make(chan group.GroupStateEvent, 256)}
+	p.wg.Add(1)
+	go p.run()
+	return p
+}
+
+func (p *groupStatePersister) Observe(event group.GroupStateEvent) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.closed {
+		return
+	}
+	p.events <- event
+}
+
+func (p *groupStatePersister) Close() {
+	p.mu.Lock()
+	if !p.closed {
+		p.closed = true
+		close(p.events)
+	}
+	p.mu.Unlock()
+	p.wg.Wait()
+}
+
+func (p *groupStatePersister) run() {
+	defer p.wg.Done()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	pendingCurrent := make(map[int64]int64)
+	flushCurrent := func() {
+		for groupID, nodeID := range pendingCurrent {
+			groupPool, err := p.store.GetGroupPool(context.Background(), groupID)
+			if err != nil || groupPool == nil {
+				if err != nil {
+					log.Printf("[app] persist group current %d: %v", groupID, err)
+				}
+				delete(pendingCurrent, groupID)
+				continue
+			}
+			groupPool.CurrentActiveNodeID = nodeID
+			if err := p.store.UpdateGroupPool(context.Background(), groupPool); err != nil {
+				log.Printf("[app] persist group current %d: %v", groupID, err)
+				continue
+			}
+			delete(pendingCurrent, groupID)
+		}
+	}
+	for {
+		select {
+		case event, ok := <-p.events:
+			if !ok {
+				flushCurrent()
+				return
+			}
+			if event.StateChanged && event.NodeID != 0 {
+				if err := p.store.UpsertGroupNodeState(context.Background(), &store.GroupNodeState{
+					GroupID: event.GroupID, NodeID: event.NodeID, FailureHistory: event.FailureHistory,
+					Evicted: event.Evicted, LastError: event.LastError, EvictedAt: event.EvictedAt,
+				}); err != nil {
+					log.Printf("[app] persist group node state %d/%d: %v", event.GroupID, event.NodeID, err)
+				}
+			}
+			if event.CurrentChanged {
+				pendingCurrent[event.GroupID] = event.CurrentNodeID
+			}
+		case <-ticker.C:
+			flushCurrent()
+		}
+	}
 }
 
 // loadNodesFromStore replaces config.Nodes with nodes from the Store.
@@ -256,6 +328,7 @@ func loadGroupsFromStore(ctx context.Context, cfg *config.Config, s store.Store)
 		converted := config.GroupPoolConfig{ID: group.ID, Name: group.Name, BindAddress: group.BindAddress,
 			BindPort: group.BindPort, Protocol: group.Protocol, Username: group.Username, Password: group.Password,
 			DispatchMode: group.DispatchMode, Regions: group.Regions, ExplicitNodeIDs: group.ExplicitNodeIDs,
+			ExcludedNodeIDs:  group.ExcludedNodeIDs,
 			FailureWindow:    time.Duration(group.FailureWindowSeconds) * time.Second,
 			FailureThreshold: group.FailureThreshold, HealthCheckInterval: time.Duration(group.HealthCheckSeconds) * time.Second,
 			CurrentActiveNodeID: group.CurrentActiveNodeID, Enabled: group.Enabled,
@@ -310,38 +383,6 @@ func periodicStatsFlush(ctx context.Context, boxMgr *boxmgr.Manager, s store.Sto
 			return
 		case <-ticker.C:
 			flushStatsToStore(ctx, boxMgr, s)
-		}
-	}
-}
-
-// syncGroupHealthFailures projects the existing global health checker into
-// each group-specific sliding failure window. Traffic failures are recorded by
-// the group outbound itself; this loop covers idle nodes that only fail probes.
-func syncGroupHealthFailures(ctx context.Context, boxMgr *boxmgr.Manager) {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			mgr := boxMgr.MonitorManager()
-			if mgr == nil {
-				continue
-			}
-			snapshots := make(map[string]monitor.Snapshot)
-			for _, snapshot := range mgr.Snapshot() {
-				snapshots[snapshot.Tag] = snapshot
-			}
-			for groupID, runtime := range group.GroupRuntimeSnapshots() {
-				for _, member := range runtime.Members {
-					snapshot, ok := snapshots[member.Tag]
-					if !ok || !snapshot.InitialCheckDone || snapshot.Available || snapshot.LastFailure.IsZero() {
-						continue
-					}
-					group.RecordGroupHealthFailure(groupID, member.Tag, errors.New(snapshot.LastError), snapshot.LastFailure)
-				}
-			}
 		}
 	}
 }

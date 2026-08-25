@@ -97,6 +97,7 @@ export interface GroupPool {
   dispatch_mode: 'fixed' | 'random'
   regions: string[]
   explicit_node_ids: number[]
+  excluded_node_ids: number[]
   failure_window_seconds: number
   failure_threshold: number
   health_check_seconds: number
@@ -131,6 +132,7 @@ export interface GroupPoolPayload {
   dispatch_mode: 'fixed' | 'random'
   regions: string[]
   explicit_node_ids: number[]
+  excluded_node_ids: number[]
   failure_window_seconds: number
   failure_threshold: number
   health_check_seconds: number
@@ -280,6 +282,8 @@ export interface ConfigNodesResponse {
 export interface ConfigNodeMutationResponse {
   node?: ConfigNodeConfig
   message: string
+  reloaded?: boolean
+  reload_error?: string
 }
 
 // ---- Subscription types ----

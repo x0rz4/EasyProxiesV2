@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -48,6 +49,31 @@ func TestGroupSubscriptionEntryAndToken(t *testing.T) {
 	}
 	if response.Header().Get("Profile-Update-Interval") != "12" {
 		t.Fatal("missing subscription headers")
+	}
+
+	reset := httptest.NewRecorder()
+	server.handleGroupItem(reset, httptest.NewRequest(http.MethodPost,
+		"/api/groups/"+strconv.FormatInt(groupPool.ID, 10)+"/subscription/reset-token", nil))
+	if reset.Code != http.StatusOK {
+		t.Fatalf("reset status=%d body=%s", reset.Code, reset.Body.String())
+	}
+	var resetBody struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(reset.Body.Bytes(), &resetBody); err != nil || resetBody.Token == "" || resetBody.Token == "secret-token" {
+		t.Fatalf("reset token=%q err=%v", resetBody.Token, err)
+	}
+	oldToken := httptest.NewRecorder()
+	server.handleGroupSubscription(oldToken, httptest.NewRequest(http.MethodGet,
+		"/sub/"+strconv.FormatInt(groupPool.ID, 10)+"?token=secret-token&format=clash", nil))
+	if oldToken.Code != http.StatusUnauthorized {
+		t.Fatalf("old token remained valid: %d", oldToken.Code)
+	}
+	newToken := httptest.NewRecorder()
+	server.handleGroupSubscription(newToken, httptest.NewRequest(http.MethodGet,
+		"/sub/"+strconv.FormatInt(groupPool.ID, 10)+"?token="+resetBody.Token+"&format=clash", nil))
+	if newToken.Code != http.StatusOK {
+		t.Fatalf("new token status=%d body=%s", newToken.Code, newToken.Body.String())
 	}
 }
 

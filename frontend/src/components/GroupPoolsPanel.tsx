@@ -7,7 +7,8 @@ import {
 import { toast } from 'sonner'
 import type { GroupMember, GroupNodeOption, GroupPool, GroupPoolPayload, GroupMemberStatus } from '../types'
 import {
-  createGroupPool, deleteGroupPool, listGroupPools, probeNode, resetGroupSubscriptionToken, restoreGroupMember, updateGroupPool,
+  activateGroupMember, createGroupPool, deleteGroupPool, listGroupPools, probeNode, removeGroupMember,
+  resetGroupSubscriptionToken, restoreGroupMember, updateGroupPool,
 } from '../api/client'
 import { cn } from '../utils/cn'
 import { controlClass, PageContent, PageHeader, PageLayout, surfaceClass } from './ui/PageLayout'
@@ -15,6 +16,7 @@ import { controlClass, PageContent, PageHeader, PageLayout, surfaceClass } from 
 const emptyPayload = (): GroupPoolPayload => ({
   name: '', bind_address: '0.0.0.0', bind_port: 0, protocol: 'mixed', username: '', password: '',
   dispatch_mode: 'fixed', regions: [], explicit_node_ids: [], failure_window_seconds: 300,
+  excluded_node_ids: [],
   failure_threshold: 3, health_check_seconds: 60, enabled: true,
 	subscription_enabled: true, subscription_mode: 'entry', external_host: '',
 })
@@ -33,12 +35,37 @@ const nodeStatusStyle: Record<GroupNodeOption['status'], { label: string; badge:
   disabled: { label: '已禁用', badge: 'badge-ghost' },
 }
 
+async function copyTextWithFallback(value: string): Promise<boolean> {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value)
+      return true
+    } catch { /* fall through for HTTP origins and denied permissions */ }
+  }
+  const textarea = document.createElement('textarea')
+  textarea.value = value
+  textarea.setAttribute('readonly', '')
+  textarea.style.position = 'fixed'
+  textarea.style.left = '-9999px'
+  textarea.style.opacity = '0'
+  document.body.appendChild(textarea)
+  textarea.select()
+  textarea.setSelectionRange(0, value.length)
+  try {
+    return document.execCommand('copy')
+  } catch {
+    return false
+  } finally {
+    textarea.remove()
+  }
+}
+
 function payloadFromGroup(group: GroupPool): GroupPoolPayload {
   return {
     name: group.name, bind_address: group.bind_address, bind_port: group.bind_port,
     protocol: group.protocol, username: group.username || '', password: group.password || '',
     dispatch_mode: group.dispatch_mode, regions: group.regions || [],
-    explicit_node_ids: group.explicit_node_ids || [], failure_window_seconds: group.failure_window_seconds,
+    explicit_node_ids: group.explicit_node_ids || [], excluded_node_ids: group.excluded_node_ids || [], failure_window_seconds: group.failure_window_seconds,
     failure_threshold: group.failure_threshold, health_check_seconds: group.health_check_seconds,
     enabled: group.enabled,
 		subscription_enabled: group.subscription_enabled, subscription_mode: group.subscription_mode || 'entry',
@@ -126,7 +153,16 @@ export default function GroupPoolsPanel() {
 
   const run = async (key: string, task: () => Promise<unknown>, message: string) => {
     setBusy(key)
-    try { await task(); toast.success(message); await refresh() }
+    try {
+      const result = await task()
+      const reloadResult = result as { reloaded?: boolean; reload_error?: string } | undefined
+      if (reloadResult?.reloaded === false) {
+        toast.warning(message, { description: `配置已保存，但自动重载失败：${reloadResult.reload_error || '请手动重试'}` })
+      } else {
+        toast.success(message)
+      }
+      await refresh()
+    }
     catch (error) { toast.error(error instanceof Error ? error.message : '操作失败') }
     finally { setBusy(null) }
   }
@@ -230,7 +266,12 @@ export default function GroupPoolsPanel() {
               onEdit={() => openEdit(group)} onDelete={() => setDeleteTarget(group)}
               onToggle={() => void run(`toggle-${group.id}`, () => updateGroupPool(group.id, { ...payloadFromGroup(group), enabled: !group.enabled }), group.enabled ? '分组已停用' : '分组已启用')}
 				onResetToken={() => void run(`token-${group.id}`, () => resetGroupSubscriptionToken(group.id), '订阅 Token 已重置，旧链接已失效')}
-              onRestore={(nodeId) => void run(`restore-${group.id}-${nodeId}`, () => restoreGroupMember(group.id, nodeId), '节点已恢复入池')} />)}
+              onRestore={(nodeId) => void run(`restore-${group.id}-${nodeId}`, () => restoreGroupMember(group.id, nodeId), '节点已恢复入池')}
+              onActivate={(nodeId) => void run(`activate-${group.id}-${nodeId}`, () => activateGroupMember(group.id, nodeId), '当前出口已立即切换')}
+              onRemoveMember={(member) => {
+                if (!window.confirm(`确认将“${member.name || member.tag}”从分组“${group.name}”移除？\n节点本身不会从节点管理中删除。`)) return
+                void run(`remove-member-${group.id}-${member.node_id}`, () => removeGroupMember(group.id, member.node_id), '节点已从当前分组移除')
+              }} />)}
           </section>
         )}
       </PageContent>
@@ -299,7 +340,7 @@ export default function GroupPoolsPanel() {
                   <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"><div><h5 className="text-sm font-bold">可添加节点</h5><p className="mt-0.5 text-xs text-base-content/50">仅显示节点管理状态为“可用”的节点</p></div><label className="input input-sm flex w-full items-center gap-2 sm:w-56"><Search className="h-3.5 w-3.5 text-base-content/40" /><input className="min-w-0 grow" value={nodeSearch} onChange={(e) => setNodeSearch(e.target.value)} placeholder="搜索节点或地区" aria-label="搜索可添加节点" /></label></div>
                   <div className="mt-3 max-h-72 space-y-2 overflow-y-auto pr-1">
                     {filteredNodes.map((node) => <NodeOptionRow key={node.id} node={node} latency={latencyOverrides[node.id] ?? node.latency_ms} probing={probingNodeIDs.has(node.id)}
-                      action="add" onAction={() => { setDraftNodeCache((current) => ({ ...current, [node.id]: node })); setForm((current) => ({ ...current, explicit_node_ids: [...current.explicit_node_ids, node.id] })) }} onProbe={() => void probeOption(node)} />)}
+                      action="add" onAction={() => { setDraftNodeCache((current) => ({ ...current, [node.id]: node })); setForm((current) => ({ ...current, explicit_node_ids: [...current.explicit_node_ids, node.id], excluded_node_ids: current.excluded_node_ids.filter((id) => id !== node.id) })) }} onProbe={() => void probeOption(node)} />)}
                     {filteredNodes.length === 0 && <EmptyMemberList message={nodeSearch ? '没有匹配的可用节点' : '当前没有其他可用节点'} />}
                   </div>
                 </div>
@@ -376,14 +417,18 @@ function RuntimeMemberRow({ member, manual, regional, latency, probing, onProbe 
   </div>
 }
 
-function GroupCard({ group, busy, expanded, onToggleExpanded, onEdit, onDelete, onToggle, onResetToken, onRestore }: { group: GroupPool; busy: string | null; expanded: boolean; onToggleExpanded: () => void; onEdit: () => void; onDelete: () => void; onToggle: () => void; onResetToken: () => void; onRestore: (nodeId: number) => void }) {
+function GroupCard({ group, busy, expanded, onToggleExpanded, onEdit, onDelete, onToggle, onResetToken, onRestore, onActivate, onRemoveMember }: { group: GroupPool; busy: string | null; expanded: boolean; onToggleExpanded: () => void; onEdit: () => void; onDelete: () => void; onToggle: () => void; onResetToken: () => void; onRestore: (nodeId: number) => void; onActivate: (nodeId: number) => void; onRemoveMember: (member: GroupMember) => void }) {
   const active = group.members.find((member) => member.is_active)
 	const copySubscription = async (format: 'clash' | 'base64', mode: 'members' | 'entry') => {
 		if (!group.subscription_token) { toast.error('当前分组没有可用的订阅 Token'); return }
 		const query = new URLSearchParams({ token: group.subscription_token, format, mode })
 		const link = `${window.location.origin}/sub/${group.id}?${query.toString()}`
-		try { await navigator.clipboard.writeText(link); toast.success(`已复制 ${format === 'clash' ? 'Clash' : 'Base64'} ${mode === 'entry' ? '入口' : '成员'}订阅`) }
-		catch { toast.error('复制失败，请检查浏览器剪贴板权限') }
+		if (await copyTextWithFallback(link)) {
+			toast.success(`已复制 ${format === 'clash' ? 'Clash' : 'Base64'} ${mode === 'entry' ? '入口' : '成员'}订阅`)
+		} else {
+			window.prompt('浏览器禁止自动复制，请手动复制订阅链接：', link)
+			toast.info('已打开手动复制窗口')
+		}
 	}
   return <article className={cn(surfaceClass, 'overflow-hidden transition-colors', !group.enabled && 'opacity-70')}>
     <div className="border-b border-base-200 p-5">
@@ -398,7 +443,7 @@ function GroupCard({ group, busy, expanded, onToggleExpanded, onEdit, onDelete, 
     </div>
     <div className="p-4 sm:p-5">
       {group.dispatch_mode === 'fixed' && <div className={cn('mb-3 flex items-center gap-3 rounded-xl border px-3 py-2.5', active ? 'border-success/25 bg-success/5' : 'border-warning/25 bg-warning/5')}><Activity className={cn('h-4 w-4 shrink-0', active ? 'text-success' : 'text-warning')} /><div className="min-w-0 flex-1"><p className="text-[11px] font-semibold uppercase tracking-wider text-base-content/45">当前主出口</p><p className="truncate text-sm font-semibold">{active?.name || '等待首个连接选择'}</p></div>{active?.latency_ms && active.latency_ms > 0 ? <span className="text-xs font-mono text-base-content/55">{active.latency_ms} ms</span> : null}</div>}
-      <div className="space-y-2">{(expanded ? group.members : group.members.slice(0, 8)).map((member) => { const style = statusStyle[member.status]; const StatusIcon = style.icon; return <div key={member.node_id} className="flex items-center gap-3 rounded-xl border border-base-200 bg-base-200/20 px-3 py-2.5"><StatusIcon className={cn('h-4 w-4 shrink-0', member.status === 'ALIVE' ? 'text-success' : member.status === 'SUSPECT' ? 'text-warning' : 'text-error')} /><div className="min-w-0 flex-1"><div className="flex items-center gap-2"><span className="truncate text-sm font-medium">{member.name || member.tag}</span>{member.region && <span className="text-[10px] font-bold uppercase text-base-content/40">{member.region}</span>}</div>{member.last_error && <p className="mt-0.5 truncate text-[11px] text-error/75" title={member.last_error}>{member.last_error}</p>}</div><span className={cn('badge badge-sm', style.badge)}>{style.label}</span>{member.latency_ms > 0 && <span className="hidden w-14 text-right font-mono text-xs text-base-content/45 sm:block">{member.latency_ms} ms</span>}{member.status === 'EVICTED' && <button className="btn btn-ghost btn-xs gap-1 text-primary" disabled={busy === `restore-${group.id}-${member.node_id}`} onClick={() => onRestore(member.node_id)} title="恢复入池"><RotateCcw className="h-3 w-3" /><span className="hidden sm:inline">恢复</span></button>}</div> })}</div>
+      <div className="space-y-2">{(expanded ? group.members : group.members.slice(0, 8)).map((member) => { const style = statusStyle[member.status]; const StatusIcon = style.icon; return <div key={member.node_id} className="flex min-w-0 items-center gap-2 rounded-xl border border-base-200 bg-base-200/20 px-3 py-2.5"><StatusIcon className={cn('h-4 w-4 shrink-0', member.status === 'ALIVE' ? 'text-success' : member.status === 'SUSPECT' ? 'text-warning' : 'text-error')} /><div className="min-w-0 flex-1"><div className="flex items-center gap-2"><span className="truncate text-sm font-medium">{member.name || member.tag}</span>{member.region && <span className="text-[10px] font-bold uppercase text-base-content/40">{member.region}</span>}</div>{member.last_error && <p className="mt-0.5 truncate text-[11px] text-error/75" title={member.last_error}>{member.last_error}</p>}</div><span className={cn('badge badge-sm', style.badge)}>{style.label}</span>{member.latency_ms > 0 && <span className="hidden w-14 text-right font-mono text-xs text-base-content/45 sm:block">{member.latency_ms} ms</span>}<div className="flex shrink-0 items-center gap-1">{member.status === 'ALIVE' && !member.is_active && <button className="btn btn-ghost btn-xs btn-square text-primary" disabled={busy === `activate-${group.id}-${member.node_id}`} onClick={() => onActivate(member.node_id)} title={group.dispatch_mode === 'random' ? '立即切换；random 模式下后续连接仍会随机选择' : '强制设为当前出口'} aria-label={`将 ${member.name || member.tag} 设为当前出口`}><Dices className="h-3.5 w-3.5" /></button>}{member.status === 'EVICTED' && <button className="btn btn-ghost btn-xs gap-1 text-primary" disabled={busy === `restore-${group.id}-${member.node_id}`} onClick={() => onRestore(member.node_id)} title="恢复入池"><RotateCcw className="h-3 w-3" /><span className="hidden sm:inline">恢复</span></button>}<button className="btn btn-ghost btn-xs btn-square text-error" disabled={busy === `remove-member-${group.id}-${member.node_id}`} onClick={() => onRemoveMember(member)} title="从此分组移除" aria-label={`从分组移除 ${member.name || member.tag}`}><Trash2 className="h-3.5 w-3.5" /></button></div></div> })}</div>
       {group.member_count === 0 && <div className="rounded-xl border border-dashed border-warning/40 bg-warning/5 px-4 py-8 text-center"><CircleAlert className="mx-auto h-6 w-6 text-warning" /><p className="mt-2 text-sm font-medium">当前没有匹配的有效节点</p><p className="mt-1 text-xs text-base-content/45">检查地区码、手动成员或节点启用状态</p></div>}
       {group.member_count > 8 && <button type="button" className="mt-3 flex min-h-9 w-full cursor-pointer items-center justify-center gap-1.5 rounded-lg text-xs font-medium text-base-content/55 transition-colors hover:bg-base-200/60 hover:text-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary" onClick={onToggleExpanded} aria-expanded={expanded}>
         <ChevronDown className={cn('h-3.5 w-3.5 transition-transform duration-200', expanded && 'rotate-180')} />{expanded ? '收起成员' : `展开其余 ${group.member_count - 8} 个成员`}

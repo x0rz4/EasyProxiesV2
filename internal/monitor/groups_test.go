@@ -9,9 +9,11 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
+	"easy_proxies/internal/group"
 	"easy_proxies/internal/store"
 )
 
@@ -173,6 +175,107 @@ func TestProbeFailureReturnsErrorStatus(t *testing.T) {
 	var payload map[string]any
 	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil || payload["error"] != "dial failed" {
 		t.Fatalf("payload=%v err=%v", payload, err)
+	}
+}
+
+func TestConcurrentGroupAutoPortAllocationIsUnique(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "groups-concurrent-port.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	mgr, err := NewManager(Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	server := &Server{store: db, mgr: mgr, nodeMgr: &reloadNodeManager{}}
+
+	var wg sync.WaitGroup
+	responses := make(chan *httptest.ResponseRecorder, 2)
+	for _, name := range []string{"group-a", "group-b"} {
+		wg.Add(1)
+		go func(name string) {
+			defer wg.Done()
+			body, _ := json.Marshal(groupPoolInput{Name: name, BindAddress: "127.0.0.1", BindPort: 0,
+				Protocol: "mixed", DispatchMode: "fixed", FailureWindowSeconds: 300,
+				FailureThreshold: 3, HealthCheckSeconds: 60})
+			response := httptest.NewRecorder()
+			server.handleGroups(response, httptest.NewRequest(http.MethodPost, "/api/groups", bytes.NewReader(body)))
+			responses <- response
+		}(name)
+	}
+	wg.Wait()
+	close(responses)
+	for response := range responses {
+		if response.Code != http.StatusCreated {
+			t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+		}
+	}
+	groups, err := db.ListGroupPools(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 2 || groups[0].BindPort == groups[1].BindPort {
+		t.Fatalf("allocated ports = %+v", groups)
+	}
+}
+
+func TestRemoveRunningMemberPersistsGroupExclusion(t *testing.T) {
+	group.Reset()
+	defer group.Reset()
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "group-remove-member.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	node := createGroupTestNode(t, ctx, db, "hk-node", store.NodeSourceManual, true)
+	groupPool := &store.GroupPool{Name: "HK", BindAddress: "127.0.0.1", BindPort: 12096, Protocol: "mixed",
+		DispatchMode: "fixed", Regions: []string{"hk"}, ExplicitNodeIDs: []int64{node.ID},
+		FailureWindowSeconds: 300, FailureThreshold: 3, HealthCheckSeconds: 60,
+		CurrentActiveNodeID: node.ID, Enabled: true}
+	if err := db.CreateGroupPool(ctx, groupPool); err != nil {
+		t.Fatal(err)
+	}
+	group.Register(groupPool.ID, 5*time.Minute, 3, "node-tag", map[string]group.GroupInitialState{"node-tag": {NodeID: node.ID}})
+	nodeManager := &reloadNodeManager{}
+	server := &Server{store: db, nodeMgr: nodeManager}
+	response := httptest.NewRecorder()
+	server.handleGroupItem(response, httptest.NewRequest(http.MethodDelete,
+		"/api/groups/"+strconv.FormatInt(groupPool.ID, 10)+"/members/"+strconv.FormatInt(node.ID, 10), nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	updated, err := db.GetGroupPool(ctx, groupPool.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.ExplicitNodeIDs) != 0 || len(updated.ExcludedNodeIDs) != 1 || updated.ExcludedNodeIDs[0] != node.ID {
+		t.Fatalf("updated membership rules = explicit %v excluded %v", updated.ExplicitNodeIDs, updated.ExcludedNodeIDs)
+	}
+	if updated.CurrentActiveNodeID != 0 || nodeManager.reloads.Load() != 1 {
+		t.Fatalf("current=%d reloads=%d", updated.CurrentActiveNodeID, nodeManager.reloads.Load())
+	}
+}
+
+func TestActivateRunningMemberUsesRuntimeHandler(t *testing.T) {
+	group.Reset()
+	defer group.Reset()
+	db, err := store.Open(filepath.Join(t.TempDir(), "group-activate.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var activated int64
+	unregister := group.RegisterActivationHandler(77, func(nodeID int64) error { activated = nodeID; return nil })
+	defer unregister()
+	server := &Server{store: db}
+	response := httptest.NewRecorder()
+	server.handleGroupItem(response, httptest.NewRequest(http.MethodPost, "/api/groups/77/members/9/activate", nil))
+	if response.Code != http.StatusOK || activated != 9 {
+		t.Fatalf("status=%d activated=%d body=%s", response.Code, activated, response.Body.String())
 	}
 }
 

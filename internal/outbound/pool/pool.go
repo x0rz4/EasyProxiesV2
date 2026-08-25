@@ -40,16 +40,17 @@ const (
 
 // Options controls pool outbound behaviour.
 type Options struct {
-	Mode              string
-	Members           []string
-	FailureThreshold  int
-	BlacklistDuration time.Duration
-	Metadata          map[string]MemberMeta
-	GroupID           int64
-	FailureWindow     time.Duration
-	PreferredMember   string
-	InitialGroupState map[string]group.GroupInitialState
-	SelectorTag       string
+	Mode                string
+	Members             []string
+	FailureThreshold    int
+	BlacklistDuration   time.Duration
+	Metadata            map[string]MemberMeta
+	GroupID             int64
+	FailureWindow       time.Duration
+	HealthCheckInterval time.Duration
+	PreferredMember     string
+	InitialGroupState   map[string]group.GroupInitialState
+	SelectorTag         string
 }
 
 // MemberMeta carries optional descriptive information for monitoring UI.
@@ -78,20 +79,23 @@ type memberState struct {
 
 type poolOutbound struct {
 	outbound.Adapter
-	ctx            context.Context
-	logger         log.ContextLogger
-	manager        adapter.OutboundManager
-	options        Options
-	mode           string
-	members        []*memberState
-	mu             sync.Mutex
-	rrCounter      atomic.Uint32
-	rng            *rand.Rand
-	rngMu          sync.Mutex // protects rng for random mode
-	monitor        *monitor.Manager
-	selector       selectorOutbound
-	selectorMu     sync.Mutex
-	candidatesPool sync.Pool
+	ctx                   context.Context
+	logger                log.ContextLogger
+	manager               adapter.OutboundManager
+	options               Options
+	mode                  string
+	members               []*memberState
+	mu                    sync.Mutex
+	rrCounter             atomic.Uint32
+	rng                   *rand.Rand
+	rngMu                 sync.Mutex // protects rng for random mode
+	monitor               *monitor.Manager
+	selector              selectorOutbound
+	selectorMu            sync.Mutex
+	candidatesPool        sync.Pool
+	unsubscribeHealth     func()
+	unsubscribeActivation func()
+	closeOnce             sync.Once
 }
 
 type selectorOutbound interface {
@@ -208,10 +212,56 @@ func (p *poolOutbound) Start(stage adapter.StartStage) error {
 	if err != nil {
 		return err
 	}
+	if p.monitor != nil && p.options.GroupID != 0 {
+		p.monitor.RegisterGroupHealthSchedule(p.options.GroupID, p.options.Members, p.options.HealthCheckInterval)
+		p.unsubscribeHealth = p.monitor.SubscribeHealthResults(p.handleHealthResult)
+		p.reconcileCurrent()
+		p.unsubscribeActivation = group.RegisterActivationHandler(p.options.GroupID, p.activateNodeID)
+	}
 	// 在初始化完成后，立即在后台触发健康检查
 	if p.monitor != nil {
 		go p.probeAllMembersOnStartup()
 	}
+	return nil
+}
+
+func (p *poolOutbound) Close() error {
+	p.closeOnce.Do(func() {
+		if p.unsubscribeActivation != nil {
+			p.unsubscribeActivation()
+		}
+		if p.monitor != nil && p.options.GroupID != 0 {
+			p.monitor.UnregisterGroupHealthSchedule(p.options.GroupID)
+		}
+		if p.unsubscribeHealth != nil {
+			p.unsubscribeHealth()
+		}
+	})
+	return nil
+}
+
+func (p *poolOutbound) activateNodeID(nodeID int64) error {
+	candidates := p.getCandidateBuffer()
+	p.mu.Lock()
+	candidates = p.availableMembersLocked(time.Now(), "", candidates)
+	p.mu.Unlock()
+	var selected *memberState
+	for _, candidate := range candidates {
+		if p.options.Metadata[candidate.tag].NodeID == nodeID {
+			selected = candidate
+			break
+		}
+	}
+	p.putCandidateBuffer(candidates)
+	if selected == nil {
+		return errors.New("node is not a healthy running group member")
+	}
+	p.selectorMu.Lock()
+	defer p.selectorMu.Unlock()
+	if p.selector != nil && !p.selector.SelectOutbound(selected.tag) {
+		return errors.New("selector rejected group member")
+	}
+	group.SetCurrentTag(p.options.GroupID, selected.tag)
 	return nil
 }
 
@@ -285,78 +335,19 @@ func (p *poolOutbound) initializeMembersLocked() error {
 
 // probeAllMembersOnStartup performs initial health checks on all members
 func (p *poolOutbound) probeAllMembersOnStartup() {
-	destination, ok := p.monitor.DestinationForProbe()
+	_, ok := p.monitor.DestinationForProbe()
 	if !ok {
 		p.logger.Warn("probe target not configured, skipping initial health check")
 		// 没有配置探测目标时，标记所有节点为可用
 		p.mu.Lock()
-		for _, member := range p.members {
-			if member.entry != nil {
-				member.entry.MarkInitialCheckDone(true)
-			}
-		}
+		members := append([]*memberState(nil), p.members...)
 		p.mu.Unlock()
+		for _, member := range members {
+			_ = p.monitor.MarkAvailableWithoutProbe(member.tag)
+		}
 		return
 	}
-
-	p.logger.Info("starting initial health check for all nodes")
-
-	p.mu.Lock()
-	members := make([]*memberState, len(p.members))
-	copy(members, p.members)
-	p.mu.Unlock()
-
-	availableCount := 0
-	failedCount := 0
-
-	for _, member := range members {
-		// Create a timeout context for each probe
-		ctx, cancel := context.WithTimeout(p.ctx, 15*time.Second)
-
-		start := time.Now()
-		conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
-
-		probeDst := destination.String()
-		if err != nil {
-			p.logger.Warn("initial probe failed for ", member.tag, ": ", err)
-			failedCount++
-			if member.entry != nil {
-				member.entry.RecordFailure(err, probeDst)
-				member.entry.MarkInitialCheckDone(false) // 标记为不可用
-			}
-			cancel()
-			continue
-		}
-
-		// Perform HTTP probe to measure actual latency (TTFB)
-		_, err = httpProbe(conn, destination.AddrString())
-		conn.Close()
-
-		if err != nil {
-			p.logger.Warn("initial HTTP probe failed for ", member.tag, ": ", err)
-			failedCount++
-			if member.entry != nil {
-				member.entry.RecordFailure(err, probeDst)
-				member.entry.MarkInitialCheckDone(false)
-			}
-			cancel()
-			continue
-		}
-
-		// Total latency = dial + HTTP probe
-		latency := time.Since(start)
-		latencyMs := latency.Milliseconds()
-		p.logger.Info("initial probe success for ", member.tag, ", latency: ", latencyMs, "ms")
-		availableCount++
-		if member.entry != nil {
-			member.entry.RecordSuccessWithLatency(latency)
-			member.entry.MarkInitialCheckDone(true)
-		}
-
-		cancel()
-	}
-
-	p.logger.Info("initial health check completed: ", availableCount, " available, ", failedCount, " failed")
+	p.monitor.RequestProbeAllOnce(15 * time.Second)
 }
 
 func (p *poolOutbound) memberName(member *memberState) string {
@@ -510,6 +501,12 @@ func (p *poolOutbound) availableMembersLocked(now time.Time, network string, buf
 		if p.options.GroupID != 0 && !group.MemberAvailable(p.options.GroupID, member.tag) {
 			continue
 		}
+		if p.options.GroupID != 0 && p.monitor != nil {
+			snapshot := p.monitor.SnapshotForTag(member.tag)
+			if snapshot == nil || !snapshot.InitialCheckDone || !snapshot.Available || snapshot.Blacklisted {
+				continue
+			}
+		}
 		// Check blacklist via shared state (auto-clears if expired)
 		if member.shared != nil && member.shared.isBlacklisted(now) {
 			continue
@@ -571,12 +568,92 @@ func (p *poolOutbound) selectMember(candidates []*memberState) *memberState {
 			}
 		}
 		selected := candidates[0]
-		group.SetCurrentTag(p.options.GroupID, selected.tag)
+		for _, candidate := range candidates[1:] {
+			if p.fixedMemberLess(candidate, selected) {
+				selected = candidate
+			}
+		}
 		return selected
 	default:
 		idx := int(p.rrCounter.Add(1)-1) % len(candidates)
 		return candidates[idx]
 	}
+}
+
+func (p *poolOutbound) fixedMemberLess(left, right *memberState) bool {
+	leftLatency, rightLatency := int64(-1), int64(-1)
+	if p.monitor != nil {
+		if snapshot := p.monitor.SnapshotForTag(left.tag); snapshot != nil {
+			leftLatency = snapshot.LastLatencyMs
+		}
+		if snapshot := p.monitor.SnapshotForTag(right.tag); snapshot != nil {
+			rightLatency = snapshot.LastLatencyMs
+		}
+	}
+	leftKnown, rightKnown := leftLatency > 0, rightLatency > 0
+	if leftKnown != rightKnown {
+		return leftKnown
+	}
+	if leftKnown && leftLatency != rightLatency {
+		return leftLatency < rightLatency
+	}
+	leftID := p.options.Metadata[left.tag].NodeID
+	rightID := p.options.Metadata[right.tag].NodeID
+	if leftID != rightID {
+		return leftID < rightID
+	}
+	return left.tag < right.tag
+}
+
+func (p *poolOutbound) handleHealthResult(event monitor.HealthResultEvent) {
+	if p.options.GroupID == 0 || !p.hasMember(event.Tag) {
+		return
+	}
+	if event.Success {
+		group.RecordHealthSuccess(p.options.GroupID, event.Tag)
+	} else {
+		group.RecordGroupHealthFailure(p.options.GroupID, event.Tag, errors.New(event.Error), event.CheckedAt)
+	}
+	p.reconcileCurrent()
+}
+
+func (p *poolOutbound) hasMember(tag string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, member := range p.members {
+		if member.tag == tag {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *poolOutbound) reconcileCurrent() {
+	candidates := p.getCandidateBuffer()
+	p.mu.Lock()
+	candidates = p.availableMembersLocked(time.Now(), "", candidates)
+	p.mu.Unlock()
+	current := group.CurrentTag(p.options.GroupID)
+	for _, candidate := range candidates {
+		if candidate.tag == current {
+			p.putCandidateBuffer(candidates)
+			return
+		}
+	}
+	if len(candidates) == 0 {
+		p.putCandidateBuffer(candidates)
+		group.SetCurrentTag(p.options.GroupID, "")
+		return
+	}
+	selected := p.selectMember(candidates)
+	p.putCandidateBuffer(candidates)
+	p.selectorMu.Lock()
+	defer p.selectorMu.Unlock()
+	if p.selector != nil && !p.selector.SelectOutbound(selected.tag) {
+		p.logger.Warn("selector rejected hot replacement: ", selected.tag)
+		return
+	}
+	group.SetCurrentTag(p.options.GroupID, selected.tag)
 }
 
 func (p *poolOutbound) recordFailure(member *memberState, cause error, destination string) {
@@ -632,7 +709,7 @@ func (p *poolOutbound) wrapConn(conn net.Conn, member *memberState, destination 
 			}
 		},
 		onError: func(err error) {
-			p.recordFailure(member, err, destination)
+			p.recordEstablishedIOError(member, err, destination)
 		},
 	}
 }
@@ -649,9 +726,22 @@ func (p *poolOutbound) wrapPacketConn(conn net.PacketConn, member *memberState, 
 			}
 		},
 		onError: func(err error) {
-			p.recordFailure(member, err, destination)
+			p.recordEstablishedIOError(member, err, destination)
 		},
 	}
+}
+
+func (p *poolOutbound) recordEstablishedIOError(member *memberState, cause error, destination string) {
+	if p.options.GroupID == 0 {
+		p.recordFailure(member, cause, destination)
+		return
+	}
+	if member.shared != nil {
+		if entry := member.shared.entryHandle(); entry != nil {
+			entry.RecordFailure(cause, destination)
+		}
+	}
+	p.logger.Warn("group ", p.options.GroupID, " connection I/O error on ", member.tag, ": ", cause)
 }
 
 func (p *poolOutbound) makeReleaseFunc(member *memberState) func() {
@@ -710,12 +800,8 @@ func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Conte
 		}
 
 		start := time.Now()
-		probeDst := destination.String()
 		conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
 		if err != nil {
-			if member.entry != nil {
-				member.entry.RecordFailure(err, probeDst)
-			}
 			return 0, err
 		}
 		defer conn.Close()
@@ -723,17 +809,11 @@ func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Conte
 		// Perform HTTP probe to measure actual latency (TTFB)
 		_, err = httpProbe(conn, destination.AddrString())
 		if err != nil {
-			if member.entry != nil {
-				member.entry.RecordFailure(err, probeDst)
-			}
 			return 0, err
 		}
 
 		// Total duration = dial time + HTTP probe
 		duration := time.Since(start)
-		if member.entry != nil {
-			member.entry.RecordSuccessWithLatency(duration)
-		}
 		return duration, nil
 	}
 }
@@ -778,12 +858,8 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 		}
 
 		start := time.Now()
-		probeDst := destination.String()
 		conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
 		if err != nil {
-			if member.entry != nil {
-				member.entry.RecordFailure(err, probeDst)
-			}
 			return 0, err
 		}
 		defer conn.Close()
@@ -791,17 +867,11 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 		// Perform HTTP probe to measure actual latency (TTFB)
 		_, err = httpProbe(conn, destination.AddrString())
 		if err != nil {
-			if member.entry != nil {
-				member.entry.RecordFailure(err, probeDst)
-			}
 			return 0, err
 		}
 
 		// Total duration = dial time + TTFB
 		duration := time.Since(start)
-		if member.entry != nil {
-			member.entry.RecordSuccessWithLatency(duration)
-		}
 		return duration, nil
 	}
 }

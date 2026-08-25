@@ -26,6 +26,7 @@ type GroupStateEvent struct {
 	LastError      string
 	EvictedAt      time.Time
 	CurrentNodeID  int64
+	CurrentChanged bool
 	StateChanged   bool
 }
 
@@ -71,7 +72,30 @@ var (
 	globalEvictedNodes sync.Map // map[int64]bool; an evicted node is excluded from every group
 	groupObserverMu    sync.RWMutex
 	groupObserver      func(GroupStateEvent)
+	activationHandlers sync.Map // map[int64]func(int64) error
 )
+
+// RegisterActivationHandler wires the runtime group to its sing-box selector.
+// The returned cleanup only removes the handler if it is still the active one.
+func RegisterActivationHandler(groupID int64, handler func(int64) error) func() {
+	if groupID == 0 || handler == nil {
+		return func() {}
+	}
+	holder := &activationHandler{activate: handler}
+	activationHandlers.Store(groupID, holder)
+	return func() { activationHandlers.CompareAndDelete(groupID, holder) }
+}
+
+type activationHandler struct{ activate func(int64) error }
+
+// ActivateMember performs a selector-only manual hot switch.
+func ActivateMember(groupID, nodeID int64) error {
+	value, ok := activationHandlers.Load(groupID)
+	if !ok {
+		return errors.New("group runtime not found")
+	}
+	return value.(*activationHandler).activate(nodeID)
+}
 
 // SetGroupStateObserver installs the persistence callback.
 func SetGroupStateObserver(observer func(GroupStateEvent)) {
@@ -93,6 +117,7 @@ func Register(groupID int64, failureWindow time.Duration, failureThreshold int, 
 	if groupID == 0 {
 		return
 	}
+	preferredTag := currentTag
 	runtime := &groupRuntime{
 		id: groupID, window: failureWindow, threshold: failureThreshold,
 		currentTag: currentTag, members: make(map[string]*groupMemberRuntime, len(members)),
@@ -113,12 +138,14 @@ func Register(groupID int64, failureWindow time.Duration, failureThreshold int, 
 			evicted: initial.Evicted || globallyEvicted, lastError: initial.LastError, evictedAt: initial.EvictedAt,
 		}
 	}
-	if current := runtime.members[runtime.currentTag]; current == nil || current.evicted {
+	if current := runtime.members[runtime.currentTag]; current == nil || current.evicted || len(current.failureHistory) > 0 {
 		runtime.currentTag = ""
 	}
 	groupRuntimeStore.Store(groupID, runtime)
 	if current := runtime.members[runtime.currentTag]; current != nil {
-		notifyGroupState(GroupStateEvent{GroupID: groupID, NodeID: current.nodeID, CurrentNodeID: current.nodeID})
+		notifyGroupState(GroupStateEvent{GroupID: groupID, NodeID: current.nodeID, CurrentNodeID: current.nodeID, CurrentChanged: true})
+	} else if preferredTag != "" {
+		notifyGroupState(GroupStateEvent{GroupID: groupID, CurrentChanged: true})
 	}
 	for _, member := range runtime.members {
 		if member.evicted {
@@ -139,7 +166,7 @@ func MemberAvailable(groupID int64, tag string) bool {
 	if member != nil && !member.evicted {
 		pruneFailures(member, runtime.window, time.Now())
 	}
-	return member != nil && !member.evicted
+	return member != nil && !member.evicted && len(member.failureHistory) == 0
 }
 
 func CurrentTag(groupID int64) string {
@@ -149,11 +176,21 @@ func CurrentTag(groupID int64) string {
 	}
 	runtime := value.(*groupRuntime)
 	runtime.mu.Lock()
-	defer runtime.mu.Unlock()
 	if member := runtime.members[runtime.currentTag]; member != nil && !member.evicted {
-		return runtime.currentTag
+		pruneFailures(member, runtime.window, time.Now())
+		if len(member.failureHistory) == 0 {
+			tag := runtime.currentTag
+			runtime.mu.Unlock()
+			return tag
+		}
+	}
+	if runtime.currentTag == "" {
+		runtime.mu.Unlock()
+		return ""
 	}
 	runtime.currentTag = ""
+	runtime.mu.Unlock()
+	notifyGroupState(GroupStateEvent{GroupID: groupID, CurrentChanged: true})
 	return ""
 }
 
@@ -175,6 +212,7 @@ func SetCurrentTag(groupID int64, tag string) {
 		event.NodeID = member.nodeID
 		event.CurrentNodeID = member.nodeID
 	}
+	event.CurrentChanged = true
 	runtime.mu.Unlock()
 	notifyGroupState(event)
 }
@@ -202,17 +240,19 @@ func RecordFailure(groupID int64, tag string, cause error, at time.Time) bool {
 	if cause != nil {
 		member.lastError = cause.Error()
 	}
+	currentChanged := false
+	if runtime.currentTag == tag {
+		runtime.currentTag = ""
+		currentChanged = true
+	}
 	newlyEvicted := len(member.failureHistory) >= runtime.threshold
 	if newlyEvicted {
 		member.evicted = true
 		member.evictedAt = at
-		if runtime.currentTag == tag {
-			runtime.currentTag = ""
-		}
 	}
 	event := GroupStateEvent{GroupID: groupID, NodeID: member.nodeID,
 		FailureHistory: append([]int64(nil), member.failureHistory...), Evicted: member.evicted,
-		LastError: member.lastError, EvictedAt: member.evictedAt, StateChanged: true}
+		LastError: member.lastError, EvictedAt: member.evictedAt, CurrentChanged: currentChanged, StateChanged: true}
 	runtime.mu.Unlock()
 	notifyGroupState(event)
 	if newlyEvicted {
@@ -220,6 +260,28 @@ func RecordFailure(groupID int64, tag string, cause error, at time.Time) bool {
 		propagateEviction(event.NodeID, event.LastError, event.EvictedAt)
 	}
 	return event.Evicted
+}
+
+// RecordHealthSuccess clears a non-evicted member's consecutive failure
+// sequence. Permanently evicted members still require an explicit restore.
+func RecordHealthSuccess(groupID int64, tag string) bool {
+	value, ok := groupRuntimeStore.Load(groupID)
+	if !ok {
+		return false
+	}
+	runtime := value.(*groupRuntime)
+	runtime.mu.Lock()
+	member := runtime.members[tag]
+	if member == nil || member.evicted || len(member.failureHistory) == 0 {
+		runtime.mu.Unlock()
+		return member != nil && !member.evicted
+	}
+	member.failureHistory = nil
+	member.lastError = ""
+	event := GroupStateEvent{GroupID: groupID, NodeID: member.nodeID, StateChanged: true}
+	runtime.mu.Unlock()
+	notifyGroupState(event)
+	return true
 }
 
 // RecordGroupHealthFailure feeds a failed background probe into every group
@@ -317,6 +379,7 @@ func Reset() {
 		return true
 	})
 	globalEvictedNodes.Range(func(key, _ any) bool { globalEvictedNodes.Delete(key); return true })
+	activationHandlers.Range(func(key, _ any) bool { activationHandlers.Delete(key); return true })
 }
 
 func pruneFailures(member *groupMemberRuntime, window time.Duration, now time.Time) bool {
@@ -355,11 +418,13 @@ func propagateEviction(nodeID int64, lastError string, evictedAt time.Time) {
 			member.evicted = true
 			member.evictedAt = evictedAt
 			member.lastError = lastError
+			currentChanged := false
 			if runtime.currentTag == member.tag {
 				runtime.currentTag = ""
+				currentChanged = true
 			}
 			event := GroupStateEvent{GroupID: runtime.id, NodeID: nodeID, FailureHistory: append([]int64(nil), member.failureHistory...),
-				Evicted: true, LastError: lastError, EvictedAt: evictedAt, StateChanged: true}
+				Evicted: true, LastError: lastError, EvictedAt: evictedAt, CurrentChanged: currentChanged, StateChanged: true}
 			runtime.mu.Unlock()
 			notifyGroupState(event)
 			return true
