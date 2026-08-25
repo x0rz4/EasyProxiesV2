@@ -8,7 +8,7 @@ import { fetchNodes, unlockNode, unlockAllNodes, fetchUnlockResults } from '../a
 import { regionFlag } from '../utils/region'
 import { PageContent, PageHeader, PageLayout, surfaceClass } from './ui/PageLayout'
 import UnlockDrawer from './UnlockDrawer'
-import { ShieldCheck, X, Play, RefreshCw } from 'lucide-react'
+import { ShieldCheck, X, Play, RefreshCw, ArrowUpDown, ArrowUp, ArrowDown } from 'lucide-react'
 import { toast } from 'sonner'
 import { cn } from '../utils/cn'
 
@@ -37,6 +37,19 @@ export default function UnlockPanel() {
   const [filter, setFilter] = useState('')
   const [statusFilter, setStatusFilter] = useState<'' | 'unlocked' | 'locked' | 'mixed' | 'failed'>('')
   const [countryFilter, setCountryFilter] = useState('')
+
+  // Sorting
+  const [sortKey, setSortKey] = useState<'name' | 'latency' | null>(null)
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc')
+
+  const handleSort = (key: 'name' | 'latency') => {
+    if (sortKey === key) {
+      setSortDir(sortDir === 'asc' ? 'desc' : 'asc')
+    } else {
+      setSortKey(key)
+      setSortDir('asc')
+    }
+  }
 
   // ---- Node list ----
   const loadNodes = useCallback(async () => {
@@ -184,6 +197,21 @@ export default function UnlockPanel() {
     })
   }, [nodes, filter, statusFilter, countryFilter, results, errors])
 
+  const sortedNodes = useMemo(() => {
+    if (!sortKey) return filteredNodes
+    return [...filteredNodes].sort((a, b) => {
+      let cmp = 0
+      if (sortKey === 'name') {
+        cmp = a.name.localeCompare(b.name)
+      } else if (sortKey === 'latency') {
+        const valA = a.last_latency_ms < 0 ? Infinity : a.last_latency_ms
+        const valB = b.last_latency_ms < 0 ? Infinity : b.last_latency_ms
+        cmp = valA - valB
+      }
+      return sortDir === 'asc' ? cmp : -cmp
+    })
+  }, [filteredNodes, sortKey, sortDir])
+
   const summary = useMemo(() => {
     const checked = Object.values(results)
     let unlocked = 0
@@ -322,8 +350,14 @@ export default function UnlockPanel() {
               <thead>
                 <tr>
                   <th className="w-10">#</th>
-                  <th className="w-48 max-w-[200px]">节点名称</th>
+                  <th className="w-48 max-w-[200px] cursor-pointer hover:bg-base-200 transition-colors select-none" onClick={() => handleSort('name')}>
+                    节点名称 <SortIcon active={sortKey === 'name'} dir={sortDir} />
+                  </th>
+                  <th className="w-24 cursor-pointer hover:bg-base-200 transition-colors select-none" onClick={() => handleSort('latency')}>
+                    延迟 <SortIcon active={sortKey === 'latency'} dir={sortDir} />
+                  </th>
                   <th className="w-48 max-w-[200px]">IP 地址</th>
+                  <th className="w-24">IP 属性</th>
                   <th className="w-auto">解锁状态</th>
                   <th className="w-24 text-right">操作</th>
                 </tr>
@@ -337,14 +371,14 @@ export default function UnlockPanel() {
                     </td>
                   </tr>
                 )}
-                {!loading && filteredNodes.length === 0 && (
+                {!loading && sortedNodes.length === 0 && (
                   <tr>
-                    <td colSpan={5} className="text-center py-10 text-base-content/50">
+                    <td colSpan={7} className="text-center py-10 text-base-content/50">
                       {nodes.length === 0 ? '暂无可用节点' : '没有匹配的节点'}
                     </td>
                   </tr>
                 )}
-                {filteredNodes.map((n, i) => (
+                {sortedNodes.map((n, i) => (
                   <UnlockRow
                     key={n.tag}
                     index={i}
@@ -378,6 +412,13 @@ export default function UnlockPanel() {
 
 // ---- Sub-components ----
 
+function SortIcon({ active, dir }: { active: boolean; dir: 'asc' | 'desc' }) {
+  if (!active) return <ArrowUpDown className="h-3 w-3 opacity-30 ml-0.5 inline" />
+  return dir === 'asc' 
+    ? <ArrowUp className="h-3 w-3 opacity-70 ml-0.5 inline" />
+    : <ArrowDown className="h-3 w-3 opacity-70 ml-0.5 inline" />
+}
+
 function SummaryCard({ label, value, accent }: { label: string; value: number; accent: string }) {
   return (
     <div className={`${surfaceClass} p-3`}>
@@ -407,16 +448,29 @@ function UnlockRow({
   onCheck: (e: React.MouseEvent) => void
 }) {
 
+  const renderIpRisk = () => {
+    if (!result) return <span className="opacity-40 text-xs">—</span>
+    if (result.error || nodeError) return <span className="opacity-40 text-xs">—</span>
+    
+    return (
+      <div className="flex flex-wrap gap-1">
+        {result.ip?.pure && <span className="badge badge-sm badge-success border-none text-[10px]">原生IP</span>}
+        {(result.ip?.risk_level === 'High' || result.ip?.risk_level === 'Medium') && 
+          <span className="badge badge-sm badge-error border-none text-[10px]">{result.ip.risk_level === 'High' ? '高风险' : '中风险'}</span>
+        }
+        {!result.ip?.pure && result.ip?.risk_level !== 'High' && result.ip?.risk_level !== 'Medium' && (
+          <span className="opacity-40 text-xs">—</span>
+        )}
+      </div>
+    )
+  }
+
   const renderBadges = () => {
     if (!result) return <span className="opacity-40 text-xs">—</span>
     if (result.error || nodeError) return <span className="badge badge-sm badge-error">检测失败</span>
     
     return (
       <div className="flex flex-wrap gap-1">
-        {result.ip?.pure && <span className="badge badge-sm badge-success border-none text-[10px]">原生IP</span>}
-        {(result.ip?.risk_level === 'High' || result.ip?.risk_level === 'Medium') && 
-          <span className="badge badge-sm badge-error border-none text-[10px]">高风险</span>
-        }
         {result.services?.slice(0, 4).map(svc => {
           if (svc.status === 'unlocked') {
             const isNetflix = svc.name === 'netflix'
@@ -469,6 +523,15 @@ function UnlockRow({
            </div>
         )}
       </td>
+      <td className="w-24">
+         {node.last_latency_ms > 0 ? (
+           <span className={`text-xs ${node.last_latency_ms <= 100 ? 'text-success' : node.last_latency_ms <= 300 ? 'text-warning' : 'text-error'}`}>
+             {node.last_latency_ms} ms
+           </span>
+         ) : (
+           <span className="text-xs text-base-content/40">—</span>
+         )}
+      </td>
       <td className="max-w-[200px] truncate">
          {result?.ip?.ip ? (
            <div className="flex flex-col">
@@ -481,17 +544,11 @@ function UnlockRow({
            <span className="opacity-40 text-xs">—</span>
          )}
       </td>
+      <td className="w-24">
+         {renderIpRisk()}
+      </td>
       <td>
         <div className="flex flex-col gap-1 max-w-[300px]">
-           <div className="flex items-center gap-2">
-             {node.last_latency_ms > 0 ? (
-               <span className={`text-xs ${node.last_latency_ms <= 100 ? 'text-success' : node.last_latency_ms <= 300 ? 'text-warning' : 'text-error'}`}>
-                 {node.last_latency_ms}ms
-               </span>
-             ) : (
-               <span className="text-xs text-base-content/40">超时</span>
-             )}
-           </div>
            {renderBadges()}
            {err && <span className="text-[10px] text-error truncate" title={err}>{err}</span>}
         </div>
