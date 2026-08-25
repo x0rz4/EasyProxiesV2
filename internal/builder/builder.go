@@ -16,6 +16,7 @@ import (
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/geoip"
 	groupruntime "easy_proxies/internal/group"
+	"easy_proxies/internal/nodecodec"
 	poolout "easy_proxies/internal/outbound/pool"
 
 	C "github.com/sagernet/sing-box/constant"
@@ -864,43 +865,27 @@ func buildV2RayTransport(query url.Values) (*option.V2RayTransportOptions, error
 }
 
 func buildShadowsocksOptions(u *url.URL) (option.ShadowsocksOutboundOptions, error) {
-	server, port, err := hostPort(u, 8388)
+	identity, err := nodecodec.ParseURI(u.String())
 	if err != nil {
 		return option.ShadowsocksOutboundOptions{}, err
 	}
-
-	// Decode userinfo (base64 encoded method:password)
-	userInfo := u.User.String()
-	decoded, err := base64.RawURLEncoding.DecodeString(userInfo)
-	if err != nil {
-		// Try standard base64
-		decoded, err = base64.StdEncoding.DecodeString(userInfo)
-		if err != nil {
-			return option.ShadowsocksOutboundOptions{}, fmt.Errorf("decode shadowsocks userinfo: %w", err)
-		}
-	}
-
-	parts := strings.SplitN(string(decoded), ":", 2)
-	if len(parts) != 2 {
-		return option.ShadowsocksOutboundOptions{}, errors.New("shadowsocks userinfo format must be method:password")
-	}
-
-	method := parts[0]
-	password := parts[1]
-
 	opts := option.ShadowsocksOutboundOptions{
-		ServerOptions: option.ServerOptions{Server: server, ServerPort: uint16(port)},
-		Method:        method,
-		Password:      password,
+		ServerOptions: option.ServerOptions{Server: identity.Identity.Server, ServerPort: identity.Identity.Port},
+		Method:        firstIdentityOption(identity.Identity.Options, "method"),
+		Password:      identity.Identity.Auth["password"],
 	}
-
-	query := u.Query()
-	if plugin := query.Get("plugin"); plugin != "" {
+	if plugin := firstIdentityOption(identity.Identity.Options, "plugin"); plugin != "" {
 		opts.Plugin = plugin
-		opts.PluginOptions = query.Get("plugin-opts")
+		opts.PluginOptions = firstIdentityOption(identity.Identity.Options, "plugin-opts")
 	}
-
 	return opts, nil
+}
+
+func firstIdentityOption(options map[string][]string, key string) string {
+	if len(options[key]) == 0 {
+		return ""
+	}
+	return options[key][0]
 }
 
 func buildTrojanOptions(u *url.URL, skipCertVerify bool) (option.TrojanOutboundOptions, error) {
@@ -985,6 +970,9 @@ func (v *vmessJSON) GetAlterId() int {
 func buildVMessOptions(rawURI string, skipCertVerify bool) (option.VMessOutboundOptions, error) {
 	// Remove vmess:// prefix
 	encoded := strings.TrimPrefix(rawURI, "vmess://")
+	if fragment := strings.IndexByte(encoded, '#'); fragment >= 0 {
+		encoded = encoded[:fragment]
+	}
 
 	// Try to decode as base64 JSON (standard format)
 	decoded, err := base64.StdEncoding.DecodeString(encoded)

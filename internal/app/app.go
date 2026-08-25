@@ -16,6 +16,7 @@ import (
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/group"
 	"easy_proxies/internal/monitor"
+	"easy_proxies/internal/nodecodec"
 	"easy_proxies/internal/store"
 	"easy_proxies/internal/subscription"
 )
@@ -297,30 +298,39 @@ func loadNodesFromStore(ctx context.Context, cfg *config.Config, s store.Store) 
 		if !n.Enabled || n.Source == store.NodeSourceSubscription {
 			continue
 		}
-		if _, ok := seen[n.URI]; ok {
+		identityKey := n.IdentityHash
+		if identityKey == "" {
+			identityKey = n.URI
+		}
+		if _, ok := seen[identityKey]; ok {
 			continue
 		}
-		seen[n.URI] = struct{}{}
+		seen[identityKey] = struct{}{}
 		configNodes = append(configNodes, config.NodeConfig{
-			ID:       n.ID,
-			Name:     n.Name,
-			URI:      n.URI,
-			Port:     n.Port,
-			Username: n.Username,
-			Password: n.Password,
-			Source:   config.NodeSource(n.Source),
-			Region:   n.Region,
-			Country:  n.Country,
+			ID:           n.ID,
+			Name:         n.Name,
+			URI:          n.URI,
+			Port:         n.Port,
+			Username:     n.Username,
+			Password:     n.Password,
+			Source:       config.NodeSource(n.Source),
+			Region:       n.Region,
+			Country:      n.Country,
+			IdentityHash: n.IdentityHash, CanonicalJSON: n.CanonicalJSON,
 		})
 	}
 	for _, n := range effectiveSubscriptionNodes {
-		if _, ok := seen[n.URI]; ok {
+		identityKey := n.IdentityHash
+		if identityKey == "" {
+			identityKey = n.URI
+		}
+		if _, ok := seen[identityKey]; ok {
 			continue
 		}
-		seen[n.URI] = struct{}{}
+		seen[identityKey] = struct{}{}
 		configNodes = append(configNodes, config.NodeConfig{ID: n.ID, Name: n.Name, URI: n.URI, Port: n.Port,
 			Username: n.Username, Password: n.Password, Source: config.NodeSourceSubscription,
-			Region: n.Region, Country: n.Country})
+			Region: n.Region, Country: n.Country, IdentityHash: n.IdentityHash, CanonicalJSON: n.CanonicalJSON})
 	}
 
 	// Always replace cfg.Nodes when the DB is non-empty, including all-disabled state.
@@ -418,15 +428,24 @@ func flushStatsToStore(ctx context.Context, boxMgr *boxmgr.Manager, s store.Stor
 		return
 	}
 	uriToID := make(map[string]int64, len(storeNodes))
+	identityToID := make(map[string]int64, len(storeNodes))
 	nameToID := make(map[string]int64, len(storeNodes))
 	for _, n := range storeNodes {
 		uriToID[n.URI] = n.ID
+		if n.IdentityHash != "" {
+			identityToID[n.IdentityHash] = n.ID
+		}
 		nameToID[n.Name] = n.ID
 	}
 
 	var updates []store.StatsUpdate
 	for _, snap := range snapshots {
 		nodeID, ok := uriToID[snap.URI]
+		if !ok {
+			if identity, identityErr := nodecodec.ParseURI(snap.URI); identityErr == nil {
+				nodeID, ok = identityToID[identity.Hash]
+			}
+		}
 		if !ok {
 			nodeID, ok = nameToID[snap.Name]
 		}

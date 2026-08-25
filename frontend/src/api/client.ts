@@ -13,6 +13,7 @@ import type {
   SubscriptionsResponse,
   SubscriptionNodesResponse,
   SubscriptionActionResponse,
+  SubscriptionRefreshResponse,
   ProbeSSEEvent,
   UnlockResult,
   UnlockResultsResponse,
@@ -516,7 +517,7 @@ export async function fetchSubscriptionStatus(): Promise<SubscriptionStatus> {
   return request<SubscriptionStatus>('/api/subscription/status')
 }
 
-export async function refreshSubscription(): Promise<{ message: string; node_count: number }> {
+export async function refreshSubscription(): Promise<SubscriptionRefreshResponse> {
   return request('/api/subscription/refresh', { method: 'POST' })
 }
 
@@ -578,7 +579,20 @@ export async function exportProxies(): Promise<string> {
 
 // ---- Import API ----
 
-export async function importNodes(content: string): Promise<{ message: string; imported: number; errors?: string[] }> {
+export interface ImportNodesResult {
+  message: string
+  imported: number
+  parsed: number
+  created: number
+  updated: number
+  duplicates_skipped: number
+  invalid: number
+  duplicate_groups?: Array<{ existing_node: string; incoming_node: string }>
+  endpoint_collisions?: Array<{ endpoint: string; existing_nodes: string[]; incoming_node: string }>
+  errors?: string[]
+}
+
+export async function importNodes(content: string): Promise<ImportNodesResult> {
   return request('/api/import', {
     method: 'POST',
     body: JSON.stringify({ content }),

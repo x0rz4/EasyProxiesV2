@@ -44,12 +44,13 @@ export default function SubscriptionsPanel() {
   const runAction = async (key: string, operation: () => Promise<unknown>, message: string) => {
     setAction(key)
     try {
-      await operation()
+      const result = await operation()
       queryClient.invalidateQueries({ queryKey: ['subscriptions'] })
       queryClient.invalidateQueries({ queryKey: ['subscriptionStatus'] })
       queryClient.invalidateQueries({ queryKey: ['nodes'] })
       queryClient.invalidateQueries({ queryKey: ['configNodes'] })
-      toast.success(message)
+      const summary = refreshSummary(result)
+      toast.success(message, summary ? { description: summary } : undefined)
       return true
     } catch (err) {
       toast.error(err instanceof Error ? err.message : '订阅操作失败')
@@ -143,4 +144,11 @@ export default function SubscriptionsPanel() {
       </PageContent>
     </PageLayout>
   )
+}
+
+function refreshSummary(value: unknown): string | null {
+  if (!value || typeof value !== 'object' || !('parsed' in value)) return null
+  const result = value as Record<string, unknown>
+  const count = (key: string) => typeof result[key] === 'number' ? result[key] : 0
+  return `解析 ${count('parsed')} · 新增 ${count('created')} · 复用 ${count('updated')} · 重复跳过 ${count('duplicates_skipped')} · 无效 ${count('invalid')}`
 }

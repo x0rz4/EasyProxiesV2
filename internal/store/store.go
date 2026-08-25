@@ -23,6 +23,8 @@ type Store interface {
 
 	// GetNodeByURI returns a node by its URI.
 	GetNodeByURI(ctx context.Context, uri string) (*Node, error)
+	// GetNodeByIdentity returns the canonical node for a semantic identity.
+	GetNodeByIdentity(ctx context.Context, identityHash string) (*Node, error)
 
 	// GetNodeByName returns a node by its name.
 	GetNodeByName(ctx context.Context, name string) (*Node, error)
@@ -171,19 +173,21 @@ type Store interface {
 
 // Node represents a proxy node stored in the database.
 type Node struct {
-	ID        int64     `json:"id"`
-	URI       string    `json:"uri"`
-	Name      string    `json:"name"`
-	Source    string    `json:"source"` // inline, nodes_file, subscription, manual
-	Port      uint16    `json:"port"`
-	Username  string    `json:"username,omitempty"`
-	Password  string    `json:"password,omitempty"`
-	Region    string    `json:"region,omitempty"`
-	Country   string    `json:"country,omitempty"`
-	Enabled   bool      `json:"enabled"`
-	Tags      []string  `json:"tags,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID            int64     `json:"id"`
+	URI           string    `json:"uri"`
+	Name          string    `json:"name"`
+	Source        string    `json:"source"` // inline, nodes_file, subscription, manual
+	Port          uint16    `json:"port"`
+	Username      string    `json:"username,omitempty"`
+	Password      string    `json:"password,omitempty"`
+	Region        string    `json:"region,omitempty"`
+	Country       string    `json:"country,omitempty"`
+	Enabled       bool      `json:"enabled"`
+	Tags          []string  `json:"tags,omitempty"`
+	IdentityHash  string    `json:"-"`
+	CanonicalJSON string    `json:"-"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 // ManagedNode is the node-management view of a node and its enabled subscriptions.
@@ -268,14 +272,16 @@ type SubscriptionNode struct {
 // SubscriptionNodeInput contains the node data required to commit a snapshot.
 // Enabled is only used when a URI is first inserted; existing node state wins.
 type SubscriptionNodeInput struct {
-	URI      string `json:"uri"`
-	Name     string `json:"name"`
-	Port     uint16 `json:"port"`
-	Username string `json:"username,omitempty"`
-	Password string `json:"password,omitempty"`
-	Region   string `json:"region,omitempty"`
-	Country  string `json:"country,omitempty"`
-	Enabled  bool   `json:"enabled"`
+	URI           string `json:"uri"`
+	Name          string `json:"name"`
+	Port          uint16 `json:"port"`
+	Username      string `json:"username,omitempty"`
+	Password      string `json:"password,omitempty"`
+	IdentityHash  string `json:"-"`
+	CanonicalJSON string `json:"-"`
+	Region        string `json:"region,omitempty"`
+	Country       string `json:"country,omitempty"`
+	Enabled       bool   `json:"enabled"`
 }
 
 // SubscriptionSnapshot is refresh metadata committed with a node snapshot.

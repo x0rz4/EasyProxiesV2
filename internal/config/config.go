@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,11 +12,16 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"easy_proxies/internal/nodecodec"
+
+	"github.com/tailscale/hujson"
 	"gopkg.in/yaml.v3"
 )
 
@@ -180,21 +186,30 @@ func NormalizeInboundProtocol(value string) (string, error) {
 
 // NodeConfig describes a single upstream proxy endpoint expressed as URI.
 type NodeConfig struct {
-	ID       int64      `yaml:"-" json:"id,omitempty"`
-	Name     string     `yaml:"name" json:"name"`
-	URI      string     `yaml:"uri" json:"uri"`
-	Port     uint16     `yaml:"port,omitempty" json:"port,omitempty"`
-	Username string     `yaml:"username,omitempty" json:"username,omitempty"`
-	Password string     `yaml:"password,omitempty" json:"password,omitempty"`
-	Source   NodeSource `yaml:"-" json:"source,omitempty"`   // Runtime only, not persisted in YAML
-	Disabled bool       `yaml:"-" json:"disabled,omitempty"` // Runtime only, not persisted in YAML; true = node is disabled
-	Region   string     `yaml:"-" json:"region,omitempty"`
-	Country  string     `yaml:"-" json:"country,omitempty"`
+	ID            int64      `yaml:"-" json:"id,omitempty"`
+	Name          string     `yaml:"name" json:"name"`
+	URI           string     `yaml:"uri" json:"uri"`
+	Port          uint16     `yaml:"port,omitempty" json:"port,omitempty"`
+	Username      string     `yaml:"username,omitempty" json:"username,omitempty"`
+	Password      string     `yaml:"password,omitempty" json:"password,omitempty"`
+	Source        NodeSource `yaml:"-" json:"source,omitempty"`   // Runtime only, not persisted in YAML
+	Disabled      bool       `yaml:"-" json:"disabled,omitempty"` // Runtime only, not persisted in YAML; true = node is disabled
+	Region        string     `yaml:"-" json:"region,omitempty"`
+	Country       string     `yaml:"-" json:"country,omitempty"`
+	IdentityHash  string     `yaml:"-" json:"-"`
+	CanonicalJSON string     `yaml:"-" json:"-"`
+	EndpointKey   string     `yaml:"-" json:"-"`
 }
 
 // NodeKey returns a unique identifier for the node based on its URI.
 // This is used to preserve port assignments across reloads.
 func (n *NodeConfig) NodeKey() string {
+	if n.IdentityHash != "" {
+		return n.IdentityHash
+	}
+	if identity, err := nodecodec.ParseURI(n.URI); err == nil {
+		return identity.Hash
+	}
 	return n.URI
 }
 
@@ -642,7 +657,8 @@ func loadNodesFromFile(path string) ([]NodeConfig, error) {
 	if err != nil {
 		return nil, err
 	}
-	return parseNodesFromContent(string(data))
+	nodes, err := parseNodesFromContent(string(data))
+	return deduplicateParsedNodes(nodes), err
 }
 
 // loadNodesFromSubscription fetches and parses nodes from a subscription URL
@@ -687,33 +703,8 @@ func loadNodesFromSubscription(subURL string, timeout time.Duration) ([]NodeConf
 
 // parseSubscriptionContent tries to parse subscription content in various formats (optimized)
 func parseSubscriptionContent(content string) ([]NodeConfig, error) {
-	content = strings.TrimSpace(content)
-
-	// Quick check for YAML format (check first 200 chars for "proxies:")
-	sampleSize := 200
-	if len(content) < sampleSize {
-		sampleSize = len(content)
-	}
-	if strings.Contains(content[:sampleSize], "proxies:") {
-		return parseClashYAML(content)
-	}
-
-	// Check if it's base64 encoded (common for v2ray subscriptions)
-	if isBase64(content) {
-		decoded, err := base64.StdEncoding.DecodeString(content)
-		if err != nil {
-			// Try URL-safe base64
-			decoded, err = base64.RawStdEncoding.DecodeString(content)
-			if err != nil {
-				// Not base64, try as plain text
-				return parseNodesFromContent(content)
-			}
-		}
-		content = string(decoded)
-	}
-
-	// Parse as plain text (one URI per line)
-	return parseNodesFromContent(content)
+	nodes, err := parseContent(strings.TrimSpace(strings.TrimPrefix(content, "\ufeff")), 0)
+	return deduplicateParsedNodes(nodes), err
 }
 
 // ParseSubscriptionContent parses Clash YAML, Base64 and plain URI
@@ -738,30 +729,53 @@ func ParseImportContent(content string) ([]NodeConfig, error) {
 		return nil, errors.New("import content is empty")
 	}
 
-	// 1. Full Clash YAML document (top-level `proxies:` key).
+	return requireImportedNodes(parseContent(strings.TrimPrefix(content, "\ufeff"), 0))
+}
+
+const maxDecodedContentBytes = 10 * 1024 * 1024
+
+func parseContent(content string, depth int) ([]NodeConfig, error) {
+	content = strings.TrimSpace(strings.TrimPrefix(content, "\ufeff"))
+	if len(content) > maxDecodedContentBytes {
+		return nil, errors.New("节点内容超过 10MB 限制")
+	}
+	if content == "" {
+		return nil, errors.New("节点内容为空")
+	}
+	if strings.HasPrefix(content, "{") {
+		if nodes, recognized, _, err := parseSingBoxJSON(content); recognized {
+			return nodes, err
+		}
+	}
 	if hasProxiesKey(content) {
-		return requireImportedNodes(parseClashYAML(content))
+		return parseClashYAML(content)
 	}
-
-	// 2. Inline Clash YAML list items ("- { ... }" or "- name: ...").
 	if looksLikeInlineYAML(content) {
-		return requireImportedNodes(parseClashYAML(wrapAsClashProxiesDoc(content)))
+		return parseClashYAML(wrapAsClashProxiesDoc(content))
 	}
-
-	// 3. Base64-encoded payload (common for v2ray subscriptions).
-	if decoded, ok := tryBase64Decode(content); ok {
-		decoded = strings.TrimSpace(decoded)
-		if hasProxiesKey(decoded) {
-			return requireImportedNodes(parseClashYAML(decoded))
+	if depth < 2 {
+		if decoded, ok := tryBase64Decode(content); ok {
+			if len(decoded) > maxDecodedContentBytes {
+				return nil, errors.New("Base64 解码内容超过 10MB 限制")
+			}
+			return parseContent(decoded, depth+1)
 		}
-		if looksLikeInlineYAML(decoded) {
-			return requireImportedNodes(parseClashYAML(wrapAsClashProxiesDoc(decoded)))
-		}
-		return requireImportedNodes(parseNodesFromContent(decoded))
 	}
+	return parseNodesFromContent(content)
+}
 
-	// 4. Plain proxy URI list.
-	return requireImportedNodes(parseNodesFromContent(content))
+// ParseImportContentReport is the API-facing variant that also reports
+// individual Sing-box outbounds that were intentionally skipped.
+func ParseImportContentReport(content string) ([]NodeConfig, []string, error) {
+	trimmed := strings.TrimSpace(strings.TrimPrefix(content, "\ufeff"))
+	if strings.HasPrefix(trimmed, "{") {
+		if nodes, recognized, issues, err := parseSingBoxJSON(trimmed); recognized {
+			nodes, err = requireImportedNodes(nodes, err)
+			return nodes, issues, err
+		}
+	}
+	nodes, err := ParseImportContent(content)
+	return nodes, nil, err
 }
 
 func requireImportedNodes(nodes []NodeConfig, err error) ([]NodeConfig, error) {
@@ -823,6 +837,12 @@ func tryBase64Decode(content string) (string, bool) {
 	if content == "" || strings.Contains(content, "://") {
 		return "", false
 	}
+	content = strings.Map(func(r rune) rune {
+		if r == '\r' || r == '\n' || r == ' ' || r == '\t' {
+			return -1
+		}
+		return r
+	}, content)
 	for _, enc := range []*base64.Encoding{
 		base64.StdEncoding, base64.URLEncoding,
 		base64.RawStdEncoding, base64.RawURLEncoding,
@@ -837,6 +857,7 @@ func tryBase64Decode(content string) (string, bool) {
 // parseNodesFromContent parses nodes from plain text content (one URI per line)
 func parseNodesFromContent(content string) ([]NodeConfig, error) {
 	var nodes []NodeConfig
+	var parseErrors []string
 	lines := strings.Split(content, "\n")
 
 	for _, line := range lines {
@@ -861,11 +882,51 @@ func parseNodesFromContent(content string) ([]NodeConfig, error) {
 					node.Name = parsed.Fragment
 				}
 			}
+			if err := enrichNodeIdentity(&node); err != nil {
+				parseErrors = append(parseErrors, err.Error())
+				continue
+			}
 			nodes = append(nodes, node)
+		} else if strings.Contains(line, "://") {
+			if _, err := nodecodec.ParseURI(line); err != nil {
+				parseErrors = append(parseErrors, err.Error())
+			}
 		}
 	}
 
+	if len(nodes) == 0 && len(parseErrors) > 0 {
+		return nil, errors.New(strings.Join(parseErrors, "; "))
+	}
 	return nodes, nil
+}
+
+func enrichNodeIdentity(node *NodeConfig) error {
+	identity, err := nodecodec.ParseURI(node.URI)
+	if err != nil {
+		return err
+	}
+	node.IdentityHash = identity.Hash
+	node.CanonicalJSON = identity.CanonicalJSON
+	node.EndpointKey = identity.EndpointKey
+	return nil
+}
+
+func deduplicateParsedNodes(nodes []NodeConfig) []NodeConfig {
+	seen := make(map[string]struct{}, len(nodes))
+	result := make([]NodeConfig, 0, len(nodes))
+	for i := range nodes {
+		if nodes[i].IdentityHash == "" {
+			if err := enrichNodeIdentity(&nodes[i]); err != nil {
+				continue
+			}
+		}
+		if _, exists := seen[nodes[i].IdentityHash]; exists {
+			continue
+		}
+		seen[nodes[i].IdentityHash] = struct{}{}
+		result = append(result, nodes[i])
+	}
+	return result
 }
 
 // unwrapProxyURILine accepts proxy links copied from Markdown-rendered text or
@@ -943,6 +1004,7 @@ type clashProxy struct {
 	Server            string                 `yaml:"server"`
 	Port              int                    `yaml:"port"`
 	UUID              string                 `yaml:"uuid"`
+	Username          string                 `yaml:"username"`
 	Password          string                 `yaml:"password"`
 	Cipher            string                 `yaml:"cipher"`
 	AlterId           int                    `yaml:"alterId"`
@@ -975,6 +1037,237 @@ type clashRealityOptions struct {
 	ShortID   string `yaml:"short-id"`
 }
 
+// parseSingBoxJSON accepts standard sing-box JSON and its commonly used JSONC
+// form. Only outbound types that EasyProxies can run losslessly are converted.
+func parseSingBoxJSON(content string) ([]NodeConfig, bool, []string, error) {
+	standard, err := hujson.Standardize([]byte(content))
+	if err != nil {
+		return nil, false, nil, nil
+	}
+	var document struct {
+		Outbounds []map[string]any `json:"outbounds"`
+	}
+	if err := json.Unmarshal(standard, &document); err != nil || document.Outbounds == nil {
+		return nil, false, nil, nil
+	}
+	var nodes []NodeConfig
+	var issues []string
+	for index, outbound := range document.Outbounds {
+		tag := mapString(outbound, "tag")
+		kind := strings.ToLower(mapString(outbound, "type"))
+		if kind == "" {
+			issues = append(issues, fmt.Sprintf("outbound %d 缺少 type", index+1))
+			continue
+		}
+		switch kind {
+		case "selector", "urltest", "direct", "block", "dns":
+			issues = append(issues, fmt.Sprintf("%s (%s): 非代理出口，已跳过", defaultString(tag, fmt.Sprintf("outbound-%d", index+1)), kind))
+			continue
+		}
+		uri, convertErr := singBoxOutboundURI(outbound)
+		if convertErr != nil {
+			issues = append(issues, fmt.Sprintf("%s (%s): %v", defaultString(tag, fmt.Sprintf("outbound-%d", index+1)), kind, convertErr))
+			continue
+		}
+		node := NodeConfig{Name: tag, URI: uri}
+		if err := enrichNodeIdentity(&node); err != nil {
+			issues = append(issues, fmt.Sprintf("%s (%s): %v", defaultString(tag, fmt.Sprintf("outbound-%d", index+1)), kind, err))
+			continue
+		}
+		nodes = append(nodes, node)
+	}
+	if len(nodes) == 0 {
+		if len(issues) == 0 {
+			return nil, true, nil, errors.New("Sing-box JSON 中没有 outbounds")
+		}
+		return nil, true, issues, errors.New(strings.Join(issues, "; "))
+	}
+	return nodes, true, issues, nil
+}
+
+func singBoxOutboundURI(outbound map[string]any) (string, error) {
+	kind := strings.ToLower(mapString(outbound, "type"))
+	if kind == "shadowsocks" {
+		kind = "ss"
+	}
+	if kind == "hy2" {
+		kind = "hysteria2"
+	}
+	switch kind {
+	case "vmess", "vless", "trojan", "ss", "hysteria2", "anytls", "http", "socks", "socks5":
+	default:
+		return "", fmt.Errorf("暂不支持的 outbound 类型")
+	}
+	if mapString(outbound, "detour") != "" {
+		return "", errors.New("包含 detour，无法无损转换")
+	}
+	server := mapString(outbound, "server")
+	port := mapInt(outbound, "server_port")
+	if server == "" || port <= 0 || port > 65535 {
+		return "", errors.New("缺少有效的 server/server_port")
+	}
+	if kind == "socks" {
+		kind = "socks5"
+	}
+	q := url.Values{}
+	for _, key := range []string{"flow", "packet_encoding", "network"} {
+		if value := mapString(outbound, key); value != "" {
+			q.Set(key, value)
+		}
+	}
+	if kind == "vmess" {
+		q.Set("alterId", strconv.Itoa(mapInt(outbound, "alter_id")))
+		if value := mapString(outbound, "security"); value != "" {
+			q.Set("encryption", value)
+		}
+	}
+	if kind == "ss" {
+		method, password := mapString(outbound, "method"), mapString(outbound, "password")
+		if method == "" || password == "" {
+			return "", errors.New("缺少 method/password")
+		}
+		encoded := base64.RawURLEncoding.EncodeToString([]byte(method + ":" + password))
+		u := &url.URL{Scheme: "ss", Host: net.JoinHostPort(server, strconv.Itoa(port)), User: url.User(encoded), Fragment: mapString(outbound, "tag")}
+		if plugin := mapString(outbound, "plugin"); plugin != "" {
+			q.Set("plugin", plugin)
+			q.Set("plugin-opts", mapString(outbound, "plugin_opts"))
+		}
+		u.RawQuery = q.Encode()
+		return u.String(), nil
+	}
+	if tls := mapMap(outbound, "tls"); tls != nil && mapBool(tls, "enabled") {
+		q.Set("security", "tls")
+		if value := mapString(tls, "server_name"); value != "" {
+			q.Set("sni", value)
+		}
+		if mapBool(tls, "insecure") {
+			q.Set("insecure", "true")
+		}
+		if alpn := mapStringSlice(tls, "alpn"); len(alpn) > 0 {
+			q.Set("alpn", strings.Join(alpn, ","))
+		}
+		if utls := mapMap(tls, "utls"); utls != nil && mapBool(utls, "enabled") {
+			q.Set("fp", mapString(utls, "fingerprint"))
+		}
+		if reality := mapMap(tls, "reality"); reality != nil && mapBool(reality, "enabled") {
+			q.Set("security", "reality")
+			q.Set("pbk", mapString(reality, "public_key"))
+			q.Set("sid", mapString(reality, "short_id"))
+		}
+	}
+	if transport := mapMap(outbound, "transport"); transport != nil {
+		transportType := mapString(transport, "type")
+		if transportType != "" {
+			q.Set("type", transportType)
+		}
+		if value := mapString(transport, "path"); value != "" {
+			q.Set("path", value)
+		}
+		if value := mapString(transport, "service_name"); value != "" {
+			q.Set("serviceName", value)
+		}
+		if headers := mapMap(transport, "headers"); headers != nil {
+			if host := mapString(headers, "Host"); host != "" {
+				q.Set("host", host)
+			} else if host := mapString(headers, "host"); host != "" {
+				q.Set("host", host)
+			}
+		}
+	}
+	if kind == "hysteria2" {
+		if value := mapInt(outbound, "up_mbps"); value > 0 {
+			q.Set("upMbps", strconv.Itoa(value))
+		}
+		if value := mapInt(outbound, "down_mbps"); value > 0 {
+			q.Set("downMbps", strconv.Itoa(value))
+		}
+		if obfs := mapMap(outbound, "obfs"); obfs != nil {
+			q.Set("obfs", mapString(obfs, "type"))
+			q.Set("obfs-password", mapString(obfs, "password"))
+		}
+	}
+	u := &url.URL{Scheme: kind, Host: net.JoinHostPort(server, strconv.Itoa(port)), Fragment: mapString(outbound, "tag")}
+	username, password := mapString(outbound, "username"), mapString(outbound, "password")
+	switch kind {
+	case "vmess", "vless":
+		username = mapString(outbound, "uuid")
+	case "trojan", "hysteria2", "anytls":
+		username = password
+	}
+	if username != "" {
+		if password != "" && kind != "trojan" && kind != "hysteria2" && kind != "anytls" {
+			u.User = url.UserPassword(username, password)
+		} else {
+			u.User = url.User(username)
+		}
+	}
+	if kind == "http" {
+		if path := mapString(outbound, "path"); path != "" {
+			u.Path = path
+		}
+	}
+	u.RawQuery = q.Encode()
+	return u.String(), nil
+}
+
+func mapString(values map[string]any, key string) string {
+	value, ok := values[key]
+	if !ok || value == nil {
+		return ""
+	}
+	if text, ok := value.(string); ok {
+		return text
+	}
+	if list, ok := value.([]any); ok && len(list) > 0 {
+		return fmt.Sprint(list[0])
+	}
+	if list, ok := value.([]string); ok && len(list) > 0 {
+		return list[0]
+	}
+	return fmt.Sprint(value)
+}
+
+func mapInt(values map[string]any, key string) int {
+	value := mapString(values, key)
+	parsed, _ := strconv.Atoi(strings.TrimSuffix(value, ".0"))
+	return parsed
+}
+
+func mapBool(values map[string]any, key string) bool {
+	value, ok := values[key]
+	if !ok {
+		return false
+	}
+	if flag, ok := value.(bool); ok {
+		return flag
+	}
+	return strings.EqualFold(fmt.Sprint(value), "true") || fmt.Sprint(value) == "1"
+}
+
+func mapMap(values map[string]any, key string) map[string]any {
+	value, _ := values[key].(map[string]any)
+	return value
+}
+
+func mapStringSlice(values map[string]any, key string) []string {
+	if stringsList, ok := values[key].([]string); ok {
+		return append([]string(nil), stringsList...)
+	}
+	raw, _ := values[key].([]any)
+	result := make([]string, 0, len(raw))
+	for _, value := range raw {
+		result = append(result, fmt.Sprint(value))
+	}
+	return result
+}
+
+func defaultString(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
+}
+
 // parseClashYAML parses Clash YAML format and converts to NodeConfig
 func parseClashYAML(content string) ([]NodeConfig, error) {
 	var clash clashConfig
@@ -986,10 +1279,13 @@ func parseClashYAML(content string) ([]NodeConfig, error) {
 	for _, proxy := range clash.Proxies {
 		uri := convertClashProxyToURI(proxy)
 		if uri != "" {
-			nodes = append(nodes, NodeConfig{
+			node := NodeConfig{
 				Name: proxy.Name,
 				URI:  uri,
-			})
+			}
+			if err := enrichNodeIdentity(&node); err == nil {
+				nodes = append(nodes, node)
+			}
 		}
 	}
 
@@ -1011,9 +1307,39 @@ func convertClashProxyToURI(p clashProxy) string {
 		return buildHysteria2URI(p)
 	case "anytls":
 		return buildAnyTLSURI(p)
+	case "http", "socks", "socks5":
+		return buildSimpleProxyURI(p)
 	default:
 		return ""
 	}
+}
+
+func buildSimpleProxyURI(p clashProxy) string {
+	scheme := strings.ToLower(p.Type)
+	if scheme == "socks" {
+		scheme = "socks5"
+	}
+	u := &url.URL{Scheme: scheme, Host: net.JoinHostPort(p.Server, strconv.Itoa(p.Port)), Fragment: p.Name}
+	if p.Username != "" || p.Password != "" {
+		u.User = url.UserPassword(p.Username, p.Password)
+	}
+	q := url.Values{}
+	if p.Network != "" {
+		q.Set("network", p.Network)
+	}
+	if p.TLS {
+		q.Set("security", "tls")
+		if p.ServerName != "" {
+			q.Set("sni", p.ServerName)
+		} else if p.SNI != "" {
+			q.Set("sni", p.SNI)
+		}
+	}
+	if p.SkipCertVerify {
+		q.Set("insecure", "true")
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 func buildVMessURI(p clashProxy) string {
@@ -1133,7 +1459,27 @@ func buildTrojanURI(p clashProxy) string {
 func buildShadowsocksURI(p clashProxy) string {
 	// Encode method:password in base64
 	userInfo := base64.StdEncoding.EncodeToString([]byte(p.Cipher + ":" + p.Password))
-	return fmt.Sprintf("ss://%s@%s:%d#%s", userInfo, p.Server, p.Port, url.QueryEscape(p.Name))
+	params := url.Values{}
+	if p.Plugin != "" {
+		params.Set("plugin", p.Plugin)
+		if len(p.PluginOpts) > 0 {
+			keys := make([]string, 0, len(p.PluginOpts))
+			for key := range p.PluginOpts {
+				keys = append(keys, key)
+			}
+			sort.Strings(keys)
+			parts := make([]string, 0, len(keys))
+			for _, key := range keys {
+				parts = append(parts, key+"="+fmt.Sprint(p.PluginOpts[key]))
+			}
+			params.Set("plugin-opts", strings.Join(parts, ";"))
+		}
+	}
+	query := ""
+	if len(params) > 0 {
+		query = "?" + params.Encode()
+	}
+	return fmt.Sprintf("ss://%s@%s:%d%s#%s", userInfo, p.Server, p.Port, query, url.QueryEscape(p.Name))
 }
 
 func buildHysteria2URI(p clashProxy) string {

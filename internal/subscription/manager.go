@@ -289,6 +289,10 @@ func (m *Manager) RefreshOne(ctx context.Context, id int64) error {
 		return errors.New("刷新正在进行")
 	}
 	defer m.refreshMu.Unlock()
+	m.mu.Lock()
+	m.status.Parsed, m.status.Created, m.status.Updated = 0, 0, 0
+	m.status.DuplicatesSkipped, m.status.Invalid = 0, 0
+	m.mu.Unlock()
 	sub, err := m.Get(ctx, id)
 	if err != nil {
 		return err
@@ -320,6 +324,8 @@ func (m *Manager) refreshDue(ctx context.Context, dueOnly bool) error {
 	now := time.Now().UTC()
 	m.mu.Lock()
 	m.status.IsRefreshing = true
+	m.status.Parsed, m.status.Created, m.status.Updated = 0, 0, 0
+	m.status.DuplicatesSkipped, m.status.Invalid = 0, 0
 	m.mu.Unlock()
 	defer func() { m.mu.Lock(); m.status.IsRefreshing = false; m.status.RefreshCount++; m.mu.Unlock() }()
 	var errs []error
@@ -363,6 +369,9 @@ func (m *Manager) refreshSubscription(ctx context.Context, sub *store.Subscripti
 		err = errors.New("订阅未返回有效节点")
 	}
 	if err != nil {
+		m.mu.Lock()
+		m.status.Invalid++
+		m.mu.Unlock()
 		sub.LastAttempt, sub.LastError = attempt, err.Error()
 		if updateErr := m.store.UpdateSubscription(ctx, sub); updateErr != nil {
 			return errors.Join(err, updateErr)
@@ -373,14 +382,41 @@ func (m *Manager) refreshSubscription(ctx context.Context, sub *store.Subscripti
 	seen := make(map[string]struct{}, len(nodes))
 	for i, n := range nodes {
 		uri := strings.TrimSpace(n.URI)
-		if _, ok := seen[uri]; ok {
+		identityKey := n.IdentityHash
+		if identityKey == "" {
+			identityKey = uri
+		}
+		if _, ok := seen[identityKey]; ok {
 			continue
 		}
-		seen[uri] = struct{}{}
+		seen[identityKey] = struct{}{}
 		name := nodeName(n.Name, uri, i+1)
 		inputs = append(inputs, store.SubscriptionNodeInput{URI: uri, Name: name, Port: n.Port,
-			Username: n.Username, Password: n.Password, Enabled: true})
+			Username: n.Username, Password: n.Password, Enabled: true,
+			IdentityHash: n.IdentityHash, CanonicalJSON: n.CanonicalJSON})
 	}
+	existingNodes, listErr := m.store.ListNodes(ctx, store.NodeFilter{})
+	if listErr != nil {
+		return listErr
+	}
+	existingIdentities := make(map[string]struct{}, len(existingNodes))
+	for _, existing := range existingNodes {
+		existingIdentities[existing.IdentityHash] = struct{}{}
+	}
+	created, updated := 0, 0
+	for _, input := range inputs {
+		if _, exists := existingIdentities[input.IdentityHash]; exists {
+			updated++
+		} else {
+			created++
+		}
+	}
+	m.mu.Lock()
+	m.status.Parsed += len(nodes)
+	m.status.Created += created
+	m.status.Updated += updated
+	m.status.DuplicatesSkipped += len(nodes) - len(inputs)
+	m.mu.Unlock()
 	return m.store.CommitSnapshot(ctx, sub.ID, inputs, store.SubscriptionSnapshot{
 		Attempt: attempt, Success: time.Now().UTC(), ETag: etag, LastModified: lastModified,
 	})
@@ -433,13 +469,17 @@ func (m *Manager) reconcileRuntime(ctx context.Context) error {
 		if !n.Enabled || uri == "" {
 			return
 		}
-		if _, ok := seen[uri]; ok {
+		identityKey := n.IdentityHash
+		if identityKey == "" {
+			identityKey = uri
+		}
+		if _, ok := seen[identityKey]; ok {
 			return
 		}
-		seen[uri] = struct{}{}
+		seen[identityKey] = struct{}{}
 		all = append(all, config.NodeConfig{ID: n.ID, Name: n.Name, URI: uri, Port: n.Port,
 			Username: n.Username, Password: n.Password, Source: config.NodeSource(n.Source),
-			Region: n.Region, Country: n.Country})
+			Region: n.Region, Country: n.Country, IdentityHash: n.IdentityHash, CanonicalJSON: n.CanonicalJSON})
 	}
 	for _, n := range regular {
 		if n.Source != store.NodeSourceSubscription {

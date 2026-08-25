@@ -1,6 +1,8 @@
 package builder
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +13,26 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 )
+
+func TestBuildShadowsocksFullSIP002URI(t *testing.T) {
+	payload := base64.RawURLEncoding.EncodeToString([]byte("aes-256-gcm:secret@example.com:8388"))
+	outbound, err := buildNodeOutbound("ss-full", "ss://"+payload+"#node", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := outbound.Options.(*option.ShadowsocksOutboundOptions)
+	if opts.Server != "example.com" || opts.ServerPort != 8388 || opts.Method != "aes-256-gcm" || opts.Password != "secret" {
+		t.Fatalf("options=%+v", opts)
+	}
+}
+
+func TestBuildVMessLegacyURIWithFragment(t *testing.T) {
+	payload, _ := json.Marshal(map[string]any{"v": "2", "add": "example.com", "port": "443", "id": "abc", "aid": "0", "net": "tcp"})
+	_, err := buildNodeOutbound("vmess-fragment", "vmess://"+base64.StdEncoding.EncodeToString(payload)+"#node", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestBuildNodeOutboundSupportsSOCKS5(t *testing.T) {
 	outbound, err := buildNodeOutbound("socks-node", "socks5://demo:secret@99.144.123.135:30350", false)

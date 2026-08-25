@@ -349,6 +349,21 @@ export interface SubscriptionNodesResponse {
 
 export interface SubscriptionActionResponse {
   ok: boolean
+  parsed?: number
+  created?: number
+  updated?: number
+  duplicates_skipped?: number
+  invalid?: number
+}
+
+export interface SubscriptionRefreshResponse {
+  message: string
+  node_count: number
+  parsed: number
+  created: number
+  updated: number
+  duplicates_skipped: number
+  invalid: number
 }
 
 // ---- GeoIP database management types ----
@@ -377,7 +392,12 @@ export interface SubscriptionStatus {
   last_error?: string
   refresh_count?: number
   is_refreshing?: boolean
-  message?: string
+	message?: string
+	parsed?: number
+	created?: number
+	updated?: number
+	duplicates_skipped?: number
+	invalid?: number
 }
 
 // ---- SSE Probe types ----

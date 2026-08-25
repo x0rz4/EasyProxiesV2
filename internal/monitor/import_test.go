@@ -58,21 +58,40 @@ func TestImportHTTPProxyGeneratesUniqueNames(t *testing.T) {
 	}
 }
 
-func TestImportSuffixesExplicitDuplicateNameAndRejectsDuplicateURI(t *testing.T) {
+func TestImportSuffixesExplicitDuplicateNameAndSkipsDuplicateIdentity(t *testing.T) {
 	manager := &importNodeManager{existing: []ManagedNodeConfig{{Name: "proxy", URI: "http://existing.example:80"}}}
 	server := &Server{nodeMgr: manager}
-	content := "http://new.example:80#proxy\nhttp://existing.example:80"
+	content := "http://new.example:80#proxy\nhttp://EXISTING.example#different-name"
 	body, _ := json.Marshal(map[string]string{"content": content})
 	response := httptest.NewRecorder()
 	server.handleImport(response, httptest.NewRequest(http.MethodPost, "/api/import", bytes.NewReader(body)))
 	var payload struct {
-		Imported int      `json:"imported"`
-		Errors   []string `json:"errors"`
+		Imported          int      `json:"imported"`
+		DuplicatesSkipped int      `json:"duplicates_skipped"`
+		Errors            []string `json:"errors"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload.Imported != 1 || len(payload.Errors) != 1 || len(manager.created) != 1 || manager.created[0].Name != "proxy-2" {
+	if payload.Imported != 1 || payload.DuplicatesSkipped != 1 || len(payload.Errors) != 0 || len(manager.created) != 1 || manager.created[0].Name != "proxy-2" {
 		t.Fatalf("payload=%+v created=%+v", payload, manager.created)
+	}
+}
+
+func TestNodeDuplicateErrorReturnsConflictWithExistingID(t *testing.T) {
+	server := &Server{}
+	response := httptest.NewRecorder()
+	server.respondNodeError(response, &NodeDuplicateError{ExistingID: 42, ExistingName: "existing"})
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status=%d", response.Code)
+	}
+	var payload struct {
+		ExistingID int64 `json:"existing_node_id"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.ExistingID != 42 {
+		t.Fatalf("payload=%s", response.Body.String())
 	}
 }

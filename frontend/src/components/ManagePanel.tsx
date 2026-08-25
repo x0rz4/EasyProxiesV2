@@ -6,6 +6,7 @@ import {
   importNodes, exportProxies,
   fetchNodes, probeNode, releaseNode, listSubscriptions,
 } from '../api/client'
+import type { ImportNodesResult } from '../api/client'
 import { regionFlag } from '../utils/region'
 import { PageContent, PageHeader, PageLayout } from './ui/PageLayout'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
@@ -200,7 +201,7 @@ export default function ManagePanel() {
   const [importContent, setImportContent] = useState('')
   const [importing, setImporting] = useState(false)
   const [importError, setImportError] = useState('')
-  const [importResult, setImportResult] = useState<{ message: string; imported: number; errors?: string[] } | null>(null)
+  const [importResult, setImportResult] = useState<ImportNodesResult | null>(null)
 
   // ---- Merge config + monitor data ----
 
@@ -1066,6 +1067,29 @@ export default function ManagePanel() {
               <div className={`alert mb-3 py-2 text-sm ${importResult.imported > 0 ? 'alert-success' : 'alert-warning'}`}>
                 <div>
                   <span>{importResult.message}</span>
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    <span className="badge badge-sm badge-outline">解析 {importResult.parsed}</span>
+                    <span className="badge badge-sm badge-success">新增 {importResult.created}</span>
+                    {importResult.updated > 0 && <span className="badge badge-sm badge-info">更新 {importResult.updated}</span>}
+                    {importResult.duplicates_skipped > 0 && <span className="badge badge-sm badge-warning">重复跳过 {importResult.duplicates_skipped}</span>}
+                    {importResult.invalid > 0 && <span className="badge badge-sm badge-error">无效 {importResult.invalid}</span>}
+                  </div>
+                  {importResult.duplicate_groups && importResult.duplicate_groups.length > 0 && (
+                    <details className="mt-2">
+                      <summary className="cursor-pointer text-xs opacity-70">查看重复节点</summary>
+                      <ul className="mt-1 space-y-0.5 text-xs">
+                        {importResult.duplicate_groups.map((group, i) => <li key={i} className="opacity-70">• {group.incoming_node || '未命名节点'} 与已有节点 {group.existing_node} 的连接配置相同</li>)}
+                      </ul>
+                    </details>
+                  )}
+                  {importResult.endpoint_collisions && importResult.endpoint_collisions.length > 0 && (
+                    <details className="mt-2">
+                      <summary className="cursor-pointer text-xs opacity-70">{importResult.endpoint_collisions.length} 个同端点不同配置（已保留）</summary>
+                      <ul className="mt-1 space-y-0.5 text-xs">
+                        {importResult.endpoint_collisions.map((group, i) => <li key={i} className="opacity-70">• {group.endpoint}：{group.incoming_node || '未命名节点'} / {group.existing_nodes.join('、')}</li>)}
+                      </ul>
+                    </details>
+                  )}
                   {importResult.errors && importResult.errors.length > 0 && (
                     <details className="mt-2">
                       <summary className="cursor-pointer text-xs opacity-70">{importResult.errors.length} 个错误</summary>
@@ -1078,14 +1102,14 @@ export default function ManagePanel() {
               </div>
             )}
             <p className="text-sm text-base-content/60 mb-3">
-              支持代理 URI 列表（每行一个，如 trojan://、vless://、ss://、http://、socks5://）、Markdown 链接、Clash 配置（含 "proxies:" 的完整 YAML 或行内项）及 Base64 订阅内容。
-              匿名节点会自动生成不重复的名称；可以直接粘贴导出文件内容或从文件导入。
+              支持代理 URI、Markdown 链接、Clash YAML、Sing-box JSON/JSONC 及最多两层 Base64 订阅内容。
+              系统按协议、端点、认证、TLS 和传输配置进行语义去重；同 IP/端口但配置不同的节点会保留并提示。
             </p>
             <div className="mb-3">
               <label className="btn btn-soft btn-sm">
                 <FileUp className="h-4 w-4" />
                 选择文件
-                <input type="file" accept=".txt,.conf,.list,.yaml,.yml" className="hidden" onChange={handleFileImport} />
+                <input type="file" accept=".txt,.conf,.list,.yaml,.yml,.json,.jsonc" className="hidden" onChange={handleFileImport} />
               </label>
             </div>
             <textarea

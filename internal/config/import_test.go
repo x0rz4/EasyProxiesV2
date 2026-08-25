@@ -159,3 +159,60 @@ func TestParseImportContent_Empty(t *testing.T) {
 		t.Fatal("expected error for empty content, got nil")
 	}
 }
+
+func TestParseImportContentSingBoxJSONC(t *testing.T) {
+	content := `{
+		// comments are accepted by sing-box
+		"outbounds": [
+			{"type":"vless","tag":"edge","server":"Example.COM","server_port":443,"uuid":"ABC","tls":{"enabled":true,"server_name":"edge.example"},"transport":{"type":"ws","path":"/proxy","headers":{"Host":"cdn.example"}}},
+			{"type":"direct","tag":"direct"},
+		]
+	}`
+	nodes, err := ParseImportContent(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 1 || nodes[0].Name != "edge" || nodes[0].IdentityHash == "" {
+		t.Fatalf("nodes=%+v", nodes)
+	}
+	reported, issues, err := ParseImportContentReport(content)
+	if err != nil || len(reported) != 1 || len(issues) != 1 || !strings.Contains(issues[0], "direct") {
+		t.Fatalf("reported=%+v issues=%v err=%v", reported, issues, err)
+	}
+}
+
+func TestParseImportContentKeepsDuplicatesForReporting(t *testing.T) {
+	nodes, err := ParseImportContent("http://user:pass@EXAMPLE.com:80#one\nhttp://user:pass@example.com#two")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 2 || nodes[0].IdentityHash != nodes[1].IdentityHash {
+		t.Fatalf("nodes=%+v", nodes)
+	}
+	subscriptionNodes, err := ParseSubscriptionContent("http://user:pass@EXAMPLE.com:80#one\nhttp://user:pass@example.com#two")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(subscriptionNodes) != 1 {
+		t.Fatalf("subscription nodes=%+v", subscriptionNodes)
+	}
+}
+
+func TestParseImportContentRejectsUnsupportedRuntimeProtocol(t *testing.T) {
+	if _, err := ParseImportContent("ssr://example"); err == nil {
+		t.Fatal("expected unsupported SSR error")
+	}
+}
+
+func TestParseClashHTTPAndSOCKSNodes(t *testing.T) {
+	content := `proxies:
+  - { name: http-node, type: http, server: proxy.example, port: 8080, username: alice, password: secret }
+  - { name: socks-node, type: socks5, server: 127.0.0.1, port: 1080 }`
+	nodes, err := ParseImportContent(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 2 || !strings.HasPrefix(nodes[0].URI, "http://") || !strings.HasPrefix(nodes[1].URI, "socks5://") {
+		t.Fatalf("nodes=%+v", nodes)
+	}
+}

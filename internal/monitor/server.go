@@ -18,6 +18,7 @@ import (
 	"os"
 	"reflect"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,6 +27,7 @@ import (
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/geoip"
 	"easy_proxies/internal/group"
+	"easy_proxies/internal/nodecodec"
 	"easy_proxies/internal/store"
 	"easy_proxies/internal/unlock"
 
@@ -85,6 +87,17 @@ var (
 	ErrInvalidNode  = errors.New("无效的节点配置")
 )
 
+type NodeDuplicateError struct {
+	ExistingID   int64
+	ExistingName string
+}
+
+func (e *NodeDuplicateError) Error() string {
+	return fmt.Sprintf("节点连接已存在: %s (ID %d)", e.ExistingName, e.ExistingID)
+}
+
+func (e *NodeDuplicateError) Unwrap() error { return ErrNodeConflict }
+
 // SubscriptionRefresher interface for subscription manager.
 type SubscriptionRefresher interface {
 	RefreshNow() error
@@ -125,15 +138,20 @@ func (e settingsValidationError) Error() string { return e.err.Error() }
 
 // SubscriptionStatus represents subscription refresh status.
 type SubscriptionStatus struct {
-	Enabled          bool      `json:"enabled"`           // Whether auto-refresh is enabled in config
-	HasSubscriptions bool      `json:"has_subscriptions"` // Whether subscription URLs are configured
-	LastRefresh      time.Time `json:"last_refresh"`
-	NextRefresh      time.Time `json:"next_refresh"`
-	NodeCount        int       `json:"node_count"`
-	LastError        string    `json:"last_error,omitempty"`
-	RefreshCount     int       `json:"refresh_count"`
-	IsRefreshing     bool      `json:"is_refreshing"`
-	NodesModified    bool      `json:"nodes_modified"` // True if nodes were modified since last refresh
+	Enabled           bool      `json:"enabled"`           // Whether auto-refresh is enabled in config
+	HasSubscriptions  bool      `json:"has_subscriptions"` // Whether subscription URLs are configured
+	LastRefresh       time.Time `json:"last_refresh"`
+	NextRefresh       time.Time `json:"next_refresh"`
+	NodeCount         int       `json:"node_count"`
+	LastError         string    `json:"last_error,omitempty"`
+	RefreshCount      int       `json:"refresh_count"`
+	IsRefreshing      bool      `json:"is_refreshing"`
+	NodesModified     bool      `json:"nodes_modified"` // True if nodes were modified since last refresh
+	Parsed            int       `json:"parsed"`
+	Created           int       `json:"created"`
+	Updated           int       `json:"updated"`
+	DuplicatesSkipped int       `json:"duplicates_skipped"`
+	Invalid           int       `json:"invalid"`
 }
 
 // Server exposes HTTP endpoints for monitoring.
@@ -1471,6 +1489,11 @@ func (s *Server) nodeIDForSnapshot(snap Snapshot) (int64, bool) {
 		if n, err := s.store.GetNodeByURI(ctx, snap.URI); err == nil && n != nil && n.ID != 0 {
 			return n.ID, true
 		}
+		if identity, identityErr := nodecodec.ParseURI(snap.URI); identityErr == nil {
+			if n, err := s.store.GetNodeByIdentity(ctx, identity.Hash); err == nil && n != nil && n.ID != 0 {
+				return n.ID, true
+			}
+		}
 	}
 	if snap.Name != "" {
 		if n, err := s.store.GetNodeByName(ctx, snap.Name); err == nil && n != nil && n.ID != 0 {
@@ -1642,7 +1665,7 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 统一解析为节点列表（支持 Clash YAML / Base64 / URI 列表）
-	parsedNodes, err := config.ParseImportContent(content)
+	parsedNodes, parseIssues, err := config.ParseImportContentReport(content)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		writeJSON(w, map[string]any{"error": fmt.Sprintf("解析导入内容失败: %v", err)})
@@ -1654,14 +1677,24 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	usedNames := make(map[string]struct{}, len(existingNodes)+len(parsedNodes))
-	usedURIs := make(map[string]struct{}, len(existingNodes)+len(parsedNodes))
+	usedIdentities := make(map[string]ManagedNodeConfig, len(existingNodes)+len(parsedNodes))
+	endpointIdentities := make(map[string]map[string]string, len(existingNodes)+len(parsedNodes))
 	for _, existing := range existingNodes {
 		usedNames[strings.TrimSpace(existing.Name)] = struct{}{}
-		usedURIs[strings.TrimSpace(existing.URI)] = struct{}{}
+		if identity, identityErr := nodecodec.ParseURI(existing.URI); identityErr == nil {
+			usedIdentities[identity.Hash] = existing
+			if endpointIdentities[identity.EndpointKey] == nil {
+				endpointIdentities[identity.EndpointKey] = map[string]string{}
+			}
+			endpointIdentities[identity.EndpointKey][identity.Hash] = existing.Name
+		}
 	}
 
 	var imported int
-	var errs []string
+	var duplicatesSkipped int
+	errs := append([]string(nil), parseIssues...)
+	var duplicateGroups []map[string]any
+	var endpointCollisions []map[string]any
 	generatedNameIndex := 1
 
 	for i := range parsedNodes {
@@ -1671,9 +1704,23 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		if _, duplicate := usedURIs[node.URI]; duplicate {
-			errs = append(errs, fmt.Sprintf("节点 URI 已存在: %s", truncateStr(node.URI, 60)))
+		identity, identityErr := nodecodec.ParseURI(node.URI)
+		if identityErr != nil {
+			errs = append(errs, fmt.Sprintf("无效的代理 URI: %v", identityErr))
 			continue
+		}
+		if existing, duplicate := usedIdentities[identity.Hash]; duplicate {
+			duplicatesSkipped++
+			duplicateGroups = append(duplicateGroups, map[string]any{"existing_node": existing.Name, "incoming_node": node.Name})
+			continue
+		}
+		if identities := endpointIdentities[identity.EndpointKey]; len(identities) > 0 {
+			var names []string
+			for _, existingName := range identities {
+				names = append(names, existingName)
+			}
+			sort.Strings(names)
+			endpointCollisions = append(endpointCollisions, map[string]any{"endpoint": identity.EndpointKey, "existing_nodes": names, "incoming_node": node.Name})
 		}
 
 		// 名称：优先用解析结果，其次从 URI fragment 提取，最后生成唯一名称。
@@ -1711,12 +1758,28 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		imported++
-		usedURIs[node.URI] = struct{}{}
+		created := ManagedNodeConfig{Name: node.Name, URI: node.URI}
+		usedIdentities[identity.Hash] = created
+		if endpointIdentities[identity.EndpointKey] == nil {
+			endpointIdentities[identity.EndpointKey] = map[string]string{}
+		}
+		endpointIdentities[identity.EndpointKey][identity.Hash] = node.Name
 	}
 
 	result := map[string]any{
-		"message":  fmt.Sprintf("成功导入 %d 个节点", imported),
-		"imported": imported,
+		"message":            fmt.Sprintf("成功导入 %d 个节点，跳过 %d 个重复项", imported, duplicatesSkipped),
+		"imported":           imported,
+		"parsed":             len(parsedNodes),
+		"created":            imported,
+		"updated":            0,
+		"duplicates_skipped": duplicatesSkipped,
+		"invalid":            len(errs),
+	}
+	if len(duplicateGroups) > 0 {
+		result["duplicate_groups"] = duplicateGroups
+	}
+	if len(endpointCollisions) > 0 {
+		result["endpoint_collisions"] = endpointCollisions
 	}
 	if len(errs) > 0 {
 		result["errors"] = errs
@@ -1806,14 +1869,19 @@ func (s *Server) handleSubscriptionStatus(w http.ResponseWriter, r *http.Request
 
 	status := s.subRefresher.Status()
 	writeJSON(w, map[string]any{
-		"enabled":           status.Enabled,
-		"has_subscriptions": status.HasSubscriptions,
-		"last_refresh":      status.LastRefresh,
-		"next_refresh":      status.NextRefresh,
-		"node_count":        status.NodeCount,
-		"last_error":        status.LastError,
-		"refresh_count":     status.RefreshCount,
-		"is_refreshing":     status.IsRefreshing,
+		"enabled":            status.Enabled,
+		"has_subscriptions":  status.HasSubscriptions,
+		"last_refresh":       status.LastRefresh,
+		"next_refresh":       status.NextRefresh,
+		"node_count":         status.NodeCount,
+		"last_error":         status.LastError,
+		"refresh_count":      status.RefreshCount,
+		"is_refreshing":      status.IsRefreshing,
+		"parsed":             status.Parsed,
+		"created":            status.Created,
+		"updated":            status.Updated,
+		"duplicates_skipped": status.DuplicatesSkipped,
+		"invalid":            status.Invalid,
 	})
 }
 
@@ -1838,8 +1906,13 @@ func (s *Server) handleSubscriptionRefresh(w http.ResponseWriter, r *http.Reques
 
 	status := s.subRefresher.Status()
 	writeJSON(w, map[string]any{
-		"message":    "刷新成功",
-		"node_count": status.NodeCount,
+		"message":            "刷新成功",
+		"node_count":         status.NodeCount,
+		"parsed":             status.Parsed,
+		"created":            status.Created,
+		"updated":            status.Updated,
+		"duplicates_skipped": status.DuplicatesSkipped,
+		"invalid":            status.Invalid,
 	})
 }
 
@@ -1920,6 +1993,12 @@ func (s *Server) handleSubscriptionItem(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		err = s.subRefresher.RefreshOne(r.Context(), id)
+		if err == nil {
+			status := s.subRefresher.Status()
+			writeJSON(w, map[string]any{"ok": true, "parsed": status.Parsed, "created": status.Created,
+				"updated": status.Updated, "duplicates_skipped": status.DuplicatesSkipped, "invalid": status.Invalid})
+			return
+		}
 	case "nodes":
 		if r.Method != http.MethodGet {
 			writeAPIError(w, http.StatusMethodNotAllowed, "请求方法不允许")
@@ -2285,14 +2364,20 @@ func (s *Server) ensureNodeManager(w http.ResponseWriter) bool {
 
 func (s *Server) respondNodeError(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
+	payload := map[string]any{"error": err.Error()}
+	var duplicate *NodeDuplicateError
 	switch {
 	case errors.Is(err, ErrNodeNotFound):
 		status = http.StatusNotFound
+	case errors.As(err, &duplicate):
+		status = http.StatusConflict
+		payload["existing_node_id"] = duplicate.ExistingID
+		payload["existing_node_name"] = duplicate.ExistingName
 	case errors.Is(err, ErrNodeConflict), errors.Is(err, ErrInvalidNode):
 		status = http.StatusBadRequest
 	}
 	w.WriteHeader(status)
-	writeJSON(w, map[string]any{"error": err.Error()})
+	writeJSON(w, payload)
 }
 
 // geoipResponse is the JSON structure returned by the GeoIP management endpoints.
@@ -2704,10 +2789,14 @@ func (s *Server) groupNodeOptions(ctx context.Context, groups []store.GroupPool,
 		}
 	}
 	monitorByURI := make(map[string]Snapshot, len(monitorByTag))
+	monitorByIdentity := make(map[string]Snapshot, len(monitorByTag))
 	monitorByName := make(map[string]Snapshot, len(monitorByTag))
 	for _, snapshot := range monitorByTag {
 		if snapshot.URI != "" {
 			monitorByURI[snapshot.URI] = snapshot
+			if identity, identityErr := nodecodec.ParseURI(snapshot.URI); identityErr == nil {
+				monitorByIdentity[identity.Hash] = snapshot
+			}
 		}
 		if snapshot.Name != "" {
 			monitorByName[snapshot.Name] = snapshot
@@ -2716,6 +2805,9 @@ func (s *Server) groupNodeOptions(ctx context.Context, groups []store.GroupPool,
 	options := make([]groupNodeOptionResponse, 0, len(managedNodes))
 	for _, managed := range managedNodes {
 		snapshot, found := monitorByURI[managed.URI]
+		if !found && managed.IdentityHash != "" {
+			snapshot, found = monitorByIdentity[managed.IdentityHash]
+		}
 		if !found {
 			snapshot, found = monitorByName[managed.Name]
 		}

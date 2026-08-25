@@ -20,6 +20,7 @@ import (
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/group"
 	"easy_proxies/internal/monitor"
+	"easy_proxies/internal/nodecodec"
 	"easy_proxies/internal/outbound/pool"
 	"easy_proxies/internal/store"
 
@@ -1064,7 +1065,7 @@ func (m *Manager) ListConfigNodes(ctx context.Context, subscriptionID *int64) ([
 	runtimePorts := make(map[string]uint16, len(m.cfg.Nodes))
 	for _, n := range m.cfg.Nodes {
 		if n.Port > 0 {
-			runtimePorts[n.URI] = n.Port
+			runtimePorts[n.NodeKey()] = n.Port
 		}
 	}
 
@@ -1086,7 +1087,15 @@ func (m *Manager) ListConfigNodes(ctx context.Context, subscriptionID *int64) ([
 	for _, n := range storeNodes {
 		port := n.Port
 		// Prefer runtime port from active config (dynamically assigned)
-		if runtimePort, ok := runtimePorts[n.URI]; ok && runtimePort > 0 {
+		identityKey := n.IdentityHash
+		if identityKey == "" {
+			if identity, identityErr := nodecodec.ParseURI(n.URI); identityErr == nil {
+				identityKey = identity.Hash
+			} else {
+				identityKey = n.URI
+			}
+		}
+		if runtimePort, ok := runtimePorts[identityKey]; ok && runtimePort > 0 {
 			port = runtimePort
 		}
 		result = append(result, monitor.ManagedNodeConfig{
@@ -1138,6 +1147,15 @@ func (m *Manager) CreateNode(ctx context.Context, node config.NodeConfig) (confi
 
 	// Persist to Store if available
 	if m.store != nil {
+		identity, identityErr := nodecodec.ParseURI(normalized.URI)
+		if identityErr != nil {
+			return config.NodeConfig{}, fmt.Errorf("%w: %v", monitor.ErrInvalidNode, identityErr)
+		}
+		if existing, lookupErr := m.store.GetNodeByIdentity(ctx, identity.Hash); lookupErr != nil {
+			return config.NodeConfig{}, fmt.Errorf("lookup node identity: %w", lookupErr)
+		} else if existing != nil {
+			return config.NodeConfig{}, &monitor.NodeDuplicateError{ExistingID: existing.ID, ExistingName: existing.Name}
+		}
 		storeNode := &store.Node{
 			URI:      normalized.URI,
 			Name:     normalized.Name,
@@ -1148,6 +1166,9 @@ func (m *Manager) CreateNode(ctx context.Context, node config.NodeConfig) (confi
 			Enabled:  true,
 		}
 		if err := m.store.CreateNode(ctx, storeNode); err != nil {
+			if existing, lookupErr := m.store.GetNodeByIdentity(ctx, identity.Hash); lookupErr == nil && existing != nil {
+				return config.NodeConfig{}, &monitor.NodeDuplicateError{ExistingID: existing.ID, ExistingName: existing.Name}
+			}
 			return config.NodeConfig{}, fmt.Errorf("save to store: %w", err)
 		}
 	}
@@ -1192,6 +1213,15 @@ func (m *Manager) UpdateNode(ctx context.Context, name string, node config.NodeC
 			return config.NodeConfig{}, fmt.Errorf("lookup in store: %w", err)
 		}
 		if existing != nil {
+			identity, identityErr := nodecodec.ParseURI(normalized.URI)
+			if identityErr != nil {
+				return config.NodeConfig{}, fmt.Errorf("%w: %v", monitor.ErrInvalidNode, identityErr)
+			}
+			if duplicate, lookupErr := m.store.GetNodeByIdentity(ctx, identity.Hash); lookupErr != nil {
+				return config.NodeConfig{}, fmt.Errorf("lookup node identity: %w", lookupErr)
+			} else if duplicate != nil && duplicate.ID != existing.ID {
+				return config.NodeConfig{}, &monitor.NodeDuplicateError{ExistingID: duplicate.ID, ExistingName: duplicate.Name}
+			}
 			existing.URI = normalized.URI
 			existing.Name = normalized.Name
 			existing.Port = normalized.Port
@@ -1346,7 +1376,7 @@ func (m *Manager) TriggerReload(ctx context.Context) error {
 			// Build set of URIs already present from inline nodes
 			inlineURIs := make(map[string]int, len(newCfg.Nodes))
 			for idx, n := range newCfg.Nodes {
-				inlineURIs[n.URI] = idx
+				inlineURIs[n.NodeKey()] = idx
 			}
 
 			// Merge store nodes, skipping duplicates and disabled nodes
@@ -1354,7 +1384,11 @@ func (m *Manager) TriggerReload(ctx context.Context) error {
 				if !n.Enabled {
 					continue
 				}
-				if idx, exists := inlineURIs[n.URI]; exists {
+				identityKey := n.IdentityHash
+				if identityKey == "" {
+					identityKey = n.URI
+				}
+				if idx, exists := inlineURIs[identityKey]; exists {
 					// Inline connection settings take priority, while SQLite owns the
 					// stable identity and discovered region metadata used by groups.
 					newCfg.Nodes[idx].ID = n.ID
@@ -1367,15 +1401,16 @@ func (m *Manager) TriggerReload(ctx context.Context) error {
 					continue
 				}
 				newCfg.Nodes = append(newCfg.Nodes, config.NodeConfig{
-					ID:       n.ID,
-					Name:     n.Name,
-					URI:      n.URI,
-					Port:     n.Port,
-					Username: n.Username,
-					Password: n.Password,
-					Source:   config.NodeSource(n.Source),
-					Region:   n.Region,
-					Country:  n.Country,
+					ID:           n.ID,
+					Name:         n.Name,
+					URI:          n.URI,
+					Port:         n.Port,
+					Username:     n.Username,
+					Password:     n.Password,
+					Source:       config.NodeSource(n.Source),
+					Region:       n.Region,
+					Country:      n.Country,
+					IdentityHash: n.IdentityHash, CanonicalJSON: n.CanonicalJSON,
 				})
 			}
 			m.logger.Infof("merged nodes for reload: %d inline + store nodes = %d total", len(inlineURIs), len(newCfg.Nodes))

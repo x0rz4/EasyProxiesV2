@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"easy_proxies/internal/nodecodec"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -46,6 +48,10 @@ func Open(dbPath string) (Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
+	if err := reconcileNodeIdentities(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("reconcile node identities: %w", err)
+	}
 
 	log.Printf("[store] SQLite store opened: %s", dbPath)
 	return &sqliteStore{db: db}, nil
@@ -70,7 +76,7 @@ type querier interface {
 // ===================== Node operations =====================
 
 func (s *sqliteStore) ListNodes(ctx context.Context, filter NodeFilter) ([]Node, error) {
-	query := "SELECT id, uri, name, source, port, username, password, region, country, enabled, tags, created_at, updated_at FROM nodes"
+	query := "SELECT id, uri, name, source, port, username, password, region, country, enabled, tags, identity_hash, canonical_json, created_at, updated_at FROM nodes"
 	var conditions []string
 	var args []any
 
@@ -113,7 +119,7 @@ func (s *sqliteStore) ListNodes(ctx context.Context, filter NodeFilter) ([]Node,
 
 func (s *sqliteStore) ListManagedNodes(ctx context.Context, subscriptionID *int64) ([]ManagedNode, error) {
 	query := `SELECT n.id, n.uri, n.name, n.source, n.port, n.username, n.password,
-		n.region, n.country, n.enabled, n.tags, n.created_at, n.updated_at,
+		n.region, n.country, n.enabled, n.tags, n.identity_hash, n.canonical_json, n.created_at, n.updated_at,
 		COALESCE(GROUP_CONCAT(DISTINCT CASE WHEN subscriptions.enabled=1 THEN subscriptions.id END), '')
 		FROM nodes n
 		LEFT JOIN subscription_nodes ON subscription_nodes.node_id=n.id
@@ -144,7 +150,7 @@ func (s *sqliteStore) ListManagedNodes(ctx context.Context, subscriptionID *int6
 		var createdAt, updatedAt, subscriptionIDs, tagsJSON string
 		if err := rows.Scan(&managed.ID, &managed.URI, &managed.Name, &managed.Source, &managed.Port,
 			&managed.Username, &managed.Password, &managed.Region, &managed.Country, &enabled,
-			&tagsJSON, &createdAt, &updatedAt, &subscriptionIDs); err != nil {
+			&tagsJSON, &managed.IdentityHash, &managed.CanonicalJSON, &createdAt, &updatedAt, &subscriptionIDs); err != nil {
 			return nil, fmt.Errorf("scan managed node: %w", err)
 		}
 		managed.Enabled = enabled != 0
@@ -171,23 +177,32 @@ func (s *sqliteStore) ListManagedNodes(ctx context.Context, subscriptionID *int6
 
 func (s *sqliteStore) GetNode(ctx context.Context, id int64) (*Node, error) {
 	row := s.conn().QueryRowContext(ctx,
-		"SELECT id, uri, name, source, port, username, password, region, country, enabled, tags, created_at, updated_at FROM nodes WHERE id = ?", id)
+		"SELECT id, uri, name, source, port, username, password, region, country, enabled, tags, identity_hash, canonical_json, created_at, updated_at FROM nodes WHERE id = ?", id)
 	return scanNode(row)
 }
 
 func (s *sqliteStore) GetNodeByURI(ctx context.Context, uri string) (*Node, error) {
 	row := s.conn().QueryRowContext(ctx,
-		"SELECT id, uri, name, source, port, username, password, region, country, enabled, tags, created_at, updated_at FROM nodes WHERE uri = ?", uri)
+		"SELECT id, uri, name, source, port, username, password, region, country, enabled, tags, identity_hash, canonical_json, created_at, updated_at FROM nodes WHERE uri = ?", uri)
+	return scanNode(row)
+}
+
+func (s *sqliteStore) GetNodeByIdentity(ctx context.Context, identityHash string) (*Node, error) {
+	row := s.conn().QueryRowContext(ctx,
+		"SELECT id, uri, name, source, port, username, password, region, country, enabled, tags, identity_hash, canonical_json, created_at, updated_at FROM nodes WHERE identity_hash = ?", identityHash)
 	return scanNode(row)
 }
 
 func (s *sqliteStore) GetNodeByName(ctx context.Context, name string) (*Node, error) {
 	row := s.conn().QueryRowContext(ctx,
-		"SELECT id, uri, name, source, port, username, password, region, country, enabled, tags, created_at, updated_at FROM nodes WHERE name = ?", name)
+		"SELECT id, uri, name, source, port, username, password, region, country, enabled, tags, identity_hash, canonical_json, created_at, updated_at FROM nodes WHERE name = ?", name)
 	return scanNode(row)
 }
 
 func (s *sqliteStore) CreateNode(ctx context.Context, node *Node) error {
+	if err := populateNodeIdentity(node, true); err != nil {
+		return err
+	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	if node.CreatedAt.IsZero() {
 		node.CreatedAt = time.Now().UTC()
@@ -208,11 +223,11 @@ func (s *sqliteStore) CreateNode(ctx context.Context, node *Node) error {
 	}
 
 	result, err := s.conn().ExecContext(ctx,
-		`INSERT INTO nodes (uri, name, source, port, username, password, region, country, enabled, tags, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO nodes (uri, name, source, port, username, password, region, country, enabled, tags, identity_hash, canonical_json, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		node.URI, node.Name, node.Source, node.Port,
 		node.Username, node.Password, node.Region, node.Country,
-		enabled, tagsJSON, now, now,
+		enabled, tagsJSON, node.IdentityHash, node.CanonicalJSON, now, now,
 	)
 	if err != nil {
 		return fmt.Errorf("create node: %w", err)
@@ -235,6 +250,9 @@ func (s *sqliteStore) CreateNode(ctx context.Context, node *Node) error {
 }
 
 func (s *sqliteStore) UpdateNode(ctx context.Context, node *Node) error {
+	if err := populateNodeIdentity(node, true); err != nil {
+		return err
+	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	enabled := 0
 	if node.Enabled {
@@ -250,11 +268,11 @@ func (s *sqliteStore) UpdateNode(ctx context.Context, node *Node) error {
 
 	result, err := s.conn().ExecContext(ctx,
 		`UPDATE nodes SET uri=?, name=?, source=?, port=?, username=?, password=?,
-		 region=?, country=?, enabled=?, tags=?, updated_at=?
+		 region=?, country=?, enabled=?, tags=?, identity_hash=?, canonical_json=?, updated_at=?
 		 WHERE id=?`,
 		node.URI, node.Name, node.Source, node.Port,
 		node.Username, node.Password, node.Region, node.Country,
-		enabled, tagsJSON, now, node.ID,
+		enabled, tagsJSON, node.IdentityHash, node.CanonicalJSON, now, node.ID,
 	)
 	if err != nil {
 		return fmt.Errorf("update node %d: %w", node.ID, err)
@@ -295,9 +313,9 @@ func (s *sqliteStore) BulkUpsertNodes(ctx context.Context, nodes []Node) error {
 	execFn := func(txStore *sqliteStore) error {
 		now := time.Now().UTC().Format(time.RFC3339)
 		stmt, err := txStore.conn().PrepareContext(ctx,
-			`INSERT INTO nodes (uri, name, source, port, username, password, region, country, enabled, created_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			 ON CONFLICT(uri) DO UPDATE SET
+			`INSERT INTO nodes (uri, name, source, port, username, password, region, country, enabled, identity_hash, canonical_json, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(identity_hash) WHERE identity_hash<>'' DO UPDATE SET
 			   name=excluded.name, source=excluded.source, port=excluded.port,
 			   username=excluded.username, password=excluded.password,
 			   region=excluded.region, country=excluded.country,
@@ -309,6 +327,9 @@ func (s *sqliteStore) BulkUpsertNodes(ctx context.Context, nodes []Node) error {
 
 		for i := range nodes {
 			n := &nodes[i]
+			if err := populateNodeIdentity(n, true); err != nil {
+				return err
+			}
 			enabled := 0
 			if n.Enabled {
 				enabled = 1
@@ -316,7 +337,7 @@ func (s *sqliteStore) BulkUpsertNodes(ctx context.Context, nodes []Node) error {
 			result, err := stmt.ExecContext(ctx,
 				n.URI, n.Name, n.Source, n.Port,
 				n.Username, n.Password, n.Region, n.Country,
-				enabled, now, now,
+				enabled, n.IdentityHash, n.CanonicalJSON, now, now,
 			)
 			if err != nil {
 				return fmt.Errorf("upsert node %q: %w", n.URI, err)
@@ -535,7 +556,7 @@ func (s *sqliteStore) ActivateSubscriptionExclusive(ctx context.Context, id int6
 func (s *sqliteStore) ListSubscriptionNodes(ctx context.Context, subscriptionID int64) ([]SubscriptionNode, error) {
 	rows, err := s.conn().QueryContext(ctx, `SELECT sn.subscription_id, sn.position,
 		n.id, n.uri, n.name, n.source, n.port, n.username, n.password, n.region, n.country,
-		n.enabled, n.tags, n.created_at, n.updated_at
+		n.enabled, n.tags, n.identity_hash, n.canonical_json, n.created_at, n.updated_at
 		FROM subscription_nodes sn JOIN nodes n ON n.id=sn.node_id
 		WHERE sn.subscription_id=? ORDER BY sn.position, n.id`, subscriptionID)
 	if err != nil {
@@ -549,7 +570,8 @@ func (s *sqliteStore) ListSubscriptionNodes(ctx context.Context, subscriptionID 
 		var tagsJSON, createdAt, updatedAt string
 		if err := rows.Scan(&member.SubscriptionID, &member.Position, &member.Node.ID, &member.Node.URI,
 			&member.Node.Name, &member.Node.Source, &member.Node.Port, &member.Node.Username,
-			&member.Node.Password, &member.Node.Region, &member.Node.Country, &enabled, &tagsJSON, &createdAt, &updatedAt); err != nil {
+			&member.Node.Password, &member.Node.Region, &member.Node.Country, &enabled, &tagsJSON,
+			&member.Node.IdentityHash, &member.Node.CanonicalJSON, &createdAt, &updatedAt); err != nil {
 			return nil, err
 		}
 		member.Node.Enabled = enabled != 0
@@ -564,7 +586,7 @@ func (s *sqliteStore) ListSubscriptionNodes(ctx context.Context, subscriptionID 
 
 func (s *sqliteStore) ListEffectiveSubscriptionNodes(ctx context.Context) ([]Node, error) {
 	rows, err := s.conn().QueryContext(ctx, `SELECT DISTINCT n.id, n.uri, n.name, n.source, n.port,
-		n.username, n.password, n.region, n.country, n.enabled, n.tags, n.created_at, n.updated_at
+		n.username, n.password, n.region, n.country, n.enabled, n.tags, n.identity_hash, n.canonical_json, n.created_at, n.updated_at
 		FROM nodes n JOIN subscription_nodes sn ON sn.node_id=n.id
 		JOIN subscriptions s ON s.id=sn.subscription_id
 		WHERE n.enabled=1 AND s.enabled=1 ORDER BY n.id`)
@@ -642,23 +664,33 @@ func (s *sqliteStore) requireSubscription(ctx context.Context, subscriptionID in
 func (s *sqliteStore) upsertSubscriptionNodes(ctx context.Context, subscriptionID int64, nodes []SubscriptionNodeInput) error {
 	now := formatTime(time.Now().UTC())
 	for position, node := range nodes {
+		if node.IdentityHash == "" {
+			identity, identityErr := nodecodec.ParseURI(node.URI)
+			if identityErr != nil {
+				node.IdentityHash = nodecodec.FallbackHash(node.URI)
+			} else {
+				node.IdentityHash, node.CanonicalJSON = identity.Hash, identity.CanonicalJSON
+			}
+		}
 		_, err := s.conn().ExecContext(ctx, `INSERT INTO nodes
-			(uri, name, source, port, username, password, region, country, enabled, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(uri) DO UPDATE SET name=excluded.name, port=excluded.port,
+			(uri, name, source, port, username, password, region, country, enabled, identity_hash, canonical_json, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(identity_hash) WHERE identity_hash<>'' DO UPDATE SET
+			name=excluded.name,
+			port=CASE WHEN nodes.port=0 THEN excluded.port ELSE nodes.port END,
 			username=excluded.username, password=excluded.password,
 			region=CASE WHEN excluded.region<>'' THEN excluded.region ELSE nodes.region END,
 			country=CASE WHEN excluded.country<>'' THEN excluded.country ELSE nodes.country END,
 			updated_at=excluded.updated_at`, node.URI, node.Name,
 			NodeSourceSubscription, node.Port, node.Username, node.Password, node.Region, node.Country,
-			boolToInt(node.Enabled), now, now)
+			boolToInt(node.Enabled), node.IdentityHash, node.CanonicalJSON, now, now)
 		if err != nil {
 			return fmt.Errorf("upsert subscription node %q: %w", node.URI, err)
 		}
 		if _, err := s.conn().ExecContext(ctx, `INSERT INTO subscription_nodes (subscription_id, node_id, position)
-			SELECT ?, id, ? FROM nodes WHERE uri=?
+			SELECT ?, id, ? FROM nodes WHERE identity_hash=?
 			ON CONFLICT(subscription_id, node_id) DO UPDATE SET position=excluded.position`,
-			subscriptionID, position, node.URI); err != nil {
+			subscriptionID, position, node.IdentityHash); err != nil {
 			return fmt.Errorf("link subscription node %q: %w", node.URI, err)
 		}
 	}
@@ -1456,6 +1488,21 @@ func requireAffected(result sql.Result, notFound string) error {
 	return nil
 }
 
+func populateNodeIdentity(node *Node, allowFallback bool) error {
+	identity, err := nodecodec.ParseURI(node.URI)
+	if err != nil {
+		if !allowFallback {
+			return fmt.Errorf("invalid node URI: %w", err)
+		}
+		node.IdentityHash = nodecodec.FallbackHash(node.URI)
+		node.CanonicalJSON = ""
+		return nil
+	}
+	node.IdentityHash = identity.Hash
+	node.CanonicalJSON = identity.CanonicalJSON
+	return nil
+}
+
 func scanNode(row *sql.Row) (*Node, error) {
 	var n Node
 	var enabled int
@@ -1464,7 +1511,7 @@ func scanNode(row *sql.Row) (*Node, error) {
 	err := row.Scan(
 		&n.ID, &n.URI, &n.Name, &n.Source, &n.Port,
 		&n.Username, &n.Password, &n.Region, &n.Country,
-		&enabled, &tagsJSON, &createdAtStr, &updatedAtStr,
+		&enabled, &tagsJSON, &n.IdentityHash, &n.CanonicalJSON, &createdAtStr, &updatedAtStr,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -1492,7 +1539,7 @@ func scanNodes(rows *sql.Rows) ([]Node, error) {
 		err := rows.Scan(
 			&n.ID, &n.URI, &n.Name, &n.Source, &n.Port,
 			&n.Username, &n.Password, &n.Region, &n.Country,
-			&enabled, &tagsJSON, &createdAtStr, &updatedAtStr,
+			&enabled, &tagsJSON, &n.IdentityHash, &n.CanonicalJSON, &createdAtStr, &updatedAtStr,
 		)
 		if err != nil {
 			return nil, err

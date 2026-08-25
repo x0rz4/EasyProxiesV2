@@ -232,6 +232,15 @@ UPDATE group_pools SET subscription_token = lower(hex(randomblob(24))) WHERE sub
 ALTER TABLE group_pools ADD COLUMN excluded_node_ids_json TEXT NOT NULL DEFAULT '[]';
 `,
 		},
+		{
+			Version:     9,
+			Description: "add protocol-aware node identities",
+			Up: `
+ALTER TABLE nodes ADD COLUMN identity_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE nodes ADD COLUMN canonical_json TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_nodes_identity_hash ON nodes(identity_hash);
+`,
+		},
 	}
 }
 
