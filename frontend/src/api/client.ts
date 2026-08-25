@@ -14,6 +14,9 @@ import type {
   SubscriptionNodesResponse,
   SubscriptionActionResponse,
   ProbeSSEEvent,
+  UnlockResult,
+  UnlockResultsResponse,
+  UnlockSSEEvent,
   TrafficStreamEvent,
   DebugLogEvent,
   GeoipStatus,
@@ -141,6 +144,23 @@ export async function releaseNode(tag: string): Promise<{ message: string }> {
   return request(`/api/nodes/${encodeURIComponent(tag)}/release`, { method: 'POST' })
 }
 
+/** Unlock detection for a single node. */
+export async function unlockNode(tag: string): Promise<UnlockResult> {
+  const data = await request<{ error?: string } & UnlockResult>(
+    `/api/nodes/${encodeURIComponent(tag)}/unlock`,
+    { method: 'POST' }
+  )
+  if ((data as { error?: string }).error) {
+    throw new ApiError((data as { error: string }).error, 400)
+  }
+  return data
+}
+
+/** Fetch the last persisted unlock detection result for every node. */
+export async function fetchUnlockResults(): Promise<UnlockResultsResponse> {
+  return request<UnlockResultsResponse>('/api/nodes/unlock-results')
+}
+
 /** Probe all nodes with SSE progress updates */
 export function probeAllNodes(
   onEvent: (event: ProbeSSEEvent) => void,
@@ -185,6 +205,66 @@ export function probeAllNodes(
           if (trimmed.startsWith('data: ')) {
             try {
               const data = JSON.parse(trimmed.slice(6)) as ProbeSSEEvent
+              onEvent(data)
+            } catch { /* skip malformed events */ }
+          }
+        }
+      }
+    } catch (err) {
+      if ((err as Error).name !== 'AbortError') {
+        onError?.(err as Error)
+      }
+    }
+  }
+
+  doFetch()
+  return controller
+}
+
+/** Unlock detection for all nodes with SSE progress updates. */
+export function unlockAllNodes(
+  onEvent: (event: UnlockSSEEvent) => void,
+  onError?: (error: Error) => void
+): AbortController {
+  const controller = new AbortController()
+
+  const doFetch = async () => {
+    try {
+      const headers: Record<string, string> = {}
+      if (authToken) {
+        headers['Authorization'] = `Bearer ${authToken}`
+      }
+
+      const res = await fetch('/api/nodes/unlock-all', {
+        method: 'POST',
+        headers,
+        credentials: 'include',
+        signal: controller.signal,
+      })
+
+      if (!res.ok) {
+        throw new ApiError(`解锁检测失败: HTTP ${res.status}`, res.status)
+      }
+
+      const reader = res.body?.getReader()
+      if (!reader) throw new Error('No response body')
+
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ''
+
+        for (const line of lines) {
+          const trimmed = line.trim()
+          if (trimmed.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(trimmed.slice(6)) as UnlockSSEEvent
               onEvent(data)
             } catch { /* skip malformed events */ }
           }

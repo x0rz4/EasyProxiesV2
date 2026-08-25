@@ -134,10 +134,13 @@ func newPool(ctx context.Context, _ adapter.Router, logger log.ContextLogger, ta
 				// Attach entry to shared state so all pool instances share it
 				state.attachEntry(entry)
 				logger.Info("registered node: ", memberTag)
-				// Set probe and release functions immediately
+				// Set probe, release, and dialer functions immediately
 				entry.SetRelease(p.makeReleaseByTagFunc(memberTag))
 				if probeFn := p.makeProbeByTagFunc(memberTag); probeFn != nil {
 					entry.SetProbe(probeFn)
+				}
+				if dialerFn := p.makeDialerByTagFunc(memberTag); dialerFn != nil {
+					entry.SetDialer(dialerFn)
 				}
 			} else {
 				logger.Warn("failed to register node: ", memberTag)
@@ -231,6 +234,9 @@ func (p *poolOutbound) initializeMembersLocked() error {
 				entry.SetRelease(p.makeReleaseFunc(member))
 				if probe := p.makeProbeFunc(member); probe != nil {
 					entry.SetProbe(probe)
+				}
+				if dialer := p.makeDialerFunc(member); dialer != nil {
+					entry.SetDialer(dialer)
 				}
 			}
 		}
@@ -708,6 +714,68 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 func (p *poolOutbound) makeReleaseByTagFunc(tag string) func() {
 	return func() {
 		releaseSharedMember(tag)
+	}
+}
+
+// makeDialerFunc returns a DialerFunc that dials an arbitrary address
+// ("host:port") through the given member's outbound. It mirrors makeProbeFunc
+// but exposes the raw connection to any destination instead of the fixed
+// probe target.
+func (p *poolOutbound) makeDialerFunc(member *memberState) monitor.DialerFunc {
+	if p.monitor == nil {
+		return nil
+	}
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		destination := M.ParseSocksaddr(address)
+		if !destination.IsValid() {
+			return nil, E.New("invalid dial address: ", address)
+		}
+		nw := network
+		if nw == "" {
+			nw = N.NetworkTCP
+		}
+		return member.outbound.DialContext(ctx, nw, destination)
+	}
+}
+
+// makeDialerByTagFunc returns a DialerFunc for a tag, resolving the member on
+// first use (works before member initialization, like makeProbeByTagFunc).
+func (p *poolOutbound) makeDialerByTagFunc(tag string) monitor.DialerFunc {
+	if p.monitor == nil {
+		return nil
+	}
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		// Ensure members are initialized
+		p.mu.Lock()
+		if len(p.members) == 0 {
+			if err := p.initializeMembersLocked(); err != nil {
+				p.mu.Unlock()
+				return nil, err
+			}
+		}
+
+		var member *memberState
+		for _, m := range p.members {
+			if m.tag == tag {
+				member = m
+				break
+			}
+		}
+		p.mu.Unlock()
+
+		if member == nil {
+			return nil, E.New("member not found: ", tag)
+		}
+
+		destination := M.ParseSocksaddr(address)
+		if !destination.IsValid() {
+			return nil, E.New("invalid dial address: ", address)
+		}
+		nw := network
+		if nw == "" {
+			nw = N.NetworkTCP
+		}
+		return member.outbound.DialContext(ctx, nw, destination)
 	}
 }
 

@@ -101,6 +101,11 @@ type TrafficSummary struct {
 type probeFunc func(ctx context.Context) (time.Duration, error)
 type releaseFunc func()
 
+// DialerFunc dials a raw connection to address ("host:port") through a node's
+// outbound. The signature matches http.Transport.DialContext so it can be
+// plugged directly into an HTTP client whose traffic is routed via the node.
+type DialerFunc func(ctx context.Context, network, address string) (net.Conn, error)
+
 type EntryHandle struct {
 	ref *entry
 }
@@ -126,6 +131,7 @@ type entry struct {
 	lastSpeedAt      time.Time
 	probe            probeFunc
 	release          releaseFunc
+	dialer           DialerFunc
 	initialCheckDone bool
 	available        bool
 	reloadGen        uint64 // generation counter to track active registrations
@@ -536,6 +542,19 @@ func (m *Manager) Snapshot() []Snapshot {
 	return m.SnapshotFiltered(false)
 }
 
+// SnapshotForTag returns a snapshot of a single node by tag, or nil if the
+// node is not registered.
+func (m *Manager) SnapshotForTag(tag string) *Snapshot {
+	m.mu.RLock()
+	e, ok := m.nodes[tag]
+	m.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+	snap := e.snapshot()
+	return &snap
+}
+
 // SnapshotFiltered returns a sorted copy of current node states.
 // If onlyAvailable is true, only returns nodes that passed initial health check.
 // Nodes that haven't been checked yet are also included (they will be checked on first use).
@@ -663,6 +682,23 @@ func (m *Manager) Release(tag string) error {
 	}
 	e.release()
 	return nil
+}
+
+// DialerFor returns the registered dial-through function for a node, if any.
+// The returned function dials a raw connection to "host:port" via the node's
+// outbound; nil is returned when the node has no dialer wired (e.g. the pool
+// outbound was not started yet).
+func (m *Manager) DialerFor(tag string) (DialerFunc, error) {
+	e, err := m.entry(tag)
+	if err != nil {
+		return nil, err
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.dialer == nil {
+		return nil, errors.New("dialer not available for this node")
+	}
+	return e.dialer, nil
 }
 
 func (m *Manager) entry(tag string) (*entry, error) {
@@ -831,6 +867,12 @@ func (e *entry) setRelease(fn releaseFunc) {
 	e.release = fn
 }
 
+func (e *entry) setDialer(fn DialerFunc) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.dialer = fn
+}
+
 func (e *entry) recordProbeLatency(d time.Duration) {
 	e.mu.Lock()
 	e.lastProbe = d
@@ -944,6 +986,15 @@ func (h *EntryHandle) SetRelease(fn func()) {
 		return
 	}
 	h.ref.setRelease(fn)
+}
+
+// SetDialer assigns a dial-through-node function so the monitor layer can
+// open arbitrary connections via this node's outbound (used by unlock tests).
+func (h *EntryHandle) SetDialer(fn DialerFunc) {
+	if h == nil || h.ref == nil {
+		return
+	}
+	h.ref.setDialer(fn)
 }
 
 // MarkInitialCheckDone marks the initial health check as completed.

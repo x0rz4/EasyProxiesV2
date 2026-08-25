@@ -126,6 +126,20 @@ type Store interface {
 	// UpdateSubscriptionStatus creates or updates the subscription status.
 	UpdateSubscriptionStatus(ctx context.Context, status *SubscriptionStatus) error
 
+	// --- Unlock detection results ---
+
+	// UpsertUnlockResult stores the latest unlock detection result for a node,
+	// keyed by node ID. Repeated checks replace the prior result.
+	UpsertUnlockResult(ctx context.Context, result *UnlockResult) error
+
+	// GetUnlockResult returns the latest stored unlock result for a node.
+	// Returns nil, nil when no result is stored.
+	GetUnlockResult(ctx context.Context, nodeID int64) (*UnlockResult, error)
+
+	// ListUnlockResults returns the latest stored unlock result for every
+	// node that has one, keyed by node ID.
+	ListUnlockResults(ctx context.Context) (map[int64]*UnlockResult, error)
+
 	// --- Lifecycle ---
 
 	// Close releases all resources held by the store.
@@ -279,6 +293,42 @@ type SubscriptionStatus struct {
 	IsRefreshing bool      `json:"is_refreshing"`
 	NodesHash    string    `json:"nodes_hash"`
 	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+// UnlockServiceResult is the persisted outcome of one streaming/AI service
+// check. Mirrors unlock.ServiceResult; kept in this package so the store layer
+// does not depend on the unlock package.
+type UnlockServiceResult struct {
+	Name        string `json:"name"`
+	DisplayName string `json:"display_name"`
+	Status      string `json:"status"`
+	Region      string `json:"region,omitempty"`
+	Detail      string `json:"detail,omitempty"`
+}
+
+// UnlockIPInfo is the persisted native-IP classification. Mirrors unlock.IPInfo.
+type UnlockIPInfo struct {
+	IP      string `json:"ip"`
+	Country string `json:"country,omitempty"`
+	ISOCode string `json:"iso_code,omitempty"`
+	Region  string `json:"region,omitempty"`
+	Pure    bool   `json:"pure"`
+}
+
+// UnlockResult is the latest unlock detection result stored for a node.
+// ResultJSON holds the original unlock.Result payload (including the full
+// per-service detail/region) so the WebUI can reconstruct it verbatim.
+type UnlockResult struct {
+	NodeID     int64                `json:"node_id"`
+	Tag        string               `json:"tag"`
+	Name       string               `json:"name"`
+	Services   []UnlockServiceResult `json:"services"`
+	IP         UnlockIPInfo          `json:"ip"`
+	Error      string               `json:"error,omitempty"`
+	Duration   int64                `json:"duration_ms"`
+	CheckedAt  time.Time            `json:"checked_at"`
+	ResultJSON string               `json:"result_json,omitempty"`
+	UpdatedAt  time.Time            `json:"updated_at"`
 }
 
 // Node source constants (matching config.NodeSource values).

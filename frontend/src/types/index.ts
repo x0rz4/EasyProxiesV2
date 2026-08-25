@@ -305,6 +305,72 @@ export interface ProbeSSEComplete {
 
 export type ProbeSSEEvent = ProbeSSEStart | ProbeSSEProgress | ProbeSSEComplete
 
+// ---- Unlock detection types ----
+
+// A single streaming/AI service unlock result.
+export interface UnlockServiceResult {
+  name: 'netflix' | 'disney_plus' | 'chatgpt'
+  display_name: string
+  status: 'unlocked' | 'originals_only' | 'locked' | 'failed'
+  region?: string
+  detail?: string
+}
+
+// Native IP purity info for the node's exit IP.
+export interface UnlockIPInfo {
+  ip: string
+  country?: string
+  iso_code?: string
+  region?: string
+  pure: boolean
+}
+
+// Full unlock report for one node (matches unlock.Result on the backend).
+export interface UnlockResult {
+  tag: string
+  name: string
+  services: UnlockServiceResult[]
+  ip: UnlockIPInfo
+  error?: string
+  duration_ms: number
+  // Only present on results loaded from the persisted store
+  // (/api/nodes/unlock-results); omitted on live check responses.
+  checked_at?: string
+}
+
+// Response from GET /api/nodes/unlock-results: last-saved detection per tag.
+export interface UnlockResultsResponse {
+  results: Record<string, UnlockResult>
+}
+
+// SSE events for the batch unlock-all stream.
+export interface UnlockSSEStart {
+  type: 'start'
+  total: number
+}
+
+export interface UnlockSSEProgress {
+  type: 'progress'
+  tag?: string
+  name?: string
+  status: 'success' | 'error'
+  error?: string
+  result?: UnlockResult
+  current: number
+  total: number
+  progress: number
+}
+
+export interface UnlockSSEComplete {
+  type: 'complete'
+  total: number
+  success: number
+  failed: number
+}
+
+export type UnlockSSEEvent = UnlockSSEStart | UnlockSSEProgress | UnlockSSEComplete
+
+
 // ---- SSE Traffic stream types ----
 
 export interface TrafficStreamNode {

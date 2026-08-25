@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strconv"
@@ -986,6 +987,142 @@ func (s *sqliteStore) UpdateSubscriptionStatus(ctx context.Context, status *Subs
 		isRefreshing, status.NodesHash, now,
 	)
 	return err
+}
+
+// ===================== Unlock detection results =====================
+
+const unlockColumns = `node_id, tag, name, netflix_status, disney_plus_status, chatgpt_status,
+	ip, ip_country, ip_iso_code, ip_region, ip_pure, error, duration_ms, checked_at,
+	result_json, updated_at`
+
+// serviceStatus extracts the Status of the named service from an UnlockResult's
+// Services slice, defaulting to "" when the service was not recorded.
+func serviceStatus(services []UnlockServiceResult, name string) string {
+	for _, s := range services {
+		if s.Name == name {
+			return s.Status
+		}
+	}
+	return ""
+}
+
+func (s *sqliteStore) UpsertUnlockResult(ctx context.Context, result *UnlockResult) error {
+	if result == nil {
+		return fmt.Errorf("upsert unlock result: nil result")
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	checkedAt := now
+	if !result.CheckedAt.IsZero() {
+		checkedAt = formatTime(result.CheckedAt)
+	}
+
+	_, err := s.conn().ExecContext(ctx,
+		`INSERT INTO node_unlock_results (`+unlockColumns+`)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(node_id) DO UPDATE SET
+		   tag=excluded.tag, name=excluded.name,
+		   netflix_status=excluded.netflix_status, disney_plus_status=excluded.disney_plus_status,
+		   chatgpt_status=excluded.chatgpt_status,
+		   ip=excluded.ip, ip_country=excluded.ip_country, ip_iso_code=excluded.ip_iso_code,
+		   ip_region=excluded.ip_region, ip_pure=excluded.ip_pure,
+		   error=excluded.error, duration_ms=excluded.duration_ms, checked_at=excluded.checked_at,
+		   result_json=excluded.result_json, updated_at=excluded.updated_at`,
+		result.NodeID, result.Tag, result.Name,
+		serviceStatus(result.Services, "netflix"), serviceStatus(result.Services, "disney_plus"),
+		serviceStatus(result.Services, "chatgpt"),
+		result.IP.IP, result.IP.Country, result.IP.ISOCode, result.IP.Region,
+		boolToInt(result.IP.Pure), result.Error, result.Duration, checkedAt,
+		result.ResultJSON, now,
+	)
+	if err != nil {
+		return fmt.Errorf("upsert unlock result for node %d: %w", result.NodeID, err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) GetUnlockResult(ctx context.Context, nodeID int64) (*UnlockResult, error) {
+	row := s.conn().QueryRowContext(ctx,
+		"SELECT "+unlockColumns+" FROM node_unlock_results WHERE node_id = ?", nodeID)
+	return scanUnlockResult(row)
+}
+
+func (s *sqliteStore) ListUnlockResults(ctx context.Context) (map[int64]*UnlockResult, error) {
+	rows, err := s.conn().QueryContext(ctx, "SELECT "+unlockColumns+" FROM node_unlock_results")
+	if err != nil {
+		return nil, fmt.Errorf("list unlock results: %w", err)
+	}
+	defer rows.Close()
+
+	result := make(map[int64]*UnlockResult)
+	for rows.Next() {
+		r, err := scanUnlockResult(rows)
+		if err != nil {
+			return nil, err
+		}
+		if r != nil {
+			result[r.NodeID] = r
+		}
+	}
+	return result, rows.Err()
+}
+
+// scanUnlockResult scans one node_unlock_results row into an UnlockResult,
+// reconstructing the Services slice from the three indexed status columns when
+// result_json is unavailable, otherwise from the stored JSON payload.
+func scanUnlockResult(row scanner) (*UnlockResult, error) {
+	var r UnlockResult
+	var ipPure int
+	var checkedAtStr, updatedAtStr, resultJSON string
+	var netflixStatus, disneyPlusStatus, chatgptStatus string
+
+	err := row.Scan(
+		&r.NodeID, &r.Tag, &r.Name,
+		&netflixStatus, &disneyPlusStatus, &chatgptStatus,
+		&r.IP.IP, &r.IP.Country, &r.IP.ISOCode, &r.IP.Region, &ipPure,
+		&r.Error, &r.Duration, &checkedAtStr,
+		&resultJSON, &updatedAtStr,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("scan unlock result: %w", err)
+	}
+
+	r.IP.Pure = ipPure != 0
+	r.CheckedAt = parseTime(checkedAtStr)
+	r.UpdatedAt = parseTime(updatedAtStr)
+	r.ResultJSON = resultJSON
+
+	// Prefer the full JSON payload; fall back to the three indexed columns.
+	if resultJSON != "" {
+		var full struct {
+			Services []UnlockServiceResult `json:"services"`
+		}
+		if json.Unmarshal([]byte(resultJSON), &full) == nil && len(full.Services) > 0 {
+			r.Services = full.Services
+		}
+	}
+	if r.Services == nil {
+		r.Services = servicesFromStatuses(netflixStatus, disneyPlusStatus, chatgptStatus)
+	}
+
+	return &r, nil
+}
+
+// servicesFromStatuses rebuilds a minimal Services slice from the indexed
+// status columns when no full JSON payload is stored.
+func servicesFromStatuses(netflix, disneyPlus, chatgpt string) []UnlockServiceResult {
+	display := map[string]string{
+		"netflix":     "Netflix",
+		"disney_plus": "Disney+",
+		"chatgpt":     "ChatGPT",
+	}
+	return []UnlockServiceResult{
+		{Name: "netflix", DisplayName: display["netflix"], Status: netflix},
+		{Name: "disney_plus", DisplayName: display["disney_plus"], Status: disneyPlus},
+		{Name: "chatgpt", DisplayName: display["chatgpt"], Status: chatgpt},
+	}
 }
 
 // ===================== Lifecycle =====================

@@ -14,6 +14,7 @@ import (
 	mathrand "math/rand"
 	"net/http"
 	"net/url"
+	"os"
 	"reflect"
 	"runtime"
 	"strconv"
@@ -24,6 +25,7 @@ import (
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/geoip"
 	"easy_proxies/internal/store"
+	"easy_proxies/internal/unlock"
 
 	"golang.org/x/sync/semaphore"
 )
@@ -141,6 +143,10 @@ type Server struct {
 
 	subRefresher SubscriptionRefresher
 	nodeMgr      NodeManager
+	geoLookup    *geoip.Lookup // optional, used by unlock checks for IP purity
+	geoLookupMu  sync.Mutex    // protects lazy open/reload of geoLookup
+	geoLookupPath  string      // path the cached geoLookup was opened from
+	geoLookupMtime time.Time   // mtime of the db file when geoLookup was opened
 }
 
 // NewServer constructs a server; it can be nil when disabled.
@@ -180,6 +186,8 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 	mux.HandleFunc("/api/nodes/config/batch-delete", s.withAuth(s.handleConfigNodesBatchDelete))
 	mux.HandleFunc("/api/nodes/config/", s.withAuth(s.handleConfigNodeItem))
 	mux.HandleFunc("/api/nodes/probe-all", s.withAuth(s.handleProbeAll))
+	mux.HandleFunc("/api/nodes/unlock-all", s.withAuth(s.handleUnlockAll))
+	mux.HandleFunc("/api/nodes/unlock-results", s.withAuth(s.handleUnlockResults))
 	mux.HandleFunc("/api/nodes/traffic/stream", s.withAuth(s.handleTrafficStream))
 	mux.HandleFunc("/api/nodes/", s.withAuth(s.handleNodeAction))
 	mux.HandleFunc("/api/debug", s.withAuth(s.handleDebug))
@@ -215,6 +223,59 @@ func (s *Server) SetNodeManager(nm NodeManager) {
 	if s != nil {
 		s.nodeMgr = nm
 	}
+}
+
+// SetGeoipLookup binds the runtime GeoIP lookup used by unlock checks to
+// classify the node's exit IP. May be nil (GeoIP disabled); unlock checks
+// then fall back to the trace endpoint's coarse loc field.
+func (s *Server) SetGeoipLookup(l *geoip.Lookup) {
+	if s != nil {
+		s.geoLookup = l
+	}
+}
+
+// geoipLookupForCheck returns a GeoIP lookup suitable for an unlock check.
+// It first prefers the runtime lookup injected via SetGeoipLookup (kept live
+// by the builder); when none is available it lazily opens one from the
+// configured database path, re-opening if the on-disk file changed (e.g.
+// after the user downloaded/updated the IP library via the WebUI).
+func (s *Server) geoipLookupForCheck() *geoip.Lookup {
+	if s != nil && s.geoLookup != nil && s.geoLookup.IsEnabled() {
+		return s.geoLookup
+	}
+	if s == nil {
+		return nil
+	}
+	dbPath := s.geoipDatabasePath()
+	if dbPath == "" || !s.geoipEnabled() {
+		return nil
+	}
+
+	s.geoLookupMu.Lock()
+	defer s.geoLookupMu.Unlock()
+
+	st, err := os.Stat(dbPath)
+	if err != nil {
+		return nil
+	}
+	mtime := st.ModTime()
+	if s.geoLookup != nil && s.geoLookupPath == dbPath && !mtime.After(s.geoLookupMtime) {
+		return s.geoLookup
+	}
+
+	// Reopen: close the stale lookup and open a fresh one bound to dbPath.
+	if s.geoLookup != nil {
+		s.geoLookup.Close()
+		s.geoLookup = nil
+	}
+	l, err := geoip.New(dbPath)
+	if err != nil || l == nil {
+		return nil
+	}
+	s.geoLookup = l
+	s.geoLookupPath = dbPath
+	s.geoLookupMtime = mtime
+	return s.geoLookup
 }
 
 // SetStore sets the data store for session persistence and other operations.
@@ -837,6 +898,32 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, map[string]any{"message": "已解除拉黑"})
+	case "unlock":
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		// Unlock checks issue several HTTP requests through the node, so allow
+		// more time than a single latency probe.
+		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+		defer cancel()
+		dialer, err := s.mgr.DialerFor(tag)
+		if err != nil {
+			writeJSON(w, map[string]any{"error": err.Error()})
+			return
+		}
+		name := tag
+		snap := s.mgr.SnapshotForTag(tag)
+		if snap != nil && snap.Name != "" {
+			name = snap.Name
+		}
+		result, err := unlock.Check(ctx, unlock.DialFunc(dialer), tag, name, s.geoipLookupForCheck(), 25*time.Second)
+		if err != nil {
+			writeJSON(w, map[string]any{"error": err.Error()})
+			return
+		}
+		s.persistUnlockResult(snap, result)
+		writeJSON(w, result)
 	default:
 		w.WriteHeader(http.StatusNotFound)
 	}
@@ -963,6 +1050,199 @@ func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 }
 
+// handleUnlockAll runs unlock checks for all nodes and streams results via SSE.
+// The event sequence mirrors handleProbeAll: {"type":"start","total":N},
+// repeated {"type":"progress",...} (one per node, carrying the full Result),
+// and a final {"type":"complete",...}. Each progress event contains the
+// node's unlock.Result serialized as the "result" field.
+func (s *Server) handleUnlockAll(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Set SSE headers
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "SSE not supported", http.StatusInternalServerError)
+		return
+	}
+
+	// Get all nodes
+	snapshots := s.mgr.Snapshot()
+	total := len(snapshots)
+	if total == 0 {
+		fmt.Fprintf(w, "data: %s\n\n", `{"type":"complete","total":0,"success":0,"failed":0}`)
+		flusher.Flush()
+		return
+	}
+
+	// Send start event
+	fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"type":"start","total":%d}`, total))
+	flusher.Flush()
+
+	// Unlock checks are heavier than latency probes, so allow a generous
+	// overall deadline (each node can take up to ~25s).
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+	defer cancel()
+
+	type unlockResult struct {
+		result *unlock.Result
+		err    string
+	}
+	results := make(chan unlockResult, total)
+	var wg sync.WaitGroup
+
+	// Launch checks with the same semaphore used by probes to bound concurrency.
+	for _, snap := range snapshots {
+		wg.Add(1)
+		go func(snap Snapshot) {
+			defer wg.Done()
+
+			// Acquire semaphore permit
+			if err := s.probeSem.Acquire(ctx, 1); err != nil {
+				results <- unlockResult{err: "unlock cancelled: " + err.Error()}
+				return
+			}
+			defer s.probeSem.Release(1)
+
+			// Execute unlock check
+			checkCtx, checkCancel := context.WithTimeout(ctx, 60*time.Second)
+			defer checkCancel()
+
+			dialer, err := s.mgr.DialerFor(snap.Tag)
+			if err != nil {
+				results <- unlockResult{err: err.Error()}
+				return
+			}
+			res, err := unlock.Check(checkCtx, unlock.DialFunc(dialer), snap.Tag, snap.Name, s.geoipLookupForCheck(), 25*time.Second)
+			if err != nil {
+				results <- unlockResult{err: err.Error()}
+				return
+			}
+			s.persistUnlockResult(&snap, res)
+			results <- unlockResult{result: res}
+		}(snap)
+	}
+
+	// Wait for all checks to complete
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Collect and stream results
+	successCount := 0
+	failedCount := 0
+	count := 0
+
+	// progressEvent is the SSE payload for one completed node.
+	type progressEvent struct {
+		Type     string          `json:"type"`
+		Tag      string          `json:"tag"`
+		Name     string          `json:"name"`
+		Status   string          `json:"status"`
+		Error    string          `json:"error,omitempty"`
+		Result   *unlock.Result  `json:"result,omitempty"`
+		Current  int             `json:"current"`
+		Total    int             `json:"total"`
+		Progress float64         `json:"progress"`
+	}
+
+	for result := range results {
+		count++
+		hasError := result.err != ""
+		if hasError {
+			failedCount++
+		} else {
+			successCount++
+		}
+
+		progress := float64(count) / float64(total) * 100
+
+		ev := progressEvent{
+			Type:     "progress",
+			Current:  count,
+			Total:    total,
+			Progress: progress,
+		}
+		if hasError {
+			ev.Status = "error"
+			ev.Error = result.err
+		} else {
+			ev.Tag = result.result.Tag
+			ev.Name = result.result.Name
+			ev.Status = "success"
+			ev.Result = result.result
+		}
+
+		data, _ := json.Marshal(ev)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
+
+	// Send complete event
+	fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"type":"complete","total":%d,"success":%d,"failed":%d}`, total, successCount, failedCount))
+	flusher.Flush()
+}
+
+// handleUnlockResults returns the latest persisted unlock detection result for
+// every node that has one, keyed by node tag. It lets the WebUI show previously
+// saved detections without re-running the checks. It is read-only and never
+// touches the live probes.
+func (s *Server) handleUnlockResults(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if s.store == nil {
+		writeJSON(w, map[string]any{"results": map[string]any{}})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	stored, err := s.store.ListUnlockResults(ctx)
+	if err != nil {
+		writeJSON(w, map[string]any{"error": err.Error()})
+		return
+	}
+
+	// unlockResultView is the JSON shape served to the WebUI. It mirrors the
+	// live unlock.Result plus a checked_at timestamp, omitting the internal
+	// node id and the redundant result_json blob (Services are already
+	// reconstructed server-side from that blob).
+	type unlockResultView struct {
+		Tag       string                   `json:"tag"`
+		Name      string                   `json:"name"`
+		Services  []store.UnlockServiceResult `json:"services"`
+		IP        store.UnlockIPInfo          `json:"ip"`
+		Error     string                   `json:"error,omitempty"`
+		Duration  int64                    `json:"duration_ms"`
+		CheckedAt time.Time                `json:"checked_at"`
+	}
+
+	out := make(map[string]unlockResultView, len(stored))
+	for _, res := range stored {
+		if res == nil || res.Tag == "" {
+			continue
+		}
+		out[res.Tag] = unlockResultView{
+			Tag:       res.Tag,
+			Name:      res.Name,
+			Services:  res.Services,
+			IP:        res.IP,
+			Error:     res.Error,
+			Duration:  res.Duration,
+			CheckedAt: res.CheckedAt,
+		}
+	}
+	writeJSON(w, map[string]any{"results": out})
+}
+
 func (s *Server) handleTrafficStream(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -1039,6 +1319,78 @@ func writeJSON(w http.ResponseWriter, payload any) {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(payload)
+}
+
+// persistUnlockResult stores an unlock.Result to the store keyed by the node ID
+// resolved from the snapshot's URI (falling back to its Name). It is best-effort:
+// the DB write never fails the check response or the SSE stream; persistence
+// errors are only logged. It is safe to call with a nil store or nil snapshot.
+func (s *Server) persistUnlockResult(snap *Snapshot, result *unlock.Result) {
+	if s == nil || s.store == nil || result == nil || snap == nil {
+		return
+	}
+	nodeID, ok := s.nodeIDForSnapshot(*snap)
+	if !ok || nodeID == 0 {
+		return
+	}
+
+	// Serialize the full result once and store it verbatim so the WebUI can
+	// reconstruct per-service detail/region exactly as reported.
+	resultJSON := ""
+	if data, err := json.Marshal(result); err == nil {
+		resultJSON = string(data)
+	}
+
+	stored := &store.UnlockResult{
+		NodeID:     nodeID,
+		Tag:        result.Tag,
+		Name:       result.Name,
+		Error:      result.Error,
+		Duration:   result.Duration,
+		CheckedAt:  time.Now().UTC(),
+		ResultJSON: resultJSON,
+		IP: store.UnlockIPInfo{
+			IP:      result.IP.IP,
+			Country: result.IP.Country,
+			ISOCode: result.IP.ISOCode,
+			Region:  result.IP.Region,
+			Pure:    result.IP.Pure,
+		},
+	}
+	for _, svc := range result.Services {
+		stored.Services = append(stored.Services, store.UnlockServiceResult{
+			Name:        svc.Name,
+			DisplayName: svc.DisplayName,
+			Status:      svc.Status,
+			Region:      svc.Region,
+			Detail:      svc.Detail,
+		})
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.store.UpsertUnlockResult(ctx, stored); err != nil {
+		s.logger.Printf("[unlock] failed to persist result for node %d (%s): %v", nodeID, snap.Tag, err)
+	}
+}
+
+// nodeIDForSnapshot resolves a monitor Snapshot to its store node ID by URI,
+// falling back to the node name, reusing the resolution pattern used by
+// flushStatsToStore. Returns (0, false) when the node is not in the store.
+func (s *Server) nodeIDForSnapshot(snap Snapshot) (int64, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if snap.URI != "" {
+		if n, err := s.store.GetNodeByURI(ctx, snap.URI); err == nil && n != nil && n.ID != 0 {
+			return n.ID, true
+		}
+	}
+	if snap.Name != "" {
+		if n, err := s.store.GetNodeByName(ctx, snap.Name); err == nil && n != nil && n.ID != 0 {
+			return n.ID, true
+		}
+	}
+	return 0, false
 }
 
 // withAuth 认证中间件，如果配置了密码则需要验证

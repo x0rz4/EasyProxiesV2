@@ -139,6 +139,36 @@ CREATE INDEX idx_subscription_nodes_node ON subscription_nodes(node_id);
 CREATE INDEX idx_subscription_nodes_subscription_position ON subscription_nodes(subscription_id, position);
 `,
 		},
+		{
+			Version:     4,
+			Description: "add node unlock detection results",
+			Up: `
+-- Latest unlock detection result per node (one row per node, upserted on each
+-- check). The full unlock.Result payload is kept in result_json so the WebUI can
+-- reconstruct the per-service detail/region exactly as reported; the indexed
+-- status and IP columns allow cheap status queries without parsing JSON.
+CREATE TABLE IF NOT EXISTS node_unlock_results (
+    node_id             INTEGER PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+    tag                 TEXT    NOT NULL DEFAULT '',
+    name                TEXT    NOT NULL DEFAULT '',
+    netflix_status      TEXT    NOT NULL DEFAULT '',
+    disney_plus_status  TEXT    NOT NULL DEFAULT '',
+    chatgpt_status      TEXT    NOT NULL DEFAULT '',
+    ip                  TEXT    NOT NULL DEFAULT '',
+    ip_country          TEXT    NOT NULL DEFAULT '',
+    ip_iso_code         TEXT    NOT NULL DEFAULT '',
+    ip_region           TEXT    NOT NULL DEFAULT '',
+    ip_pure             INTEGER NOT NULL DEFAULT 0,
+    error               TEXT    NOT NULL DEFAULT '',
+    duration_ms         INTEGER NOT NULL DEFAULT 0,
+    checked_at          TEXT    NOT NULL DEFAULT (datetime('now')),
+    result_json         TEXT    NOT NULL DEFAULT '',
+    updated_at          TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_unlock_status ON node_unlock_results(netflix_status, disney_plus_status, chatgpt_status);
+`,
+		},
 	}
 }
 
