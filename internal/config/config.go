@@ -2,7 +2,6 @@ package config
 
 import (
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	json "easy_proxies/internal/jsonx"
 	"easy_proxies/internal/nodecodec"
 
 	"github.com/tailscale/hujson"

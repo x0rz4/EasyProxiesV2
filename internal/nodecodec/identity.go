@@ -7,7 +7,6 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -15,6 +14,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	json "easy_proxies/internal/jsonx"
 
 	"golang.org/x/net/idna"
 )
@@ -365,7 +366,7 @@ func finish(identity Identity) (Result, error) {
 	if len(identity.Options) == 0 {
 		identity.Options = nil
 	}
-	canonical, err := json.Marshal(identity)
+	canonical, err := json.MarshalCanonical(identity)
 	if err != nil {
 		return Result{}, err
 	}
@@ -417,8 +418,6 @@ func stringValue(value any) string {
 		return typed
 	case float64:
 		return strconv.FormatFloat(typed, 'f', -1, 64)
-	case json.Number:
-		return typed.String()
 	case nil:
 		return ""
 	default:

@@ -10,7 +10,6 @@ package unlock
 import (
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -21,6 +20,7 @@ import (
 	"time"
 
 	"easy_proxies/internal/geoip"
+	json "easy_proxies/internal/jsonx"
 )
 
 // DialFunc dials a raw connection to address ("host:port") through a node's
@@ -167,11 +167,11 @@ func newClient(ctx context.Context, dialer DialFunc, timeout time.Duration) *htt
 			defer cancel()
 			return dialer(d, network, addr)
 		},
-		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
-		TLSHandshakeTimeout: timeout,
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
+		TLSHandshakeTimeout:   timeout,
 		ResponseHeaderTimeout: timeout,
-		ForceAttemptHTTP2:   false,
-		DisableKeepAlives:   true,
+		ForceAttemptHTTP2:     false,
+		DisableKeepAlives:     true,
 	}
 	return &http.Client{
 		Transport: transport,
@@ -237,7 +237,7 @@ func probeIP(ctx context.Context, client *http.Client, geo *geoip.Lookup, timeou
 	// Heuristic purity: a clean country resolution with a non-empty trace loc
 	// is treated as native.
 	info.Pure = info.ISOCode != "" && info.IP != ""
-	
+
 	if info.IP != "" {
 		// Enhance with IP-API / Risk data
 		riskInfo := fetchIPQualityRisk(ctx, client, info.IP, timeout)
@@ -251,7 +251,7 @@ func probeIP(ctx context.Context, client *http.Client, geo *geoip.Lookup, timeou
 			info.Pure = true
 		}
 	}
-	
+
 	return info
 }
 

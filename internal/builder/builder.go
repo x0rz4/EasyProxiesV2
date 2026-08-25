@@ -2,7 +2,6 @@ package builder
 
 import (
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -16,6 +15,7 @@ import (
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/geoip"
 	groupruntime "easy_proxies/internal/group"
+	json "easy_proxies/internal/jsonx"
 	"easy_proxies/internal/nodecodec"
 	poolout "easy_proxies/internal/outbound/pool"
 

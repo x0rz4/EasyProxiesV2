@@ -2,10 +2,11 @@ package unlock
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"time"
+
+	json "easy_proxies/internal/jsonx"
 )
 
 // fetchIPQualityRisk fetches risk and fraud information from IPQuality's backend
@@ -19,12 +20,12 @@ func fetchIPQualityRisk(ctx context.Context, client *http.Client, ip string, tim
 	// We'll fetch from https://ipinfo.check.place/$IP?db=scamalytics
 	// Example response for Scamalytics:
 	// {"ip":"...","score":"15","risk":"low"} (hypothetical, as we can't see the exact JSON)
-	
+
 	// Since we don't know the exact JSON schema of ipinfo.check.place, we can
-	// fallback to a known free API like ip-api.com for ASN/Org, and just 
-	// set placeholder or best-effort RiskLevel. 
+	// fallback to a known free API like ip-api.com for ASN/Org, and just
+	// set placeholder or best-effort RiskLevel.
 	// Let's use ip-api.com as a reliable fallback for ASN/Org/UsageType.
-	
+
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -57,7 +58,7 @@ func fetchIPQualityRisk(ctx context.Context, client *http.Client, ip string, tim
 					if info.Org == "" {
 						info.Org = data.ISP
 					}
-					
+
 					if data.Hosting || data.Proxy {
 						info.IPType = "Datacenter/Proxy"
 						info.UsageType = "Hosting"
@@ -68,7 +69,7 @@ func fetchIPQualityRisk(ctx context.Context, client *http.Client, ip string, tim
 						info.IPType = "Residential"
 						info.UsageType = "ISP"
 					}
-					
+
 					// Basic heuristic risk
 					if data.Hosting || data.Proxy {
 						info.FraudScore = 50
@@ -81,7 +82,7 @@ func fetchIPQualityRisk(ctx context.Context, client *http.Client, ip string, tim
 			}
 		}
 	}
-	
+
 	// Basic purity heuristic
 	info.Pure = info.UsageType == "ISP" || info.UsageType == "Mobile"
 

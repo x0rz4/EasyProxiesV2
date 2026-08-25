@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -11,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	json "easy_proxies/internal/jsonx"
 	"easy_proxies/internal/nodecodec"
 
 	_ "modernc.org/sqlite"

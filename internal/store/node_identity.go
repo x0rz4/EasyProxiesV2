@@ -3,10 +3,10 @@ package store
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"sort"
 
+	json "easy_proxies/internal/jsonx"
 	"easy_proxies/internal/nodecodec"
 )
 

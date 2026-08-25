@@ -5,13 +5,14 @@ package subrender
 
 import (
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/url"
 	"strconv"
 	"strings"
+
+	json "easy_proxies/internal/jsonx"
 
 	"go.yaml.in/yaml/v3"
 )
@@ -310,8 +311,6 @@ func stringValue(value any) string {
 		return v
 	case float64:
 		return strconv.FormatFloat(v, 'f', -1, 64)
-	case json.Number:
-		return v.String()
 	default:
 		return fmt.Sprint(v)
 	}
