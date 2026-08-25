@@ -10,7 +10,7 @@ COPY frontend/ .
 RUN npx vite build --outDir /frontend-dist
 
 # ── Stage 2: Build Go binary ───────────────────────────────────
-FROM --platform=$BUILDPLATFORM golang:1.24 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.25 AS builder
 ARG TARGETARCH
 WORKDIR /src
 COPY go.mod go.sum ./
