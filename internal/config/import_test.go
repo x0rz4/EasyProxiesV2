@@ -166,7 +166,7 @@ func TestParseImportContentSingBoxJSONC(t *testing.T) {
 		"outbounds": [
 			{"type":"vless","tag":"edge","server":"Example.COM","server_port":443,"uuid":"ABC","tls":{"enabled":true,"server_name":"edge.example"},"transport":{"type":"ws","path":"/proxy","headers":{"Host":"cdn.example"}}},
 			{"type":"direct","tag":"direct"},
-		]
+		],
 	}`
 	nodes, err := ParseImportContent(content)
 	if err != nil {

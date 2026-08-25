@@ -2,7 +2,54 @@ package geoip
 
 import (
 	"testing"
+
+	"github.com/oschwald/geoip2-golang/v2"
 )
+
+func TestParseLookupAddress(t *testing.T) {
+	for _, input := range []string{"203.0.113.10", "2001:db8::10"} {
+		if _, ok := parseLookupAddress(input); !ok {
+			t.Fatalf("parseLookupAddress(%q) rejected a valid address", input)
+		}
+	}
+	if _, ok := parseLookupAddress("not-an-ip"); ok {
+		t.Fatal("parseLookupAddress accepted an invalid address")
+	}
+}
+
+func TestRegionInfoFromCountry(t *testing.T) {
+	tests := []struct {
+		name   string
+		record *geoip2.Country
+		want   RegionInfo
+	}{
+		{
+			name: "localized country name",
+			record: &geoip2.Country{Country: geoip2.CountryRecord{
+				ISOCode: "JP",
+				Names:   geoip2.Names{English: "Japan"},
+			}},
+			want: RegionInfo{Code: RegionJP, Country: "Japan", ISOCode: "JP"},
+		},
+		{
+			name: "ISO code fallback",
+			record: &geoip2.Country{Country: geoip2.CountryRecord{
+				ISOCode: "SG",
+			}},
+			want: RegionInfo{Code: "sg", Country: "SG", ISOCode: "SG"},
+		},
+		{name: "nil record", want: unknownRegionInfo()},
+		{name: "empty record", record: &geoip2.Country{}, want: unknownRegionInfo()},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := regionInfoFromCountry(tt.record); got != tt.want {
+				t.Fatalf("regionInfoFromCountry() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
 
 func TestExtractHostFromURISupportsHTTPAndSOCKS5(t *testing.T) {
 	tests := []struct {
