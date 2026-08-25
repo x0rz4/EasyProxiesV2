@@ -52,6 +52,81 @@ export interface NodesResponse {
   region_healthy: Record<string, number>
 }
 
+// ---- Group pool types ----
+
+export interface GroupNodeOption {
+  id: number
+  name: string
+  uri: string
+  region?: string
+  country?: string
+  enabled: boolean
+}
+
+export type GroupMemberStatus = 'ALIVE' | 'SUSPECT' | 'EVICTED'
+
+export interface GroupMember {
+  node_id: number
+  tag: string
+  name: string
+  region?: string
+  country?: string
+  status: GroupMemberStatus
+  failure_count: number
+  last_error?: string
+  evicted_at?: string
+  latency_ms: number
+  available: boolean
+  is_active: boolean
+}
+
+export interface GroupPool {
+  id: number
+  name: string
+  bind_address: string
+  bind_port: number
+  protocol: string
+  username?: string
+  password?: string
+  dispatch_mode: 'fixed' | 'random'
+  regions: string[]
+  explicit_node_ids: number[]
+  failure_window_seconds: number
+  failure_threshold: number
+  health_check_seconds: number
+  current_active_node_id?: number
+  enabled: boolean
+  current_active_tag?: string
+  members: GroupMember[]
+  member_count: number
+  alive_count: number
+  evicted_count: number
+  created_at: string
+  updated_at: string
+}
+
+export interface GroupPoolsResponse {
+  groups: GroupPool[]
+  nodes: GroupNodeOption[]
+  port_range: { start: number; end: number }
+}
+
+export interface GroupPoolPayload {
+  name: string
+  bind_address: string
+  bind_port: number
+  protocol: string
+  username: string
+  password: string
+  dispatch_mode: 'fixed' | 'random'
+  regions: string[]
+  explicit_node_ids: number[]
+  failure_window_seconds: number
+  failure_threshold: number
+  health_check_seconds: number
+  enabled: boolean
+}
+
 export interface DebugNode {
   tag: string
   name: string

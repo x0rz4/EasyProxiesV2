@@ -16,4 +16,9 @@ func TestRuntimeConfigEqual(t *testing.T) {
 	if runtimeConfigEqual(a, b) {
 		t.Fatal("different configurations were considered equal")
 	}
+	b = a.Clone()
+	b.Groups = []config.GroupPoolConfig{{ID: 1, Name: "group", BindPort: 10001}}
+	if runtimeConfigEqual(a, b) {
+		t.Fatal("group configuration change was ignored")
+	}
 }

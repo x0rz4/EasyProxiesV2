@@ -437,8 +437,9 @@ func (m *Manager) reconcileRuntime(ctx context.Context) error {
 			return
 		}
 		seen[uri] = struct{}{}
-		all = append(all, config.NodeConfig{Name: n.Name, URI: uri, Port: n.Port,
-			Username: n.Username, Password: n.Password, Source: config.NodeSource(n.Source)})
+		all = append(all, config.NodeConfig{ID: n.ID, Name: n.Name, URI: uri, Port: n.Port,
+			Username: n.Username, Password: n.Password, Source: config.NodeSource(n.Source),
+			Region: n.Region, Country: n.Country})
 	}
 	for _, n := range regular {
 		if n.Source != store.NodeSourceSubscription {

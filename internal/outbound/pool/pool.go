@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"easy_proxies/internal/group"
 	"easy_proxies/internal/monitor"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -34,6 +35,7 @@ const (
 	modeSequential = "sequential"
 	modeRandom     = "random"
 	modeBalance    = "balance"
+	modeFixed      = "fixed"
 )
 
 // Options controls pool outbound behaviour.
@@ -43,10 +45,16 @@ type Options struct {
 	FailureThreshold  int
 	BlacklistDuration time.Duration
 	Metadata          map[string]MemberMeta
+	GroupID           int64
+	FailureWindow     time.Duration
+	PreferredMember   string
+	InitialGroupState map[string]group.GroupInitialState
+	SelectorTag       string
 }
 
 // MemberMeta carries optional descriptive information for monitoring UI.
 type MemberMeta struct {
+	NodeID        int64
 	Name          string
 	URI           string
 	Mode          string
@@ -81,7 +89,15 @@ type poolOutbound struct {
 	rng            *rand.Rand
 	rngMu          sync.Mutex // protects rng for random mode
 	monitor        *monitor.Manager
+	selector       selectorOutbound
+	selectorMu     sync.Mutex
 	candidatesPool sync.Pool
+}
+
+type selectorOutbound interface {
+	adapter.Outbound
+	SelectOutbound(tag string) bool
+	Now() string
 }
 
 func newPool(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag string, options Options) (adapter.Outbound, error) {
@@ -95,8 +111,12 @@ func newPool(ctx context.Context, _ adapter.Router, logger log.ContextLogger, ta
 	monitorMgr := monitor.FromContext(ctx)
 	normalized := normalizeOptions(options)
 	memberCount := len(normalized.Members)
+	dependencies := append([]string(nil), normalized.Members...)
+	if normalized.SelectorTag != "" {
+		dependencies = append(dependencies, normalized.SelectorTag)
+	}
 	p := &poolOutbound{
-		Adapter: outbound.NewAdapter(Type, tag, []string{N.NetworkTCP, N.NetworkUDP}, normalized.Members),
+		Adapter: outbound.NewAdapter(Type, tag, []string{N.NetworkTCP, N.NetworkUDP}, dependencies),
 		ctx:     ctx,
 		logger:  logger,
 		manager: manager,
@@ -110,6 +130,8 @@ func newPool(ctx context.Context, _ adapter.Router, logger log.ContextLogger, ta
 			},
 		},
 	}
+	group.Register(normalized.GroupID, normalized.FailureWindow, normalized.FailureThreshold,
+		normalized.PreferredMember, normalized.InitialGroupState)
 
 	// Register nodes immediately if monitor is available
 	if monitorMgr != nil {
@@ -168,6 +190,8 @@ func normalizeOptions(options Options) Options {
 		options.Mode = modeRandom
 	case modeBalance:
 		options.Mode = modeBalance
+	case modeFixed:
+		options.Mode = modeFixed
 	default:
 		options.Mode = modeSequential
 	}
@@ -241,6 +265,17 @@ func (p *poolOutbound) initializeMembersLocked() error {
 			}
 		}
 		members = append(members, member)
+	}
+	if p.options.SelectorTag != "" {
+		detour, loaded := p.manager.Outbound(p.options.SelectorTag)
+		if !loaded {
+			return E.New("group selector not found: ", p.options.SelectorTag)
+		}
+		selector, ok := detour.(selectorOutbound)
+		if !ok {
+			return E.New("outbound is not a selector: ", p.options.SelectorTag)
+		}
+		p.selector = selector
 	}
 	p.members = members
 	p.logger.Info("pool initialized with ", len(members), " members")
@@ -346,7 +381,7 @@ func (p *poolOutbound) DialContext(ctx context.Context, network string, destinat
 		attempted[member] = struct{}{}
 		p.logger.Info("→ ", dst, " ⇒ ", p.memberName(member), " [", network, "]")
 		p.incActive(member)
-		conn, err := member.outbound.DialContext(ctx, network, destination)
+		conn, err := p.dialSelected(ctx, member, network, destination)
 		if err != nil {
 			p.decActive(member)
 			p.recordFailure(member, err, dst)
@@ -376,7 +411,7 @@ func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 		attempted[member] = struct{}{}
 		p.logger.Info("→ ", dst, " ⇒ ", p.memberName(member), " [udp]")
 		p.incActive(member)
-		conn, err := member.outbound.ListenPacket(ctx, destination)
+		conn, err := p.listenPacketSelected(ctx, member, destination)
 		if err != nil {
 			p.decActive(member)
 			p.recordFailure(member, err, dst)
@@ -389,6 +424,32 @@ func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 		p.recordSuccess(member, dst)
 		return p.wrapPacketConn(conn, member, dst), nil
 	}
+}
+
+func (p *poolOutbound) dialSelected(ctx context.Context, member *memberState, network string, destination M.Socksaddr) (net.Conn, error) {
+	if p.selector == nil {
+		return member.outbound.DialContext(ctx, network, destination)
+	}
+	p.selectorMu.Lock()
+	defer p.selectorMu.Unlock()
+	if !p.selector.SelectOutbound(member.tag) {
+		return nil, E.New("selector rejected member: ", member.tag)
+	}
+	group.SetCurrentTag(p.options.GroupID, member.tag)
+	return p.selector.DialContext(ctx, network, destination)
+}
+
+func (p *poolOutbound) listenPacketSelected(ctx context.Context, member *memberState, destination M.Socksaddr) (net.PacketConn, error) {
+	if p.selector == nil {
+		return member.outbound.ListenPacket(ctx, destination)
+	}
+	p.selectorMu.Lock()
+	defer p.selectorMu.Unlock()
+	if !p.selector.SelectOutbound(member.tag) {
+		return nil, E.New("selector rejected member: ", member.tag)
+	}
+	group.SetCurrentTag(p.options.GroupID, member.tag)
+	return p.selector.ListenPacket(ctx, destination)
 }
 
 func (p *poolOutbound) pickMember(network string) (*memberState, error) {
@@ -446,6 +507,9 @@ func excludeMembers(candidates []*memberState, excluded map[*memberState]struct{
 func (p *poolOutbound) availableMembersLocked(now time.Time, network string, buf []*memberState) []*memberState {
 	result := buf[:0]
 	for _, member := range p.members {
+		if p.options.GroupID != 0 && !group.MemberAvailable(p.options.GroupID, member.tag) {
+			continue
+		}
 		// Check blacklist via shared state (auto-clears if expired)
 		if member.shared != nil && member.shared.isBlacklisted(now) {
 			continue
@@ -499,6 +563,16 @@ func (p *poolOutbound) selectMember(candidates []*memberState) *memberState {
 			}
 		}
 		return selected
+	case modeFixed:
+		current := group.CurrentTag(p.options.GroupID)
+		for _, member := range candidates {
+			if member.tag == current {
+				return member
+			}
+		}
+		selected := candidates[0]
+		group.SetCurrentTag(p.options.GroupID, selected.tag)
+		return selected
 	default:
 		idx := int(p.rrCounter.Add(1)-1) % len(candidates)
 		return candidates[idx]
@@ -506,6 +580,20 @@ func (p *poolOutbound) selectMember(candidates []*memberState) *memberState {
 }
 
 func (p *poolOutbound) recordFailure(member *memberState, cause error, destination string) {
+	if p.options.GroupID != 0 {
+		evicted := group.RecordFailure(p.options.GroupID, member.tag, cause, time.Now())
+		if member.shared != nil {
+			if entry := member.shared.entryHandle(); entry != nil {
+				entry.RecordFailure(cause, destination)
+			}
+		}
+		if evicted {
+			p.logger.Warn("group ", p.options.GroupID, " permanently evicted ", member.tag, ": ", cause)
+		} else {
+			p.logger.Warn("group ", p.options.GroupID, " marked ", member.tag, " suspect: ", cause)
+		}
+		return
+	}
 	if member.shared == nil {
 		p.logger.Warn("proxy ", member.tag, " failure (no shared state): ", cause)
 		return
@@ -519,6 +607,14 @@ func (p *poolOutbound) recordFailure(member *memberState, cause error, destinati
 }
 
 func (p *poolOutbound) recordSuccess(member *memberState, destination string) {
+	if p.options.GroupID != 0 {
+		if member.shared != nil {
+			if entry := member.shared.entryHandle(); entry != nil {
+				entry.RecordSuccess(destination)
+			}
+		}
+		return
+	}
 	if member.shared != nil {
 		member.shared.recordSuccess(destination)
 	}

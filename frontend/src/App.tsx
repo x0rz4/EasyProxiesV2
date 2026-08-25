@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import { 
   Activity, Cloud, Server, ShieldCheck, TerminalSquare, Settings, 
-  Menu, Hexagon, Palette, ChevronDown, Check, LogOut 
+  Menu, Hexagon, Palette, ChevronDown, Check, LogOut, Layers3
 } from 'lucide-react'
 import MonitorPanel from './components/MonitorPanel'
 import ManagePanel from './components/ManagePanel'
@@ -10,11 +10,12 @@ import SettingsPanel from './components/SettingsPanel'
 import SubscriptionsPanel from './components/SubscriptionsPanel'
 import UnlockPanel from './components/UnlockPanel'
 import LoginPage from './components/LoginPage'
+import GroupPoolsPanel from './components/GroupPoolsPanel'
 import { checkAuth, getToken, logout } from './api/client'
 import packageJson from '../package.json'
 
 type AuthState = 'loading' | 'need_login' | 'authenticated'
-type TabId = 'monitor' | 'manage' | 'subscriptions' | 'unlock' | 'debug' | 'settings'
+type TabId = 'monitor' | 'groups' | 'manage' | 'subscriptions' | 'unlock' | 'debug' | 'settings'
 
 const ALL_THEMES = [
   'light', 'dark', 'cupcake', 'bumblebee', 'emerald', 'corporate',
@@ -45,6 +46,12 @@ const MENU_ITEMS: { id: TabId; label: string; icon: React.ReactNode; desc: strin
     icon: <Server className="h-5 w-5" />,
   },
   {
+		id: 'groups',
+		label: '分组池',
+		desc: '独立端口与热替换',
+		icon: <Layers3 className="h-5 w-5" />,
+	},
+	{
     id: 'unlock',
     label: '解锁检测',
     desc: '流媒体/AI 鉴定',
@@ -64,7 +71,7 @@ const MENU_ITEMS: { id: TabId; label: string; icon: React.ReactNode; desc: strin
   },
 ]
 
-const VALID_TABS: TabId[] = ['monitor', 'manage', 'subscriptions', 'unlock', 'debug', 'settings']
+const VALID_TABS: TabId[] = ['monitor', 'groups', 'manage', 'subscriptions', 'unlock', 'debug', 'settings']
 const THEME_STORAGE_KEY = 'ep-theme'
 
 const APP_VERSION = `v${packageJson.version}`
@@ -174,6 +181,7 @@ function App() {
     switch (activeTab) {
       case 'monitor': return <MonitorPanel />
       case 'manage': return <ManagePanel />
+      case 'groups': return <GroupPoolsPanel />
       case 'subscriptions': return <SubscriptionsPanel />
       case 'unlock': return <UnlockPanel />
       case 'debug': return <DebugPanel />

@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	mathrand "math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -24,6 +25,7 @@ import (
 
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/geoip"
+	"easy_proxies/internal/group"
 	"easy_proxies/internal/store"
 	"easy_proxies/internal/unlock"
 
@@ -141,12 +143,12 @@ type Server struct {
 	// Lifecycle
 	done chan struct{} // closed on Shutdown to stop background goroutines
 
-	subRefresher SubscriptionRefresher
-	nodeMgr      NodeManager
-	geoLookup    *geoip.Lookup // optional, used by unlock checks for IP purity
-	geoLookupMu  sync.Mutex    // protects lazy open/reload of geoLookup
-	geoLookupPath  string      // path the cached geoLookup was opened from
-	geoLookupMtime time.Time   // mtime of the db file when geoLookup was opened
+	subRefresher   SubscriptionRefresher
+	nodeMgr        NodeManager
+	geoLookup      *geoip.Lookup // optional, used by unlock checks for IP purity
+	geoLookupMu    sync.Mutex    // protects lazy open/reload of geoLookup
+	geoLookupPath  string        // path the cached geoLookup was opened from
+	geoLookupMtime time.Time     // mtime of the db file when geoLookup was opened
 }
 
 // NewServer constructs a server; it can be nil when disabled.
@@ -199,6 +201,8 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 	mux.HandleFunc("/api/subscriptions", s.withAuth(s.handleSubscriptions))
 	mux.HandleFunc("/api/subscriptions/", s.withAuth(s.handleSubscriptionItem))
 	mux.HandleFunc("/api/reload", s.withAuth(s.handleReload))
+	mux.HandleFunc("/api/groups", s.withAuth(s.handleGroups))
+	mux.HandleFunc("/api/groups/", s.withAuth(s.handleGroupItem))
 
 	// GeoIP database management
 	mux.HandleFunc("/api/geoip/status", s.withAuth(s.handleGeoipStatus))
@@ -918,7 +922,7 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 			return
 		}
-		
+
 		// Wrap dialer slightly to fit signature
 		wrappedDialer := func(ctx context.Context, network, addr string) (interface{}, error) {
 			return dialer(ctx, network, addr)
@@ -1181,15 +1185,15 @@ func (s *Server) handleUnlockAll(w http.ResponseWriter, r *http.Request) {
 
 	// progressEvent is the SSE payload for one completed node.
 	type progressEvent struct {
-		Type     string          `json:"type"`
-		Tag      string          `json:"tag"`
-		Name     string          `json:"name"`
-		Status   string          `json:"status"`
-		Error    string          `json:"error,omitempty"`
-		Result   *unlock.Result  `json:"result,omitempty"`
-		Current  int             `json:"current"`
-		Total    int             `json:"total"`
-		Progress float64         `json:"progress"`
+		Type     string         `json:"type"`
+		Tag      string         `json:"tag"`
+		Name     string         `json:"name"`
+		Status   string         `json:"status"`
+		Error    string         `json:"error,omitempty"`
+		Result   *unlock.Result `json:"result,omitempty"`
+		Current  int            `json:"current"`
+		Total    int            `json:"total"`
+		Progress float64        `json:"progress"`
 	}
 
 	for result := range results {
@@ -1255,13 +1259,13 @@ func (s *Server) handleUnlockResults(w http.ResponseWriter, r *http.Request) {
 	// node id and the redundant result_json blob (Services are already
 	// reconstructed server-side from that blob).
 	type unlockResultView struct {
-		Tag       string                   `json:"tag"`
-		Name      string                   `json:"name"`
+		Tag       string                      `json:"tag"`
+		Name      string                      `json:"name"`
 		Services  []store.UnlockServiceResult `json:"services"`
 		IP        store.UnlockIPInfo          `json:"ip"`
-		Error     string                   `json:"error,omitempty"`
-		Duration  int64                    `json:"duration_ms"`
-		CheckedAt time.Time                `json:"checked_at"`
+		Error     string                      `json:"error,omitempty"`
+		Duration  int64                       `json:"duration_ms"`
+		CheckedAt time.Time                   `json:"checked_at"`
 	}
 
 	out := make(map[string]unlockResultView, len(stored))
@@ -1432,7 +1436,7 @@ func (s *Server) persistUnlockResult(snap *Snapshot, result *unlock.Result) {
 				newTags = append(newTags, svc.DisplayName+"解锁")
 			}
 		}
-		
+
 		node.Tags = newTags
 		if err := s.store.UpdateNode(ctx, node); err != nil {
 			s.logger.Printf("[unlock] failed to update tags for node %d: %v", nodeID, err)
@@ -2262,6 +2266,354 @@ func (s *Server) geoipEnabled() bool {
 	c.RLock()
 	defer c.RUnlock()
 	return c.GeoIP.Enabled
+}
+
+type groupPoolInput struct {
+	Name                 string   `json:"name"`
+	BindAddress          string   `json:"bind_address"`
+	BindPort             uint16   `json:"bind_port"`
+	Protocol             string   `json:"protocol"`
+	Username             string   `json:"username"`
+	Password             string   `json:"password"`
+	DispatchMode         string   `json:"dispatch_mode"`
+	Regions              []string `json:"regions"`
+	ExplicitNodeIDs      []int64  `json:"explicit_node_ids"`
+	FailureWindowSeconds int      `json:"failure_window_seconds"`
+	FailureThreshold     int      `json:"failure_threshold"`
+	HealthCheckSeconds   int      `json:"health_check_seconds"`
+	Enabled              *bool    `json:"enabled"`
+}
+
+type groupMemberResponse struct {
+	NodeID       int64     `json:"node_id"`
+	Tag          string    `json:"tag"`
+	Name         string    `json:"name"`
+	Region       string    `json:"region,omitempty"`
+	Country      string    `json:"country,omitempty"`
+	Status       string    `json:"status"`
+	FailureCount int       `json:"failure_count"`
+	LastError    string    `json:"last_error,omitempty"`
+	EvictedAt    time.Time `json:"evicted_at,omitempty"`
+	LatencyMs    int64     `json:"latency_ms"`
+	Available    bool      `json:"available"`
+	IsActive     bool      `json:"is_active"`
+}
+
+type groupPoolResponse struct {
+	store.GroupPool
+	CurrentActiveTag string                `json:"current_active_tag,omitempty"`
+	Members          []groupMemberResponse `json:"members"`
+	MemberCount      int                   `json:"member_count"`
+	AliveCount       int                   `json:"alive_count"`
+	EvictedCount     int                   `json:"evicted_count"`
+}
+
+func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
+	if s.store == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "数据存储不可用")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		s.writeGroupList(w, r)
+	case http.MethodPost:
+		var input groupPoolInput
+		if err := decodeJSON(r, &input); err != nil {
+			writeAPIError(w, http.StatusBadRequest, "无效的请求数据")
+			return
+		}
+		group, err := s.groupFromInput(r.Context(), input, nil)
+		if err != nil {
+			writeAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := s.store.CreateGroupPool(r.Context(), group); err != nil {
+			writeAPIError(w, http.StatusConflict, err.Error())
+			return
+		}
+		reloadError := s.reloadAfterGroupMutation(r.Context())
+		w.WriteHeader(http.StatusCreated)
+		writeJSON(w, map[string]any{"group": group, "reloaded": reloadError == "", "reload_error": reloadError})
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleGroupItem(w http.ResponseWriter, r *http.Request) {
+	if s.store == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "数据存储不可用")
+		return
+	}
+	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/groups/"), "/"), "/")
+	groupID, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || groupID <= 0 {
+		writeAPIError(w, http.StatusBadRequest, "无效的分组 ID")
+		return
+	}
+	if len(parts) == 4 && parts[1] == "members" && parts[3] == "restore" && r.Method == http.MethodPost {
+		nodeID, err := strconv.ParseInt(parts[2], 10, 64)
+		if err != nil || nodeID <= 0 {
+			writeAPIError(w, http.StatusBadRequest, "无效的节点 ID")
+			return
+		}
+		if err := s.store.ClearGroupNodeState(r.Context(), groupID, nodeID); err != nil {
+			writeAPIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if err := group.RestoreGroupMember(groupID, nodeID); err != nil {
+			// A disabled/invalid node may not currently have a runtime; the cleared
+			// persisted state still guarantees restoration on the next reload.
+			s.logger.Printf("restore group runtime: %v", err)
+		}
+		writeJSON(w, map[string]any{"message": "节点已恢复", "group_id": groupID, "node_id": nodeID})
+		return
+	}
+	if len(parts) != 1 {
+		writeAPIError(w, http.StatusNotFound, "接口不存在")
+		return
+	}
+	existing, err := s.store.GetGroupPool(r.Context(), groupID)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if existing == nil {
+		writeAPIError(w, http.StatusNotFound, "分组不存在")
+		return
+	}
+	switch r.Method {
+	case http.MethodPut:
+		var input groupPoolInput
+		if err := decodeJSON(r, &input); err != nil {
+			writeAPIError(w, http.StatusBadRequest, "无效的请求数据")
+			return
+		}
+		updated, err := s.groupFromInput(r.Context(), input, existing)
+		if err != nil {
+			writeAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := s.store.UpdateGroupPool(r.Context(), updated); err != nil {
+			writeAPIError(w, http.StatusConflict, err.Error())
+			return
+		}
+		reloadError := s.reloadAfterGroupMutation(r.Context())
+		writeJSON(w, map[string]any{"group": updated, "reloaded": reloadError == "", "reload_error": reloadError})
+	case http.MethodDelete:
+		if err := s.store.DeleteGroupPool(r.Context(), groupID); err != nil {
+			writeAPIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		reloadError := s.reloadAfterGroupMutation(r.Context())
+		writeJSON(w, map[string]any{"message": "分组已删除", "reloaded": reloadError == "", "reload_error": reloadError})
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) writeGroupList(w http.ResponseWriter, r *http.Request) {
+	groups, err := s.store.ListGroupPools(r.Context())
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	nodes, _ := s.store.ListNodes(r.Context(), store.NodeFilter{})
+	nodeByID := make(map[int64]store.Node, len(nodes))
+	for _, node := range nodes {
+		nodeByID[node.ID] = node
+	}
+	monitorByTag := make(map[string]Snapshot)
+	if s.mgr != nil {
+		for _, snapshot := range s.mgr.Snapshot() {
+			monitorByTag[snapshot.Tag] = snapshot
+		}
+	}
+	runtimes := group.GroupRuntimeSnapshots()
+	responses := make([]groupPoolResponse, 0, len(groups))
+	for _, group := range groups {
+		response := groupPoolResponse{GroupPool: group, Members: []groupMemberResponse{}}
+		if runtimeState, ok := runtimes[group.ID]; ok {
+			response.CurrentActiveTag = runtimeState.CurrentTag
+			for _, member := range runtimeState.Members {
+				node := nodeByID[member.NodeID]
+				mon := monitorByTag[member.Tag]
+				status := member.Status
+				if status == "ALIVE" && mon.InitialCheckDone && !mon.Available {
+					status = "SUSPECT"
+				}
+				item := groupMemberResponse{NodeID: member.NodeID, Tag: member.Tag, Name: node.Name,
+					Region: mon.Region, Country: mon.Country, Status: status, FailureCount: member.FailureCount,
+					LastError: member.LastError, EvictedAt: member.EvictedAt, LatencyMs: mon.LastLatencyMs,
+					Available: mon.Available, IsActive: member.NodeID == runtimeState.CurrentNodeID}
+				if item.Region == "" {
+					item.Region = node.Region
+				}
+				if item.Country == "" {
+					item.Country = node.Country
+				}
+				response.Members = append(response.Members, item)
+				if status == "EVICTED" {
+					response.EvictedCount++
+				} else if status == "ALIVE" {
+					response.AliveCount++
+				}
+			}
+		}
+		response.MemberCount = len(response.Members)
+		responses = append(responses, response)
+	}
+	writeJSON(w, map[string]any{"groups": responses, "nodes": nodes, "port_range": map[string]int{"start": 10000, "end": 19999}})
+}
+
+func (s *Server) groupFromInput(ctx context.Context, input groupPoolInput, existing *store.GroupPool) (*store.GroupPool, error) {
+	input.Name = strings.TrimSpace(input.Name)
+	if input.Name == "" {
+		return nil, errors.New("分组名称不能为空")
+	}
+	if input.BindAddress == "" {
+		input.BindAddress = "0.0.0.0"
+	}
+	if net.ParseIP(input.BindAddress) == nil && input.BindAddress != "localhost" {
+		return nil, errors.New("监听地址无效")
+	}
+	if input.Protocol == "" {
+		input.Protocol = config.InboundProtocolMixed
+	}
+	protocol, err := config.NormalizeInboundProtocol(input.Protocol)
+	if err != nil {
+		return nil, err
+	}
+	if input.DispatchMode != "random" {
+		input.DispatchMode = "fixed"
+	}
+	if input.FailureWindowSeconds <= 0 {
+		input.FailureWindowSeconds = 300
+	}
+	if input.FailureThreshold <= 0 {
+		input.FailureThreshold = 3
+	}
+	if input.HealthCheckSeconds <= 0 {
+		input.HealthCheckSeconds = 60
+	}
+	autoPort := input.BindPort == 0
+	if autoPort {
+		input.BindPort, err = s.allocateGroupPort(ctx)
+		if err != nil {
+			return nil, err
+		}
+	} else if err := s.validateGroupPort(ctx, input.BindAddress, input.BindPort, existing); err != nil {
+		return nil, err
+	}
+	regions := make([]string, 0, len(input.Regions))
+	seenRegions := make(map[string]struct{})
+	for _, value := range input.Regions {
+		region := strings.ToLower(strings.TrimSpace(value))
+		if region == "" {
+			continue
+		}
+		if _, ok := seenRegions[region]; !ok {
+			seenRegions[region] = struct{}{}
+			regions = append(regions, region)
+		}
+	}
+	enabled := true
+	if input.Enabled != nil {
+		enabled = *input.Enabled
+	} else if existing != nil {
+		enabled = existing.Enabled
+	}
+	group := &store.GroupPool{Name: input.Name, BindAddress: input.BindAddress, BindPort: input.BindPort,
+		Protocol: protocol, Username: input.Username, Password: input.Password, DispatchMode: input.DispatchMode,
+		Regions: regions, ExplicitNodeIDs: input.ExplicitNodeIDs, FailureWindowSeconds: input.FailureWindowSeconds,
+		FailureThreshold: input.FailureThreshold, HealthCheckSeconds: input.HealthCheckSeconds, Enabled: enabled}
+	if existing != nil {
+		group.ID, group.CurrentActiveNodeID, group.CreatedAt, group.NodeStates = existing.ID, existing.CurrentActiveNodeID, existing.CreatedAt, existing.NodeStates
+	}
+	return group, nil
+}
+
+func (s *Server) allocateGroupPort(ctx context.Context) (uint16, error) {
+	groups, err := s.store.ListGroupPools(ctx)
+	if err != nil {
+		return 0, err
+	}
+	used := make(map[uint16]struct{}, len(groups)+2)
+	for _, group := range groups {
+		used[group.BindPort] = struct{}{}
+	}
+	s.cfgMu.RLock()
+	cfg := s.cfgSrc
+	s.cfgMu.RUnlock()
+	if cfg != nil {
+		cfg.RLock()
+		used[cfg.Listener.Port] = struct{}{}
+		for _, node := range cfg.Nodes {
+			used[node.Port] = struct{}{}
+		}
+		cfg.RUnlock()
+	}
+	for port := 10000; port <= 19999; port++ {
+		candidate := uint16(port)
+		if _, ok := used[candidate]; ok {
+			continue
+		}
+		listener, err := net.Listen("tcp", net.JoinHostPort("0.0.0.0", strconv.Itoa(port)))
+		if err == nil {
+			listener.Close()
+			return candidate, nil
+		}
+	}
+	return 0, errors.New("10000–19999 端口段没有可用端口")
+}
+
+func (s *Server) validateGroupPort(ctx context.Context, address string, port uint16, existing *store.GroupPool) error {
+	groups, err := s.store.ListGroupPools(ctx)
+	if err != nil {
+		return err
+	}
+	for _, group := range groups {
+		if existing != nil && group.ID == existing.ID {
+			continue
+		}
+		if group.BindPort == port {
+			return fmt.Errorf("端口 %d 已被分组“%s”使用", port, group.Name)
+		}
+	}
+	s.cfgMu.RLock()
+	cfg := s.cfgSrc
+	s.cfgMu.RUnlock()
+	if cfg != nil {
+		cfg.RLock()
+		if cfg.Listener.Port == port {
+			cfg.RUnlock()
+			return fmt.Errorf("端口 %d 与全局代理入口冲突", port)
+		}
+		for _, node := range cfg.Nodes {
+			if node.Port == port {
+				cfg.RUnlock()
+				return fmt.Errorf("端口 %d 与节点“%s”冲突", port, node.Name)
+			}
+		}
+		cfg.RUnlock()
+	}
+	if existing == nil || existing.BindPort != port || existing.BindAddress != address {
+		listener, err := net.Listen("tcp", net.JoinHostPort(address, strconv.Itoa(int(port))))
+		if err != nil {
+			return fmt.Errorf("端口 %d 当前不可用: %w", port, err)
+		}
+		listener.Close()
+	}
+	return nil
+}
+
+func (s *Server) reloadAfterGroupMutation(ctx context.Context) string {
+	if s.nodeMgr == nil {
+		return "重载管理器不可用"
+	}
+	if err := s.nodeMgr.TriggerReload(ctx); err != nil {
+		return err.Error()
+	}
+	return ""
 }
 
 // handleGeoipStatus reports the on-disk state of the GeoIP database.

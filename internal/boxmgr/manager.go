@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/url"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -163,7 +164,7 @@ func (m *Manager) Start(ctx context.Context) error {
 	// Start periodic health check after nodes are registered
 	m.mu.Lock()
 	if m.monitorMgr != nil && !m.healthCheckStarted {
-		interval := cfg.Management.HealthCheckInterval
+		interval := effectiveHealthCheckInterval(cfg)
 		m.monitorMgr.StartPeriodicHealthCheck(interval, periodicHealthTimeout)
 		m.healthCheckStarted = true
 	}
@@ -293,6 +294,7 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 
 	// Reload 成功后立即触发 1 次全量探测（内部去重，避免多次 Reload 造成突发）
 	if m.monitorMgr != nil {
+		m.monitorMgr.SetHealthCheckInterval(effectiveHealthCheckInterval(newCfg))
 		go m.monitorMgr.RequestProbeAllOnce(periodicHealthTimeout)
 	}
 	m.logger.Infof("reload completed successfully with %d nodes", len(newCfg.Nodes))
@@ -305,7 +307,23 @@ func runtimeConfigEqual(a, b *config.Config) bool {
 	}
 	aYAML, aErr := yaml.Marshal(a)
 	bYAML, bErr := yaml.Marshal(b)
-	return aErr == nil && bErr == nil && bytes.Equal(aYAML, bYAML)
+	return aErr == nil && bErr == nil && bytes.Equal(aYAML, bYAML) && reflect.DeepEqual(a.Groups, b.Groups)
+}
+
+func effectiveHealthCheckInterval(cfg *config.Config) time.Duration {
+	if cfg == nil {
+		return 2 * time.Hour
+	}
+	interval := cfg.Management.HealthCheckInterval
+	if interval <= 0 {
+		interval = 2 * time.Hour
+	}
+	for _, group := range cfg.Groups {
+		if group.Enabled && group.HealthCheckInterval > 0 && group.HealthCheckInterval < interval {
+			interval = group.HealthCheckInterval
+		}
+	}
+	return interval
 }
 
 func (m *Manager) waitForConnectionsToDrain(timeout time.Duration) {
@@ -896,9 +914,9 @@ func (m *Manager) TriggerReload(ctx context.Context) error {
 			m.logger.Warnf("failed to list nodes from store during reload: %v", err)
 		} else if len(storeNodes) > 0 {
 			// Build set of URIs already present from inline nodes
-			inlineURIs := make(map[string]bool, len(newCfg.Nodes))
-			for _, n := range newCfg.Nodes {
-				inlineURIs[n.URI] = true
+			inlineURIs := make(map[string]int, len(newCfg.Nodes))
+			for idx, n := range newCfg.Nodes {
+				inlineURIs[n.URI] = idx
 			}
 
 			// Merge store nodes, skipping duplicates and disabled nodes
@@ -906,19 +924,37 @@ func (m *Manager) TriggerReload(ctx context.Context) error {
 				if !n.Enabled {
 					continue
 				}
-				if inlineURIs[n.URI] {
-					continue // inline node takes priority
+				if idx, exists := inlineURIs[n.URI]; exists {
+					// Inline connection settings take priority, while SQLite owns the
+					// stable identity and discovered region metadata used by groups.
+					newCfg.Nodes[idx].ID = n.ID
+					if newCfg.Nodes[idx].Region == "" {
+						newCfg.Nodes[idx].Region = n.Region
+					}
+					if newCfg.Nodes[idx].Country == "" {
+						newCfg.Nodes[idx].Country = n.Country
+					}
+					continue
 				}
 				newCfg.Nodes = append(newCfg.Nodes, config.NodeConfig{
+					ID:       n.ID,
 					Name:     n.Name,
 					URI:      n.URI,
 					Port:     n.Port,
 					Username: n.Username,
 					Password: n.Password,
 					Source:   config.NodeSource(n.Source),
+					Region:   n.Region,
+					Country:  n.Country,
 				})
 			}
 			m.logger.Infof("merged nodes for reload: %d inline + store nodes = %d total", len(inlineURIs), len(newCfg.Nodes))
+		}
+		groups, err := m.store.ListGroupPools(ctx)
+		if err != nil {
+			m.logger.Warnf("failed to list group pools during reload: %v", err)
+		} else {
+			newCfg.Groups = groupConfigsFromStore(groups)
 		}
 	}
 
@@ -942,6 +978,25 @@ func (m *Manager) TriggerReload(ctx context.Context) error {
 	}
 
 	return m.ReloadWithPortMap(newCfg, portMap)
+}
+
+func groupConfigsFromStore(groups []store.GroupPool) []config.GroupPoolConfig {
+	result := make([]config.GroupPoolConfig, 0, len(groups))
+	for _, group := range groups {
+		converted := config.GroupPoolConfig{ID: group.ID, Name: group.Name, BindAddress: group.BindAddress,
+			BindPort: group.BindPort, Protocol: group.Protocol, Username: group.Username, Password: group.Password,
+			DispatchMode: group.DispatchMode, Regions: group.Regions, ExplicitNodeIDs: group.ExplicitNodeIDs,
+			FailureWindow:    time.Duration(group.FailureWindowSeconds) * time.Second,
+			FailureThreshold: group.FailureThreshold, HealthCheckInterval: time.Duration(group.HealthCheckSeconds) * time.Second,
+			CurrentActiveNodeID: group.CurrentActiveNodeID, Enabled: group.Enabled,
+			CreatedAt: group.CreatedAt, UpdatedAt: group.UpdatedAt}
+		for _, state := range group.NodeStates {
+			converted.NodeStates = append(converted.NodeStates, config.GroupNodeStateConfig{NodeID: state.NodeID,
+				FailureHistory: state.FailureHistory, Evicted: state.Evicted, LastError: state.LastError, EvictedAt: state.EvictedAt})
+		}
+		result = append(result, converted)
+	}
+	return result
 }
 
 // ReloadWithPortMap gracefully switches to a new configuration, preserving port assignments.

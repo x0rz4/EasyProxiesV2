@@ -140,6 +140,15 @@ type Store interface {
 	// node that has one, keyed by node ID.
 	ListUnlockResults(ctx context.Context) (map[int64]*UnlockResult, error)
 
+	// --- Group pools ---
+	ListGroupPools(ctx context.Context) ([]GroupPool, error)
+	GetGroupPool(ctx context.Context, id int64) (*GroupPool, error)
+	CreateGroupPool(ctx context.Context, group *GroupPool) error
+	UpdateGroupPool(ctx context.Context, group *GroupPool) error
+	DeleteGroupPool(ctx context.Context, id int64) error
+	UpsertGroupNodeState(ctx context.Context, state *GroupNodeState) error
+	ClearGroupNodeState(ctx context.Context, groupID, nodeID int64) error
+
 	// --- Lifecycle ---
 
 	// Close releases all resources held by the store.
@@ -182,6 +191,39 @@ type NodeFilter struct {
 	Enabled *bool  // Filter by enabled status (nil = all)
 	Limit   int    // Max results (0 = no limit)
 	Offset  int    // Pagination offset
+}
+
+// GroupPool is a persisted independently-addressable proxy pool definition.
+type GroupPool struct {
+	ID                   int64            `json:"id"`
+	Name                 string           `json:"name"`
+	BindAddress          string           `json:"bind_address"`
+	BindPort             uint16           `json:"bind_port"`
+	Protocol             string           `json:"protocol"`
+	Username             string           `json:"username,omitempty"`
+	Password             string           `json:"password,omitempty"`
+	DispatchMode         string           `json:"dispatch_mode"`
+	Regions              []string         `json:"regions"`
+	ExplicitNodeIDs      []int64          `json:"explicit_node_ids"`
+	FailureWindowSeconds int              `json:"failure_window_seconds"`
+	FailureThreshold     int              `json:"failure_threshold"`
+	HealthCheckSeconds   int              `json:"health_check_seconds"`
+	CurrentActiveNodeID  int64            `json:"current_active_node_id,omitempty"`
+	Enabled              bool             `json:"enabled"`
+	CreatedAt            time.Time        `json:"created_at"`
+	UpdatedAt            time.Time        `json:"updated_at"`
+	NodeStates           []GroupNodeState `json:"node_states,omitempty"`
+}
+
+// GroupNodeState persists the sliding failure window and permanent eviction.
+type GroupNodeState struct {
+	GroupID        int64     `json:"group_id"`
+	NodeID         int64     `json:"node_id"`
+	FailureHistory []int64   `json:"failure_history,omitempty"`
+	Evicted        bool      `json:"evicted"`
+	LastError      string    `json:"last_error,omitempty"`
+	EvictedAt      time.Time `json:"evicted_at,omitempty"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 // Subscription is a remotely refreshed collection of nodes.
@@ -309,33 +351,33 @@ type UnlockServiceResult struct {
 
 // UnlockIPInfo is the persisted native-IP classification. Mirrors unlock.IPInfo.
 type UnlockIPInfo struct {
-	IP          string `json:"ip"`
-	Country     string `json:"country,omitempty"`
-	ISOCode     string `json:"iso_code,omitempty"`
-	Region      string `json:"region,omitempty"`
-	Pure        bool   `json:"pure"`
-	ASN         string `json:"asn,omitempty"`
-	Org         string `json:"org,omitempty"`
-	IPType      string `json:"ip_type,omitempty"`
-	UsageType   string `json:"usage_type,omitempty"`
-	FraudScore  int    `json:"fraud_score,omitempty"`
-	RiskLevel   string `json:"risk_level,omitempty"`
+	IP         string `json:"ip"`
+	Country    string `json:"country,omitempty"`
+	ISOCode    string `json:"iso_code,omitempty"`
+	Region     string `json:"region,omitempty"`
+	Pure       bool   `json:"pure"`
+	ASN        string `json:"asn,omitempty"`
+	Org        string `json:"org,omitempty"`
+	IPType     string `json:"ip_type,omitempty"`
+	UsageType  string `json:"usage_type,omitempty"`
+	FraudScore int    `json:"fraud_score,omitempty"`
+	RiskLevel  string `json:"risk_level,omitempty"`
 }
 
 // UnlockResult is the latest unlock detection result stored for a node.
 // ResultJSON holds the original unlock.Result payload (including the full
 // per-service detail/region) so the WebUI can reconstruct it verbatim.
 type UnlockResult struct {
-	NodeID     int64                `json:"node_id"`
-	Tag        string               `json:"tag"`
-	Name       string               `json:"name"`
+	NodeID     int64                 `json:"node_id"`
+	Tag        string                `json:"tag"`
+	Name       string                `json:"name"`
 	Services   []UnlockServiceResult `json:"services"`
 	IP         UnlockIPInfo          `json:"ip"`
-	Error      string               `json:"error,omitempty"`
-	Duration   int64                `json:"duration_ms"`
-	CheckedAt  time.Time            `json:"checked_at"`
-	ResultJSON string               `json:"result_json,omitempty"`
-	UpdatedAt  time.Time            `json:"updated_at"`
+	Error      string                `json:"error,omitempty"`
+	Duration   int64                 `json:"duration_ms"`
+	CheckedAt  time.Time             `json:"checked_at"`
+	ResultJSON string                `json:"result_json,omitempty"`
+	UpdatedAt  time.Time             `json:"updated_at"`
 }
 
 // Node source constants (matching config.NodeSource values).

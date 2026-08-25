@@ -20,6 +20,8 @@ import type {
   TrafficStreamEvent,
   DebugLogEvent,
   GeoipStatus,
+  GroupPoolsResponse,
+  GroupPoolPayload,
 } from '../types'
 
 // ---- Token management ----
@@ -134,6 +136,28 @@ export function logout() {
 
 export async function fetchNodes(): Promise<NodesResponse> {
   return request<NodesResponse>('/api/nodes')
+}
+
+// ---- Group pools API ----
+
+export async function listGroupPools(): Promise<GroupPoolsResponse> {
+  return request<GroupPoolsResponse>('/api/groups')
+}
+
+export async function createGroupPool(payload: GroupPoolPayload) {
+  return request('/api/groups', { method: 'POST', body: JSON.stringify(payload) })
+}
+
+export async function updateGroupPool(id: number, payload: GroupPoolPayload) {
+  return request(`/api/groups/${id}`, { method: 'PUT', body: JSON.stringify(payload) })
+}
+
+export async function deleteGroupPool(id: number) {
+  return request(`/api/groups/${id}`, { method: 'DELETE' })
+}
+
+export async function restoreGroupMember(groupId: number, nodeId: number) {
+  return request(`/api/groups/${groupId}/members/${nodeId}/restore`, { method: 'POST' })
 }
 
 export async function probeNode(tag: string): Promise<{ message: string; latency_ms: number }> {

@@ -176,6 +176,44 @@ CREATE INDEX IF NOT EXISTS idx_unlock_status ON node_unlock_results(netflix_stat
 ALTER TABLE nodes ADD COLUMN tags TEXT NOT NULL DEFAULT '[]';
 `,
 		},
+		{
+			Version:     6,
+			Description: "add group pools",
+			Up: `
+CREATE TABLE group_pools (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    name                   TEXT    NOT NULL,
+    bind_address           TEXT    NOT NULL DEFAULT '0.0.0.0',
+    bind_port              INTEGER NOT NULL UNIQUE,
+    protocol               TEXT    NOT NULL DEFAULT 'mixed',
+    username               TEXT    NOT NULL DEFAULT '',
+    password               TEXT    NOT NULL DEFAULT '',
+    dispatch_mode          TEXT    NOT NULL DEFAULT 'fixed',
+    regions_json           TEXT    NOT NULL DEFAULT '[]',
+    explicit_node_ids_json TEXT    NOT NULL DEFAULT '[]',
+    failure_window_seconds INTEGER NOT NULL DEFAULT 300,
+    failure_threshold      INTEGER NOT NULL DEFAULT 3,
+    health_check_seconds   INTEGER NOT NULL DEFAULT 60,
+    current_active_node_id INTEGER NOT NULL DEFAULT 0,
+    enabled                INTEGER NOT NULL DEFAULT 1,
+    created_at             TEXT    NOT NULL DEFAULT (datetime('now')),
+    updated_at             TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE group_node_states (
+    group_id            INTEGER NOT NULL REFERENCES group_pools(id) ON DELETE CASCADE,
+    node_id             INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    failure_history_json TEXT    NOT NULL DEFAULT '[]',
+    evicted             INTEGER NOT NULL DEFAULT 0,
+    last_error          TEXT    NOT NULL DEFAULT '',
+    evicted_at          TEXT    NOT NULL DEFAULT '',
+    updated_at          TEXT    NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (group_id, node_id)
+);
+
+CREATE INDEX idx_group_states_evicted ON group_node_states(group_id, evicted);
+`,
+		},
 	}
 }
 

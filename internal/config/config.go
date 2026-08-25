@@ -27,6 +27,7 @@ type Config struct {
 	Listener            ListenerConfig            `yaml:"listener"`
 	MultiPort           MultiPortConfig           `yaml:"multi_port"`
 	Pool                PoolConfig                `yaml:"pool"`
+	Groups              []GroupPoolConfig         `yaml:"-"` // Runtime-only; persisted in SQLite.
 	Management          ManagementConfig          `yaml:"management"`
 	SubscriptionRefresh SubscriptionRefreshConfig `yaml:"subscription_refresh"`
 	GeoIP               GeoIPConfig               `yaml:"geoip"`
@@ -65,6 +66,38 @@ type PoolConfig struct {
 	Mode              string        `yaml:"mode"`
 	FailureThreshold  int           `yaml:"failure_threshold"`
 	BlacklistDuration time.Duration `yaml:"blacklist_duration"`
+}
+
+// GroupPoolConfig describes an independent listener backed by a dynamic subset
+// of the globally configured nodes. Definitions are persisted in SQLite.
+type GroupPoolConfig struct {
+	ID                  int64                  `yaml:"-" json:"id"`
+	Name                string                 `yaml:"-" json:"name"`
+	BindAddress         string                 `yaml:"-" json:"bind_address"`
+	BindPort            uint16                 `yaml:"-" json:"bind_port"`
+	Protocol            string                 `yaml:"-" json:"protocol"`
+	Username            string                 `yaml:"-" json:"username,omitempty"`
+	Password            string                 `yaml:"-" json:"password,omitempty"`
+	DispatchMode        string                 `yaml:"-" json:"dispatch_mode"`
+	Regions             []string               `yaml:"-" json:"regions"`
+	ExplicitNodeIDs     []int64                `yaml:"-" json:"explicit_node_ids"`
+	FailureWindow       time.Duration          `yaml:"-" json:"-"`
+	FailureThreshold    int                    `yaml:"-" json:"failure_threshold"`
+	HealthCheckInterval time.Duration          `yaml:"-" json:"-"`
+	CurrentActiveNodeID int64                  `yaml:"-" json:"current_active_node_id,omitempty"`
+	Enabled             bool                   `yaml:"-" json:"enabled"`
+	CreatedAt           time.Time              `yaml:"-" json:"created_at,omitempty"`
+	UpdatedAt           time.Time              `yaml:"-" json:"updated_at,omitempty"`
+	NodeStates          []GroupNodeStateConfig `yaml:"-" json:"-"`
+}
+
+// GroupNodeStateConfig restores eviction state across reloads and restarts.
+type GroupNodeStateConfig struct {
+	NodeID         int64     `json:"node_id"`
+	FailureHistory []int64   `json:"failure_history,omitempty"`
+	Evicted        bool      `json:"evicted"`
+	LastError      string    `json:"last_error,omitempty"`
+	EvictedAt      time.Time `json:"evicted_at,omitempty"`
 }
 
 // MultiPortConfig defines address/credential defaults for multi-port mode.
@@ -142,6 +175,7 @@ func NormalizeInboundProtocol(value string) (string, error) {
 
 // NodeConfig describes a single upstream proxy endpoint expressed as URI.
 type NodeConfig struct {
+	ID       int64      `yaml:"-" json:"id,omitempty"`
 	Name     string     `yaml:"name" json:"name"`
 	URI      string     `yaml:"uri" json:"uri"`
 	Port     uint16     `yaml:"port,omitempty" json:"port,omitempty"`
@@ -149,6 +183,8 @@ type NodeConfig struct {
 	Password string     `yaml:"password,omitempty" json:"password,omitempty"`
 	Source   NodeSource `yaml:"-" json:"source,omitempty"`   // Runtime only, not persisted in YAML
 	Disabled bool       `yaml:"-" json:"disabled,omitempty"` // Runtime only, not persisted in YAML; true = node is disabled
+	Region   string     `yaml:"-" json:"region,omitempty"`
+	Country  string     `yaml:"-" json:"country,omitempty"`
 }
 
 // NodeKey returns a unique identifier for the node based on its URI.
@@ -257,6 +293,34 @@ func (c *Config) applyDefaults() error {
 	}
 	if c.Pool.BlacklistDuration <= 0 {
 		c.Pool.BlacklistDuration = 24 * time.Hour
+	}
+	for idx := range c.Groups {
+		g := &c.Groups[idx]
+		if g.BindAddress == "" {
+			g.BindAddress = "0.0.0.0"
+		}
+		if g.Protocol == "" {
+			g.Protocol = InboundProtocolMixed
+		}
+		groupProtocol, err := NormalizeInboundProtocol(g.Protocol)
+		if err != nil {
+			return fmt.Errorf("group %q: %w", g.Name, err)
+		}
+		g.Protocol = groupProtocol
+		if strings.EqualFold(g.DispatchMode, "random") {
+			g.DispatchMode = "random"
+		} else {
+			g.DispatchMode = "fixed"
+		}
+		if g.FailureWindow <= 0 {
+			g.FailureWindow = 5 * time.Minute
+		}
+		if g.FailureThreshold <= 0 {
+			g.FailureThreshold = 3
+		}
+		if g.HealthCheckInterval <= 0 {
+			g.HealthCheckInterval = time.Minute
+		}
 	}
 	if c.MultiPort.Address == "" {
 		c.MultiPort.Address = "0.0.0.0"
@@ -1110,6 +1174,18 @@ func (c *Config) Clone() *Config {
 	if c.Subscriptions != nil {
 		cloned.Subscriptions = make([]string, len(c.Subscriptions))
 		copy(cloned.Subscriptions, c.Subscriptions)
+	}
+	if c.Groups != nil {
+		cloned.Groups = make([]GroupPoolConfig, len(c.Groups))
+		copy(cloned.Groups, c.Groups)
+		for idx := range cloned.Groups {
+			cloned.Groups[idx].Regions = append([]string(nil), c.Groups[idx].Regions...)
+			cloned.Groups[idx].ExplicitNodeIDs = append([]int64(nil), c.Groups[idx].ExplicitNodeIDs...)
+			cloned.Groups[idx].NodeStates = append([]GroupNodeStateConfig(nil), c.Groups[idx].NodeStates...)
+			for stateIdx := range cloned.Groups[idx].NodeStates {
+				cloned.Groups[idx].NodeStates[stateIdx].FailureHistory = append([]int64(nil), c.Groups[idx].NodeStates[stateIdx].FailureHistory...)
+			}
+		}
 	}
 	return &cloned
 }

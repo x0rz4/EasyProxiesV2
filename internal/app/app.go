@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -12,6 +13,7 @@ import (
 
 	"easy_proxies/internal/boxmgr"
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/group"
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/store"
 	"easy_proxies/internal/subscription"
@@ -42,6 +44,9 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	if err := loadNodesFromStore(ctx, cfg, dataStore); err != nil {
 		log.Printf("⚠️ Failed to load nodes from store: %v", err)
 	}
+	if err := loadGroupsFromStore(ctx, cfg, dataStore); err != nil {
+		return fmt.Errorf("load group pools: %w", err)
+	}
 
 	// ── 3. Build monitor config ──
 	proxyUsername := cfg.Listener.Username
@@ -63,6 +68,20 @@ func Run(ctx context.Context, cfg *config.Config) error {
 
 	// ── 4. Create and start BoxManager ──
 	boxMgr := boxmgr.New(cfg, monitorCfg, boxmgr.WithStore(dataStore))
+	group.SetGroupStateObserver(func(event group.GroupStateEvent) {
+		if event.StateChanged && event.NodeID != 0 {
+			_ = dataStore.UpsertGroupNodeState(context.Background(), &store.GroupNodeState{
+				GroupID: event.GroupID, NodeID: event.NodeID, FailureHistory: event.FailureHistory,
+				Evicted: event.Evicted, LastError: event.LastError, EvictedAt: event.EvictedAt})
+		}
+		if event.CurrentNodeID != 0 {
+			if group, err := dataStore.GetGroupPool(context.Background(), event.GroupID); err == nil && group != nil {
+				group.CurrentActiveNodeID = event.CurrentNodeID
+				_ = dataStore.UpdateGroupPool(context.Background(), group)
+			}
+		}
+	})
+	defer group.SetGroupStateObserver(nil)
 	if err := boxMgr.Start(ctx); err != nil {
 		return fmt.Errorf("start box manager: %w", err)
 	}
@@ -93,6 +112,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	statsCtx, statsCancel := context.WithCancel(ctx)
 	defer statsCancel()
 	go periodicStatsFlush(statsCtx, boxMgr, dataStore)
+	go syncGroupHealthFailures(statsCtx, boxMgr)
 
 	// ── 7. Wait for shutdown signal ──
 	sigCh := make(chan os.Signal, 1)
@@ -198,12 +218,15 @@ func loadNodesFromStore(ctx context.Context, cfg *config.Config, s store.Store) 
 		}
 		seen[n.URI] = struct{}{}
 		configNodes = append(configNodes, config.NodeConfig{
+			ID:       n.ID,
 			Name:     n.Name,
 			URI:      n.URI,
 			Port:     n.Port,
 			Username: n.Username,
 			Password: n.Password,
 			Source:   config.NodeSource(n.Source),
+			Region:   n.Region,
+			Country:  n.Country,
 		})
 	}
 	for _, n := range effectiveSubscriptionNodes {
@@ -211,14 +234,38 @@ func loadNodesFromStore(ctx context.Context, cfg *config.Config, s store.Store) 
 			continue
 		}
 		seen[n.URI] = struct{}{}
-		configNodes = append(configNodes, config.NodeConfig{Name: n.Name, URI: n.URI, Port: n.Port,
-			Username: n.Username, Password: n.Password, Source: config.NodeSourceSubscription})
+		configNodes = append(configNodes, config.NodeConfig{ID: n.ID, Name: n.Name, URI: n.URI, Port: n.Port,
+			Username: n.Username, Password: n.Password, Source: config.NodeSourceSubscription,
+			Region: n.Region, Country: n.Country})
 	}
 
 	// Always replace cfg.Nodes when the DB is non-empty, including all-disabled state.
 	cfg.Nodes = configNodes
 	log.Printf("[app] loaded %d effective nodes from store", len(configNodes))
 
+	return nil
+}
+
+func loadGroupsFromStore(ctx context.Context, cfg *config.Config, s store.Store) error {
+	groups, err := s.ListGroupPools(ctx)
+	if err != nil {
+		return err
+	}
+	cfg.Groups = make([]config.GroupPoolConfig, 0, len(groups))
+	for _, group := range groups {
+		converted := config.GroupPoolConfig{ID: group.ID, Name: group.Name, BindAddress: group.BindAddress,
+			BindPort: group.BindPort, Protocol: group.Protocol, Username: group.Username, Password: group.Password,
+			DispatchMode: group.DispatchMode, Regions: group.Regions, ExplicitNodeIDs: group.ExplicitNodeIDs,
+			FailureWindow:    time.Duration(group.FailureWindowSeconds) * time.Second,
+			FailureThreshold: group.FailureThreshold, HealthCheckInterval: time.Duration(group.HealthCheckSeconds) * time.Second,
+			CurrentActiveNodeID: group.CurrentActiveNodeID, Enabled: group.Enabled,
+			CreatedAt: group.CreatedAt, UpdatedAt: group.UpdatedAt}
+		for _, state := range group.NodeStates {
+			converted.NodeStates = append(converted.NodeStates, config.GroupNodeStateConfig{NodeID: state.NodeID,
+				FailureHistory: state.FailureHistory, Evicted: state.Evicted, LastError: state.LastError, EvictedAt: state.EvictedAt})
+		}
+		cfg.Groups = append(cfg.Groups, converted)
+	}
 	return nil
 }
 
@@ -261,6 +308,38 @@ func periodicStatsFlush(ctx context.Context, boxMgr *boxmgr.Manager, s store.Sto
 			return
 		case <-ticker.C:
 			flushStatsToStore(ctx, boxMgr, s)
+		}
+	}
+}
+
+// syncGroupHealthFailures projects the existing global health checker into
+// each group-specific sliding failure window. Traffic failures are recorded by
+// the group outbound itself; this loop covers idle nodes that only fail probes.
+func syncGroupHealthFailures(ctx context.Context, boxMgr *boxmgr.Manager) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			mgr := boxMgr.MonitorManager()
+			if mgr == nil {
+				continue
+			}
+			snapshots := make(map[string]monitor.Snapshot)
+			for _, snapshot := range mgr.Snapshot() {
+				snapshots[snapshot.Tag] = snapshot
+			}
+			for groupID, runtime := range group.GroupRuntimeSnapshots() {
+				for _, member := range runtime.Members {
+					snapshot, ok := snapshots[member.Tag]
+					if !ok || !snapshot.InitialCheckDone || snapshot.Available || snapshot.LastFailure.IsZero() {
+						continue
+					}
+					group.RecordGroupHealthFailure(groupID, member.Tag, errors.New(snapshot.LastError), snapshot.LastFailure)
+				}
+			}
 		}
 	}
 }

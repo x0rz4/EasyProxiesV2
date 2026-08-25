@@ -1145,6 +1145,156 @@ func servicesFromStatuses(netflix, disneyPlus, chatgpt string) []UnlockServiceRe
 	}
 }
 
+// ===================== Group pool operations =====================
+
+const groupPoolColumns = `id, name, bind_address, bind_port, protocol, username, password,
+dispatch_mode, regions_json, explicit_node_ids_json, failure_window_seconds,
+failure_threshold, health_check_seconds, current_active_node_id, enabled, created_at, updated_at`
+
+func (s *sqliteStore) ListGroupPools(ctx context.Context) ([]GroupPool, error) {
+	rows, err := s.conn().QueryContext(ctx, "SELECT "+groupPoolColumns+" FROM group_pools ORDER BY id")
+	if err != nil {
+		return nil, fmt.Errorf("list group pools: %w", err)
+	}
+	var groups []GroupPool
+	for rows.Next() {
+		g, err := scanGroupPool(rows)
+		if err != nil {
+			rows.Close()
+			return nil, err
+		}
+		groups = append(groups, g)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	for idx := range groups {
+		states, err := s.listGroupNodeStates(ctx, groups[idx].ID)
+		if err != nil {
+			return nil, err
+		}
+		groups[idx].NodeStates = states
+	}
+	return groups, nil
+}
+
+func (s *sqliteStore) GetGroupPool(ctx context.Context, id int64) (*GroupPool, error) {
+	g, err := scanGroupPool(s.conn().QueryRowContext(ctx, "SELECT "+groupPoolColumns+" FROM group_pools WHERE id = ?", id))
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	g.NodeStates, err = s.listGroupNodeStates(ctx, id)
+	return &g, err
+}
+
+func (s *sqliteStore) CreateGroupPool(ctx context.Context, g *GroupPool) error {
+	regions, _ := json.Marshal(g.Regions)
+	nodeIDs, _ := json.Marshal(g.ExplicitNodeIDs)
+	result, err := s.conn().ExecContext(ctx, `INSERT INTO group_pools
+(name, bind_address, bind_port, protocol, username, password, dispatch_mode, regions_json,
+ explicit_node_ids_json, failure_window_seconds, failure_threshold, health_check_seconds,
+ current_active_node_id, enabled, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		g.Name, g.BindAddress, g.BindPort, g.Protocol, g.Username, g.Password, g.DispatchMode,
+		string(regions), string(nodeIDs), g.FailureWindowSeconds, g.FailureThreshold,
+		g.HealthCheckSeconds, g.CurrentActiveNodeID, boolToInt(g.Enabled), formatTime(time.Now()), formatTime(time.Now()))
+	if err != nil {
+		return fmt.Errorf("create group pool: %w", err)
+	}
+	g.ID, err = result.LastInsertId()
+	return err
+}
+
+func (s *sqliteStore) UpdateGroupPool(ctx context.Context, g *GroupPool) error {
+	regions, _ := json.Marshal(g.Regions)
+	nodeIDs, _ := json.Marshal(g.ExplicitNodeIDs)
+	result, err := s.conn().ExecContext(ctx, `UPDATE group_pools SET
+name=?, bind_address=?, bind_port=?, protocol=?, username=?, password=?, dispatch_mode=?,
+regions_json=?, explicit_node_ids_json=?, failure_window_seconds=?, failure_threshold=?,
+health_check_seconds=?, current_active_node_id=?, enabled=?, updated_at=? WHERE id=?`,
+		g.Name, g.BindAddress, g.BindPort, g.Protocol, g.Username, g.Password, g.DispatchMode,
+		string(regions), string(nodeIDs), g.FailureWindowSeconds, g.FailureThreshold,
+		g.HealthCheckSeconds, g.CurrentActiveNodeID, boolToInt(g.Enabled), formatTime(time.Now()), g.ID)
+	if err != nil {
+		return fmt.Errorf("update group pool: %w", err)
+	}
+	return requireAffected(result, "group pool not found")
+}
+
+func (s *sqliteStore) DeleteGroupPool(ctx context.Context, id int64) error {
+	result, err := s.conn().ExecContext(ctx, "DELETE FROM group_pools WHERE id = ?", id)
+	if err != nil {
+		return fmt.Errorf("delete group pool: %w", err)
+	}
+	return requireAffected(result, "group pool not found")
+}
+
+func (s *sqliteStore) UpsertGroupNodeState(ctx context.Context, state *GroupNodeState) error {
+	history, _ := json.Marshal(state.FailureHistory)
+	_, err := s.conn().ExecContext(ctx, `INSERT INTO group_node_states
+(group_id, node_id, failure_history_json, evicted, last_error, evicted_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(group_id, node_id) DO UPDATE SET failure_history_json=excluded.failure_history_json,
+evicted=excluded.evicted, last_error=excluded.last_error, evicted_at=excluded.evicted_at,
+updated_at=excluded.updated_at`, state.GroupID, state.NodeID, string(history), boolToInt(state.Evicted),
+		state.LastError, formatTime(state.EvictedAt), formatTime(time.Now()))
+	if err != nil {
+		return fmt.Errorf("upsert group node state: %w", err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) ClearGroupNodeState(ctx context.Context, groupID, nodeID int64) error {
+	_, err := s.conn().ExecContext(ctx, "DELETE FROM group_node_states WHERE group_id = ? AND node_id = ?", groupID, nodeID)
+	return err
+}
+
+func (s *sqliteStore) listGroupNodeStates(ctx context.Context, groupID int64) ([]GroupNodeState, error) {
+	rows, err := s.conn().QueryContext(ctx, `SELECT group_id, node_id, failure_history_json, evicted,
+last_error, evicted_at, updated_at FROM group_node_states WHERE group_id = ?`, groupID)
+	if err != nil {
+		return nil, fmt.Errorf("list group node states: %w", err)
+	}
+	defer rows.Close()
+	var states []GroupNodeState
+	for rows.Next() {
+		var state GroupNodeState
+		var history, evictedAt, updatedAt string
+		var evicted int
+		if err := rows.Scan(&state.GroupID, &state.NodeID, &history, &evicted, &state.LastError, &evictedAt, &updatedAt); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal([]byte(history), &state.FailureHistory)
+		state.Evicted = evicted != 0
+		state.EvictedAt = parseTime(evictedAt)
+		state.UpdatedAt = parseTime(updatedAt)
+		states = append(states, state)
+	}
+	return states, rows.Err()
+}
+
+func scanGroupPool(row scanner) (GroupPool, error) {
+	var g GroupPool
+	var regions, nodeIDs, createdAt, updatedAt string
+	var enabled int
+	err := row.Scan(&g.ID, &g.Name, &g.BindAddress, &g.BindPort, &g.Protocol, &g.Username, &g.Password,
+		&g.DispatchMode, &regions, &nodeIDs, &g.FailureWindowSeconds, &g.FailureThreshold,
+		&g.HealthCheckSeconds, &g.CurrentActiveNodeID, &enabled, &createdAt, &updatedAt)
+	if err != nil {
+		return g, err
+	}
+	_ = json.Unmarshal([]byte(regions), &g.Regions)
+	_ = json.Unmarshal([]byte(nodeIDs), &g.ExplicitNodeIDs)
+	g.Enabled = enabled != 0
+	g.CreatedAt, g.UpdatedAt = parseTime(createdAt), parseTime(updatedAt)
+	return g, nil
+}
+
 // ===================== Lifecycle =====================
 
 func (s *sqliteStore) Close() error {

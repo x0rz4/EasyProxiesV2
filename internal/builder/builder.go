@@ -15,6 +15,7 @@ import (
 
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/geoip"
+	groupruntime "easy_proxies/internal/group"
 	poolout "easy_proxies/internal/outbound/pool"
 
 	C "github.com/sagernet/sing-box/constant"
@@ -28,6 +29,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 	baseOutbounds := make([]option.Outbound, 0, len(cfg.Nodes))
 	memberTags := make([]string, 0, len(cfg.Nodes))
 	metadata := make(map[string]poolout.MemberMeta)
+	nodeTagsByID := make(map[int64]string)
 	var failedNodes []string
 	usedTags := make(map[string]int) // Track tag usage for uniqueness
 
@@ -81,9 +83,10 @@ func Build(cfg *config.Config) (option.Options, error) {
 		memberTags = append(memberTags, tag)
 		baseOutbounds = append(baseOutbounds, outbound)
 		meta := poolout.MemberMeta{
-			Name: node.Name,
-			URI:  node.URI,
-			Mode: cfg.Mode,
+			NodeID: node.ID,
+			Name:   node.Name,
+			URI:    node.URI,
+			Mode:   cfg.Mode,
 		}
 		// For multi-port and hybrid modes, use per-node port
 		if cfg.Mode == "multi-port" || cfg.Mode == "hybrid" {
@@ -95,7 +98,11 @@ func Build(cfg *config.Config) (option.Options, error) {
 		}
 
 		// GeoIP lookup for region classification
-		if geoLookup != nil && geoLookup.IsEnabled() {
+		if node.Region != "" {
+			meta.Region = strings.ToLower(node.Region)
+			meta.Country = node.Country
+			regionMembers[meta.Region] = append(regionMembers[meta.Region], tag)
+		} else if geoLookup != nil && geoLookup.IsEnabled() {
 			regionInfo := geoLookup.LookupURI(node.URI)
 			meta.Region = regionInfo.Code
 			meta.Country = regionInfo.Country
@@ -107,6 +114,9 @@ func Build(cfg *config.Config) (option.Options, error) {
 		}
 
 		metadata[tag] = meta
+		if node.ID != 0 {
+			nodeTagsByID[node.ID] = tag
+		}
 	}
 
 	// Close GeoIP database after lookup
@@ -230,6 +240,85 @@ func Build(cfg *config.Config) (option.Options, error) {
 				},
 			})
 		}
+	}
+
+	// Build one independent inbound/outbound pair for each enabled group. Group
+	// membership is re-evaluated on every reload, so newly subscribed nodes join
+	// automatically when their region or explicit node ID matches.
+	for _, group := range cfg.Groups {
+		if !group.Enabled || group.ID == 0 || group.BindPort == 0 {
+			continue
+		}
+		regionSet := make(map[string]struct{}, len(group.Regions))
+		for _, region := range group.Regions {
+			regionSet[strings.ToLower(strings.TrimSpace(region))] = struct{}{}
+		}
+		explicitSet := make(map[int64]struct{}, len(group.ExplicitNodeIDs))
+		for _, nodeID := range group.ExplicitNodeIDs {
+			explicitSet[nodeID] = struct{}{}
+		}
+		members := make([]string, 0)
+		groupMeta := make(map[string]poolout.MemberMeta)
+		for _, tag := range memberTags {
+			meta := metadata[tag]
+			_, explicit := explicitSet[meta.NodeID]
+			_, regional := regionSet[strings.ToLower(meta.Region)]
+			if !explicit && !regional {
+				continue
+			}
+			members = append(members, tag)
+			groupMeta[tag] = meta
+		}
+		if len(members) == 0 {
+			log.Printf("⚠️  Group %q has no matching nodes; listener %d is inactive", group.Name, group.BindPort)
+			continue
+		}
+
+		stateByTag := make(map[string]groupruntime.GroupInitialState)
+		for _, state := range group.NodeStates {
+			tag := nodeTagsByID[state.NodeID]
+			if tag == "" {
+				continue
+			}
+			stateByTag[tag] = groupruntime.GroupInitialState{NodeID: state.NodeID,
+				FailureHistory: state.FailureHistory, Evicted: state.Evicted,
+				LastError: state.LastError, EvictedAt: state.EvictedAt}
+		}
+		for _, tag := range members {
+			if _, ok := stateByTag[tag]; !ok {
+				stateByTag[tag] = groupruntime.GroupInitialState{NodeID: metadata[tag].NodeID}
+			}
+		}
+		preferredTag := nodeTagsByID[group.CurrentActiveNodeID]
+		if preferredTag == "" {
+			preferredTag = members[0]
+		}
+		selectorTag := fmt.Sprintf("group-selector-%d", group.ID)
+		groupOutboundTag := fmt.Sprintf("group-pool-%d", group.ID)
+		groupInboundTag := fmt.Sprintf("group-in-%d", group.ID)
+		outbounds = append(outbounds, option.Outbound{Type: C.TypeSelector, Tag: selectorTag,
+			Options: &option.SelectorOutboundOptions{Outbounds: members, Default: preferredTag, InterruptExistConnections: false}})
+		groupOptions := poolout.Options{Mode: group.DispatchMode, Members: members,
+			FailureThreshold: group.FailureThreshold, FailureWindow: group.FailureWindow,
+			BlacklistDuration: 100 * 365 * 24 * time.Hour, Metadata: groupMeta,
+			GroupID: group.ID, PreferredMember: preferredTag, InitialGroupState: stateByTag, SelectorTag: selectorTag}
+		outbounds = append(outbounds, option.Outbound{Type: poolout.Type, Tag: groupOutboundTag, Options: &groupOptions})
+
+		addr, err := parseAddr(group.BindAddress)
+		if err != nil {
+			return option.Options{}, fmt.Errorf("parse group %q address: %w", group.Name, err)
+		}
+		inbound, err := buildInboundByProtocol(group.Protocol, addr, group.BindPort,
+			group.Username, group.Password, groupInboundTag)
+		if err != nil {
+			return option.Options{}, fmt.Errorf("build group %q inbound: %w", group.Name, err)
+		}
+		inbounds = append(inbounds, inbound)
+		route.Rules = append(route.Rules, option.Rule{Type: C.RuleTypeDefault,
+			DefaultOptions: option.DefaultRule{RawDefaultRule: option.RawDefaultRule{
+				Inbound: badoption.Listable[string]{groupInboundTag}}, RuleAction: option.RuleAction{
+				Action: C.RuleActionTypeRoute, RouteOptions: option.RouteActionOptions{Outbound: groupOutboundTag}}}})
+		log.Printf("🧩 Group %q listening on %s:%d with %d members (%s)", group.Name, group.BindAddress, group.BindPort, len(members), group.DispatchMode)
 	}
 
 	// Build GeoIP region-based pool outbounds and routing

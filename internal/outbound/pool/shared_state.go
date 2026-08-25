@@ -5,6 +5,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"easy_proxies/internal/group"
 	"easy_proxies/internal/monitor"
 )
 
@@ -48,6 +49,7 @@ func ResetSharedStateStore() {
 		sharedStateStore.Delete(key)
 		return true
 	})
+	group.Reset()
 }
 
 // ActiveConnections returns the number of currently open proxied connections.
