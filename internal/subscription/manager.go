@@ -395,10 +395,11 @@ func (m *Manager) refreshSubscription(ctx context.Context, sub *store.Subscripti
 			continue
 		}
 		seen[identityKey] = struct{}{}
-		name := nodeName(n.Name, uri, i+1)
+		logicalName := strings.TrimSpace(n.Name)
+		name := nodeName(logicalName, uri, i+1)
 		inputs = append(inputs, store.SubscriptionNodeInput{URI: uri, Name: name, Port: n.Port,
 			Username: n.Username, Password: n.Password, Enabled: true,
-			IdentityHash: n.IdentityHash, CanonicalJSON: n.CanonicalJSON})
+			IdentityHash: n.IdentityHash, CanonicalJSON: n.CanonicalJSON, LogicalName: logicalName})
 	}
 	existingNodes, listErr := m.store.ListNodes(ctx, store.NodeFilter{})
 	if listErr != nil {
@@ -408,23 +409,65 @@ func (m *Manager) refreshSubscription(ctx context.Context, sub *store.Subscripti
 	for _, existing := range existingNodes {
 		existingIdentities[existing.IdentityHash] = struct{}{}
 	}
-	created, updated := 0, 0
-	for _, input := range inputs {
-		if _, exists := existingIdentities[input.IdentityHash]; exists {
-			updated++
-		} else {
-			created++
-		}
-	}
 	m.mu.Lock()
 	m.status.Parsed += len(nodes)
-	m.status.Created += created
-	m.status.Updated += updated
 	m.status.DuplicatesSkipped += len(nodes) - len(inputs)
 	m.mu.Unlock()
-	return m.store.CommitSnapshot(ctx, sub.ID, inputs, store.SubscriptionSnapshot{
+	if err := m.store.CommitSnapshot(ctx, sub.ID, inputs, store.SubscriptionSnapshot{
 		Attempt: attempt, Success: time.Now().UTC(), ETag: etag, LastModified: lastModified,
-	})
+	}); err != nil {
+		return err
+	}
+	// Count a logical in-place replacement as an update rather than a newly
+	// created node. This keeps refresh statistics aligned with the diff that was
+	// actually committed.
+	afterNodes, err := m.store.ListNodes(ctx, store.NodeFilter{})
+	if err != nil {
+		// The snapshot is already committed. A secondary statistics read must
+		// not turn a successful refresh into a reported failure or suppress the
+		// runtime reconciliation that follows it.
+		m.logger.Warnf("count committed subscription %d diff: %v", sub.ID, err)
+		created, updated := 0, 0
+		for _, input := range inputs {
+			if _, existed := existingIdentities[input.IdentityHash]; existed {
+				updated++
+			} else {
+				created++
+			}
+		}
+		m.mu.Lock()
+		m.status.Created += created
+		m.status.Updated += updated
+		m.mu.Unlock()
+		return nil
+	}
+	beforeIDs := make(map[int64]struct{}, len(existingNodes))
+	for _, existing := range existingNodes {
+		beforeIDs[existing.ID] = struct{}{}
+	}
+	afterByIdentity := make(map[string]int64, len(afterNodes))
+	for _, node := range afterNodes {
+		afterByIdentity[node.IdentityHash] = node.ID
+	}
+	created, updated := 0, 0
+	for _, input := range inputs {
+		if _, existed := existingIdentities[input.IdentityHash]; existed {
+			updated++
+			continue
+		}
+		if nodeID := afterByIdentity[input.IdentityHash]; nodeID != 0 {
+			if _, reused := beforeIDs[nodeID]; reused {
+				updated++
+				continue
+			}
+		}
+		created++
+	}
+	m.mu.Lock()
+	m.status.Created += created
+	m.status.Updated += updated
+	m.mu.Unlock()
+	return nil
 }
 
 func (m *Manager) fetchSubscription(parent context.Context, rawURL string, timeout time.Duration) ([]config.NodeConfig, string, string, error) {

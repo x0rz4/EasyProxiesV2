@@ -272,8 +272,12 @@ type SubscriptionNode struct {
 // SubscriptionNodeInput contains the node data required to commit a snapshot.
 // Enabled is only used when a URI is first inserted; existing node state wins.
 type SubscriptionNodeInput struct {
-	URI           string `json:"uri"`
-	Name          string `json:"name"`
+	URI  string `json:"uri"`
+	Name string `json:"name"`
+	// LogicalName is the provider-supplied display name used to reconcile a
+	// connection change within one subscription. It is intentionally empty for
+	// generated fallback names so reordered anonymous nodes are never merged.
+	LogicalName   string `json:"-"`
 	Port          uint16 `json:"port"`
 	Username      string `json:"username,omitempty"`
 	Password      string `json:"password,omitempty"`

@@ -196,6 +196,136 @@ func TestCommitSnapshotMergesAndRetainsMissingNodes(t *testing.T) {
 	}
 }
 
+func TestCommitSnapshotReconcilesUniqueLogicalNodeInPlace(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "logical-replace.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	sub := &Subscription{Name: "home", URL: "https://home.example/sub", Enabled: true}
+	if err := db.CreateSubscription(ctx, sub); err != nil {
+		t.Fatal(err)
+	}
+
+	const logicalName = "lite-家庭宽带-香港hgc"
+	oldInput := SubscriptionNodeInput{
+		URI: "http://old-user:old-pass@old.example:3129", Name: logicalName,
+		LogicalName: logicalName, Port: 24038, Region: "hk", Enabled: true,
+	}
+	if err := db.CommitSnapshot(ctx, sub.ID, []SubscriptionNodeInput{oldInput}, SubscriptionSnapshot{Attempt: time.Now(), Success: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	oldNode, err := db.GetNodeByURI(ctx, oldInput.URI)
+	if err != nil || oldNode == nil {
+		t.Fatalf("old node=%+v err=%v", oldNode, err)
+	}
+	oldNode.Enabled = false
+	if err := db.UpdateNode(ctx, oldNode); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertNodeStats(ctx, &NodeStats{NodeID: oldNode.ID, SuccessCount: 8, LastLatencyMs: 66}); err != nil {
+		t.Fatal(err)
+	}
+	group := &GroupPool{
+		Name: "HK", BindAddress: "127.0.0.1", BindPort: 10088, Protocol: "mixed", DispatchMode: "fixed",
+		ExplicitNodeIDs: []int64{oldNode.ID}, CurrentActiveNodeID: oldNode.ID, Enabled: true,
+	}
+	if err := db.CreateGroupPool(ctx, group); err != nil {
+		t.Fatal(err)
+	}
+
+	newInput := SubscriptionNodeInput{
+		URI: "http://new-user:new-pass@new.example:8080", Name: logicalName,
+		LogicalName: logicalName, Port: 24155, Region: "us", Enabled: true,
+	}
+	if err := db.CommitSnapshot(ctx, sub.ID, []SubscriptionNodeInput{newInput}, SubscriptionSnapshot{Attempt: time.Now(), Success: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	members, err := db.ListSubscriptionNodes(ctx, sub.ID)
+	if err != nil || len(members) != 1 {
+		t.Fatalf("members=%+v err=%v", members, err)
+	}
+	replaced := members[0].Node
+	if replaced.ID != oldNode.ID || replaced.URI != newInput.URI || replaced.Port != oldNode.Port || replaced.Enabled {
+		t.Fatalf("logical replacement did not preserve stable state: old=%+v new=%+v", oldNode, replaced)
+	}
+	if stale, _ := db.GetNodeByURI(ctx, oldInput.URI); stale != nil {
+		t.Fatalf("stale logical node was retained: %+v", stale)
+	}
+	stats, _ := db.GetNodeStats(ctx, oldNode.ID)
+	if stats == nil || stats.SuccessCount != 8 || stats.LastLatencyMs != 66 {
+		t.Fatalf("logical replacement lost stats: %+v", stats)
+	}
+	storedGroup, _ := db.GetGroupPool(ctx, group.ID)
+	if storedGroup == nil || storedGroup.CurrentActiveNodeID != oldNode.ID || len(storedGroup.ExplicitNodeIDs) != 1 || storedGroup.ExplicitNodeIDs[0] != oldNode.ID {
+		t.Fatalf("logical replacement lost group references: %+v", storedGroup)
+	}
+}
+
+func TestCommitSnapshotCleansAccumulatedLogicalDuplicatesUsingOldestNode(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "logical-cleanup.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	sub := &Subscription{Name: "legacy", URL: "https://legacy.example/sub", Enabled: true}
+	if err := db.CreateSubscription(ctx, sub); err != nil {
+		t.Fatal(err)
+	}
+	const logicalName = "lite-家庭宽带-香港hgc"
+	oldInput := SubscriptionNodeInput{URI: "http://first:pass@one.example:3129", Name: logicalName, Port: 24038, Enabled: true}
+	currentInput := SubscriptionNodeInput{URI: "http://second:pass@two.example:3129", Name: logicalName, Port: 24155, Enabled: true}
+	if err := db.CommitSnapshot(ctx, sub.ID, []SubscriptionNodeInput{oldInput}, SubscriptionSnapshot{Attempt: time.Now(), Success: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	oldNode, _ := db.GetNodeByURI(ctx, oldInput.URI)
+	if err := db.CommitSnapshot(ctx, sub.ID, []SubscriptionNodeInput{currentInput}, SubscriptionSnapshot{Attempt: time.Now(), Success: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := db.ListSubscriptionNodes(ctx, sub.ID)
+	if len(before) != 2 {
+		t.Fatalf("legacy setup did not contain two nodes: %+v", before)
+	}
+	currentInput.LogicalName = logicalName
+	if err := db.CommitSnapshot(ctx, sub.ID, []SubscriptionNodeInput{currentInput}, SubscriptionSnapshot{Attempt: time.Now(), Success: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := db.ListSubscriptionNodes(ctx, sub.ID)
+	if err != nil || len(after) != 1 {
+		t.Fatalf("logical duplicates were not cleaned: members=%+v err=%v", after, err)
+	}
+	if after[0].Node.ID != oldNode.ID || after[0].Node.Port != oldNode.Port || after[0].Node.URI != currentInput.URI {
+		t.Fatalf("oldest stable node was not reused: old=%+v current=%+v", oldNode, after[0].Node)
+	}
+}
+
+func TestCommitSnapshotKeepsDistinctIncomingNodesWithSameName(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "same-name.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	sub := &Subscription{Name: "same-name", URL: "https://same-name.example/sub", Enabled: true}
+	if err := db.CreateSubscription(ctx, sub); err != nil {
+		t.Fatal(err)
+	}
+	const logicalName = "provider-duplicate-name"
+	inputs := []SubscriptionNodeInput{
+		{URI: "http://one:pass@one.example:8080", Name: logicalName, LogicalName: logicalName, Enabled: true},
+		{URI: "http://two:pass@two.example:8080", Name: logicalName, LogicalName: logicalName, Enabled: true},
+	}
+	if err := db.CommitSnapshot(ctx, sub.ID, inputs, SubscriptionSnapshot{Attempt: time.Now(), Success: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	members, err := db.ListSubscriptionNodes(ctx, sub.ID)
+	if err != nil || len(members) != 2 {
+		t.Fatalf("legitimate same-name nodes were merged: members=%+v err=%v", members, err)
+	}
+}
+
 func TestDeleteSubscriptionPreservesExclusiveNodesAsManual(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(filepath.Join(t.TempDir(), "delete-preserve.db"))

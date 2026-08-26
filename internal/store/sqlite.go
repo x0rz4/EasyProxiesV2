@@ -641,6 +641,12 @@ func (s *sqliteStore) mergeSubscriptionNodes(ctx context.Context, subscriptionID
 	if len(nodes) == 0 {
 		return errors.New("subscription snapshot contains no nodes")
 	}
+	for index := range nodes {
+		prepareSubscriptionNodeIdentity(&nodes[index])
+	}
+	if err := s.reconcileSubscriptionLogicalNodes(ctx, subscriptionID, nodes); err != nil {
+		return err
+	}
 	// Move retained members behind the current snapshot. Members present in the
 	// new snapshot are upserted back to positions starting at zero below.
 	if _, err := s.conn().ExecContext(ctx, `UPDATE subscription_nodes SET position=position+?
@@ -648,6 +654,143 @@ func (s *sqliteStore) mergeSubscriptionNodes(ctx context.Context, subscriptionID
 		return fmt.Errorf("reorder retained subscription %d nodes: %w", subscriptionID, err)
 	}
 	return s.upsertSubscriptionNodes(ctx, subscriptionID, nodes)
+}
+
+type subscriptionLogicalCandidate struct {
+	id              int64
+	name            string
+	identityHash    string
+	source          string
+	membershipCount int
+}
+
+// reconcileSubscriptionLogicalNodes treats a unique provider-supplied name as
+// a stable logical slot inside one subscription. Providers frequently rotate
+// the endpoint or credentials without changing that name; without this pass,
+// the new semantic identity would be appended forever while the old listener
+// and group references remained active.
+//
+// Reconciliation is deliberately conservative: a name must occur exactly once
+// in the incoming snapshot, and only subscription-owned nodes exclusive to this
+// subscription may be rewritten or merged. Legitimate same-name endpoints and
+// nodes shared by multiple subscriptions are left untouched.
+func (s *sqliteStore) reconcileSubscriptionLogicalNodes(ctx context.Context, subscriptionID int64, nodes []SubscriptionNodeInput) error {
+	if s.tx == nil {
+		return errors.New("logical subscription reconciliation requires a transaction")
+	}
+	incomingCounts := make(map[string]int, len(nodes))
+	incomingByName := make(map[string]SubscriptionNodeInput, len(nodes))
+	for _, node := range nodes {
+		logicalName := normalizeSubscriptionLogicalName(node.LogicalName)
+		if logicalName == "" {
+			continue
+		}
+		incomingCounts[logicalName]++
+		incomingByName[logicalName] = node
+	}
+
+	rows, err := s.conn().QueryContext(ctx, `SELECT n.id,n.name,n.identity_hash,n.source,
+		(SELECT COUNT(*) FROM subscription_nodes memberships WHERE memberships.node_id=n.id)
+		FROM subscription_nodes current_membership
+		JOIN nodes n ON n.id=current_membership.node_id
+		WHERE current_membership.subscription_id=? ORDER BY n.id`, subscriptionID)
+	if err != nil {
+		return fmt.Errorf("list logical nodes for subscription %d: %w", subscriptionID, err)
+	}
+	candidatesByName := make(map[string][]subscriptionLogicalCandidate)
+	for rows.Next() {
+		var candidate subscriptionLogicalCandidate
+		if err := rows.Scan(&candidate.id, &candidate.name, &candidate.identityHash, &candidate.source, &candidate.membershipCount); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan logical node for subscription %d: %w", subscriptionID, err)
+		}
+		logicalName := normalizeSubscriptionLogicalName(candidate.name)
+		if logicalName != "" {
+			candidatesByName[logicalName] = append(candidatesByName[logicalName], candidate)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	for logicalName, input := range incomingByName {
+		if incomingCounts[logicalName] != 1 {
+			continue
+		}
+		eligible := make([]subscriptionLogicalCandidate, 0, len(candidatesByName[logicalName]))
+		for _, candidate := range candidatesByName[logicalName] {
+			if candidate.source == NodeSourceSubscription && candidate.membershipCount == 1 {
+				eligible = append(eligible, candidate)
+			}
+		}
+		if len(eligible) == 0 {
+			continue
+		}
+
+		var targetID int64
+		err := s.conn().QueryRowContext(ctx, "SELECT id FROM nodes WHERE identity_hash=?", input.IdentityHash).Scan(&targetID)
+		if err != nil && err != sql.ErrNoRows {
+			return fmt.Errorf("resolve current identity for %q: %w", input.Name, err)
+		}
+		targetIsEligible := false
+		for _, candidate := range eligible {
+			if candidate.id == targetID {
+				targetIsEligible = true
+				break
+			}
+		}
+		if targetID == 0 || targetIsEligible {
+			// Reuse the oldest exclusive node so its port, admin state,
+			// statistics and group references stay attached to a stable ID. If
+			// a later duplicate already owns the incoming identity, merge it
+			// first; deleting it releases the unique hash before the update.
+			targetID = eligible[0].id
+			for _, candidate := range eligible[1:] {
+				if err := mergeNodeReferences(s.tx, targetID, candidate.id); err != nil {
+					return fmt.Errorf("merge stale logical node %d into %d: %w", candidate.id, targetID, err)
+				}
+			}
+			if _, err := s.conn().ExecContext(ctx, `UPDATE nodes SET uri=?,name=?,username=?,password=?,
+				region=CASE WHEN ?<>'' THEN ? ELSE region END,
+				country=CASE WHEN ?<>'' THEN ? ELSE country END,
+				identity_hash=?,canonical_json=?,updated_at=? WHERE id=?`,
+				input.URI, input.Name, input.Username, input.Password,
+				input.Region, input.Region, input.Country, input.Country,
+				input.IdentityHash, input.CanonicalJSON, formatTime(time.Now().UTC()), targetID); err != nil {
+				return fmt.Errorf("update logical subscription node %d: %w", targetID, err)
+			}
+			continue
+		}
+
+		// The current identity already exists (including legacy accumulated
+		// duplicates). Merge every stale exclusive copy into it so explicit
+		// group membership, current selection and statistics follow the winner.
+		for _, candidate := range eligible {
+			if candidate.id == targetID {
+				continue
+			}
+			if err := mergeNodeReferences(s.tx, targetID, candidate.id); err != nil {
+				return fmt.Errorf("merge stale logical node %d into %d: %w", candidate.id, targetID, err)
+			}
+		}
+	}
+	return nil
+}
+
+func normalizeSubscriptionLogicalName(value string) string {
+	return strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(value)), " "))
+}
+
+func prepareSubscriptionNodeIdentity(node *SubscriptionNodeInput) {
+	if node.IdentityHash != "" {
+		return
+	}
+	identity, identityErr := nodecodec.ParseURI(node.URI)
+	if identityErr != nil {
+		node.IdentityHash = nodecodec.FallbackHash(node.URI)
+		return
+	}
+	node.IdentityHash, node.CanonicalJSON = identity.Hash, identity.CanonicalJSON
 }
 
 func (s *sqliteStore) requireSubscription(ctx context.Context, subscriptionID int64) error {
@@ -664,14 +807,7 @@ func (s *sqliteStore) requireSubscription(ctx context.Context, subscriptionID in
 func (s *sqliteStore) upsertSubscriptionNodes(ctx context.Context, subscriptionID int64, nodes []SubscriptionNodeInput) error {
 	now := formatTime(time.Now().UTC())
 	for position, node := range nodes {
-		if node.IdentityHash == "" {
-			identity, identityErr := nodecodec.ParseURI(node.URI)
-			if identityErr != nil {
-				node.IdentityHash = nodecodec.FallbackHash(node.URI)
-			} else {
-				node.IdentityHash, node.CanonicalJSON = identity.Hash, identity.CanonicalJSON
-			}
-		}
+		prepareSubscriptionNodeIdentity(&node)
 		_, err := s.conn().ExecContext(ctx, `INSERT INTO nodes
 			(uri, name, source, port, username, password, region, country, enabled, identity_hash, canonical_json, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)

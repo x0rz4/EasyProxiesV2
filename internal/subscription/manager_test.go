@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -181,6 +182,56 @@ func TestChangedSubscriptionURLMergesOldAndNewNodes(t *testing.T) {
 	afterEmpty, err := mgr.Nodes(context.Background(), sub.ID)
 	if err != nil || len(afterEmpty) != 3 {
 		t.Fatalf("empty refresh changed members=%+v err=%v", afterEmpty, err)
+	}
+}
+
+func TestRefreshDiffReusesUniqueProviderNodeName(t *testing.T) {
+	var revision atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if revision.Load() == 0 {
+			_, _ = w.Write([]byte("http://old-user:old-pass@old.example:3129#lite-家庭宽带-香港hgc"))
+			return
+		}
+		_, _ = w.Write([]byte("http://new-user:new-pass@new.example:8080#lite-家庭宽带-香港hgc"))
+	}))
+	defer server.Close()
+	db, err := store.Open(filepath.Join(t.TempDir(), "logical-refresh.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	cfg := &config.Config{}
+	cfg.SubscriptionRefresh.Interval = time.Hour
+	cfg.SubscriptionRefresh.Timeout = time.Second
+	mgr := New(cfg, nil, WithStore(db), WithHTTPClient(server.Client()))
+	defer mgr.Stop()
+	sub, err := mgr.Create(context.Background(), store.Subscription{Name: "logical", URL: server.URL, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.RefreshOne(context.Background(), sub.ID); err != nil {
+		t.Fatal(err)
+	}
+	first, err := mgr.Nodes(context.Background(), sub.ID)
+	if err != nil || len(first) != 1 {
+		t.Fatalf("first members=%+v err=%v", first, err)
+	}
+	firstID := first[0].Node.ID
+
+	revision.Store(1)
+	if err := mgr.RefreshOne(context.Background(), sub.ID); err != nil {
+		t.Fatal(err)
+	}
+	second, err := mgr.Nodes(context.Background(), sub.ID)
+	if err != nil || len(second) != 1 {
+		t.Fatalf("logical refresh appended a duplicate: members=%+v err=%v", second, err)
+	}
+	if second[0].Node.ID != firstID || second[0].Node.URI != "http://new-user:new-pass@new.example:8080#lite-家庭宽带-香港hgc" {
+		t.Fatalf("logical refresh did not reuse the node: first=%+v second=%+v", first[0].Node, second[0].Node)
+	}
+	status := mgr.Status()
+	if status.Created != 0 || status.Updated != 1 {
+		t.Fatalf("logical refresh status=%+v", status)
 	}
 }
 
