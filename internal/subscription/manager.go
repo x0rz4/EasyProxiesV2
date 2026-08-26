@@ -36,10 +36,15 @@ func WithHTTPClient(c *http.Client) Option { return func(m *Manager) { m.httpCli
 var _ boxmgr.ConfigUpdateListener = (*Manager)(nil)
 var _ monitor.SubscriptionRefresher = (*Manager)(nil)
 
+type runtimeManager interface {
+	ReloadWithPortMap(newCfg *config.Config, portMap map[string]uint16) error
+	CurrentPortMap() map[string]uint16
+}
+
 type Manager struct {
 	mu         sync.RWMutex
 	baseCfg    *config.Config
-	boxMgr     *boxmgr.Manager
+	boxMgr     runtimeManager
 	logger     Logger
 	httpClient *http.Client
 	store      store.Store
@@ -49,7 +54,7 @@ type Manager struct {
 	refreshMu  sync.Mutex
 }
 
-func New(cfg *config.Config, boxMgr *boxmgr.Manager, opts ...Option) *Manager {
+func New(cfg *config.Config, boxMgr runtimeManager, opts ...Option) *Manager {
 	ctx, cancel := context.WithCancel(context.Background())
 	transport := &http.Transport{
 		Proxy:             http.ProxyFromEnvironment,
@@ -493,6 +498,15 @@ func (m *Manager) reconcileRuntime(ctx context.Context) error {
 	newCfg := m.baseCfg.Clone()
 	m.mu.RUnlock()
 	newCfg.Nodes = all
+	// Group definitions and their explicit/excluded node relationships are
+	// persisted independently from config.yaml. Always hydrate them from the
+	// store immediately before reload so a stale subscription config snapshot
+	// can never make BoxManager stop or roll back an existing group runtime.
+	groups, err := m.store.ListGroupPools(ctx)
+	if err != nil {
+		return fmt.Errorf("list groups for runtime reconciliation: %w", err)
+	}
+	newCfg.Groups = boxmgr.GroupConfigsFromStore(groups)
 	if err := m.boxMgr.ReloadWithPortMap(newCfg, m.boxMgr.CurrentPortMap()); err != nil {
 		return fmt.Errorf("reload runtime: %w", err)
 	}

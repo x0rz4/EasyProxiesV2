@@ -137,6 +137,28 @@ func TestGroupRuntimeTopologyOnlyChangesForAffectedMembers(t *testing.T) {
 	}
 }
 
+func TestGroupConfigsFromStorePreservesDetachedMembership(t *testing.T) {
+	stored := []store.GroupPool{{
+		ID: 7, Name: "persisted", Regions: []string{"hk"}, ExplicitNodeIDs: []int64{11, 12},
+		ExcludedNodeIDs: []int64{13}, Enabled: true,
+		NodeStates: []store.GroupNodeState{{NodeID: 11, FailureHistory: []int64{1, 2}}},
+	}}
+	converted := GroupConfigsFromStore(stored)
+	if len(converted) != 1 || len(converted[0].ExplicitNodeIDs) != 2 ||
+		len(converted[0].ExcludedNodeIDs) != 1 || converted[0].ExcludedNodeIDs[0] != 13 {
+		t.Fatalf("group membership was not converted: %+v", converted)
+	}
+
+	converted[0].Regions[0] = "us"
+	converted[0].ExplicitNodeIDs[0] = 99
+	converted[0].ExcludedNodeIDs[0] = 98
+	converted[0].NodeStates[0].FailureHistory[0] = 9
+	if stored[0].Regions[0] != "hk" || stored[0].ExplicitNodeIDs[0] != 11 ||
+		stored[0].ExcludedNodeIDs[0] != 13 || stored[0].NodeStates[0].FailureHistory[0] != 1 {
+		t.Fatalf("runtime conversion aliases persisted membership: stored=%+v", stored[0])
+	}
+}
+
 func TestForcedTopologyUpdateDoesNotKeepRemovedNodeRuntime(t *testing.T) {
 	group.Reset()
 	defer group.Reset()

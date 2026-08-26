@@ -345,24 +345,7 @@ func loadGroupsFromStore(ctx context.Context, cfg *config.Config, s store.Store)
 	if err != nil {
 		return err
 	}
-	cfg.Groups = make([]config.GroupPoolConfig, 0, len(groups))
-	for _, group := range groups {
-		converted := config.GroupPoolConfig{ID: group.ID, Name: group.Name, BindAddress: group.BindAddress,
-			BindPort: group.BindPort, Protocol: group.Protocol, Username: group.Username, Password: group.Password,
-			DispatchMode: group.DispatchMode, Regions: group.Regions, ExplicitNodeIDs: group.ExplicitNodeIDs,
-			ExcludedNodeIDs:  group.ExcludedNodeIDs,
-			FailureWindow:    time.Duration(group.FailureWindowSeconds) * time.Second,
-			FailureThreshold: group.FailureThreshold, HealthCheckInterval: time.Duration(group.HealthCheckSeconds) * time.Second,
-			CurrentActiveNodeID: group.CurrentActiveNodeID, Enabled: group.Enabled,
-			SubscriptionEnabled: group.SubscriptionEnabled, SubscriptionToken: group.SubscriptionToken,
-			SubscriptionMode: group.SubscriptionMode, ExternalHost: group.ExternalHost,
-			CreatedAt: group.CreatedAt, UpdatedAt: group.UpdatedAt}
-		for _, state := range group.NodeStates {
-			converted.NodeStates = append(converted.NodeStates, config.GroupNodeStateConfig{NodeID: state.NodeID,
-				FailureHistory: state.FailureHistory, Evicted: state.Evicted, LastError: state.LastError, EvictedAt: state.EvictedAt})
-		}
-		cfg.Groups = append(cfg.Groups, converted)
-	}
+	cfg.Groups = boxmgr.GroupConfigsFromStore(groups)
 	return nil
 }
 

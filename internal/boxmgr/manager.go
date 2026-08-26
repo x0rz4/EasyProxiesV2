@@ -793,7 +793,7 @@ func (m *Manager) configWithGroup(groupPool *store.GroupPool) *config.Config {
 		}
 	}
 	if groupPool != nil {
-		groups = append(groups, groupConfigsFromStore([]store.GroupPool{*groupPool})[0])
+		groups = append(groups, GroupConfigsFromStore([]store.GroupPool{*groupPool})[0])
 	}
 	cfg.Groups = groups
 	return cfg
@@ -812,7 +812,7 @@ func (m *Manager) replaceCachedGroup(groupPool *store.GroupPool) {
 		}
 	}
 	if groupPool != nil {
-		groups = append(groups, groupConfigsFromStore([]store.GroupPool{*groupPool})[0])
+		groups = append(groups, GroupConfigsFromStore([]store.GroupPool{*groupPool})[0])
 	}
 	m.cfg.Groups = groups
 }
@@ -1419,7 +1419,7 @@ func (m *Manager) TriggerReload(ctx context.Context) error {
 		if err != nil {
 			m.logger.Warnf("failed to list group pools during reload: %v", err)
 		} else {
-			newCfg.Groups = groupConfigsFromStore(groups)
+			newCfg.Groups = GroupConfigsFromStore(groups)
 		}
 	}
 
@@ -1445,12 +1445,18 @@ func (m *Manager) TriggerReload(ctx context.Context) error {
 	return m.ReloadWithPortMap(newCfg, portMap)
 }
 
-func groupConfigsFromStore(groups []store.GroupPool) []config.GroupPoolConfig {
+// GroupConfigsFromStore converts the persisted group definitions into a
+// detached runtime snapshot. SQLite is the source of truth for group
+// membership, so callers rebuilding the base topology should use this helper
+// instead of carrying a potentially stale cached Groups slice forward.
+func GroupConfigsFromStore(groups []store.GroupPool) []config.GroupPoolConfig {
 	result := make([]config.GroupPoolConfig, 0, len(groups))
 	for _, group := range groups {
 		converted := config.GroupPoolConfig{ID: group.ID, Name: group.Name, BindAddress: group.BindAddress,
 			BindPort: group.BindPort, Protocol: group.Protocol, Username: group.Username, Password: group.Password,
-			DispatchMode: group.DispatchMode, Regions: group.Regions, ExplicitNodeIDs: group.ExplicitNodeIDs,
+			DispatchMode: group.DispatchMode, Regions: append([]string(nil), group.Regions...),
+			ExplicitNodeIDs:  append([]int64(nil), group.ExplicitNodeIDs...),
+			ExcludedNodeIDs:  append([]int64(nil), group.ExcludedNodeIDs...),
 			FailureWindow:    time.Duration(group.FailureWindowSeconds) * time.Second,
 			FailureThreshold: group.FailureThreshold, HealthCheckInterval: time.Duration(group.HealthCheckSeconds) * time.Second,
 			CurrentActiveNodeID: group.CurrentActiveNodeID, Enabled: group.Enabled,
@@ -1459,7 +1465,8 @@ func groupConfigsFromStore(groups []store.GroupPool) []config.GroupPoolConfig {
 			CreatedAt: group.CreatedAt, UpdatedAt: group.UpdatedAt}
 		for _, state := range group.NodeStates {
 			converted.NodeStates = append(converted.NodeStates, config.GroupNodeStateConfig{NodeID: state.NodeID,
-				FailureHistory: state.FailureHistory, Evicted: state.Evicted, LastError: state.LastError, EvictedAt: state.EvictedAt})
+				FailureHistory: append([]int64(nil), state.FailureHistory...), Evicted: state.Evicted,
+				LastError: state.LastError, EvictedAt: state.EvictedAt})
 		}
 		result = append(result, converted)
 	}
