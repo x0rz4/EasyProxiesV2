@@ -343,8 +343,8 @@ func TestRefreshKeepsBoundGroupRuntimeListening(t *testing.T) {
 	if err := db.CreateGroupPool(ctx, groupPool); err != nil {
 		t.Fatal(err)
 	}
-	runtimeCfg := &config.Config{Mode: "pool", LogLevel: "error",
-		Listener: config.ListenerConfig{Address: "127.0.0.1", Port: ports[0], Protocol: "http"},
+	runtimeCfg := &config.Config{LogLevel: "error",
+		Listener: config.ListenerConfig{Enabled: true, Address: "127.0.0.1", Port: ports[0], Protocol: "http"},
 		Pool:     config.PoolConfig{Mode: "sequential", FailureThreshold: 3, BlacklistDuration: time.Minute},
 		Nodes:    []config.NodeConfig{{ID: boundNode.ID, Name: boundNode.Name, URI: boundNode.URI}},
 		Groups:   boxmgr.GroupConfigsFromStore([]store.GroupPool{*groupPool}),

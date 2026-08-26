@@ -100,9 +100,10 @@ cp ./config.example.yaml ./config.yaml
 
 配置模板见 `config.example.yaml`，重点关注：
 
-- `mode`: `pool` / `multi-port` / `hybrid`
-- `listener`: 代理入口监听与认证（新增 `listener.protocol`: `http` / `socks5` / `mixed`）
-- `multi_port`: 多端口入口参数（新增 `multi_port.protocol`: `http` / `socks5` / `mixed`）
+- `listener.enabled`: 是否创建共享 Pool 入口，默认 `false`
+- `listener`: Pool 入口监听、协议与认证参数
+- `multi_port.enabled`: 是否为每个节点创建独立入口，默认 `false`；节点较多时建议关闭
+- `multi_port`: 每节点入口的监听、协议与默认认证参数
 - `management.listen`: Web 管理面板地址（默认 `0.0.0.0:9888`）
 - `management.password`: 面板登录密码（为空则不需要登录）
 - `subscriptions` / `nodes_file` / `nodes`: 节点来源（三选一或混用）
@@ -138,7 +139,7 @@ cd easy-proxies
 curl -L https://raw.githubusercontent.com/xiamuceer-j/EasyProxiesV2/main/config.example.yaml -o config.yaml
 ```
 
-编辑 `config.yaml`，至少确认代理模式、订阅地址、监听端口及管理密码。默认管理面板监听 `0.0.0.0:9888`。
+编辑 `config.yaml`，至少确认订阅地址、需要启用的入口开关及管理密码。默认两类基础代理入口均关闭，管理面板仍监听 `0.0.0.0:9888`。
 
 ### 2) 拉取镜像
 
@@ -176,7 +177,7 @@ docker run -d \
   mumujie/easy_proxies:latest
 ```
 
-只使用 `pool` 模式时无需映射 `24000-24200`；多端口范围应与 `config.yaml` 中的配置保持一致。
+仅当 `listener.enabled: true` 时需映射 `2323`；仅当 `multi_port.enabled: true` 时需映射每节点端口范围，并与 `config.yaml` 保持一致。
 
 ### 4) 查看状态
 
@@ -184,7 +185,7 @@ docker run -d \
 docker logs -f easy-proxies
 ```
 
-浏览器访问 `http://<服务器IP>:9888` 打开管理面板。代理池默认入口为 `http://<服务器IP>:2323`。
+浏览器访问 `http://<服务器IP>:9888` 打开管理面板。如需共享 Pool 入口，先设置 `listener.enabled: true`，默认端口为 `2323`。
 
 ### 5) 更新镜像
 

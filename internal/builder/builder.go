@@ -87,13 +87,14 @@ func Build(cfg *config.Config) (option.Options, error) {
 			NodeID: node.ID,
 			Name:   node.Name,
 			URI:    node.URI,
-			Mode:   cfg.Mode,
+			Mode:   cfg.EntryMode(),
 		}
-		// For multi-port and hybrid modes, use per-node port
-		if cfg.Mode == "multi-port" || cfg.Mode == "hybrid" {
+		// Prefer the concrete per-node entry when it exists; otherwise expose the
+		// shared pool entry. Disabled entries intentionally have no listen address.
+		if cfg.MultiPort.Enabled {
 			meta.ListenAddress = cfg.MultiPort.Address
 			meta.Port = node.Port
-		} else {
+		} else if cfg.Listener.Enabled {
 			meta.ListenAddress = cfg.Listener.Address
 			meta.Port = cfg.Listener.Port
 		}
@@ -160,21 +161,23 @@ func Build(cfg *config.Config) (option.Options, error) {
 	)
 	copy(outbounds, baseOutbounds)
 
-	// Determine which components to enable based on mode
-	enablePoolInbound := cfg.Mode == "pool" || cfg.Mode == "hybrid"
-	enableMultiPort := cfg.Mode == "multi-port" || cfg.Mode == "hybrid"
+	// The shared pool and per-node listeners are independent and may both be disabled.
+	// Keep one shared pool without an inbound when both entry types are disabled so
+	// node monitoring and health checks continue to run. A multi-port-only runtime
+	// already registers every node through its per-node pools.
+	enablePoolInbound := cfg.Listener.Enabled
+	enableMultiPort := cfg.MultiPort.Enabled
+	buildSharedPool := enablePoolInbound || !enableMultiPort
 
-	if !enablePoolInbound && !enableMultiPort {
-		return option.Options{}, fmt.Errorf("unsupported mode %s", cfg.Mode)
-	}
-
-	// Build pool inbound (single entry point for all nodes)
+	// Build the optional shared pool inbound (single entry point for all nodes).
 	if enablePoolInbound {
 		inbound, err := buildPoolInbound(cfg)
 		if err != nil {
 			return option.Options{}, err
 		}
 		inbounds = append(inbounds, inbound)
+	}
+	if buildSharedPool {
 		poolOptions := poolout.Options{
 			Mode:              cfg.Pool.Mode,
 			Members:           memberTags,
@@ -413,6 +416,8 @@ func BuildBase(cfg *config.Config) (option.Options, error) {
 // outbounds on which that pool depends.
 func BuildGroup(cfg *config.Config, groupID int64) (option.Options, error) {
 	groupCfg := cfg.Clone()
+	groupCfg.Listener.Enabled = false
+	groupCfg.MultiPort.Enabled = false
 	groupCfg.Groups = nil
 	for _, candidate := range cfg.Groups {
 		if candidate.ID == groupID {
@@ -1250,8 +1255,12 @@ func printProxyLinks(cfg *config.Config, metadata map[string]poolout.MemberMeta)
 	log.Println("📡 Proxy Links:")
 	log.Println("═══════════════════════════════════════════════════════════════")
 
-	showPoolEntry := cfg.Mode == "pool" || cfg.Mode == "hybrid"
-	showMultiPort := cfg.Mode == "multi-port" || cfg.Mode == "hybrid"
+	showPoolEntry := cfg.Listener.Enabled
+	showMultiPort := cfg.MultiPort.Enabled
+	if !showPoolEntry && !showMultiPort {
+		log.Println("🔒 Pool and multi-port entry points are disabled")
+		return
+	}
 
 	if showPoolEntry {
 		// Pool mode: single entry point for all nodes

@@ -344,12 +344,12 @@ func (s *Server) SetConfig(cfg *config.Config) {
 // allSettingsResponse is the JSON structure for GET /api/settings.
 type allSettingsResponse struct {
 	// Global
-	Mode           string `json:"mode"`
 	LogLevel       string `json:"log_level"`
 	ExternalIP     string `json:"external_ip"`
 	SkipCertVerify bool   `json:"skip_cert_verify"`
 
 	// Listener
+	ListenerEnabled  bool   `json:"listener_enabled"`
 	ListenerAddress  string `json:"listener_address"`
 	ListenerPort     uint16 `json:"listener_port"`
 	ListenerProtocol string `json:"listener_protocol"`
@@ -357,6 +357,7 @@ type allSettingsResponse struct {
 	ListenerPassword string `json:"listener_password"`
 
 	// Multi-port
+	MultiPortEnabled  bool   `json:"multi_port_enabled"`
 	MultiPortAddress  string `json:"multi_port_address"`
 	MultiPortBasePort uint16 `json:"multi_port_base_port"`
 	MultiPortProtocol string `json:"multi_port_protocol"`
@@ -396,12 +397,12 @@ type allSettingsResponse struct {
 // allSettingsRequest is the JSON structure for PUT /api/settings.
 type allSettingsRequest struct {
 	// Global
-	Mode           string `json:"mode"`
 	LogLevel       string `json:"log_level"`
 	ExternalIP     string `json:"external_ip"`
 	SkipCertVerify bool   `json:"skip_cert_verify"`
 
 	// Listener
+	ListenerEnabled  bool   `json:"listener_enabled"`
 	ListenerAddress  string `json:"listener_address"`
 	ListenerPort     uint16 `json:"listener_port"`
 	ListenerProtocol string `json:"listener_protocol"`
@@ -409,6 +410,7 @@ type allSettingsRequest struct {
 	ListenerPassword string `json:"listener_password"`
 
 	// Multi-port
+	MultiPortEnabled  bool   `json:"multi_port_enabled"`
 	MultiPortAddress  string `json:"multi_port_address"`
 	MultiPortBasePort uint16 `json:"multi_port_base_port"`
 	MultiPortProtocol string `json:"multi_port_protocol"`
@@ -463,17 +465,18 @@ func (s *Server) getAllSettings() allSettingsResponse {
 	}
 
 	return allSettingsResponse{
-		Mode:           c.Mode,
 		LogLevel:       c.LogLevel,
 		ExternalIP:     c.ExternalIP,
 		SkipCertVerify: c.SkipCertVerify,
 
+		ListenerEnabled:  c.Listener.Enabled,
 		ListenerAddress:  c.Listener.Address,
 		ListenerPort:     c.Listener.Port,
 		ListenerProtocol: c.Listener.Protocol,
 		ListenerUsername: c.Listener.Username,
 		ListenerPassword: c.Listener.Password,
 
+		MultiPortEnabled:  c.MultiPort.Enabled,
 		MultiPortAddress:  c.MultiPort.Address,
 		MultiPortBasePort: c.MultiPort.BasePort,
 		MultiPortProtocol: c.MultiPort.Protocol,
@@ -510,7 +513,7 @@ func (s *Server) getAllSettings() allSettingsResponse {
 func (s *Server) updateAllSettings(ctx context.Context, req allSettingsRequest) (SettingsUpdateResult, error) {
 	// Validate request before applying
 	if err := config.ValidateSettingsRequest(
-		req.Mode, req.ListenerPort, req.MultiPortBasePort,
+		req.ListenerEnabled, req.MultiPortEnabled, req.ListenerPort, req.MultiPortBasePort,
 		req.ListenerProtocol, req.MultiPortProtocol,
 		req.PoolBlacklistDuration, req.SubRefreshInterval, req.SubRefreshTimeout,
 		req.SubRefreshHealthCheckTimeout, req.SubRefreshDrainTimeout,
@@ -531,12 +534,12 @@ func (s *Server) updateAllSettings(ctx context.Context, req allSettingsRequest) 
 	c = updated
 
 	// Global
-	c.Mode = req.Mode
 	c.LogLevel = req.LogLevel
 	c.ExternalIP = strings.TrimSpace(req.ExternalIP)
 	c.SkipCertVerify = req.SkipCertVerify
 
 	// Listener
+	c.Listener.Enabled = req.ListenerEnabled
 	c.Listener.Address = req.ListenerAddress
 	c.Listener.Port = req.ListenerPort
 	if p, err := config.NormalizeInboundProtocol(req.ListenerProtocol); err == nil {
@@ -546,6 +549,7 @@ func (s *Server) updateAllSettings(ctx context.Context, req allSettingsRequest) 
 	c.Listener.Password = req.ListenerPassword
 
 	// Multi-port
+	c.MultiPort.Enabled = req.MultiPortEnabled
 	c.MultiPort.Address = req.MultiPortAddress
 	c.MultiPort.BasePort = req.MultiPortBasePort
 	if p, err := config.NormalizeInboundProtocol(req.MultiPortProtocol); err == nil {
@@ -3017,9 +3021,13 @@ func (s *Server) allocateGroupPort(ctx context.Context) (uint16, error) {
 	s.cfgMu.RUnlock()
 	if cfg != nil {
 		cfg.RLock()
-		used[cfg.Listener.Port] = struct{}{}
-		for _, node := range cfg.Nodes {
-			used[node.Port] = struct{}{}
+		if cfg.Listener.Enabled {
+			used[cfg.Listener.Port] = struct{}{}
+		}
+		if cfg.MultiPort.Enabled {
+			for _, node := range cfg.Nodes {
+				used[node.Port] = struct{}{}
+			}
 		}
 		cfg.RUnlock()
 	}
@@ -3055,14 +3063,16 @@ func (s *Server) validateGroupPort(ctx context.Context, address string, port uin
 	s.cfgMu.RUnlock()
 	if cfg != nil {
 		cfg.RLock()
-		if cfg.Listener.Port == port {
+		if cfg.Listener.Enabled && cfg.Listener.Port == port {
 			cfg.RUnlock()
 			return fmt.Errorf("端口 %d 与全局代理入口冲突", port)
 		}
-		for _, node := range cfg.Nodes {
-			if node.Port == port {
-				cfg.RUnlock()
-				return fmt.Errorf("端口 %d 与节点“%s”冲突", port, node.Name)
+		if cfg.MultiPort.Enabled {
+			for _, node := range cfg.Nodes {
+				if node.Port == port {
+					cfg.RUnlock()
+					return fmt.Errorf("端口 %d 与节点“%s”冲突", port, node.Name)
+				}
 			}
 		}
 		cfg.RUnlock()

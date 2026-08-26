@@ -14,7 +14,7 @@ import (
 )
 
 func TestRuntimeConfigEqual(t *testing.T) {
-	a := &config.Config{Mode: "pool", Nodes: []config.NodeConfig{{Name: "a", URI: "http://a.example:80"}}}
+	a := &config.Config{Nodes: []config.NodeConfig{{Name: "a", URI: "http://a.example:80"}}}
 	b := a.Clone()
 	if !runtimeConfigEqual(a, b) {
 		t.Fatal("equivalent configurations were considered different")
@@ -30,14 +30,61 @@ func TestRuntimeConfigEqual(t *testing.T) {
 	}
 }
 
+func TestReloadTogglesPoolEntryWithoutAffectingBaseRuntime(t *testing.T) {
+	port := reserveTCPPorts(t, 1)[0]
+	cfg := &config.Config{
+		Listener:            config.ListenerConfig{Address: "127.0.0.1", Port: port, Protocol: "http"},
+		Pool:                config.PoolConfig{Mode: "sequential", FailureThreshold: 3, BlacklistDuration: time.Minute},
+		Nodes:               []config.NodeConfig{{ID: 1, Name: "node", URI: "http://127.0.0.1:65530"}},
+		SubscriptionRefresh: config.SubscriptionRefreshConfig{HealthCheckTimeout: time.Millisecond},
+		LogLevel:            "error",
+	}
+	if err := cfg.NormalizeWithPortMap(nil); err != nil {
+		t.Fatal(err)
+	}
+	manager := New(cfg, monitor.Config{})
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	assertTCPNotListening(t, port)
+	snapshots := manager.monitorMgr.Snapshot()
+	if len(snapshots) != 1 || snapshots[0].Mode != "disabled" {
+		t.Fatalf("disabled entries did not retain node monitoring: %+v", snapshots)
+	}
+
+	enabled := cfg.Clone()
+	enabled.Listener.Enabled = true
+	if err := manager.ReloadWithPortMap(enabled, manager.CurrentPortMap()); err != nil {
+		t.Fatal(err)
+	}
+	assertTCPListening(t, port)
+
+	disabled := enabled.Clone()
+	disabled.Listener.Enabled = false
+	if err := manager.ReloadWithPortMap(disabled, manager.CurrentPortMap()); err != nil {
+		t.Fatal(err)
+	}
+	assertTCPNotListening(t, port)
+}
+
+func TestReassignConflictingPortRequiresMultiPort(t *testing.T) {
+	cfg := &config.Config{Nodes: []config.NodeConfig{{Name: "retained", Port: 2323}}}
+	if reassignConflictingPort(cfg, 2323) {
+		t.Fatal("disabled multi-port reassigned a retained node port")
+	}
+	if cfg.Nodes[0].Port != 2323 {
+		t.Fatalf("disabled multi-port changed retained port to %d", cfg.Nodes[0].Port)
+	}
+}
+
 func TestApplyGroupRuntimeDoesNotReplaceBaseOrSiblingRuntime(t *testing.T) {
 	group.Reset()
 	defer group.Reset()
 	ports := reserveTCPPorts(t, 3)
 	basePort, firstPort, secondPort := ports[0], ports[1], ports[2]
 	cfg := &config.Config{
-		Mode:     "pool",
-		Listener: config.ListenerConfig{Address: "127.0.0.1", Port: basePort, Protocol: "http"},
+		Listener: config.ListenerConfig{Enabled: true, Address: "127.0.0.1", Port: basePort, Protocol: "http"},
 		Pool:     config.PoolConfig{Mode: "fixed", FailureThreshold: 3, BlacklistDuration: time.Minute},
 		Nodes:    []config.NodeConfig{{ID: 1, Name: "node", URI: "http://127.0.0.1:65530", Region: "hk"}},
 		Groups: []config.GroupPoolConfig{
@@ -164,9 +211,9 @@ func TestForcedTopologyUpdateDoesNotKeepRemovedNodeRuntime(t *testing.T) {
 	defer group.Reset()
 	ports := reserveTCPPorts(t, 2)
 	cfg := &config.Config{
-		Mode: "pool", Listener: config.ListenerConfig{Address: "127.0.0.1", Port: ports[0], Protocol: "http"},
-		Pool:  config.PoolConfig{Mode: "fixed", FailureThreshold: 3, BlacklistDuration: time.Minute},
-		Nodes: []config.NodeConfig{{ID: 1, Name: "node", URI: "http://127.0.0.1:65530", Region: "hk"}},
+		Listener: config.ListenerConfig{Enabled: true, Address: "127.0.0.1", Port: ports[0], Protocol: "http"},
+		Pool:     config.PoolConfig{Mode: "fixed", FailureThreshold: 3, BlacklistDuration: time.Minute},
+		Nodes:    []config.NodeConfig{{ID: 1, Name: "node", URI: "http://127.0.0.1:65530", Region: "hk"}},
 		Groups: []config.GroupPoolConfig{{ID: 11, Name: "group", BindAddress: "127.0.0.1", BindPort: ports[1],
 			Protocol: "mixed", DispatchMode: "fixed", Regions: []string{"hk"}, FailureWindow: 5 * time.Minute,
 			FailureThreshold: 3, HealthCheckInterval: time.Minute, Enabled: true}}, LogLevel: "error",
@@ -218,6 +265,15 @@ func assertTCPListening(t *testing.T, port uint16) {
 		t.Fatalf("port %d is not listening: %v", port, err)
 	}
 	_ = connection.Close()
+}
+
+func assertTCPNotListening(t *testing.T, port uint16) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 100*time.Millisecond)
+	if err == nil {
+		_ = conn.Close()
+		t.Fatalf("port %d is unexpectedly listening", port)
+	}
 }
 
 func cloneStoreGroupForTest(value *store.GroupPool) *store.GroupPool {

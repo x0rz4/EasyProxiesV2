@@ -53,9 +53,12 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	// ── 3. Build monitor config ──
 	proxyUsername := cfg.Listener.Username
 	proxyPassword := cfg.Listener.Password
-	if cfg.Mode == "multi-port" || cfg.Mode == "hybrid" {
+	if !cfg.Listener.Enabled && cfg.MultiPort.Enabled {
 		proxyUsername = cfg.MultiPort.Username
 		proxyPassword = cfg.MultiPort.Password
+	} else if !cfg.Listener.Enabled {
+		proxyUsername = ""
+		proxyPassword = ""
 	}
 
 	monitorCfg := monitor.Config{

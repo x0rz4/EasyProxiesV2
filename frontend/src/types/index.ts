@@ -179,12 +179,12 @@ export interface DebugResponse {
 
 export interface SettingsData {
   // Global
-  mode: string
   log_level: string
   external_ip: string
   skip_cert_verify: boolean
 
   // Listener
+  listener_enabled: boolean
   listener_address: string
   listener_port: number
   listener_protocol: string
@@ -192,6 +192,7 @@ export interface SettingsData {
   listener_password: string
 
   // Multi-port
+  multi_port_enabled: boolean
   multi_port_address: string
   multi_port_base_port: number
   multi_port_protocol: string

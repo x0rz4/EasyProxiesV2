@@ -2,14 +2,6 @@
 # Easy Proxies 完整配置文件
 # ═══════════════════════════════════════════════════════════════
 
-# ───────────────────────────────────────────────────────────────
-# 运行模式
-# ───────────────────────────────────────────────────────────────
-# pool: 单端口代理池，所有节点共享一个端口，自动负载均衡
-# multi-port: 多端口模式，每个节点独立端口
-# hybrid: 混合模式，同时启用 pool + multi-port
-mode: pool
-
 # 日志级别: debug, info, warn, error
 log_level: info
 
@@ -24,9 +16,10 @@ skip_cert_verify: false
 # database_path: "data/data.db"
 
 # ───────────────────────────────────────────────────────────────
-# 监听配置（Pool 模式入口）
+# 共享 Pool 入口配置
 # ───────────────────────────────────────────────────────────────
 listener:
+  enabled: false        # 是否创建共享 Pool 入口；默认关闭
   address: 0.0.0.0      # 监听地址
   port: 2323            # 监听端口
   protocol: http        # 监听协议: http | socks5 | mixed
@@ -45,9 +38,10 @@ pool:
   blacklist_duration: 24h
 
 # ───────────────────────────────────────────────────────────────
-# 多端口模式配置（multi-port / hybrid 模式使用）
+# 每节点多端口入口配置
 # ───────────────────────────────────────────────────────────────
 multi_port:
+  enabled: false        # 是否为每个节点创建独立入口；节点较多时建议关闭
   address: 0.0.0.0      # 监听地址
   base_port: 24000      # 起始端口号
   protocol: http        # 监听协议: http | socks5 | mixed
@@ -125,7 +119,7 @@ subscriptions:
   # 完整配置：手动指定名称和端口
   # - name: "自定义名称"
   #   uri: "ss://base64@server:8388"
-  #   port: 24001              # 手动指定端口（multi-port/hybrid 模式）
+  #   port: 24001              # 手动指定端口（multi_port.enabled=true 时使用）
   #   username: "custom_user"  # 覆盖默认认证（可选）
   #   password: "custom_pass"
 

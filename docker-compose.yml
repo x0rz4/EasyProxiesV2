@@ -10,23 +10,17 @@ services:
     network_mode: host
     # 方式二：手动映射端口（注释掉 network_mode，启用下面的 ports）
     # ports:
-    #   # Pool 模式入口（pool/hybrid 模式使用）
+    #   # 共享 Pool 入口（listener.enabled=true 时使用）
     #   - "2323:2323"
     #   # Web 监控面板
-    #   - "9091:9091"
-    #   # Multi-port 端口范围（multi-port/hybrid 模式使用，根据节点数量调整）
+    #   - "9888:9888"
+    #   # 每节点端口范围（multi_port.enabled=true 时使用，根据节点数量调整）
     #   - "24000-24200:24000-24200"
     #
-    # 支持的运行模式（在 config.yaml 中配置）：
-    #   - pool: 单端口代理池，所有节点共享 2323 端口
-    #   - multi-port: 多端口模式，每个节点独立端口
-    #   - hybrid: 混合模式，同时启用 pool (2323) + multi-port (24000+)
-    #
-    # hybrid 模式说明：
-    #   - 代理池入口：http://0.0.0.0:2323（自动负载均衡）
-    #   - 独立节点入口：http://0.0.0.0:24000, 24001, ...（直连特定节点）
-    #   - 节点状态在两种入口间共享（黑名单同步）
-    #   - 端口冲突时自动重分配到下一个可用端口
+    # 两类入口可独立启用，也可同时关闭：
+    #   - listener.enabled=true: 共享 Pool 入口 2323
+    #   - multi_port.enabled=true: 每个节点独立端口 24000+
+    #   - 两者同时启用时节点状态共享，端口冲突会自动重分配
     volumes:
       # 配置文件需要可写权限以支持 WebUI 设置保存
       # 如遇权限问题，请在宿主机执行: chmod 666 config.yaml nodes.txt

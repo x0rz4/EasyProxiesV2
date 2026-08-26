@@ -3,6 +3,7 @@ package builder
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +14,87 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 )
+
+func TestBuildBaseEntrySwitchCombinations(t *testing.T) {
+	tests := []struct {
+		name              string
+		listener, multi   bool
+		wantInbounds      int
+		wantDerivedMode   string
+		wantPoolOutbounds int
+		wantRouteRules    int
+		wantFinal         string
+	}{
+		{name: "disabled", wantDerivedMode: "disabled", wantPoolOutbounds: 1, wantFinal: poolout.Tag},
+		{name: "pool", listener: true, wantInbounds: 1, wantDerivedMode: "pool", wantPoolOutbounds: 1, wantFinal: poolout.Tag},
+		{name: "multi-port", multi: true, wantInbounds: 1, wantDerivedMode: "multi-port", wantPoolOutbounds: 1, wantRouteRules: 1},
+		{name: "hybrid", listener: true, multi: true, wantInbounds: 2, wantDerivedMode: "hybrid", wantPoolOutbounds: 2, wantRouteRules: 1, wantFinal: poolout.Tag},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.Config{
+				Listener:  config.ListenerConfig{Enabled: tt.listener, Address: "127.0.0.1", Port: 2323, Protocol: "http"},
+				MultiPort: config.MultiPortConfig{Enabled: tt.multi, Address: "127.0.0.1", BasePort: 24000, Protocol: "http"},
+				Pool:      config.PoolConfig{Mode: "sequential", FailureThreshold: 3, BlacklistDuration: time.Hour},
+				Nodes:     []config.NodeConfig{{Name: "node", URI: "http://node.example:80", Port: 24000}},
+			}
+			opts, err := BuildBase(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(opts.Inbounds) != tt.wantInbounds {
+				t.Fatalf("inbounds=%d, want %d", len(opts.Inbounds), tt.wantInbounds)
+			}
+			poolCount := 0
+			for _, outbound := range opts.Outbounds {
+				if outbound.Type == poolout.Type {
+					poolCount++
+					poolOptions := outbound.Options.(*poolout.Options)
+					for _, meta := range poolOptions.Metadata {
+						if meta.Mode != tt.wantDerivedMode {
+							t.Fatalf("monitor metadata mode=%q, want %q", meta.Mode, tt.wantDerivedMode)
+						}
+					}
+				}
+			}
+			if poolCount != tt.wantPoolOutbounds {
+				t.Fatalf("pool outbounds=%d, want %d", poolCount, tt.wantPoolOutbounds)
+			}
+			if got := cfg.EntryMode(); got != tt.wantDerivedMode {
+				t.Fatalf("derived mode=%q, want %q", got, tt.wantDerivedMode)
+			}
+			if opts.Route == nil || len(opts.Route.Rules) != tt.wantRouteRules || opts.Route.Final != tt.wantFinal {
+				t.Fatalf("route=%+v, want rules=%d final=%q", opts.Route, tt.wantRouteRules, tt.wantFinal)
+			}
+		})
+	}
+}
+
+func TestBuildBaseWithManyNodesAndEntriesDisabledHasOnlySharedMonitoringPool(t *testing.T) {
+	nodes := make([]config.NodeConfig, 500)
+	for i := range nodes {
+		nodes[i] = config.NodeConfig{Name: fmt.Sprintf("node-%d", i), URI: fmt.Sprintf("http://node-%d.example:80", i)}
+	}
+	opts, err := BuildBase(&config.Config{Pool: config.PoolConfig{Mode: "sequential"}, Nodes: nodes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(opts.Inbounds) != 0 || len(opts.Outbounds) != len(nodes)+1 {
+		t.Fatalf("disabled topology: inbounds=%d outbounds=%d, want 0/%d", len(opts.Inbounds), len(opts.Outbounds), len(nodes)+1)
+	}
+	poolCount := 0
+	for _, outbound := range opts.Outbounds {
+		if outbound.Type == poolout.Type {
+			poolCount++
+			if outbound.Tag != poolout.Tag {
+				t.Fatalf("disabled topology contains per-node pool %q", outbound.Tag)
+			}
+		}
+	}
+	if poolCount != 1 {
+		t.Fatalf("disabled topology pool outbounds=%d, want one shared monitoring pool", poolCount)
+	}
+}
 
 func TestBuildShadowsocksFullSIP002URI(t *testing.T) {
 	payload := base64.RawURLEncoding.EncodeToString([]byte("aes-256-gcm:secret@example.com:8388"))
@@ -65,7 +147,7 @@ func TestBuildNodeOutboundSupportsSOCKS5(t *testing.T) {
 }
 
 func TestBuildCreatesIndependentGroupListenerSelectorAndPool(t *testing.T) {
-	cfg := &config.Config{Mode: "pool", Listener: config.ListenerConfig{Address: "127.0.0.1", Port: 2323, Protocol: "http"},
+	cfg := &config.Config{Listener: config.ListenerConfig{Enabled: true, Address: "127.0.0.1", Port: 2323, Protocol: "http"},
 		Pool: config.PoolConfig{Mode: "random", FailureThreshold: 3, BlacklistDuration: time.Hour},
 		Nodes: []config.NodeConfig{{ID: 1, Name: "hk", URI: "http://hk.example:80", Region: "hk"},
 			{ID: 2, Name: "jp", URI: "http://jp.example:80", Region: "jp"}},
@@ -98,7 +180,7 @@ func TestBuildCreatesIndependentGroupListenerSelectorAndPool(t *testing.T) {
 }
 
 func TestBuildLeavesLowestLatencyGroupWithoutSyntheticCurrent(t *testing.T) {
-	cfg := &config.Config{Mode: "pool", Listener: config.ListenerConfig{Address: "127.0.0.1", Port: 2323, Protocol: "http"},
+	cfg := &config.Config{Listener: config.ListenerConfig{Enabled: true, Address: "127.0.0.1", Port: 2323, Protocol: "http"},
 		Pool: config.PoolConfig{Mode: "random", FailureThreshold: 3, BlacklistDuration: time.Hour},
 		Nodes: []config.NodeConfig{{ID: 1, Name: "first", URI: "http://first.example:80", Region: "hk"},
 			{ID: 2, Name: "second", URI: "http://second.example:80", Region: "hk"}},
@@ -126,7 +208,7 @@ func TestBuildLeavesLowestLatencyGroupWithoutSyntheticCurrent(t *testing.T) {
 }
 
 func TestBuildBaseAndGroupAreRuntimeIsolated(t *testing.T) {
-	cfg := &config.Config{Mode: "pool", Listener: config.ListenerConfig{Address: "127.0.0.1", Port: 2323, Protocol: "http"},
+	cfg := &config.Config{Listener: config.ListenerConfig{Address: "127.0.0.1", Port: 2323, Protocol: "http"},
 		Pool:  config.PoolConfig{Mode: "random", FailureThreshold: 3, BlacklistDuration: time.Hour},
 		Nodes: []config.NodeConfig{{ID: 1, Name: "hk", URI: "http://hk.example:80", Region: "hk"}},
 		Groups: []config.GroupPoolConfig{{ID: 9, Name: "isolated", BindAddress: "127.0.0.1", BindPort: 10009,
@@ -135,6 +217,9 @@ func TestBuildBaseAndGroupAreRuntimeIsolated(t *testing.T) {
 	base, err := BuildBase(cfg)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(base.Inbounds) != 0 {
+		t.Fatalf("disabled base entries produced %d inbounds", len(base.Inbounds))
 	}
 	for _, inbound := range base.Inbounds {
 		if strings.HasPrefix(inbound.Tag, "group-in-") {

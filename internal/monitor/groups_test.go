@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -14,9 +15,44 @@ import (
 	"testing"
 	"time"
 
+	"easy_proxies/internal/config"
 	"easy_proxies/internal/group"
 	"easy_proxies/internal/store"
 )
+
+func TestValidateGroupPortIgnoresDisabledBaseEntries(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "groups-disabled-entries.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := uint16(listener.Addr().(*net.TCPAddr).Port)
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{
+		Listener: config.ListenerConfig{Port: port},
+		Nodes:    []config.NodeConfig{{Name: "retained", Port: port}},
+	}
+	server := &Server{store: db, cfgSrc: cfg}
+	if err := server.validateGroupPort(ctx, "127.0.0.1", port, nil); err != nil {
+		t.Fatalf("disabled base entries blocked group port: %v", err)
+	}
+	cfg.Listener.Enabled = true
+	if err := server.validateGroupPort(ctx, "127.0.0.1", port, nil); err == nil {
+		t.Fatal("enabled Pool entry did not block its port")
+	}
+	cfg.Listener.Enabled = false
+	cfg.MultiPort.Enabled = true
+	if err := server.validateGroupPort(ctx, "127.0.0.1", port, nil); err == nil {
+		t.Fatal("enabled multi-port entry did not block its node port")
+	}
+}
 
 func TestGroupNodeOptionsUseManagedAvailableNodes(t *testing.T) {
 	ctx := context.Background()

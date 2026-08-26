@@ -45,17 +45,18 @@ function formatTimestamp(ts: string): string {
 }
 
 const defaultSettings: SettingsData = {
-  mode: 'pool',
   log_level: 'info',
   external_ip: '',
   skip_cert_verify: false,
 
+  listener_enabled: false,
   listener_address: '0.0.0.0',
   listener_port: 2323,
   listener_protocol: 'http',
   listener_username: '',
   listener_password: '',
 
+  multi_port_enabled: false,
   multi_port_address: '0.0.0.0',
   multi_port_base_port: 24000,
   multi_port_protocol: 'http',
@@ -297,20 +298,6 @@ export default function SettingsPanel() {
           </div>
 
           <fieldset className="fieldset">
-            <legend className="fieldset-legend font-semibold text-base-content/80">运行模式</legend>
-            <select
-              className="select select-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
-              value={settings.mode}
-              onChange={(e) => updateField('mode', e.target.value)}
-            >
-              <option value="pool">pool - 单端口代理池</option>
-              <option value="multi-port">multi-port - 多端口模式</option>
-              <option value="hybrid">hybrid - 混合模式</option>
-            </select>
-            <p className="label text-base-content/50 mt-1">pool: 共享端口 | multi-port: 独立端口 | hybrid: 两者并存</p>
-          </fieldset>
-
-          <fieldset className="fieldset">
             <legend className="fieldset-legend font-semibold text-base-content/80">日志级别</legend>
             <select
               className="select select-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
@@ -360,7 +347,16 @@ export default function SettingsPanel() {
               <h3 className="font-bold text-lg text-base-content">监听配置 (Pool)</h3>
               <p className="text-xs text-base-content/50 font-medium">代理池入口网络参数</p>
             </div>
+            <input
+              type="checkbox"
+              className="toggle toggle-success toggle-md ml-auto"
+              checked={settings.listener_enabled}
+              onChange={(e) => updateField('listener_enabled', e.target.checked)}
+              aria-label="启用 Pool 入口"
+            />
           </div>
+
+          {!settings.listener_enabled && <p className="text-xs text-base-content/50">已关闭，不创建 Pool 监听端口。</p>}
 
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <fieldset className="fieldset">
@@ -370,6 +366,7 @@ export default function SettingsPanel() {
                 className="input input-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
                 value={settings.listener_address}
                 onChange={(e) => updateField('listener_address', e.target.value)}
+                disabled={!settings.listener_enabled}
               />
             </fieldset>
             <fieldset className="fieldset">
@@ -381,6 +378,7 @@ export default function SettingsPanel() {
                 onChange={(e) => updateField('listener_port', parseInt(e.target.value) || 0)}
                 min={1}
                 max={65535}
+                disabled={!settings.listener_enabled}
               />
             </fieldset>
           </div>
@@ -391,6 +389,7 @@ export default function SettingsPanel() {
               className="select select-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
               value={settings.listener_protocol}
               onChange={(e) => updateField('listener_protocol', e.target.value)}
+              disabled={!settings.listener_enabled}
             >
               <option value="http">http</option>
               <option value="socks5">socks5</option>
@@ -408,6 +407,7 @@ export default function SettingsPanel() {
                 placeholder="可选，留空表示无验证"
                 value={settings.listener_username}
                 onChange={(e) => updateField('listener_username', e.target.value)}
+                disabled={!settings.listener_enabled}
               />
             </fieldset>
             <fieldset className="fieldset">
@@ -418,6 +418,7 @@ export default function SettingsPanel() {
                 placeholder="可选，留空表示无验证"
                 value={settings.listener_password}
                 onChange={(e) => updateField('listener_password', e.target.value)}
+                disabled={!settings.listener_enabled}
               />
             </fieldset>
           </div>
@@ -431,9 +432,18 @@ export default function SettingsPanel() {
             </div>
             <div>
               <h3 className="font-bold text-lg text-base-content">多端口配置</h3>
-              <p className="text-xs text-base-content/50 font-medium">用于 multi-port 或 hybrid 模式</p>
+              <p className="text-xs text-base-content/50 font-medium">每个节点独立入口网络参数</p>
             </div>
+            <input
+              type="checkbox"
+              className="toggle toggle-secondary toggle-md ml-auto"
+              checked={settings.multi_port_enabled}
+              onChange={(e) => updateField('multi_port_enabled', e.target.checked)}
+              aria-label="启用每节点多端口入口"
+            />
           </div>
+
+          {!settings.multi_port_enabled && <p className="text-xs text-base-content/50">已关闭，不为节点创建独立监听端口。</p>}
 
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <fieldset className="fieldset">
@@ -443,6 +453,7 @@ export default function SettingsPanel() {
                 className="input input-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
                 value={settings.multi_port_address}
                 onChange={(e) => updateField('multi_port_address', e.target.value)}
+                disabled={!settings.multi_port_enabled}
               />
             </fieldset>
             <fieldset className="fieldset">
@@ -454,6 +465,7 @@ export default function SettingsPanel() {
                 onChange={(e) => updateField('multi_port_base_port', parseInt(e.target.value) || 0)}
                 min={1}
                 max={65535}
+                disabled={!settings.multi_port_enabled}
               />
             </fieldset>
           </div>
@@ -464,6 +476,7 @@ export default function SettingsPanel() {
               className="select select-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
               value={settings.multi_port_protocol}
               onChange={(e) => updateField('multi_port_protocol', e.target.value)}
+              disabled={!settings.multi_port_enabled}
             >
               <option value="http">http</option>
               <option value="socks5">socks5</option>
@@ -481,6 +494,7 @@ export default function SettingsPanel() {
                 placeholder="可选"
                 value={settings.multi_port_username}
                 onChange={(e) => updateField('multi_port_username', e.target.value)}
+                disabled={!settings.multi_port_enabled}
               />
             </fieldset>
             <fieldset className="fieldset">
@@ -491,6 +505,7 @@ export default function SettingsPanel() {
                 placeholder="可选"
                 value={settings.multi_port_password}
                 onChange={(e) => updateField('multi_port_password', e.target.value)}
+                disabled={!settings.multi_port_enabled}
               />
             </fieldset>
           </div>

@@ -29,7 +29,6 @@ import (
 type Config struct {
 	mu sync.RWMutex `yaml:"-"` // protects all fields for concurrent access
 
-	Mode                string                    `yaml:"mode"`
 	Listener            ListenerConfig            `yaml:"listener"`
 	MultiPort           MultiPortConfig           `yaml:"multi_port"`
 	Pool                PoolConfig                `yaml:"pool"`
@@ -60,6 +59,7 @@ type GeoIPConfig struct {
 
 // ListenerConfig defines how the proxy should listen for clients.
 type ListenerConfig struct {
+	Enabled  bool   `yaml:"enabled"`
 	Address  string `yaml:"address"`
 	Port     uint16 `yaml:"port"`
 	Protocol string `yaml:"protocol"` // http, socks5, mixed
@@ -113,6 +113,7 @@ type GroupNodeStateConfig struct {
 
 // MultiPortConfig defines address/credential defaults for multi-port mode.
 type MultiPortConfig struct {
+	Enabled  bool   `yaml:"enabled"`
 	Address  string `yaml:"address"`
 	BasePort uint16 `yaml:"base_port"`
 	Protocol string `yaml:"protocol"` // http, socks5, mixed
@@ -279,18 +280,6 @@ func (c *Config) normalize() error {
 // This is the single source of truth for defaults, used by both
 // normalizeInternal and NormalizeWithPortMap to avoid code duplication.
 func (c *Config) applyDefaults() error {
-	if c.Mode == "" {
-		c.Mode = "pool"
-	}
-	// Normalize mode name: support both multi-port and multi_port
-	if c.Mode == "multi_port" {
-		c.Mode = "multi-port"
-	}
-	switch c.Mode {
-	case "pool", "multi-port", "hybrid":
-	default:
-		return fmt.Errorf("unsupported mode %q (use 'pool', 'multi-port', or 'hybrid')", c.Mode)
-	}
 	if c.Listener.Address == "" {
 		c.Listener.Address = "0.0.0.0"
 	}
@@ -460,7 +449,7 @@ func (c *Config) normalizeInternal(skipSubscriptionFetch bool) error {
 		// Not fatal — Store may have nodes from a previous run.
 		log.Printf("⚠️ No nodes in config (inline/subscription/file). Will check Store for existing nodes.")
 	}
-	portCursor := c.MultiPort.BasePort
+	portCursor := int(c.MultiPort.BasePort)
 	for idx := range c.Nodes {
 		c.Nodes[idx].Name = strings.TrimSpace(c.Nodes[idx].Name)
 		c.Nodes[idx].URI = strings.TrimSpace(c.Nodes[idx].URI)
@@ -486,23 +475,20 @@ func (c *Config) normalizeInternal(skipSubscriptionFetch bool) error {
 			c.Nodes[idx].Name = fmt.Sprintf("node-%d", idx)
 		}
 
-		// Auto-assign port in multi-port/hybrid mode, skip occupied ports
-		if c.Nodes[idx].Port == 0 && (c.Mode == "multi-port" || c.Mode == "hybrid") {
-			for !isPortAvailable(c.MultiPort.Address, portCursor) {
+		// Only multi-port listeners need per-node port allocation.
+		if c.Nodes[idx].Port == 0 && c.MultiPort.Enabled {
+			for portCursor <= 65535 && !isPortAvailable(c.MultiPort.Address, uint16(portCursor)) {
 				log.Printf("⚠️  Port %d is in use, trying next port", portCursor)
 				portCursor++
-				if portCursor > 65535 {
-					return fmt.Errorf("no available ports found starting from %d", c.MultiPort.BasePort)
-				}
 			}
-			c.Nodes[idx].Port = portCursor
-			portCursor++
-		} else if c.Nodes[idx].Port == 0 {
-			c.Nodes[idx].Port = portCursor
+			if portCursor > 65535 {
+				return fmt.Errorf("no available ports found starting from %d", c.MultiPort.BasePort)
+			}
+			c.Nodes[idx].Port = uint16(portCursor)
 			portCursor++
 		}
 
-		if c.Mode == "multi-port" || c.Mode == "hybrid" {
+		if c.MultiPort.Enabled {
 			if c.Nodes[idx].Username == "" {
 				c.Nodes[idx].Username = c.MultiPort.Username
 				c.Nodes[idx].Password = c.MultiPort.Password
@@ -517,8 +503,8 @@ func (c *Config) normalizeInternal(skipSubscriptionFetch bool) error {
 		c.DatabasePath = filepath.Join(filepath.Dir(c.filePath), c.DatabasePath)
 	}
 
-	// Auto-fix port conflicts in hybrid mode (pool port vs multi-port)
-	if c.Mode == "hybrid" {
+	// Auto-fix conflicts only when both base entry points are enabled.
+	if c.Listener.Enabled && c.MultiPort.Enabled {
 		poolPort := c.Listener.Port
 		usedPorts := make(map[uint16]bool)
 		usedPorts[poolPort] = true
@@ -528,16 +514,16 @@ func (c *Config) normalizeInternal(skipSubscriptionFetch bool) error {
 		for idx := range c.Nodes {
 			if c.Nodes[idx].Port == poolPort {
 				// Find next available port
-				newPort := c.Nodes[idx].Port + 1
-				for usedPorts[newPort] || !isPortAvailable(c.MultiPort.Address, newPort) {
+				newPort := int(c.Nodes[idx].Port) + 1
+				for newPort <= 65535 && (usedPorts[uint16(newPort)] || !isPortAvailable(c.MultiPort.Address, uint16(newPort))) {
 					newPort++
-					if newPort > 65535 {
-						return fmt.Errorf("no available port for node %q after conflict with pool port %d", c.Nodes[idx].Name, poolPort)
-					}
+				}
+				if newPort > 65535 {
+					return fmt.Errorf("no available port for node %q after conflict with pool port %d", c.Nodes[idx].Name, poolPort)
 				}
 				log.Printf("⚠️  Node %q port %d conflicts with pool port, reassigned to %d", c.Nodes[idx].Name, poolPort, newPort)
-				usedPorts[newPort] = true
-				c.Nodes[idx].Port = newPort
+				usedPorts[uint16(newPort)] = true
+				c.Nodes[idx].Port = uint16(newPort)
 			}
 		}
 	}
@@ -570,7 +556,7 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 
 	// Build set of ports already assigned from portMap
 	usedPorts := make(map[uint16]bool)
-	if c.Mode == "hybrid" {
+	if c.Listener.Enabled && c.MultiPort.Enabled {
 		usedPorts[c.Listener.Port] = true
 	}
 
@@ -597,7 +583,7 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 		}
 
 		// Check if this node has a preserved port from portMap
-		if c.Mode == "multi-port" || c.Mode == "hybrid" {
+		if c.MultiPort.Enabled {
 			nodeKey := c.Nodes[idx].NodeKey()
 			if existingPort, ok := portMap[nodeKey]; ok && existingPort > 0 {
 				c.Nodes[idx].Port = existingPort
@@ -611,27 +597,24 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 	}
 
 	// Second pass: assign new ports for nodes without preserved ports
-	portCursor := c.MultiPort.BasePort
+	portCursor := int(c.MultiPort.BasePort)
 	for idx := range c.Nodes {
-		if c.Nodes[idx].Port == 0 && (c.Mode == "multi-port" || c.Mode == "hybrid") {
+		if c.Nodes[idx].Port == 0 && c.MultiPort.Enabled {
 			// Find next available port that's not used
-			for usedPorts[portCursor] || !isPortAvailable(c.MultiPort.Address, portCursor) {
+			for portCursor <= 65535 && (usedPorts[uint16(portCursor)] || !isPortAvailable(c.MultiPort.Address, uint16(portCursor))) {
 				portCursor++
-				if portCursor > 65535 {
-					return fmt.Errorf("no available ports found starting from %d", c.MultiPort.BasePort)
-				}
 			}
-			c.Nodes[idx].Port = portCursor
-			usedPorts[portCursor] = true
+			if portCursor > 65535 {
+				return fmt.Errorf("no available ports found starting from %d", c.MultiPort.BasePort)
+			}
+			c.Nodes[idx].Port = uint16(portCursor)
+			usedPorts[uint16(portCursor)] = true
 			log.Printf("📌 Assigned new port %d for node %q", portCursor, c.Nodes[idx].Name)
-			portCursor++
-		} else if c.Nodes[idx].Port == 0 {
-			c.Nodes[idx].Port = portCursor
 			portCursor++
 		}
 
 		// Apply default credentials
-		if c.Mode == "multi-port" || c.Mode == "hybrid" {
+		if c.MultiPort.Enabled {
 			if c.Nodes[idx].Username == "" {
 				c.Nodes[idx].Username = c.MultiPort.Username
 				c.Nodes[idx].Password = c.MultiPort.Password
@@ -648,6 +631,23 @@ func (c *Config) ManagementEnabled() bool {
 		return true
 	}
 	return *c.Management.Enabled
+}
+
+// EntryMode derives the public runtime mode from the two independent entry switches.
+func (c *Config) EntryMode() string {
+	if c == nil {
+		return "disabled"
+	}
+	switch {
+	case c.Listener.Enabled && c.MultiPort.Enabled:
+		return "hybrid"
+	case c.Listener.Enabled:
+		return "pool"
+	case c.MultiPort.Enabled:
+		return "multi-port"
+	default:
+		return "disabled"
+	}
 }
 
 // loadNodesFromFile reads a nodes file where each line is a proxy URI
@@ -1554,8 +1554,24 @@ func (c *Config) Clone() *Config {
 	if c == nil {
 		return nil
 	}
-	cloned := *c
-	cloned.mu = sync.RWMutex{} // fresh mutex for the clone
+	cloned := Config{
+		Listener:            c.Listener,
+		MultiPort:           c.MultiPort,
+		Pool:                c.Pool,
+		Management:          c.Management,
+		SubscriptionRefresh: c.SubscriptionRefresh,
+		GeoIP:               c.GeoIP,
+		NodesFile:           c.NodesFile,
+		ExternalIP:          c.ExternalIP,
+		LogLevel:            c.LogLevel,
+		SkipCertVerify:      c.SkipCertVerify,
+		DatabasePath:        c.DatabasePath,
+		filePath:            c.filePath,
+	}
+	if c.Management.Enabled != nil {
+		enabled := *c.Management.Enabled
+		cloned.Management.Enabled = &enabled
+	}
 
 	// Deep copy slices
 	if c.Nodes != nil {
@@ -1572,6 +1588,7 @@ func (c *Config) Clone() *Config {
 		for idx := range cloned.Groups {
 			cloned.Groups[idx].Regions = append([]string(nil), c.Groups[idx].Regions...)
 			cloned.Groups[idx].ExplicitNodeIDs = append([]int64(nil), c.Groups[idx].ExplicitNodeIDs...)
+			cloned.Groups[idx].ExcludedNodeIDs = append([]int64(nil), c.Groups[idx].ExcludedNodeIDs...)
 			cloned.Groups[idx].NodeStates = append([]GroupNodeStateConfig(nil), c.Groups[idx].NodeStates...)
 			for stateIdx := range cloned.Groups[idx].NodeStates {
 				cloned.Groups[idx].NodeStates[stateIdx].FailureHistory = append([]int64(nil), c.Groups[idx].NodeStates[stateIdx].FailureHistory...)
@@ -1633,7 +1650,6 @@ func (c *Config) SaveSettings() error {
 	}
 
 	// Sync all editable fields from runtime config
-	saveCfg.Mode = c.Mode
 	saveCfg.LogLevel = c.LogLevel
 	saveCfg.ExternalIP = c.ExternalIP
 	saveCfg.SkipCertVerify = c.SkipCertVerify
@@ -1673,24 +1689,17 @@ func (c *Config) SaveSettings() error {
 
 // ValidateSettingsRequest validates the settings request fields and returns
 // a descriptive error for any invalid values, instead of silently ignoring them.
-func ValidateSettingsRequest(mode string, listenerPort, multiPortBasePort uint16,
+func ValidateSettingsRequest(listenerEnabled, multiPortEnabled bool, listenerPort, multiPortBasePort uint16,
 	listenerProtocol, multiPortProtocol,
 	poolBlacklistDuration, subRefreshInterval, subRefreshTimeout,
 	subRefreshHealthCheckTimeout, subRefreshDrainTimeout,
 	geoIPAutoUpdateInterval, managementHealthCheckInterval string) error {
 
-	// Validate mode
-	switch mode {
-	case "pool", "multi-port", "hybrid":
-	default:
-		return fmt.Errorf("不支持的运行模式: %q", mode)
-	}
-
 	// Validate ports
-	if listenerPort == 0 {
+	if listenerEnabled && listenerPort == 0 {
 		return fmt.Errorf("监听端口不能为 0")
 	}
-	if multiPortBasePort == 0 {
+	if multiPortEnabled && multiPortBasePort == 0 {
 		return fmt.Errorf("多端口起始端口不能为 0")
 	}
 

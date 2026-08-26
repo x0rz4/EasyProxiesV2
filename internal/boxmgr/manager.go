@@ -86,10 +86,8 @@ type Manager struct {
 	configListeners    []ConfigUpdateListener
 	idle               bool // true when manager was started but stopped due to 0 enabled nodes
 
-	// lastAppliedMode and lastAppliedBasePort track the mode/BasePort from the
-	// last successful Start/Reload. Used by TriggerReload to detect changes,
-	// since m.cfg may have been mutated by updateAllSettings before reload.
-	lastAppliedMode     string
+	// lastAppliedBasePort tracks the BasePort from the last successful
+	// Start/Reload so an enabled multi-port topology can be reassigned when it changes.
 	lastAppliedBasePort uint16
 
 	groupSlotsMu sync.Mutex
@@ -172,7 +170,6 @@ func (m *Manager) Start(ctx context.Context) error {
 
 	m.mu.Lock()
 	m.currentBox = instance
-	m.lastAppliedMode = cfg.Mode
 	m.lastAppliedBasePort = cfg.MultiPort.BasePort
 	m.mu.Unlock()
 
@@ -299,7 +296,6 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 	m.currentBox = instance
 	m.cfg = newCfg
 	m.idle = false // Clear idle state on successful reload
-	m.lastAppliedMode = newCfg.Mode
 	m.lastAppliedBasePort = newCfg.MultiPort.BasePort
 	// Update monitor server's config reference so settings API reads the latest config
 	if m.monitorServer != nil {
@@ -1335,7 +1331,6 @@ func (m *Manager) TriggerReload(ctx context.Context) error {
 
 	m.mu.RLock()
 	portMap := m.cfg.BuildPortMap() // Preserve existing port assignments
-	oldMode := m.lastAppliedMode
 	oldBasePort := m.lastAppliedBasePort
 	cfgPath := ""
 	if m.cfg != nil {
@@ -1429,13 +1424,13 @@ func (m *Manager) TriggerReload(ctx context.Context) error {
 		return m.enterIdle(newCfg)
 	}
 
-	// Detect mode or base port changes — if either changed, discard old port
-	// assignments so all nodes get fresh ports from the new BasePort.
-	modeChanged := newCfg.Mode != oldMode
+	// When an active multi-port base changes, discard old assignments so all
+	// node listeners are rebuilt from the new base. Entry switch changes alone
+	// preserve prior assignments for a later re-enable.
 	basePortChanged := newCfg.MultiPort.BasePort != oldBasePort
-	if modeChanged || basePortChanged {
-		m.logger.Infof("mode/base-port changed (mode: %s→%s, base: %d→%d), reassigning all ports",
-			oldMode, newCfg.Mode, oldBasePort, newCfg.MultiPort.BasePort)
+	if newCfg.MultiPort.Enabled && basePortChanged {
+		m.logger.Infof("multi-port base changed (%d→%d), reassigning all node ports",
+			oldBasePort, newCfg.MultiPort.BasePort)
 		portMap = nil // Discard old port map
 		for idx := range newCfg.Nodes {
 			newCfg.Nodes[idx].Port = 0 // Clear all ports for reassignment
@@ -1614,9 +1609,12 @@ func isPortAvailable(address string, port uint16) bool {
 
 // reassignConflictingPort finds the node using the conflicting port and assigns a new port.
 func reassignConflictingPort(cfg *config.Config, conflictPort uint16) bool {
+	if cfg == nil || !cfg.MultiPort.Enabled {
+		return false
+	}
 	// Build set of used ports
 	usedPorts := make(map[uint16]bool)
-	if cfg.Mode == "hybrid" {
+	if cfg.Listener.Enabled && cfg.MultiPort.Enabled {
 		usedPorts[cfg.Listener.Port] = true
 	}
 	for _, node := range cfg.Nodes {
@@ -1627,20 +1625,20 @@ func reassignConflictingPort(cfg *config.Config, conflictPort uint16) bool {
 	for idx := range cfg.Nodes {
 		if cfg.Nodes[idx].Port == conflictPort {
 			// Find next available port
-			newPort := conflictPort + 1
+			newPort := int(conflictPort) + 1
 			address := cfg.MultiPort.Address
 			if address == "" {
 				address = "0.0.0.0"
 			}
-			for usedPorts[newPort] || !isPortAvailable(address, newPort) {
+			for newPort <= 65535 && (usedPorts[uint16(newPort)] || !isPortAvailable(address, uint16(newPort))) {
 				newPort++
-				if newPort > 65535 {
-					log.Printf("❌ No available port found for node %q", cfg.Nodes[idx].Name)
-					return false
-				}
+			}
+			if newPort > 65535 {
+				log.Printf("❌ No available port found for node %q", cfg.Nodes[idx].Name)
+				return false
 			}
 			log.Printf("⚠️  Port %d in use, reassigning node %q to port %d", conflictPort, cfg.Nodes[idx].Name, newPort)
-			cfg.Nodes[idx].Port = newPort
+			cfg.Nodes[idx].Port = uint16(newPort)
 			return true
 		}
 	}
@@ -1743,8 +1741,8 @@ func (m *Manager) prepareNodeLocked(node config.NodeConfig, currentName string) 
 		}
 	}
 
-	// Handle multi-port mode specifics
-	if m.cfg.Mode == "multi-port" {
+	// Per-node ports and default credentials only apply while multi-port is enabled.
+	if m.cfg.MultiPort.Enabled {
 		if node.Port == 0 {
 			node.Port = m.nextAvailablePortLocked()
 		} else if m.portInUseLocked(node.Port, currentName) {
