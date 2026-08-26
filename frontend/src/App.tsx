@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import { 
   Activity, Cloud, Server, ShieldCheck, TerminalSquare, Settings, 
-  Menu, Hexagon, Palette, ChevronDown, Check, LogOut, Layers3
+  Menu, Hexagon, Palette, ChevronDown, Check, LogOut, Layers3, Wrench
 } from 'lucide-react'
 import MonitorPanel from './components/MonitorPanel'
 import ManagePanel from './components/ManagePanel'
@@ -11,11 +11,12 @@ import SubscriptionsPanel from './components/SubscriptionsPanel'
 import UnlockPanel from './components/UnlockPanel'
 import LoginPage from './components/LoginPage'
 import GroupPoolsPanel from './components/GroupPoolsPanel'
+import OperationsPanel from './components/OperationsPanel'
 import { checkAuth, getToken, logout } from './api/client'
 import packageJson from '../package.json'
 
 type AuthState = 'loading' | 'need_login' | 'authenticated'
-type TabId = 'monitor' | 'groups' | 'manage' | 'subscriptions' | 'unlock' | 'debug' | 'settings'
+type TabId = 'monitor' | 'groups' | 'manage' | 'subscriptions' | 'unlock' | 'operations' | 'debug' | 'settings'
 
 const ALL_THEMES = [
   'light', 'dark', 'cupcake', 'bumblebee', 'emerald', 'corporate',
@@ -58,6 +59,12 @@ const MENU_ITEMS: { id: TabId; label: string; icon: React.ReactNode; desc: strin
     icon: <ShieldCheck className="h-5 w-5" />,
   },
   {
+    id: 'operations',
+    label: '运维管理',
+    desc: '探测调度与运行状态',
+    icon: <Wrench className="h-5 w-5" />,
+  },
+  {
     id: 'debug',
     label: '调试面板',
     desc: '运行时信息',
@@ -71,7 +78,7 @@ const MENU_ITEMS: { id: TabId; label: string; icon: React.ReactNode; desc: strin
   },
 ]
 
-const VALID_TABS: TabId[] = ['monitor', 'groups', 'manage', 'subscriptions', 'unlock', 'debug', 'settings']
+const VALID_TABS: TabId[] = ['monitor', 'groups', 'manage', 'subscriptions', 'unlock', 'operations', 'debug', 'settings']
 const THEME_STORAGE_KEY = 'ep-theme'
 
 const APP_VERSION = `v${packageJson.version}`
@@ -184,6 +191,7 @@ function App() {
       case 'groups': return <GroupPoolsPanel />
       case 'subscriptions': return <SubscriptionsPanel />
       case 'unlock': return <UnlockPanel />
+      case 'operations': return <OperationsPanel />
       case 'debug': return <DebugPanel />
       case 'settings': return <SettingsPanel />
       default: return <MonitorPanel />

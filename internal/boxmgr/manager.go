@@ -37,8 +37,6 @@ const (
 	defaultDrainTimeout       = 10 * time.Second
 	defaultHealthCheckTimeout = 30 * time.Second
 	healthCheckPollInterval   = 500 * time.Millisecond
-	// periodicHealthInterval is configured via cfg.Management.HealthCheckInterval
-	periodicHealthTimeout = 10 * time.Second
 )
 
 // Logger defines logging interface for the manager.
@@ -189,10 +187,13 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.mu.Lock()
 	if m.monitorMgr != nil && !m.healthCheckStarted {
 		interval := effectiveHealthCheckInterval(cfg)
-		m.monitorMgr.StartPeriodicHealthCheck(interval, periodicHealthTimeout)
+		m.monitorMgr.StartPeriodicHealthCheck(interval)
 		m.healthCheckStarted = true
 	}
 	m.mu.Unlock()
+	if m.monitorMgr != nil {
+		m.monitorMgr.RequestStartupProbeAllOnce()
+	}
 
 	// Wait for initial health check if min nodes configured
 	if cfg.SubscriptionRefresh.MinAvailableNodes > 0 {
@@ -313,8 +314,16 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 
 	// Reload 成功后立即触发 1 次全量探测（内部去重，避免多次 Reload 造成突发）
 	if m.monitorMgr != nil {
+		m.monitorMgr.UpdateProbePolicy(monitor.ProbePolicy{
+			Concurrency: newCfg.Management.ProbeConcurrency, StartupTimeout: newCfg.Management.StartupProbeTimeout,
+			RoutineTimeout: newCfg.Management.RoutineProbeTimeout, DialTimeout: newCfg.Management.ProbeDialTimeout,
+			ResponseTimeout: newCfg.Management.ProbeResponseTimeout, RoutineRetries: newCfg.RoutineProbeRetryCount(),
+		})
+		if err := m.monitorMgr.SetProbeTarget(newCfg.Management.ProbeTarget); err != nil {
+			m.logger.Warnf("apply reloaded probe target: %v", err)
+		}
 		m.monitorMgr.SetHealthCheckInterval(effectiveHealthCheckInterval(newCfg))
-		go m.monitorMgr.RequestProbeAllOnce(periodicHealthTimeout)
+		m.monitorMgr.RequestStartupProbeAllOnce()
 	}
 	if groupReloadErr != nil {
 		m.logger.Warnf("base reload completed with group runtime errors: %v", groupReloadErr)

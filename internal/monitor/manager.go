@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,14 +18,123 @@ import (
 
 // Config mirrors user settings needed by the monitoring server.
 type Config struct {
-	Enabled        bool
-	Listen         string
-	ProbeTarget    string
-	Password       string
-	ProxyUsername  string // 代理池的用户名（用于导出）
-	ProxyPassword  string // 代理池的密码（用于导出）
-	ExternalIP     string // 外部 IP 地址，用于导出时替换 0.0.0.0
-	SkipCertVerify bool   // 全局跳过 SSL 证书验证
+	Enabled              bool
+	Listen               string
+	ProbeTarget          string
+	Password             string
+	ProxyUsername        string // 代理池的用户名（用于导出）
+	ProxyPassword        string // 代理池的密码（用于导出）
+	ExternalIP           string // 外部 IP 地址，用于导出时替换 0.0.0.0
+	SkipCertVerify       bool   // 全局跳过 SSL 证书验证
+	ProbeConcurrency     int
+	StartupProbeTimeout  time.Duration
+	RoutineProbeTimeout  time.Duration
+	ProbeDialTimeout     time.Duration
+	ProbeResponseTimeout time.Duration
+	RoutineProbeRetries  int
+}
+
+type ProbeRoundKind string
+
+const (
+	ProbeRoundStartup  ProbeRoundKind = "startup"
+	ProbeRoundPeriodic ProbeRoundKind = "periodic"
+	ProbeRoundManual   ProbeRoundKind = "manual"
+)
+
+var ErrProbeRoundInProgress = errors.New("probe round already in progress")
+
+type ProbePolicy struct {
+	Concurrency     int           `json:"probe_concurrency"`
+	StartupTimeout  time.Duration `json:"-"`
+	RoutineTimeout  time.Duration `json:"-"`
+	DialTimeout     time.Duration `json:"-"`
+	ResponseTimeout time.Duration `json:"-"`
+	RoutineRetries  int           `json:"routine_probe_retries"`
+}
+
+type probePhaseTimeouts struct {
+	dial     time.Duration
+	response time.Duration
+}
+
+type probePhaseTimeoutsContextKey struct{}
+
+func withProbePhaseTimeouts(ctx context.Context, dial, response time.Duration) context.Context {
+	return context.WithValue(ctx, probePhaseTimeoutsContextKey{}, probePhaseTimeouts{dial: dial, response: response})
+}
+
+type ProbeBatchResult struct {
+	Tag      string
+	Name     string
+	Latency  time.Duration
+	Err      error
+	Attempts int
+}
+
+type ProbeBatchSummary struct {
+	Total   int
+	Success int
+	Failed  int
+}
+
+type ProbeRoundStatus struct {
+	InFlight  bool           `json:"in_flight"`
+	Kind      ProbeRoundKind `json:"kind,omitempty"`
+	StartedAt time.Time      `json:"started_at,omitempty"`
+	Total     int            `json:"total"`
+	Completed int            `json:"completed"`
+	Success   int            `json:"success"`
+	Failed    int            `json:"failed"`
+}
+
+func normalizeProbePolicy(policy ProbePolicy) ProbePolicy {
+	if policy.Concurrency < 0 || policy.Concurrency > 512 {
+		policy.Concurrency = 0
+	}
+	if policy.StartupTimeout <= 0 {
+		policy.StartupTimeout = 5 * time.Second
+	}
+	if policy.RoutineTimeout <= 0 {
+		policy.RoutineTimeout = 10 * time.Second
+	}
+	if policy.DialTimeout <= 0 {
+		policy.DialTimeout = 3 * time.Second
+	}
+	if policy.ResponseTimeout <= 0 {
+		policy.ResponseTimeout = 2 * time.Second
+	}
+	if policy.RoutineRetries < 0 {
+		policy.RoutineRetries = 0
+	} else if policy.RoutineRetries > 2 {
+		policy.RoutineRetries = 2
+	}
+	return policy
+}
+
+func autoProbeConcurrency(nodeCount int) int {
+	workerLimit := (nodeCount + 9) / 10
+	if workerLimit < 32 {
+		workerLimit = 32
+	}
+	if workerLimit > 128 {
+		workerLimit = 128
+	}
+	return workerLimit
+}
+
+func effectiveProbeConcurrency(configured, nodeCount int) int {
+	workerLimit := configured
+	if workerLimit <= 0 {
+		workerLimit = autoProbeConcurrency(nodeCount)
+	}
+	if nodeCount < workerLimit {
+		workerLimit = nodeCount
+	}
+	if workerLimit < 1 {
+		return 0
+	}
+	return workerLimit
 }
 
 // ProbeTarget is the complete HTTP endpoint used by node health checks.
@@ -178,10 +286,13 @@ type Manager struct {
 	// periodic health check control
 	healthMu          sync.Mutex
 	healthInterval    time.Duration
-	healthTimeout     time.Duration
 	healthTicker      *time.Ticker
 	healthIntervalC   chan time.Duration
+	policyMu          sync.RWMutex
+	probePolicy       ProbePolicy
 	probeAllInFlight  atomic.Bool
+	probeRoundMu      sync.RWMutex
+	probeRound        ProbeRoundStatus
 	probeTagMu        sync.Mutex
 	probeTagsInFlight map[string]struct{}
 	debugSubMu        sync.RWMutex
@@ -218,6 +329,11 @@ func NewManager(cfg Config) (*Manager, error) {
 		probeTagsInFlight: make(map[string]struct{}),
 		healthSubscribers: make(map[uint64]func(HealthResultEvent)),
 		groupSchedules:    make(map[int64]groupHealthSchedule),
+		probePolicy: normalizeProbePolicy(ProbePolicy{
+			Concurrency: cfg.ProbeConcurrency, StartupTimeout: cfg.StartupProbeTimeout,
+			RoutineTimeout: cfg.RoutineProbeTimeout, DialTimeout: cfg.ProbeDialTimeout,
+			ResponseTimeout: cfg.ProbeResponseTimeout, RoutineRetries: cfg.RoutineProbeRetries,
+		}),
 	}
 	if strings.TrimSpace(cfg.ProbeTarget) != "" {
 		target, err := parseProbeTarget(cfg.ProbeTarget)
@@ -239,13 +355,9 @@ func (m *Manager) SetLogger(logger Logger) {
 
 // StartPeriodicHealthCheck starts a background goroutine that periodically checks all nodes.
 // interval: how often to check (e.g., 30 * time.Second)
-// timeout: timeout for each probe (e.g., 10 * time.Second)
-func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
+func (m *Manager) StartPeriodicHealthCheck(interval time.Duration) {
 	if interval <= 0 {
 		interval = 2 * time.Hour
-	}
-	if timeout <= 0 {
-		timeout = 10 * time.Second
 	}
 
 	m.healthMu.Lock()
@@ -253,7 +365,6 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 		m.healthIntervalC = make(chan time.Duration, 1)
 	}
 	m.healthInterval = interval
-	m.healthTimeout = timeout
 	if m.healthTicker != nil {
 		m.healthTicker.Stop()
 	}
@@ -263,9 +374,6 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 	m.healthMu.Unlock()
 
 	go func() {
-		// 启动后立即进行一次检查（走去重）
-		m.RequestProbeAllOnce(timeout)
-
 		for {
 			select {
 			case <-m.ctx.Done():
@@ -281,7 +389,7 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 					m.logger.Info("periodic health check interval updated: ", newInterval)
 				}
 			case <-ticker.C:
-				m.RequestDueProbesOnce(timeout)
+				m.RequestDueProbesOnce()
 			}
 		}
 	}()
@@ -367,110 +475,225 @@ func (m *Manager) probeDue(tag string, lastCheck, now time.Time) bool {
 	return !now.Before(lastCheck.Add(interval))
 }
 
-// RequestProbeAllOnce triggers a full probe round at most once concurrently.
-// If another full probe is already running, it returns immediately.
-func (m *Manager) RequestProbeAllOnce(timeout time.Duration) {
+// RequestStartupProbeAllOnce triggers the one fast full round used after all
+// nodes have been registered at startup or reload.
+func (m *Manager) RequestStartupProbeAllOnce() {
 	if _, ready := m.TargetForProbe(); !ready {
+		m.mu.RLock()
+		tags := make([]string, 0, len(m.nodes))
+		for tag := range m.nodes {
+			tags = append(tags, tag)
+		}
+		m.mu.RUnlock()
+		for _, tag := range tags {
+			_ = m.MarkAvailableWithoutProbe(tag)
+		}
 		return
 	}
-	if m.probeAllInFlight.Swap(true) {
-		return
-	}
-	go func() {
-		defer m.probeAllInFlight.Store(false)
-		m.probeAllNodes(timeout)
-	}()
+	m.requestProbeBatch(ProbeRoundStartup, false)
+}
+
+// RequestRoutineProbeAllOnce triggers a periodic-policy full round.
+func (m *Manager) RequestRoutineProbeAllOnce() {
+	m.requestProbeBatch(ProbeRoundPeriodic, false)
 }
 
 // RequestDueProbesOnce checks only nodes whose effective management/group
-// interval has elapsed. A full and a due round never overlap.
-func (m *Manager) RequestDueProbesOnce(timeout time.Duration) {
-	if _, ready := m.TargetForProbe(); !ready {
-		return
-	}
-	if m.probeAllInFlight.Swap(true) {
+// interval has elapsed. Batch rounds never overlap.
+func (m *Manager) RequestDueProbesOnce() {
+	m.requestProbeBatch(ProbeRoundPeriodic, true)
+}
+
+func (m *Manager) requestProbeBatch(kind ProbeRoundKind, dueOnly bool) {
+	if _, ready := m.TargetForProbe(); !ready || m.probeAllInFlight.Load() {
 		return
 	}
 	go func() {
-		defer m.probeAllInFlight.Store(false)
-		m.probeNodes(timeout, true)
+		if _, err := m.RunProbeBatch(m.ctx, kind, dueOnly, nil, nil); err != nil &&
+			!errors.Is(err, ErrProbeRoundInProgress) && !errors.Is(err, context.Canceled) && m.logger != nil {
+			m.logger.Warn("probe round failed: ", err)
+		}
 	}()
 }
 
-// probeAllNodes checks all registered nodes concurrently.
-func (m *Manager) probeAllNodes(timeout time.Duration) {
-	m.probeNodes(timeout, false)
-}
-
-func (m *Manager) probeNodes(timeout time.Duration, dueOnly bool) {
+// RunProbeBatch executes one mutually exclusive worker-pool round. The result
+// callback is serialized on the caller goroutine, which makes it safe for SSE.
+func (m *Manager) RunProbeBatch(ctx context.Context, kind ProbeRoundKind, dueOnly bool,
+	onStart func(total int), onResult func(ProbeBatchResult)) (ProbeBatchSummary, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ready := m.TargetForProbe(); !ready {
+		return ProbeBatchSummary{}, errors.New("probe target not configured")
+	}
 	m.mu.RLock()
 	entries := make([]*entry, 0, len(m.nodes))
 	for _, e := range m.nodes {
+		e.mu.RLock()
+		probeFn := e.probe
+		lastHealthCheck := e.lastHealthCheck
+		tag := e.info.Tag
+		e.mu.RUnlock()
+		if probeFn == nil || (dueOnly && !m.probeDue(tag, lastHealthCheck, time.Now())) {
+			continue
+		}
 		entries = append(entries, e)
 	}
 	m.mu.RUnlock()
 
+	if !m.probeAllInFlight.CompareAndSwap(false, true) {
+		return ProbeBatchSummary{}, ErrProbeRoundInProgress
+	}
+	entries = m.reserveBatchProbeEntries(entries)
+	policy := m.ProbePolicy()
+	timeout, retries := policy.RoutineTimeout, policy.RoutineRetries
+	if kind == ProbeRoundStartup {
+		timeout, retries = policy.StartupTimeout, 0
+	}
+	status := ProbeRoundStatus{InFlight: true, Kind: kind, StartedAt: time.Now(), Total: len(entries)}
+	m.probeRoundMu.Lock()
+	m.probeRound = status
+	m.probeRoundMu.Unlock()
+	defer func() {
+		m.probeAllInFlight.Store(false)
+		m.probeRoundMu.Lock()
+		m.probeRound.InFlight = false
+		m.probeRoundMu.Unlock()
+	}()
+	if onStart != nil {
+		onStart(len(entries))
+	}
 	if len(entries) == 0 {
-		return
+		return ProbeBatchSummary{}, nil
 	}
 
 	if m.logger != nil {
-		m.logger.Info("starting health check for ", len(entries), " nodes")
+		m.logger.Info("starting ", kind, " health check for ", len(entries), " nodes")
 	}
-
-	workerLimit := runtime.NumCPU() * 2
-	if workerLimit < 8 {
-		workerLimit = 8
-	}
-	sem := make(chan struct{}, workerLimit)
+	workerLimit := effectiveProbeConcurrency(policy.Concurrency, len(entries))
+	jobs := make(chan *entry, len(entries))
+	results := make(chan ProbeBatchResult, len(entries))
 	var wg sync.WaitGroup
-	var availableCount atomic.Int32
-	var failedCount atomic.Int32
-
 	for _, e := range entries {
-		e.mu.RLock()
-		probeFn := e.probe
-		tag := e.info.Tag
-		lastHealthCheck := e.lastHealthCheck
-		e.mu.RUnlock()
-
-		if probeFn == nil {
-			continue
-		}
-		if dueOnly && !m.probeDue(tag, lastHealthCheck, time.Now()) {
-			continue
-		}
-		if !m.beginTagProbe(tag) {
-			continue
-		}
-
-		sem <- struct{}{}
+		jobs <- e
+	}
+	close(jobs)
+	for range workerLimit {
 		wg.Add(1)
-		go func(entry *entry, probe probeFunc, tag string) {
+		go func() {
 			defer wg.Done()
-			defer func() { <-sem }()
-			defer m.endTagProbe(tag)
-
-			ctx, cancel := context.WithTimeout(m.ctx, timeout)
-			latency, err := probe(ctx)
-			cancel()
-			m.applyHealthResult(entry, latency, err, time.Now())
-			if err != nil {
-				failedCount.Add(1)
-			} else {
-				availableCount.Add(1)
+			for entry := range jobs {
+				results <- m.probeBatchEntry(ctx, entry, timeout, retries, policy.DialTimeout, policy.ResponseTimeout)
 			}
-
-			if err != nil && m.logger != nil {
-				m.logger.Warn("probe failed for ", tag, ": ", err)
-			}
-		}(e, probeFn, tag)
+		}()
 	}
-	wg.Wait()
-
+	go func() { wg.Wait(); close(results) }()
+	summary := ProbeBatchSummary{Total: len(entries)}
+	for result := range results {
+		if result.Err != nil {
+			summary.Failed++
+			if m.logger != nil {
+				m.logger.Warn("probe failed for ", result.Tag, ": ", result.Err)
+			}
+		} else {
+			summary.Success++
+		}
+		m.probeRoundMu.Lock()
+		m.probeRound.Completed++
+		m.probeRound.Success = summary.Success
+		m.probeRound.Failed = summary.Failed
+		m.probeRoundMu.Unlock()
+		if onResult != nil {
+			onResult(result)
+		}
+	}
 	if m.logger != nil {
-		m.logger.Info("health check completed: ", availableCount.Load(), " available, ", failedCount.Load(), " failed")
+		m.logger.Info(kind, " health check completed: ", summary.Success, " available, ", summary.Failed, " failed")
 	}
+	return summary, ctx.Err()
+}
+
+func (m *Manager) probeBatchEntry(ctx context.Context, entry *entry, timeout time.Duration, retries int, dialTimeout, responseTimeout time.Duration) ProbeBatchResult {
+	entry.mu.RLock()
+	probe, tag, name := entry.probe, entry.info.Tag, entry.info.Name
+	entry.mu.RUnlock()
+	result := ProbeBatchResult{Tag: tag, Name: name}
+	defer m.endTagProbe(tag)
+	if probe == nil {
+		result.Err = errors.New("probe function not configured")
+		return result
+	}
+	nodeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	nodeCtx = withProbePhaseTimeouts(nodeCtx, dialTimeout, responseTimeout)
+	for attempt := 0; attempt <= retries; attempt++ {
+		result.Attempts = attempt + 1
+		result.Latency, result.Err = probe(nodeCtx)
+		if result.Err == nil || nodeCtx.Err() != nil {
+			break
+		}
+	}
+	if ctx.Err() == nil {
+		m.applyHealthResult(entry, result.Latency, result.Err, time.Now())
+	}
+	return result
+}
+
+func (m *Manager) reserveBatchProbeEntries(entries []*entry) []*entry {
+	m.probeTagMu.Lock()
+	defer m.probeTagMu.Unlock()
+	reserved := entries[:0]
+	for _, entry := range entries {
+		entry.mu.RLock()
+		tag := entry.info.Tag
+		entry.mu.RUnlock()
+		if _, exists := m.probeTagsInFlight[tag]; exists {
+			continue
+		}
+		m.probeTagsInFlight[tag] = struct{}{}
+		reserved = append(reserved, entry)
+	}
+	return reserved
+}
+
+func (m *Manager) ProbePolicy() ProbePolicy {
+	m.policyMu.RLock()
+	defer m.policyMu.RUnlock()
+	return m.probePolicy
+}
+
+func (m *Manager) UpdateProbePolicy(policy ProbePolicy) {
+	m.policyMu.Lock()
+	m.probePolicy = normalizeProbePolicy(policy)
+	m.policyMu.Unlock()
+}
+
+func (m *Manager) ProbePhaseTimeouts() (time.Duration, time.Duration) {
+	policy := m.ProbePolicy()
+	return policy.DialTimeout, policy.ResponseTimeout
+}
+
+// ProbePhaseTimeoutsFor returns the round snapshot carried by ctx, falling
+// back to the current policy for standalone probes.
+func (m *Manager) ProbePhaseTimeoutsFor(ctx context.Context) (time.Duration, time.Duration) {
+	if ctx != nil {
+		if snapshot, ok := ctx.Value(probePhaseTimeoutsContextKey{}).(probePhaseTimeouts); ok {
+			return snapshot.dial, snapshot.response
+		}
+	}
+	return m.ProbePhaseTimeouts()
+}
+
+func (m *Manager) ProbeRoundStatus() ProbeRoundStatus {
+	m.probeRoundMu.RLock()
+	defer m.probeRoundMu.RUnlock()
+	return m.probeRound
+}
+
+func (m *Manager) ProbeNodeCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.nodes)
 }
 
 // Stop stops the periodic health check.
@@ -596,6 +819,16 @@ func (m *Manager) TargetForProbe() (ProbeTarget, bool) {
 
 // UpdateProbeTarget dynamically updates the probe destination at runtime.
 func (m *Manager) UpdateProbeTarget(target string) error {
+	if err := m.SetProbeTarget(target); err != nil {
+		return err
+	}
+	m.RequestRoutineProbeAllOnce()
+	return nil
+}
+
+// SetProbeTarget updates the destination without scheduling a round. Reload
+// uses this so the target is applied before its single startup-policy round.
+func (m *Manager) SetProbeTarget(target string) error {
 	target = strings.TrimSpace(target)
 	if target == "" {
 		m.mu.Lock()
@@ -615,14 +848,6 @@ func (m *Manager) UpdateProbeTarget(target string) error {
 	m.probeReady = true
 	m.cfg.ProbeTarget = target
 	m.mu.Unlock()
-	m.healthMu.Lock()
-	timeout := m.healthTimeout
-	m.healthMu.Unlock()
-	if timeout <= 0 {
-		timeout = 10 * time.Second
-	}
-	m.RequestProbeAllOnce(timeout)
-
 	return nil
 }
 
@@ -799,7 +1024,17 @@ func (m *Manager) Probe(ctx context.Context, tag string) (time.Duration, error) 
 		return 0, errors.New("probe already in progress for this node")
 	}
 	defer m.endTagProbe(tag)
-	latency, err := probe(ctx)
+	policy := m.ProbePolicy()
+	probeCtx, cancel := context.WithTimeout(ctx, policy.RoutineTimeout)
+	defer cancel()
+	probeCtx = withProbePhaseTimeouts(probeCtx, policy.DialTimeout, policy.ResponseTimeout)
+	var latency time.Duration
+	for attempt := 0; attempt <= policy.RoutineRetries; attempt++ {
+		latency, err = probe(probeCtx)
+		if err == nil || probeCtx.Err() != nil {
+			break
+		}
+	}
 	m.applyHealthResult(e, latency, err, time.Now())
 	if err != nil {
 		return 0, err

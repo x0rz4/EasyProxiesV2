@@ -62,13 +62,20 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	}
 
 	monitorCfg := monitor.Config{
-		Enabled:       cfg.ManagementEnabled(),
-		Listen:        cfg.Management.Listen,
-		ProbeTarget:   cfg.Management.ProbeTarget,
-		Password:      cfg.Management.Password,
-		ProxyUsername: proxyUsername,
-		ProxyPassword: proxyPassword,
-		ExternalIP:    cfg.ExternalIP,
+		Enabled:              cfg.ManagementEnabled(),
+		Listen:               cfg.Management.Listen,
+		ProbeTarget:          cfg.Management.ProbeTarget,
+		Password:             cfg.Management.Password,
+		ProxyUsername:        proxyUsername,
+		ProxyPassword:        proxyPassword,
+		ExternalIP:           cfg.ExternalIP,
+		SkipCertVerify:       cfg.SkipCertVerify,
+		ProbeConcurrency:     cfg.Management.ProbeConcurrency,
+		StartupProbeTimeout:  cfg.Management.StartupProbeTimeout,
+		RoutineProbeTimeout:  cfg.Management.RoutineProbeTimeout,
+		ProbeDialTimeout:     cfg.Management.ProbeDialTimeout,
+		ProbeResponseTimeout: cfg.Management.ProbeResponseTimeout,
+		RoutineProbeRetries:  cfg.RoutineProbeRetryCount(),
 	}
 
 	// ── 4. Create and start BoxManager ──

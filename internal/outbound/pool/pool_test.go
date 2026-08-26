@@ -199,6 +199,57 @@ func TestProbeFunctionSupportsTargetConfiguredAfterPoolCreation(t *testing.T) {
 	}
 }
 
+func TestProbeMemberUsesIndependentDialDeadline(t *testing.T) {
+	mgr, err := monitor.NewManager(monitor.Config{
+		ProbeTarget: "http://example.com", ProbeDialTimeout: 25 * time.Millisecond,
+		ProbeResponseTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	member := &memberState{tag: "slow-dial", outbound: &fakeOutbound{dial: func(ctx context.Context, _ string, _ M.Socksaddr) (net.Conn, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}}}
+	target, _ := mgr.TargetForProbe()
+	started := time.Now()
+	if _, err := (&poolOutbound{monitor: mgr}).probeMember(t.Context(), member, target); err == nil {
+		t.Fatal("stalled dial passed health probe")
+	}
+	if elapsed := time.Since(started); elapsed > 300*time.Millisecond {
+		t.Fatalf("dial phase ignored configured deadline: %s", elapsed)
+	}
+}
+
+func TestProbeMemberUsesIndependentResponseDeadline(t *testing.T) {
+	mgr, err := monitor.NewManager(monitor.Config{
+		ProbeTarget: "http://example.com", ProbeDialTimeout: time.Second,
+		ProbeResponseTimeout: 25 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	client, server := net.Pipe()
+	defer server.Close()
+	go func() {
+		buffer := make([]byte, 1024)
+		_, _ = server.Read(buffer)
+	}()
+	member := &memberState{tag: "slow-response", outbound: &fakeOutbound{dial: func(context.Context, string, M.Socksaddr) (net.Conn, error) {
+		return client, nil
+	}}}
+	target, _ := mgr.TargetForProbe()
+	started := time.Now()
+	if _, err := (&poolOutbound{monitor: mgr}).probeMember(t.Context(), member, target); err == nil {
+		t.Fatal("stalled response passed health probe")
+	}
+	if elapsed := time.Since(started); elapsed > 300*time.Millisecond {
+		t.Fatalf("response phase ignored configured deadline: %s", elapsed)
+	}
+}
+
 func TestBasePoolExcludesActiveProbeFailures(t *testing.T) {
 	mgr, err := monitor.NewManager(monitor.Config{ProbeTarget: "http://example.com/generate_204"})
 	if err != nil {

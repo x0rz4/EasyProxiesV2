@@ -15,6 +15,8 @@ import type {
   SubscriptionActionResponse,
   SubscriptionRefreshResponse,
   ProbeSSEEvent,
+  ProbeOperationsSettings,
+  ProbeOperationsStatus,
   UnlockResult,
   UnlockResultsResponse,
   UnlockSSEEvent,
@@ -140,6 +142,21 @@ export async function fetchNodes(): Promise<NodesResponse> {
   return request<NodesResponse>('/api/nodes')
 }
 
+export async function fetchProbeSettings(): Promise<ProbeOperationsSettings> {
+  return request<ProbeOperationsSettings>('/api/operations/probe-settings')
+}
+
+export async function updateProbeSettings(settings: ProbeOperationsSettings): Promise<ProbeOperationsSettings> {
+  return request<ProbeOperationsSettings>('/api/operations/probe-settings', {
+    method: 'PUT',
+    body: JSON.stringify(settings),
+  })
+}
+
+export async function fetchProbeStatus(): Promise<ProbeOperationsStatus> {
+  return request<ProbeOperationsStatus>('/api/operations/probe-status')
+}
+
 // ---- Group pools API ----
 
 export async function listGroupPools(): Promise<GroupPoolsResponse> {
@@ -225,7 +242,12 @@ export function probeAllNodes(
       })
 
       if (!res.ok) {
-        throw new ApiError(`探测失败: HTTP ${res.status}`, res.status)
+        let message = `探测失败: HTTP ${res.status}`
+        try {
+          const body = await res.json() as { error?: string }
+          if (body.error) message = body.error
+        } catch { /* ignore parse errors */ }
+        throw new ApiError(message, res.status)
       }
 
       const reader = res.body?.getReader()

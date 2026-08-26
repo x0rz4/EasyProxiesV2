@@ -245,10 +245,6 @@ func (p *poolOutbound) Start(stage adapter.StartStage) error {
 		p.reconcileCurrent()
 		p.unsubscribeActivation = group.RegisterActivationHandler(p.options.GroupID, p.activateNodeID)
 	}
-	// 在初始化完成后，立即在后台触发健康检查
-	if p.monitor != nil && !p.options.MonitorObserverOnly {
-		go p.probeAllMembersOnStartup()
-	}
 	return nil
 }
 
@@ -364,23 +360,6 @@ func (p *poolOutbound) initializeMembersLocked() error {
 	p.logger.Info("pool initialized with ", len(members), " members")
 
 	return nil
-}
-
-// probeAllMembersOnStartup performs initial health checks on all members
-func (p *poolOutbound) probeAllMembersOnStartup() {
-	_, ok := p.monitor.DestinationForProbe()
-	if !ok {
-		p.logger.Warn("probe target not configured, skipping initial health check")
-		// 没有配置探测目标时，标记所有节点为可用
-		p.mu.Lock()
-		members := append([]*memberState(nil), p.members...)
-		p.mu.Unlock()
-		for _, member := range members {
-			_ = p.monitor.MarkAvailableWithoutProbe(member.tag)
-		}
-		return
-	}
-	p.monitor.RequestProbeAllOnce(15 * time.Second)
 }
 
 func (p *poolOutbound) memberName(member *memberState) string {
@@ -937,22 +916,7 @@ func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Conte
 			return 0, E.New("probe target not configured")
 		}
 
-		start := time.Now()
-		conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, target.Destination)
-		if err != nil {
-			return 0, err
-		}
-		defer conn.Close()
-
-		// Validate the complete HTTP response headers and expected status.
-		_, err = httpProbe(ctx, conn, target, nil)
-		if err != nil {
-			return 0, err
-		}
-
-		// Total duration = dial time + HTTP probe
-		duration := time.Since(start)
-		return duration, nil
+		return p.probeMember(ctx, member, target)
 	}
 }
 
@@ -991,23 +955,27 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 			return 0, E.New("member not found: ", tag)
 		}
 
-		start := time.Now()
-		conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, target.Destination)
-		if err != nil {
-			return 0, err
-		}
-		defer conn.Close()
-
-		// Validate the complete HTTP response headers and expected status.
-		_, err = httpProbe(ctx, conn, target, nil)
-		if err != nil {
-			return 0, err
-		}
-
-		// Total duration includes dial, optional TLS handshake, and response headers.
-		duration := time.Since(start)
-		return duration, nil
+		return p.probeMember(ctx, member, target)
 	}
+}
+
+func (p *poolOutbound) probeMember(ctx context.Context, member *memberState, target monitor.ProbeTarget) (time.Duration, error) {
+	dialTimeout, responseTimeout := p.monitor.ProbePhaseTimeoutsFor(ctx)
+	start := time.Now()
+	dialCtx, cancelDial := context.WithTimeout(ctx, dialTimeout)
+	conn, err := member.outbound.DialContext(dialCtx, N.NetworkTCP, target.Destination)
+	cancelDial()
+	if err != nil {
+		return 0, err
+	}
+	defer conn.Close()
+	responseCtx, cancelResponse := context.WithTimeout(ctx, responseTimeout)
+	_, err = httpProbe(responseCtx, conn, target, nil)
+	cancelResponse()
+	if err != nil {
+		return 0, err
+	}
+	return time.Since(start), nil
 }
 
 // makeReleaseByTagFunc creates a release function that works before member initialization

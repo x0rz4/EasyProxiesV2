@@ -171,6 +171,7 @@ type Server struct {
 
 	// Concurrency control
 	probeSem            *semaphore.Weighted
+	configMutationMu    sync.Mutex
 	groupMutationMu     sync.Mutex
 	groupOperationLocks sync.Map // map[int64]*sync.Mutex
 
@@ -216,6 +217,8 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/auth", s.handleAuth)
 	mux.HandleFunc("/api/settings", s.withAuth(s.handleSettings))
+	mux.HandleFunc("/api/operations/probe-settings", s.withAuth(s.handleProbeSettings))
+	mux.HandleFunc("/api/operations/probe-status", s.withAuth(s.handleProbeStatus))
 	mux.HandleFunc("/api/nodes", s.withAuth(s.handleNodes))
 	mux.HandleFunc("/api/nodes/config", s.withAuth(s.handleConfigNodes))
 	mux.HandleFunc("/api/nodes/config/batch-toggle", s.withAuth(s.handleConfigNodesBatchToggle))
@@ -339,6 +342,179 @@ func (s *Server) SetConfig(cfg *config.Config) {
 		s.cfg.SkipCertVerify = cfg.SkipCertVerify
 		cfg.RUnlock()
 	}
+}
+
+type probeSettingsResponse struct {
+	ProbeTarget          string `json:"probe_target"`
+	HealthCheckInterval  string `json:"health_check_interval"`
+	ProbeConcurrency     int    `json:"probe_concurrency"`
+	StartupProbeTimeout  string `json:"startup_probe_timeout"`
+	RoutineProbeTimeout  string `json:"routine_probe_timeout"`
+	ProbeDialTimeout     string `json:"probe_dial_timeout"`
+	ProbeResponseTimeout string `json:"probe_response_timeout"`
+	RoutineProbeRetries  int    `json:"routine_probe_retries"`
+}
+
+type probeStatusResponse struct {
+	NodeCount                    int              `json:"node_count"`
+	ConcurrencyMode              string           `json:"concurrency_mode"`
+	ConfiguredConcurrency        int              `json:"configured_concurrency"`
+	EffectiveConcurrency         int              `json:"effective_concurrency"`
+	EstimatedStartupWorstCase    string           `json:"estimated_startup_worst_case"`
+	EstimatedStartupWorstSeconds float64          `json:"estimated_startup_worst_seconds"`
+	EstimatedRoutineWorstCase    string           `json:"estimated_routine_worst_case"`
+	EstimatedRoutineWorstSeconds float64          `json:"estimated_routine_worst_seconds"`
+	Round                        ProbeRoundStatus `json:"round"`
+}
+
+func probeSettingsFromConfig(c *config.Config) probeSettingsResponse {
+	return probeSettingsResponse{
+		ProbeTarget:          c.Management.ProbeTarget,
+		HealthCheckInterval:  c.Management.HealthCheckInterval.String(),
+		ProbeConcurrency:     c.Management.ProbeConcurrency,
+		StartupProbeTimeout:  c.Management.StartupProbeTimeout.String(),
+		RoutineProbeTimeout:  c.Management.RoutineProbeTimeout.String(),
+		ProbeDialTimeout:     c.Management.ProbeDialTimeout.String(),
+		ProbeResponseTimeout: c.Management.ProbeResponseTimeout.String(),
+		RoutineProbeRetries:  c.RoutineProbeRetryCount(),
+	}
+}
+
+func parsePositiveDuration(name, value string) (time.Duration, error) {
+	duration, err := time.ParseDuration(strings.TrimSpace(value))
+	if err != nil || duration <= 0 {
+		return 0, fmt.Errorf("%s必须是大于 0 的 Go 时长（例如 5s、2m）", name)
+	}
+	return duration, nil
+}
+
+func (s *Server) handleProbeSettings(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.cfgMu.RLock()
+		cfg := s.cfgSrc
+		s.cfgMu.RUnlock()
+		if cfg == nil {
+			writeAPIError(w, http.StatusServiceUnavailable, "配置存储未初始化")
+			return
+		}
+		snapshot := cfg.Snapshot()
+		writeJSON(w, probeSettingsFromConfig(snapshot))
+	case http.MethodPut:
+		var request probeSettingsResponse
+		if err := decodeJSON(r, &request); err != nil {
+			writeAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		startupTimeout, err := parsePositiveDuration("启动探测超时", request.StartupProbeTimeout)
+		if err != nil {
+			writeAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		routineTimeout, err := parsePositiveDuration("周期/手动探测超时", request.RoutineProbeTimeout)
+		if err != nil {
+			writeAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		dialTimeout, err := parsePositiveDuration("拨号超时", request.ProbeDialTimeout)
+		if err != nil {
+			writeAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		responseTimeout, err := parsePositiveDuration("响应超时", request.ProbeResponseTimeout)
+		if err != nil {
+			writeAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		healthInterval, err := parsePositiveDuration("健康检查间隔", request.HealthCheckInterval)
+		if err != nil {
+			writeAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		probeTarget := strings.TrimSpace(request.ProbeTarget)
+		if probeTarget != "" {
+			if _, err := parseProbeTarget(probeTarget); err != nil {
+				writeAPIError(w, http.StatusBadRequest, "探测目标无效: "+err.Error())
+				return
+			}
+		}
+		if err := config.ValidateManagementProbeSettings(request.ProbeConcurrency, startupTimeout,
+			routineTimeout, dialTimeout, responseTimeout, request.RoutineProbeRetries); err != nil {
+			writeAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		s.configMutationMu.Lock()
+		defer s.configMutationMu.Unlock()
+		s.cfgMu.RLock()
+		current := s.cfgSrc
+		s.cfgMu.RUnlock()
+		if current == nil {
+			writeAPIError(w, http.StatusServiceUnavailable, "配置存储未初始化")
+			return
+		}
+		updated := current.Snapshot()
+		oldTarget := updated.Management.ProbeTarget
+		updated.Management.ProbeTarget = probeTarget
+		updated.Management.HealthCheckInterval = healthInterval
+		updated.Management.ProbeConcurrency = request.ProbeConcurrency
+		updated.Management.StartupProbeTimeout = startupTimeout
+		updated.Management.RoutineProbeTimeout = routineTimeout
+		updated.Management.ProbeDialTimeout = dialTimeout
+		updated.Management.ProbeResponseTimeout = responseTimeout
+		retries := request.RoutineProbeRetries
+		updated.Management.RoutineProbeRetries = &retries
+		if err := updated.SaveSettings(); err != nil {
+			writeAPIError(w, http.StatusInternalServerError, "保存配置失败: "+err.Error())
+			return
+		}
+		s.cfgMu.Lock()
+		s.cfgSrc = updated
+		s.cfg.ProbeTarget = probeTarget
+		s.cfgMu.Unlock()
+		s.mgr.UpdateProbePolicy(ProbePolicy{
+			Concurrency: request.ProbeConcurrency, StartupTimeout: startupTimeout,
+			RoutineTimeout: routineTimeout, DialTimeout: dialTimeout,
+			ResponseTimeout: responseTimeout, RoutineRetries: retries,
+		})
+		s.mgr.SetHealthCheckInterval(healthInterval)
+		if oldTarget != probeTarget {
+			if err := s.mgr.UpdateProbeTarget(probeTarget); err != nil {
+				writeAPIError(w, http.StatusInternalServerError, "运行时应用探测目标失败: "+err.Error())
+				return
+			}
+		}
+		writeJSON(w, probeSettingsFromConfig(updated))
+	default:
+		writeAPIError(w, http.StatusMethodNotAllowed, "请求方法不允许")
+	}
+}
+
+func (s *Server) handleProbeStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAPIError(w, http.StatusMethodNotAllowed, "请求方法不允许")
+		return
+	}
+	policy := s.mgr.ProbePolicy()
+	nodeCount := s.mgr.ProbeNodeCount()
+	effective := effectiveProbeConcurrency(policy.Concurrency, nodeCount)
+	rounds := 0
+	if effective > 0 {
+		rounds = (nodeCount + effective - 1) / effective
+	}
+	startupEstimate := time.Duration(rounds) * policy.StartupTimeout
+	routineEstimate := time.Duration(rounds) * policy.RoutineTimeout
+	mode := "fixed"
+	if policy.Concurrency == 0 {
+		mode = "auto"
+	}
+	writeJSON(w, probeStatusResponse{
+		NodeCount: nodeCount, ConcurrencyMode: mode,
+		ConfiguredConcurrency: policy.Concurrency, EffectiveConcurrency: effective,
+		EstimatedStartupWorstCase: startupEstimate.String(), EstimatedStartupWorstSeconds: startupEstimate.Seconds(),
+		EstimatedRoutineWorstCase: routineEstimate.String(), EstimatedRoutineWorstSeconds: routineEstimate.Seconds(),
+		Round: s.mgr.ProbeRoundStatus(),
+	})
 }
 
 // allSettingsResponse is the JSON structure for GET /api/settings.
@@ -526,6 +702,8 @@ func (s *Server) updateAllSettings(ctx context.Context, req allSettingsRequest) 
 			return SettingsUpdateResult{}, settingsValidationError{fmt.Errorf("参数验证失败: 探测目标无效: %w", err)}
 		}
 	}
+	s.configMutationMu.Lock()
+	defer s.configMutationMu.Unlock()
 
 	s.cfgMu.RLock()
 	c := s.cfgSrc
@@ -1022,118 +1200,56 @@ func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-
-	// Set SSE headers
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "SSE not supported", http.StatusInternalServerError)
 		return
 	}
-
-	// Get all nodes
-	snapshots := s.mgr.Snapshot()
-	total := len(snapshots)
-	if total == 0 {
-		fmt.Fprintf(w, "data: %s\n\n", `{"type":"complete","total":0,"success":0,"failed":0}`)
+	started := false
+	completed := 0
+	total := 0
+	summary, err := s.mgr.RunProbeBatch(r.Context(), ProbeRoundManual, false, func(count int) {
+		started, total = true, count
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		data, _ := json.Marshal(map[string]any{"type": "start", "total": total})
+		fmt.Fprintf(w, "data: %s\n\n", data)
 		flusher.Flush()
+	}, func(result ProbeBatchResult) {
+		completed++
+		status, errorMessage := "success", ""
+		latency := result.Latency.Milliseconds()
+		if result.Err != nil {
+			status, errorMessage, latency = "error", result.Err.Error(), -1
+		}
+		progress := float64(100)
+		if total > 0 {
+			progress = float64(completed) / float64(total) * 100
+		}
+		data, _ := json.Marshal(map[string]any{
+			"type": "progress", "tag": result.Tag, "name": result.Name,
+			"latency": latency, "status": status, "error": errorMessage,
+			"current": completed, "total": total, "progress": progress,
+		})
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	})
+	if errors.Is(err, ErrProbeRoundInProgress) && !started {
+		writeAPIError(w, http.StatusConflict, "已有全量探测正在运行")
 		return
 	}
-
-	// Send start event
-	fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"type":"start","total":%d}`, total))
-	flusher.Flush()
-
-	// Create context with timeout
-	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
-	defer cancel()
-
-	// Probe all nodes with semaphore control
-	type probeResult struct {
-		tag     string
-		name    string
-		latency int64
-		err     string
-	}
-	results := make(chan probeResult, total)
-	var wg sync.WaitGroup
-
-	// Launch probes with semaphore control
-	for _, snap := range snapshots {
-		wg.Add(1)
-		go func(snap Snapshot) {
-			defer wg.Done()
-
-			// Acquire semaphore permit
-			if err := s.probeSem.Acquire(ctx, 1); err != nil {
-				results <- probeResult{
-					tag:  snap.Tag,
-					name: snap.Name,
-					err:  "probe cancelled: " + err.Error(),
-				}
-				return
-			}
-			defer s.probeSem.Release(1)
-
-			// Execute probe
-			probeCtx, probeCancel := context.WithTimeout(ctx, 10*time.Second)
-			defer probeCancel()
-
-			latency, err := s.mgr.Probe(probeCtx, snap.Tag)
-			if err != nil {
-				results <- probeResult{
-					tag:     snap.Tag,
-					name:    snap.Name,
-					latency: -1,
-					err:     err.Error(),
-				}
-			} else {
-				results <- probeResult{
-					tag:     snap.Tag,
-					name:    snap.Name,
-					latency: latency.Milliseconds(),
-					err:     "",
-				}
-			}
-		}(snap)
-	}
-
-	// Wait for all probes to complete
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	// Collect results
-	successCount := 0
-	failedCount := 0
-	count := 0
-
-	for result := range results {
-		count++
-		if result.err != "" {
-			failedCount++
-		} else {
-			successCount++
+	if err != nil {
+		if !started {
+			writeAPIError(w, http.StatusBadRequest, err.Error())
 		}
-
-		progress := float64(count) / float64(total) * 100
-		status := "success"
-		if result.err != "" {
-			status = "error"
-		}
-
-		eventData := fmt.Sprintf(`{"type":"progress","tag":"%s","name":"%s","latency":%d,"status":"%s","error":"%s","current":%d,"total":%d,"progress":%.1f}`,
-			result.tag, result.name, result.latency, status, result.err, count, total, progress)
-		fmt.Fprintf(w, "data: %s\n\n", eventData)
-		flusher.Flush()
+		return
 	}
-
-	// Send complete event
-	fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"type":"complete","total":%d,"success":%d,"failed":%d}`, total, successCount, failedCount))
+	data, _ := json.Marshal(map[string]any{
+		"type": "complete", "total": summary.Total,
+		"success": summary.Success, "failed": summary.Failed,
+	})
+	fmt.Fprintf(w, "data: %s\n\n", data)
 	flusher.Flush()
 }
 

@@ -123,11 +123,17 @@ type MultiPortConfig struct {
 
 // ManagementConfig controls the monitoring HTTP endpoint.
 type ManagementConfig struct {
-	Enabled             *bool         `yaml:"enabled"`
-	Listen              string        `yaml:"listen"`
-	ProbeTarget         string        `yaml:"probe_target"`
-	Password            string        `yaml:"password"` // WebUI 访问密码，为空则不需要密码
-	HealthCheckInterval time.Duration `yaml:"health_check_interval"`
+	Enabled              *bool         `yaml:"enabled"`
+	Listen               string        `yaml:"listen"`
+	ProbeTarget          string        `yaml:"probe_target"`
+	Password             string        `yaml:"password"` // WebUI 访问密码，为空则不需要密码
+	HealthCheckInterval  time.Duration `yaml:"health_check_interval"`
+	ProbeConcurrency     int           `yaml:"probe_concurrency"`
+	StartupProbeTimeout  time.Duration `yaml:"startup_probe_timeout"`
+	RoutineProbeTimeout  time.Duration `yaml:"routine_probe_timeout"`
+	ProbeDialTimeout     time.Duration `yaml:"probe_dial_timeout"`
+	ProbeResponseTimeout time.Duration `yaml:"probe_response_timeout"`
+	RoutineProbeRetries  *int          `yaml:"routine_probe_retries"`
 }
 
 // SubscriptionRefreshConfig controls subscription auto-refresh and reload settings.
@@ -363,6 +369,28 @@ func (c *Config) applyDefaults() error {
 	}
 	if c.Management.HealthCheckInterval <= 0 {
 		c.Management.HealthCheckInterval = 2 * time.Hour
+	}
+	if c.Management.StartupProbeTimeout <= 0 {
+		c.Management.StartupProbeTimeout = 5 * time.Second
+	}
+	if c.Management.RoutineProbeTimeout <= 0 {
+		c.Management.RoutineProbeTimeout = 10 * time.Second
+	}
+	if c.Management.ProbeDialTimeout <= 0 {
+		c.Management.ProbeDialTimeout = 3 * time.Second
+	}
+	if c.Management.ProbeResponseTimeout <= 0 {
+		c.Management.ProbeResponseTimeout = 2 * time.Second
+	}
+	if c.Management.RoutineProbeRetries == nil {
+		defaultRetries := 1
+		c.Management.RoutineProbeRetries = &defaultRetries
+	}
+	if err := ValidateManagementProbeSettings(c.Management.ProbeConcurrency,
+		c.Management.StartupProbeTimeout, c.Management.RoutineProbeTimeout,
+		c.Management.ProbeDialTimeout, c.Management.ProbeResponseTimeout,
+		c.RoutineProbeRetryCount()); err != nil {
+		return fmt.Errorf("management probe settings: %w", err)
 	}
 
 	// Subscription refresh defaults
@@ -631,6 +659,38 @@ func (c *Config) ManagementEnabled() bool {
 		return true
 	}
 	return *c.Management.Enabled
+}
+
+// RoutineProbeRetryCount returns the configured retry count for periodic and
+// manual probes. A nil value means the legacy/default policy of one retry.
+func (c *Config) RoutineProbeRetryCount() int {
+	if c == nil || c.Management.RoutineProbeRetries == nil {
+		return 1
+	}
+	return *c.Management.RoutineProbeRetries
+}
+
+// ValidateManagementProbeSettings validates the operational probe policy.
+func ValidateManagementProbeSettings(concurrency int, startupTimeout, routineTimeout,
+	dialTimeout, responseTimeout time.Duration, routineRetries int) error {
+	if concurrency < 0 || concurrency > 512 {
+		return errors.New("探测并发必须为 0（自动）或 1-512")
+	}
+	for _, item := range []struct {
+		name  string
+		value time.Duration
+	}{
+		{"启动探测超时", startupTimeout}, {"周期/手动探测超时", routineTimeout},
+		{"拨号超时", dialTimeout}, {"响应超时", responseTimeout},
+	} {
+		if item.value <= 0 {
+			return fmt.Errorf("%s必须大于 0", item.name)
+		}
+	}
+	if routineRetries < 0 || routineRetries > 2 {
+		return errors.New("周期/手动失败重试次数必须为 0-2")
+	}
+	return nil
 }
 
 // EntryMode derives the public runtime mode from the two independent entry switches.
@@ -1700,6 +1760,10 @@ func (c *Config) Clone() *Config {
 	if c.Management.Enabled != nil {
 		enabled := *c.Management.Enabled
 		cloned.Management.Enabled = &enabled
+	}
+	if c.Management.RoutineProbeRetries != nil {
+		retries := *c.Management.RoutineProbeRetries
+		cloned.Management.RoutineProbeRetries = &retries
 	}
 
 	// Deep copy slices

@@ -56,6 +56,12 @@ management:
   listen: 0.0.0.0:9888                               # 监听地址
   probe_target: https://cp.cloudflare.com/generate_204 # 必须返回 204；HTTPS 会执行 TLS/SNI/证书校验
   health_check_interval: 2h                          # 周期健康检查间隔（默认 2 小时）
+  probe_concurrency: 0                               # 0=按节点数自动计算；也可固定为 1-512
+  startup_probe_timeout: 5s                         # 启动/重载时每个节点的总探测预算
+  routine_probe_timeout: 10s                        # 周期/手动探测总预算（包含失败重试）
+  probe_dial_timeout: 3s                            # 代理拨号阶段上限
+  probe_response_timeout: 2s                        # TLS、HTTP 写入及响应头读取上限
+  routine_probe_retries: 1                          # 周期/手动失败重试次数（0-2）
   password: "123456"                                       # WebUI 访问密码，为空则不需要密码
 
 # ───────────────────────────────────────────────────────────────

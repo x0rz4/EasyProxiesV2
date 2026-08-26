@@ -435,6 +435,39 @@ export interface ProbeSSEComplete {
 
 export type ProbeSSEEvent = ProbeSSEStart | ProbeSSEProgress | ProbeSSEComplete
 
+export interface ProbeOperationsSettings {
+  probe_target: string
+  health_check_interval: string
+  probe_concurrency: number
+  startup_probe_timeout: string
+  routine_probe_timeout: string
+  probe_dial_timeout: string
+  probe_response_timeout: string
+  routine_probe_retries: number
+}
+
+export interface ProbeRoundStatus {
+  in_flight: boolean
+  kind?: 'startup' | 'periodic' | 'manual'
+  started_at?: string
+  total: number
+  completed: number
+  success: number
+  failed: number
+}
+
+export interface ProbeOperationsStatus {
+  node_count: number
+  concurrency_mode: 'auto' | 'fixed'
+  configured_concurrency: number
+  effective_concurrency: number
+  estimated_startup_worst_case: string
+  estimated_startup_worst_seconds: number
+  estimated_routine_worst_case: string
+  estimated_routine_worst_seconds: number
+  round: ProbeRoundStatus
+}
+
 // ---- Unlock detection types ----
 
 // A single streaming/AI service unlock result.

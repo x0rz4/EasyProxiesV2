@@ -6,9 +6,89 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"go.yaml.in/yaml/v3"
 )
+
+func TestManagementProbeSettingsDefaultsAndExplicitZeroRetries(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("log_level: info\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadForReload(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Management.ProbeConcurrency != 0 || cfg.Management.StartupProbeTimeout != 5*time.Second ||
+		cfg.Management.RoutineProbeTimeout != 10*time.Second || cfg.Management.ProbeDialTimeout != 3*time.Second ||
+		cfg.Management.ProbeResponseTimeout != 2*time.Second || cfg.RoutineProbeRetryCount() != 1 {
+		t.Fatalf("unexpected defaults: %+v", cfg.Management)
+	}
+
+	if err := os.WriteFile(path, []byte("management:\n  routine_probe_retries: 0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = LoadForReload(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Management.RoutineProbeRetries == nil || cfg.RoutineProbeRetryCount() != 0 {
+		t.Fatalf("explicit zero retry was not preserved: %+v", cfg.Management.RoutineProbeRetries)
+	}
+}
+
+func TestManagementProbeSettingsCloneAndSaveRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("management:\n  probe_target: example.com:80\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadForReload(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retries := 2
+	cfg.Management.ProbeConcurrency = 64
+	cfg.Management.StartupProbeTimeout = 6 * time.Second
+	cfg.Management.RoutineProbeTimeout = 18 * time.Second
+	cfg.Management.ProbeDialTimeout = 3 * time.Second
+	cfg.Management.ProbeResponseTimeout = 3 * time.Second
+	cfg.Management.RoutineProbeRetries = &retries
+	clone := cfg.Clone()
+	*clone.Management.RoutineProbeRetries = 1
+	if cfg.RoutineProbeRetryCount() != 2 {
+		t.Fatal("clone shared the retry pointer with its source")
+	}
+	if err := cfg.SaveSettings(); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := LoadForReload(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Management.ProbeConcurrency != 64 || reloaded.Management.RoutineProbeTimeout != 18*time.Second || reloaded.RoutineProbeRetryCount() != 2 {
+		t.Fatalf("saved probe settings = %+v", reloaded.Management)
+	}
+}
+
+func TestValidateManagementProbeSettings(t *testing.T) {
+	valid := func(concurrency, retries int, startup, routine, dial, response time.Duration) error {
+		return ValidateManagementProbeSettings(concurrency, startup, routine, dial, response, retries)
+	}
+	if err := valid(0, 1, 5*time.Second, 10*time.Second, 3*time.Second, 2*time.Second); err != nil {
+		t.Fatalf("defaults rejected: %v", err)
+	}
+	for name, err := range map[string]error{
+		"concurrency": valid(513, 1, 5*time.Second, 10*time.Second, 3*time.Second, 2*time.Second),
+		"retries":     valid(32, 3, 5*time.Second, 15*time.Second, 3*time.Second, 2*time.Second),
+		"startup":     valid(32, 1, 0, 10*time.Second, 3*time.Second, 2*time.Second),
+		"routine":     valid(32, 2, 5*time.Second, 0, 3*time.Second, 2*time.Second),
+	} {
+		if err == nil {
+			t.Fatalf("%s validation accepted an invalid value", name)
+		}
+	}
+}
 
 func TestIsProxyURIRecognizesHTTPAndSOCKS5(t *testing.T) {
 	tests := []struct {

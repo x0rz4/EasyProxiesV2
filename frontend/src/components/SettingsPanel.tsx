@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import type { SettingsData } from '../types'
 import {
   fetchSettings,
@@ -90,10 +90,10 @@ const defaultSettings: SettingsData = {
 
 export default function SettingsPanel() {
   const queryClient = useQueryClient()
-  const { data: fetchedSettings, isLoading: loading } = useQuery({ queryKey: ['settings'], queryFn: fetchSettings })
-
-  const [settings, setSettings] = useState<SettingsData>(defaultSettings)
-  const [savedSettings, setSavedSettings] = useState<SettingsData>(defaultSettings)
+  const cachedSettings = queryClient.getQueryData<SettingsData>(['settings'])
+  const initialSettings = { ...defaultSettings, ...cachedSettings }
+  const [settings, setSettings] = useState<SettingsData>(() => initialSettings)
+  const [savedSettings, setSavedSettings] = useState<SettingsData>(() => initialSettings)
   const [saving, setSaving] = useState(false)
   const [reloading, setReloading] = useState(false)
   const [reloadWarning, setReloadWarning] = useState('')
@@ -102,15 +102,16 @@ export default function SettingsPanel() {
   const [applied, setApplied] = useState<string[]>([])
   const [pending, setPending] = useState<string[]>([])
   const [isDirty, setIsDirty] = useState(false)
-
-  useEffect(() => {
-    if (fetchedSettings) {
-      const merged = { ...defaultSettings, ...fetchedSettings }
-      // Only set initial state if not dirty to avoid overriding user's unsaved changes
+  const { isLoading: loading } = useQuery({
+    queryKey: ['settings'],
+    queryFn: async () => {
+      const fetched = await fetchSettings()
+      const merged = { ...defaultSettings, ...fetched }
       setSettings(prev => isDirty ? prev : merged)
       setSavedSettings(merged)
-    }
-  }, [fetchedSettings, isDirty])
+      return fetched
+    },
+  })
 
   // GeoIP database management state
   const { data: geoipStatus, refetch: refetchGeoip } = useQuery({ queryKey: ['geoipStatus'], queryFn: fetchGeoipStatus })
@@ -569,7 +570,7 @@ export default function SettingsPanel() {
             </div>
             <div>
               <h3 className="font-bold text-lg text-base-content">管理面板</h3>
-              <p className="text-xs text-base-content/50 font-medium">Web 界面及探针设置</p>
+              <p className="text-xs text-base-content/50 font-medium">Web 界面与访问控制；探测参数已迁至运维管理</p>
             </div>
           </div>
 
@@ -592,30 +593,6 @@ export default function SettingsPanel() {
               value={settings.management_listen}
               onChange={(e) => updateField('management_listen', e.target.value)}
             />
-          </fieldset>
-
-          <fieldset className="fieldset">
-            <legend className="fieldset-legend font-semibold text-base-content/80">探测目标</legend>
-            <input
-              type="text"
-              className="input input-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
-              placeholder="https://example.com/generate_204"
-              value={settings.management_probe_target}
-              onChange={(e) => updateField('management_probe_target', e.target.value)}
-            />
-            <p className="label text-base-content/50 mt-1">必须返回 HTTP 204；HTTPS 会校验 TLS/SNI，未填路径时默认使用 /generate_204</p>
-          </fieldset>
-
-          <fieldset className="fieldset">
-            <legend className="fieldset-legend font-semibold text-base-content/80">健康检查间隔</legend>
-            <input
-              type="text"
-              className="input input-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
-              placeholder="例如: 2h, 30m, 1h30m"
-              value={settings.management_health_check_interval}
-              onChange={(e) => updateField('management_health_check_interval', e.target.value)}
-            />
-            <p className="label text-base-content/50 mt-1">Go duration 格式：如 2h、30m、1h30m（修改后立即生效，无需重载）</p>
           </fieldset>
 
           <fieldset className="fieldset">
