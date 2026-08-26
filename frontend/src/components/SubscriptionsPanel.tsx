@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import type { Subscription, SubscriptionPayload } from '../types'
+import type { Subscription, SubscriptionFormat, SubscriptionPayload } from '../types'
 import {
   activateSubscription,
   createSubscription,
@@ -29,13 +29,18 @@ export default function SubscriptionsPanel() {
   const [action, setAction] = useState<string | null>(null)
   const [newName, setNewName] = useState('')
   const [newUrl, setNewUrl] = useState('')
+  const [newFormat, setNewFormat] = useState<SubscriptionFormat>('auto')
+  const [newUserAgent, setNewUserAgent] = useState('')
   const [editing, setEditing] = useState<Subscription | null>(null)
   const [editName, setEditName] = useState('')
   const [editUrl, setEditUrl] = useState('')
+  const [editFormat, setEditFormat] = useState<SubscriptionFormat>('auto')
+  const [editUserAgent, setEditUserAgent] = useState('')
   const [deleteTarget, setDeleteTarget] = useState<Subscription | null>(null)
 
-  const payloadFor = (name: string, url: string, current?: Subscription): SubscriptionPayload => ({
+  const payloadFor = (name: string, url: string, format: SubscriptionFormat, userAgent: string, current?: Subscription): SubscriptionPayload => ({
     name: name.trim(), url: url.trim(), enabled: current?.enabled ?? true,
+    format, user_agent: userAgent.trim(),
     refresh_interval_seconds: current?.refresh_interval_seconds ?? 0,
     refresh_timeout_seconds: current?.refresh_timeout_seconds ?? 0,
     sort_order: current?.sort_order ?? subscriptions.length,
@@ -62,9 +67,11 @@ export default function SubscriptionsPanel() {
 
   const addSubscription = async () => {
     if (!newName.trim() || !newUrl.trim()) return
-    if (await runAction('create', () => createSubscription(payloadFor(newName, newUrl)), '订阅已添加')) {
+    if (await runAction('create', () => createSubscription(payloadFor(newName, newUrl, newFormat, newUserAgent)), '订阅已添加')) {
       setNewName('')
       setNewUrl('')
+      setNewFormat('auto')
+      setNewUserAgent('')
     }
   }
 
@@ -72,11 +79,13 @@ export default function SubscriptionsPanel() {
     setEditing(subscription)
     setEditName(subscription.name)
     setEditUrl(subscription.url)
+    setEditFormat(subscription.format || 'auto')
+    setEditUserAgent(subscription.user_agent || '')
   }
 
   const saveSubscription = async () => {
     if (!editing || !editName.trim() || !editUrl.trim()) return
-    if (await runAction(`edit-${editing.id}`, () => updateSubscription(editing.id, payloadFor(editName, editUrl, editing)), '订阅已更新')) setEditing(null)
+    if (await runAction(`edit-${editing.id}`, () => updateSubscription(editing.id, payloadFor(editName, editUrl, editFormat, editUserAgent, editing)), '订阅已更新')) setEditing(null)
   }
 
   const enabledCount = subscriptions.filter((subscription) => subscription.enabled).length
@@ -114,10 +123,12 @@ export default function SubscriptionsPanel() {
             <div><h3 className="text-lg font-bold">添加订阅源</h3><p className="mt-0.5 text-xs text-base-content/50">填写名称和订阅地址，添加后会立即同步</p></div>
             <span className={cn("badge", status?.enabled ? 'badge-success' : 'badge-ghost')}>{status?.enabled ? '自动刷新已开启' : '自动刷新未开启'}</span>
           </div>
-          <div className="grid items-end gap-4 lg:grid-cols-[minmax(0,0.7fr)_minmax(0,1.3fr)_auto]">
+          <div className="grid items-end gap-4 lg:grid-cols-2">
             <fieldset className="fieldset"><legend className="fieldset-legend font-semibold text-base-content/80">订阅名称</legend><input className={cn(`input input-md w-full`, controlClass)} placeholder="例如：主力节点" value={newName} onChange={(event) => setNewName(event.target.value)} /></fieldset>
             <fieldset className="fieldset"><legend className="fieldset-legend font-semibold text-base-content/80">订阅地址</legend><input type="url" className={cn(`input input-md w-full font-mono text-sm`, controlClass)} placeholder="https://example.com/subscribe" value={newUrl} onChange={(event) => setNewUrl(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && void addSubscription()} /></fieldset>
-            <button className="btn btn-primary btn-md lg:min-w-28" disabled={!newName.trim() || !newUrl.trim() || busy} onClick={() => void addSubscription()}>{action === 'create' && <span className="loading loading-spinner loading-sm" />}添加订阅</button>
+            <fieldset className="fieldset"><legend className="fieldset-legend font-semibold text-base-content/80">响应格式</legend><select className={cn('select select-md w-full', controlClass)} value={newFormat} onChange={(event) => setNewFormat(event.target.value as SubscriptionFormat)}><option value="auto">自动识别（推荐）</option><option value="clash">Clash / Mihomo YAML</option><option value="base64">Base64 URI 列表</option><option value="sing-box">Sing-box JSON</option></select></fieldset>
+            <fieldset className="fieldset"><legend className="fieldset-legend font-semibold text-base-content/80">自定义 User-Agent</legend><input className={cn('input input-md w-full font-mono text-sm', controlClass)} placeholder="留空时按格式自动选择" value={newUserAgent} onChange={(event) => setNewUserAgent(event.target.value)} /></fieldset>
+            <div className="flex justify-end lg:col-span-2"><button className="btn btn-primary btn-md lg:min-w-28" disabled={!newName.trim() || !newUrl.trim() || busy} onClick={() => void addSubscription()}>{action === 'create' && <span className="loading loading-spinner loading-sm" />}添加订阅</button></div>
           </div>
         </section>
 
@@ -126,14 +137,16 @@ export default function SubscriptionsPanel() {
           {subscriptions.length ? <div className="space-y-3 p-4 lg:p-6">{subscriptions.map((subscription) => (
             <article key={subscription.id} className={cn(`rounded-xl border bg-base-200/30 p-4`, subscription.enabled ? 'border-base-300' : 'border-base-200 opacity-70')}>
               {editing?.id === subscription.id ? (
-                <div className="grid gap-3 sm:grid-cols-[minmax(0,0.7fr)_minmax(0,1.3fr)_auto]">
+                <div className="grid gap-3 sm:grid-cols-2">
                   <input className="input input-sm w-full" value={editName} onChange={(event) => setEditName(event.target.value)} />
                   <input className="input input-sm w-full font-mono text-xs" value={editUrl} onChange={(event) => setEditUrl(event.target.value)} />
-                  <div className="flex gap-2"><button className="btn btn-primary btn-sm" disabled={!editName.trim() || !editUrl.trim() || busy} onClick={() => void saveSubscription()}>保存</button><button className="btn btn-ghost btn-sm" disabled={busy} onClick={() => setEditing(null)}>取消</button></div>
+                  <select className="select select-sm w-full" value={editFormat} onChange={(event) => setEditFormat(event.target.value as SubscriptionFormat)}><option value="auto">自动识别</option><option value="clash">Clash / Mihomo YAML</option><option value="base64">Base64 URI 列表</option><option value="sing-box">Sing-box JSON</option></select>
+                  <input className="input input-sm w-full font-mono text-xs" placeholder="自定义 User-Agent（可选）" value={editUserAgent} onChange={(event) => setEditUserAgent(event.target.value)} />
+                  <div className="flex justify-end gap-2 sm:col-span-2"><button className="btn btn-primary btn-sm" disabled={!editName.trim() || !editUrl.trim() || busy} onClick={() => void saveSubscription()}>保存</button><button className="btn btn-ghost btn-sm" disabled={busy} onClick={() => setEditing(null)}>取消</button></div>
                 </div>
               ) : (
                 <div className="flex flex-col gap-4 lg:flex-row lg:items-center">
-                  <div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><strong>{subscription.name}</strong><span className={cn("badge badge-sm", subscription.enabled ? 'badge-success' : 'badge-ghost')}>{subscription.enabled ? '已启用' : '已禁用'}</span><span className="badge badge-outline badge-sm">{subscription.node_count} 节点</span></div><code className="mt-1 block break-all text-xs text-base-content/55">{subscription.url}</code><div className="mt-2 flex flex-wrap gap-x-4 text-xs text-base-content/55"><span>最近成功：{subscription.last_success && !subscription.last_success.startsWith('0001-') ? new Date(subscription.last_success).toLocaleString() : '尚未成功'}</span>{subscription.last_error && <span className="break-all text-error">错误：{subscription.last_error}</span>}</div></div>
+                  <div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><strong>{subscription.name}</strong><span className={cn("badge badge-sm", subscription.enabled ? 'badge-success' : 'badge-ghost')}>{subscription.enabled ? '已启用' : '已禁用'}</span><span className="badge badge-outline badge-sm">{subscription.node_count} 节点</span><span className="badge badge-ghost badge-sm">{subscriptionFormatLabel(subscription.format)}</span>{subscription.user_agent && <span className="badge badge-ghost badge-sm font-mono">UA: {subscription.user_agent}</span>}</div><code className="mt-1 block break-all text-xs text-base-content/55">{subscription.url}</code><div className="mt-2 flex flex-wrap gap-x-4 text-xs text-base-content/55"><span>最近成功：{subscription.last_success && !subscription.last_success.startsWith('0001-') ? new Date(subscription.last_success).toLocaleString() : '尚未成功'}</span>{subscription.last_error && <span className="break-all text-error">错误：{subscription.last_error}</span>}</div></div>
                   <div className="flex flex-wrap gap-2 lg:justify-end"><button className="btn btn-ghost btn-sm" disabled={busy} onClick={() => startEditing(subscription)}>编辑</button><button className="btn btn-ghost btn-sm" disabled={busy} onClick={() => void runAction(`toggle-${subscription.id}`, () => toggleSubscription(subscription.id, !subscription.enabled), subscription.enabled ? '订阅已禁用' : '订阅已启用')}>{action === `toggle-${subscription.id}` && <span className="loading loading-spinner loading-xs" />}{subscription.enabled ? '禁用' : '启用'}</button><button className="btn btn-ghost btn-sm" disabled={busy} onClick={() => void runAction(`refresh-${subscription.id}`, () => refreshOneSubscription(subscription.id), `${subscription.name} 刷新完成`)}>{action === `refresh-${subscription.id}` && <span className="loading loading-spinner loading-xs" />}刷新</button><button className="btn btn-ghost btn-sm text-primary" disabled={busy || (subscription.enabled && enabledCount === 1)} onClick={() => void runAction(`activate-${subscription.id}`, () => activateSubscription(subscription.id), `已独占启用 ${subscription.name}`)}>独占启用</button><button className="btn btn-ghost btn-sm text-error" disabled={busy} onClick={() => setDeleteTarget(subscription)}>删除</button></div>
                 </div>
               )}
@@ -151,4 +164,13 @@ function refreshSummary(value: unknown): string | null {
   const result = value as Record<string, unknown>
   const count = (key: string) => typeof result[key] === 'number' ? result[key] : 0
   return `解析 ${count('parsed')} · 新增 ${count('created')} · 复用 ${count('updated')} · 重复跳过 ${count('duplicates_skipped')} · 无效 ${count('invalid')}`
+}
+
+function subscriptionFormatLabel(format: SubscriptionFormat | undefined): string {
+  switch (format) {
+    case 'clash': return 'Clash/Mihomo'
+    case 'base64': return 'Base64'
+    case 'sing-box': return 'Sing-box'
+    default: return '自动识别'
+  }
 }

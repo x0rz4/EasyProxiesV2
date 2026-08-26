@@ -241,6 +241,14 @@ ALTER TABLE nodes ADD COLUMN canonical_json TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_nodes_identity_hash ON nodes(identity_hash);
 `,
 		},
+		{
+			Version:     10,
+			Description: "add subscription request format and user agent",
+			Up: `
+ALTER TABLE subscriptions ADD COLUMN format TEXT NOT NULL DEFAULT 'auto';
+ALTER TABLE subscriptions ADD COLUMN user_agent TEXT NOT NULL DEFAULT '';
+`,
+		},
 	}
 }
 

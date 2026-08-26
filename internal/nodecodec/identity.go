@@ -62,9 +62,9 @@ func ParseURI(rawURI string) (Result, error) {
 	case "vless", "trojan", "hysteria2", "anytls", "http", "socks5":
 		return parseURLIdentity(rawURI, scheme)
 	case "ssr", "hysteria":
-		return Result{}, fmt.Errorf("%w: %s is accepted by some clients but is not runnable by EasyProxies", ErrUnsupportedProtocol, scheme)
+		return Result{}, fmt.Errorf("%w: %q is accepted by some clients but is not runnable by EasyProxies", ErrUnsupportedProtocol, scheme)
 	default:
-		return Result{}, fmt.Errorf("%w: %s", ErrUnsupportedProtocol, scheme)
+		return Result{}, fmt.Errorf("%w: %q", ErrUnsupportedProtocol, scheme)
 	}
 }
 

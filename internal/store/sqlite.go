@@ -402,7 +402,7 @@ func (s *sqliteStore) CountNodes(ctx context.Context, filter NodeFilter) (int64,
 
 // ===================== Subscriptions =====================
 
-const subscriptionColumns = `id, name, url, enabled, refresh_interval_seconds,
+const subscriptionColumns = `id, name, url, format, user_agent, enabled, refresh_interval_seconds,
 	refresh_timeout_seconds, sort_order, last_attempt, last_success, last_error,
 	node_count, etag, last_modified, created_at, updated_at`
 
@@ -432,12 +432,15 @@ func (s *sqliteStore) GetSubscriptionByURL(ctx context.Context, url string) (*Su
 }
 
 func (s *sqliteStore) CreateSubscription(ctx context.Context, subscription *Subscription) error {
+	if subscription.Format == "" {
+		subscription.Format = "auto"
+	}
 	now := time.Now().UTC()
 	result, err := s.conn().ExecContext(ctx, `INSERT INTO subscriptions
-		(name, url, enabled, refresh_interval_seconds, refresh_timeout_seconds, sort_order,
+		(name, url, format, user_agent, enabled, refresh_interval_seconds, refresh_timeout_seconds, sort_order,
 		 last_attempt, last_success, last_error, node_count, etag, last_modified, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		subscription.Name, subscription.URL, boolToInt(subscription.Enabled),
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		subscription.Name, subscription.URL, subscription.Format, subscription.UserAgent, boolToInt(subscription.Enabled),
 		subscription.RefreshIntervalSeconds, subscription.RefreshTimeoutSeconds, subscription.SortOrder,
 		formatTime(subscription.LastAttempt), formatTime(subscription.LastSuccess), subscription.LastError,
 		subscription.NodeCount, subscription.ETag, subscription.LastModified, formatTime(now), formatTime(now))
@@ -453,10 +456,13 @@ func (s *sqliteStore) CreateSubscription(ctx context.Context, subscription *Subs
 }
 
 func (s *sqliteStore) UpdateSubscription(ctx context.Context, subscription *Subscription) error {
-	result, err := s.conn().ExecContext(ctx, `UPDATE subscriptions SET name=?, url=?, enabled=?,
+	if subscription.Format == "" {
+		subscription.Format = "auto"
+	}
+	result, err := s.conn().ExecContext(ctx, `UPDATE subscriptions SET name=?, url=?, format=?, user_agent=?, enabled=?,
 		refresh_interval_seconds=?, refresh_timeout_seconds=?, sort_order=?, last_attempt=?,
 		last_success=?, last_error=?, node_count=?, etag=?, last_modified=?, updated_at=? WHERE id=?`,
-		subscription.Name, subscription.URL, boolToInt(subscription.Enabled), subscription.RefreshIntervalSeconds,
+		subscription.Name, subscription.URL, subscription.Format, subscription.UserAgent, boolToInt(subscription.Enabled), subscription.RefreshIntervalSeconds,
 		subscription.RefreshTimeoutSeconds, subscription.SortOrder, formatTime(subscription.LastAttempt),
 		formatTime(subscription.LastSuccess), subscription.LastError, subscription.NodeCount, subscription.ETag,
 		subscription.LastModified, formatTime(time.Now().UTC()), subscription.ID)
@@ -1603,7 +1609,7 @@ func scanSubscription(row scanner) (Subscription, error) {
 	var subscription Subscription
 	var enabled int
 	var lastAttempt, lastSuccess, createdAt, updatedAt string
-	err := row.Scan(&subscription.ID, &subscription.Name, &subscription.URL, &enabled,
+	err := row.Scan(&subscription.ID, &subscription.Name, &subscription.URL, &subscription.Format, &subscription.UserAgent, &enabled,
 		&subscription.RefreshIntervalSeconds, &subscription.RefreshTimeoutSeconds, &subscription.SortOrder,
 		&lastAttempt, &lastSuccess, &subscription.LastError, &subscription.NodeCount, &subscription.ETag,
 		&subscription.LastModified, &createdAt, &updatedAt)

@@ -208,6 +208,7 @@ func (m *Manager) Update(ctx context.Context, id int64, input store.Subscription
 		return nil, err
 	}
 	current.Name, current.URL, current.Enabled = input.Name, input.URL, input.Enabled
+	current.Format, current.UserAgent = input.Format, input.UserAgent
 	current.RefreshIntervalSeconds = input.RefreshIntervalSeconds
 	current.RefreshTimeoutSeconds = input.RefreshTimeoutSeconds
 	current.SortOrder = input.SortOrder
@@ -264,6 +265,10 @@ func (m *Manager) Nodes(ctx context.Context, id int64) ([]store.SubscriptionNode
 func applyDefaults(sub *store.Subscription, defaults func() (int, int)) {
 	interval, timeout := defaults()
 	sub.Name, sub.URL = strings.TrimSpace(sub.Name), strings.TrimSpace(sub.URL)
+	sub.UserAgent = strings.TrimSpace(sub.UserAgent)
+	if format, err := config.NormalizeSubscriptionFormat(sub.Format); err == nil {
+		sub.Format = format
+	}
 	if sub.RefreshIntervalSeconds <= 0 {
 		sub.RefreshIntervalSeconds = interval
 	}
@@ -285,6 +290,14 @@ func validateSubscription(sub *store.Subscription) error {
 	}
 	if sub.RefreshTimeoutSeconds <= 0 {
 		return errors.New("刷新超时必须大于 0")
+	}
+	format, err := config.NormalizeSubscriptionFormat(sub.Format)
+	if err != nil {
+		return err
+	}
+	sub.Format = format
+	if len(sub.UserAgent) > 512 || strings.ContainsAny(sub.UserAgent, "\r\n") {
+		return errors.New("订阅 User-Agent 无效")
 	}
 	return nil
 }
@@ -369,7 +382,7 @@ func (m *Manager) refreshSubscription(ctx context.Context, sub *store.Subscripti
 		_, seconds := m.defaults()
 		timeout = time.Duration(seconds) * time.Second
 	}
-	nodes, etag, lastModified, err := m.fetchSubscription(ctx, sub.URL, timeout)
+	nodes, etag, lastModified, err := m.fetchSubscription(ctx, sub, timeout)
 	if err == nil && len(nodes) == 0 {
 		err = errors.New("订阅未返回有效节点")
 	}
@@ -470,15 +483,23 @@ func (m *Manager) refreshSubscription(ctx context.Context, sub *store.Subscripti
 	return nil
 }
 
-func (m *Manager) fetchSubscription(parent context.Context, rawURL string, timeout time.Duration) ([]config.NodeConfig, string, string, error) {
+func (m *Manager) fetchSubscription(parent context.Context, sub *store.Subscription, timeout time.Duration) ([]config.NodeConfig, string, string, error) {
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sub.URL, nil)
 	if err != nil {
 		return nil, "", "", fmt.Errorf("create request: %w", err)
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-	req.Header.Set("Accept", "*/*")
+	format, err := config.NormalizeSubscriptionFormat(sub.Format)
+	if err != nil {
+		return nil, "", "", err
+	}
+	userAgent := strings.TrimSpace(sub.UserAgent)
+	if userAgent == "" {
+		userAgent = defaultSubscriptionUserAgent(format)
+	}
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Accept", subscriptionAccept(format))
 	resp, err := m.httpClient.Do(req)
 	if err != nil {
 		return nil, "", "", fmt.Errorf("fetch: %w", err)
@@ -494,8 +515,38 @@ func (m *Manager) fetchSubscription(parent context.Context, rawURL string, timeo
 	if len(body) > 10*1024*1024 {
 		return nil, "", "", errors.New("subscription response exceeds 10MB")
 	}
-	nodes, err := config.ParseSubscriptionContent(string(body))
+	nodes, err := config.ParseSubscriptionContentAs(string(body), format)
+	if err != nil {
+		contentType := strings.TrimSpace(strings.Split(resp.Header.Get("Content-Type"), ";")[0])
+		if contentType != "" {
+			err = fmt.Errorf("解析订阅响应（Content-Type %s）: %w", contentType, err)
+		}
+	}
 	return nodes, resp.Header.Get("ETag"), resp.Header.Get("Last-Modified"), err
+}
+
+func defaultSubscriptionUserAgent(format string) string {
+	switch format {
+	case config.SubscriptionFormatBase64:
+		return "v2rayN"
+	case config.SubscriptionFormatSingBox:
+		return "sing-box"
+	default:
+		// Auto mode prefers the broadly supported Mihomo representation; its
+		// response is still parsed structurally and can fall back to Base64/URIs.
+		return "mihomo"
+	}
+}
+
+func subscriptionAccept(format string) string {
+	switch format {
+	case config.SubscriptionFormatClash:
+		return "application/yaml, text/yaml, text/plain;q=0.9, */*;q=0.8"
+	case config.SubscriptionFormatSingBox:
+		return "application/json, text/plain;q=0.9, */*;q=0.8"
+	default:
+		return "text/plain, application/yaml, application/json, */*;q=0.8"
+	}
 }
 
 func (m *Manager) reconcileRuntime(ctx context.Context) error {

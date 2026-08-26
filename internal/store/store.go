@@ -248,6 +248,8 @@ type Subscription struct {
 	ID                     int64     `json:"id"`
 	Name                   string    `json:"name"`
 	URL                    string    `json:"url"`
+	Format                 string    `json:"format"`
+	UserAgent              string    `json:"user_agent"`
 	Enabled                bool      `json:"enabled"`
 	RefreshIntervalSeconds int       `json:"refresh_interval_seconds"`
 	RefreshTimeoutSeconds  int       `json:"refresh_timeout_seconds"`

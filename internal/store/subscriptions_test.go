@@ -15,7 +15,7 @@ func TestSubscriptionsAndSnapshots(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	a := &Subscription{Name: "A", URL: "https://a.example/sub", Enabled: true, RefreshIntervalSeconds: 60, RefreshTimeoutSeconds: 10, SortOrder: 2}
+	a := &Subscription{Name: "A", URL: "https://a.example/sub", Format: "clash", UserAgent: "custom-client", Enabled: true, RefreshIntervalSeconds: 60, RefreshTimeoutSeconds: 10, SortOrder: 2}
 	b := &Subscription{Name: "B", URL: "https://b.example/sub", Enabled: true, RefreshIntervalSeconds: 120, RefreshTimeoutSeconds: 20, SortOrder: 1}
 	if err := db.CreateSubscription(ctx, a); err != nil {
 		t.Fatal(err)
@@ -23,7 +23,7 @@ func TestSubscriptionsAndSnapshots(t *testing.T) {
 	if err := db.CreateSubscription(ctx, b); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := db.GetSubscriptionByURL(ctx, a.URL); err != nil || got == nil || got.ID != a.ID {
+	if got, err := db.GetSubscriptionByURL(ctx, a.URL); err != nil || got == nil || got.ID != a.ID || got.Format != "clash" || got.UserAgent != "custom-client" {
 		t.Fatalf("get by URL: got=%+v err=%v", got, err)
 	}
 	if err := db.CreateSubscription(ctx, &Subscription{URL: a.URL}); err == nil {

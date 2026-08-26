@@ -292,10 +292,14 @@ export interface ConfigNodeMutationResponse {
 
 // ---- Subscription types ----
 
+export type SubscriptionFormat = 'auto' | 'clash' | 'base64' | 'sing-box'
+
 export interface Subscription {
   id: number
   name: string
   url: string
+  format: SubscriptionFormat
+  user_agent: string
   enabled: boolean
   refresh_interval_seconds: number
   refresh_timeout_seconds: number
@@ -313,6 +317,8 @@ export interface Subscription {
 export interface SubscriptionPayload {
   name: string
   url: string
+  format: SubscriptionFormat
+  user_agent: string
   enabled: boolean
   refresh_interval_seconds: number
   refresh_timeout_seconds: number

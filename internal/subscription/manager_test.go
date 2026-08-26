@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -21,6 +22,41 @@ import (
 type recordingRuntimeManager struct {
 	config *config.Config
 	ports  map[string]uint16
+}
+
+func TestFetchSubscriptionUsesSelectedFormatAndUserAgent(t *testing.T) {
+	var gotUserAgent, gotAccept string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUserAgent, gotAccept = r.UserAgent(), r.Header.Get("Accept")
+		w.Header().Set("Content-Type", "application/yaml")
+		_, _ = fmt.Fprint(w, "proxies:\n  - { name: edge, type: ss, server: example.com, port: 8388, cipher: aes-256-gcm, password: pass }\n")
+	}))
+	defer server.Close()
+
+	mgr := New(&config.Config{}, nil, WithHTTPClient(server.Client()))
+	defer mgr.Stop()
+	sub := &store.Subscription{URL: server.URL, Format: config.SubscriptionFormatClash, UserAgent: "provider-client/1.0"}
+	nodes, _, _, err := mgr.fetchSubscription(context.Background(), sub, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 1 || gotUserAgent != sub.UserAgent || !strings.Contains(gotAccept, "application/yaml") {
+		t.Fatalf("nodes=%+v user-agent=%q accept=%q", nodes, gotUserAgent, gotAccept)
+	}
+}
+
+func TestSubscriptionDefaultUserAgents(t *testing.T) {
+	tests := map[string]string{
+		config.SubscriptionFormatAuto:    "mihomo",
+		config.SubscriptionFormatClash:   "mihomo",
+		config.SubscriptionFormatBase64:  "v2rayN",
+		config.SubscriptionFormatSingBox: "sing-box",
+	}
+	for format, want := range tests {
+		if got := defaultSubscriptionUserAgent(format); got != want {
+			t.Fatalf("format %q user-agent=%q, want %q", format, got, want)
+		}
+	}
 }
 
 func (m *recordingRuntimeManager) ReloadWithPortMap(cfg *config.Config, _ map[string]uint16) error {

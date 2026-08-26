@@ -216,3 +216,45 @@ func TestParseClashHTTPAndSOCKSNodes(t *testing.T) {
 		t.Fatalf("nodes=%+v", nodes)
 	}
 }
+
+func TestParseSubscriptionContentFindsLateClashProxiesKey(t *testing.T) {
+	preamble := strings.Repeat("  fallback-filter:\n    geoip: true\n", 12)
+	content := "port: 7890\ndns:\n" + preamble + `proxies:
+  - name: late-node
+    type: vless
+    server: example.com
+    port: 443
+    uuid: 11111111-2222-3333-4444-555555555555
+    tls: true
+`
+	if index := strings.Index(content, "proxies:"); index <= 200 {
+		t.Fatalf("test precondition failed: proxies key at %d", index)
+	}
+	nodes, err := ParseSubscriptionContent(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 1 || nodes[0].Name != "late-node" {
+		t.Fatalf("nodes=%+v", nodes)
+	}
+}
+
+func TestParseSubscriptionContentAsRejectsWrongPayloadsClearly(t *testing.T) {
+	if _, err := ParseSubscriptionContentAs("<!doctype html><html><body>login</body></html>", SubscriptionFormatAuto); err == nil || !strings.Contains(err.Error(), "HTML") {
+		t.Fatalf("HTML error=%v", err)
+	}
+	if _, err := ParseSubscriptionContentAs("dHJvamFuOi8vcGFzc0BleGFtcGxlLmNvbTo0NDM=", SubscriptionFormatClash); err == nil || !strings.Contains(err.Error(), "proxies") {
+		t.Fatalf("forced Clash error=%v", err)
+	}
+}
+
+func TestParseClashReportsUnsupportedTypesWhenNoneAreUsable(t *testing.T) {
+	content := `proxies:
+  - { name: wg, type: wireguard, server: example.com, port: 443 }
+  - { name: tuic, type: tuic, server: example.com, port: 443 }
+`
+	_, err := ParseSubscriptionContent(content)
+	if err == nil || !strings.Contains(err.Error(), `type="wireguard"`) || !strings.Contains(err.Error(), `type="tuic"`) {
+		t.Fatalf("error=%v", err)
+	}
+}

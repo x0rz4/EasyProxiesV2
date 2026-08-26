@@ -676,9 +676,10 @@ func loadNodesFromSubscription(subURL string, timeout time.Duration) ([]NodeConf
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 
-	// Set common headers to avoid being blocked
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-	req.Header.Set("Accept", "*/*")
+	// Prefer a Mihomo response for legacy config.yaml subscriptions. Managed
+	// subscriptions can override this per source in the WebUI/API.
+	req.Header.Set("User-Agent", "mihomo")
+	req.Header.Set("Accept", "text/plain, application/yaml, application/json, */*;q=0.8")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -704,7 +705,14 @@ func loadNodesFromSubscription(subURL string, timeout time.Duration) ([]NodeConf
 // parseSubscriptionContent tries to parse subscription content in various formats (optimized)
 func parseSubscriptionContent(content string) ([]NodeConfig, error) {
 	nodes, err := parseContent(strings.TrimSpace(strings.TrimPrefix(content, "\ufeff")), 0)
-	return deduplicateParsedNodes(nodes), err
+	if err != nil {
+		return nil, err
+	}
+	nodes = deduplicateParsedNodes(nodes)
+	if len(nodes) == 0 {
+		return nil, errors.New("订阅内容中未找到支持的代理节点")
+	}
+	return nodes, nil
 }
 
 // ParseSubscriptionContent parses Clash YAML, Base64 and plain URI
@@ -712,6 +720,81 @@ func parseSubscriptionContent(content string) ([]NodeConfig, error) {
 // accepted formats remain consistent.
 func ParseSubscriptionContent(content string) ([]NodeConfig, error) {
 	return parseSubscriptionContent(content)
+}
+
+const (
+	SubscriptionFormatAuto    = "auto"
+	SubscriptionFormatClash   = "clash"
+	SubscriptionFormatBase64  = "base64"
+	SubscriptionFormatSingBox = "sing-box"
+)
+
+// NormalizeSubscriptionFormat accepts UI/provider aliases and returns the
+// canonical format stored for a subscription.
+func NormalizeSubscriptionFormat(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", SubscriptionFormatAuto:
+		return SubscriptionFormatAuto, nil
+	case SubscriptionFormatClash, "mihomo", "meta", "clash-meta":
+		return SubscriptionFormatClash, nil
+	case SubscriptionFormatBase64, "uri", "v2ray", "v2rayn":
+		return SubscriptionFormatBase64, nil
+	case SubscriptionFormatSingBox, "singbox":
+		return SubscriptionFormatSingBox, nil
+	default:
+		return "", fmt.Errorf("不支持的订阅格式 %q", value)
+	}
+}
+
+// ParseSubscriptionContentAs parses a response using a selected subscription
+// format. Auto mode performs structural detection; explicit modes provide
+// clearer errors when a provider returns a login page or the wrong payload.
+func ParseSubscriptionContentAs(content, format string) ([]NodeConfig, error) {
+	format, err := NormalizeSubscriptionFormat(format)
+	if err != nil {
+		return nil, err
+	}
+	content = strings.TrimSpace(strings.TrimPrefix(content, "\ufeff"))
+	if looksLikeHTML(content) {
+		return nil, errors.New("订阅地址返回了 HTML 页面，请检查链接、鉴权参数或请求 User-Agent")
+	}
+	switch format {
+	case SubscriptionFormatAuto:
+		return parseSubscriptionContent(content)
+	case SubscriptionFormatClash:
+		if looksLikeInlineYAML(content) {
+			content = wrapAsClashProxiesDoc(content)
+		} else if !hasTopLevelProxiesKey(content) {
+			return nil, errors.New("Clash/Mihomo 响应中未找到顶层 proxies 数组")
+		}
+		nodes, err := parseClashYAML(content)
+		return requireSubscriptionNodes(nodes, err)
+	case SubscriptionFormatBase64:
+		decoded, ok := tryBase64Decode(content)
+		if !ok {
+			return nil, errors.New("订阅响应不是有效的 Base64 内容")
+		}
+		nodes, err := parseContent(decoded, 1)
+		return requireSubscriptionNodes(deduplicateParsedNodes(nodes), err)
+	case SubscriptionFormatSingBox:
+		nodes, recognized, _, err := parseSingBoxJSON(content)
+		if !recognized {
+			return nil, errors.New("订阅响应不是包含 outbounds 的 Sing-box JSON/JSONC")
+		}
+		return requireSubscriptionNodes(deduplicateParsedNodes(nodes), err)
+	default:
+		panic("unreachable subscription format")
+	}
+}
+
+func requireSubscriptionNodes(nodes []NodeConfig, err error) ([]NodeConfig, error) {
+	if err != nil {
+		return nil, err
+	}
+	if len(nodes) == 0 {
+		return nil, errors.New("订阅内容中未找到支持的代理节点")
+	}
+	return nodes, nil
 }
 
 // ParseImportContent parses pasted or imported proxy content in any supported
@@ -742,12 +825,15 @@ func parseContent(content string, depth int) ([]NodeConfig, error) {
 	if content == "" {
 		return nil, errors.New("节点内容为空")
 	}
+	if looksLikeHTML(content) {
+		return nil, errors.New("订阅地址返回了 HTML 页面，请检查链接、鉴权参数或请求 User-Agent")
+	}
 	if strings.HasPrefix(content, "{") {
 		if nodes, recognized, _, err := parseSingBoxJSON(content); recognized {
 			return nodes, err
 		}
 	}
-	if hasProxiesKey(content) {
+	if hasTopLevelProxiesKey(content) {
 		return parseClashYAML(content)
 	}
 	if looksLikeInlineYAML(content) {
@@ -788,14 +874,43 @@ func requireImportedNodes(nodes []NodeConfig, err error) ([]NodeConfig, error) {
 	return nodes, nil
 }
 
-// hasProxiesKey reports whether content looks like a Clash YAML document by
-// checking for a top-level `proxies:` key in its leading bytes.
-func hasProxiesKey(content string) bool {
-	sampleSize := 200
-	if len(content) < sampleSize {
-		sampleSize = len(content)
+// hasTopLevelProxiesKey structurally inspects the complete YAML document. Full
+// Mihomo configurations commonly place `proxies:` well after DNS and profile
+// settings, so a prefix scan is not sufficient.
+func hasTopLevelProxiesKey(content string) bool {
+	var document yaml.Node
+	if err := yaml.Unmarshal([]byte(content), &document); err == nil && len(document.Content) > 0 {
+		root := document.Content[0]
+		if root.Kind == yaml.MappingNode {
+			for i := 0; i+1 < len(root.Content); i += 2 {
+				if root.Content[i].Value == "proxies" && root.Content[i+1].Kind == yaml.SequenceNode {
+					return true
+				}
+			}
+		}
 	}
-	return strings.Contains(content[:sampleSize], "proxies:")
+	// Preserve a useful YAML parse error for malformed documents that still
+	// clearly declare a top-level proxies key.
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		if len(line) > 0 && (line[0] == ' ' || line[0] == '\t') {
+			continue
+		}
+		if strings.HasPrefix(strings.TrimSpace(line), "proxies:") {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeHTML(content string) bool {
+	lower := strings.ToLower(strings.TrimSpace(content))
+	for _, prefix := range []string{"<!doctype html", "<html", "<head", "<body", "<script", "<?xml"} {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // looksLikeInlineYAML reports whether the first non-empty, non-comment line is a
@@ -860,7 +975,7 @@ func parseNodesFromContent(content string) ([]NodeConfig, error) {
 	var parseErrors []string
 	lines := strings.Split(content, "\n")
 
-	for _, line := range lines {
+	for lineIndex, line := range lines {
 		line = strings.TrimSpace(line)
 
 		// Skip empty lines and comments
@@ -889,7 +1004,7 @@ func parseNodesFromContent(content string) ([]NodeConfig, error) {
 			nodes = append(nodes, node)
 		} else if strings.Contains(line, "://") {
 			if _, err := nodecodec.ParseURI(line); err != nil {
-				parseErrors = append(parseErrors, err.Error())
+				parseErrors = append(parseErrors, fmt.Sprintf("第 %d 行: %v", lineIndex+1, err))
 			}
 		}
 	}
@@ -1276,19 +1391,33 @@ func parseClashYAML(content string) ([]NodeConfig, error) {
 	}
 
 	var nodes []NodeConfig
+	var issues []string
 	for _, proxy := range clash.Proxies {
 		uri := convertClashProxyToURI(proxy)
-		if uri != "" {
-			node := NodeConfig{
-				Name: proxy.Name,
-				URI:  uri,
-			}
-			if err := enrichNodeIdentity(&node); err == nil {
-				nodes = append(nodes, node)
-			}
+		label := strings.TrimSpace(proxy.Name)
+		if label == "" {
+			label = "未命名节点"
 		}
+		if uri == "" {
+			issues = append(issues, fmt.Sprintf("%s: 不支持 type=%q", label, proxy.Type))
+			continue
+		}
+		node := NodeConfig{Name: proxy.Name, URI: uri}
+		if err := enrichNodeIdentity(&node); err != nil {
+			issues = append(issues, fmt.Sprintf("%s (%s): %v", label, proxy.Type, err))
+			continue
+		}
+		nodes = append(nodes, node)
 	}
-
+	if len(nodes) == 0 {
+		if len(clash.Proxies) == 0 {
+			return nil, errors.New("Clash/Mihomo YAML 的 proxies 数组为空")
+		}
+		if len(issues) > 5 {
+			issues = append(issues[:5], fmt.Sprintf("另有 %d 个节点无法解析", len(issues)-5))
+		}
+		return nil, fmt.Errorf("Clash/Mihomo YAML 中没有可用节点: %s", strings.Join(issues, "; "))
+	}
 	return nodes, nil
 }
 
