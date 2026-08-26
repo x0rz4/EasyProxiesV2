@@ -54,7 +54,7 @@ multi_port:
 management:
   enabled: true                                      # 是否启用管理面板
   listen: 0.0.0.0:9888                               # 监听地址
-  probe_target: http://cp.cloudflare.com/generate_204  # 健康检查目标
+  probe_target: https://cp.cloudflare.com/generate_204 # 必须返回 204；HTTPS 会执行 TLS/SNI/证书校验
   health_check_interval: 2h                          # 周期健康检查间隔（默认 2 小时）
   password: "123456"                                       # WebUI 访问密码，为空则不需要密码
 

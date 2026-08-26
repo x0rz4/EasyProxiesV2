@@ -3,11 +3,13 @@ package pool
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"math/rand"
 	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -515,13 +517,18 @@ func excludeMembers(candidates []*memberState, excluded map[*memberState]struct{
 
 func (p *poolOutbound) availableMembersLocked(now time.Time, network string, buf []*memberState) []*memberState {
 	result := buf[:0]
+	probeConfigured := false
+	if p.monitor != nil {
+		_, probeConfigured = p.monitor.TargetForProbe()
+	}
 	for _, member := range p.members {
 		if p.options.GroupID != 0 && !group.MemberAvailable(p.options.GroupID, member.tag) {
 			continue
 		}
-		if p.options.GroupID != 0 && p.monitor != nil {
+		if p.monitor != nil {
 			snapshot := p.monitor.SnapshotForTag(member.tag)
-			if snapshot == nil || !snapshot.InitialCheckDone || !snapshot.Available || snapshot.Blacklisted {
+			if (p.options.GroupID != 0 || probeConfigured) &&
+				(snapshot == nil || !snapshot.InitialCheckDone || !snapshot.Available || snapshot.Blacklisted) {
 				continue
 			}
 		}
@@ -802,6 +809,11 @@ func (p *poolOutbound) wrapConn(conn net.Conn, member *memberState, destination 
 		onError: func(err error) {
 			p.recordEstablishedIOError(member, err, destination)
 		},
+		onEstablishedSuccess: func() {
+			if member.shared != nil {
+				member.shared.recordEstablishedSuccess()
+			}
+		},
 	}
 }
 
@@ -818,6 +830,11 @@ func (p *poolOutbound) wrapPacketConn(conn net.PacketConn, member *memberState, 
 		},
 		onError: func(err error) {
 			p.recordEstablishedIOError(member, err, destination)
+		},
+		onEstablishedSuccess: func() {
+			if member.shared != nil {
+				member.shared.recordEstablishedSuccess()
+			}
 		},
 	}
 }
@@ -843,62 +860,77 @@ func (p *poolOutbound) makeReleaseFunc(member *memberState) func() {
 	}
 }
 
-// httpProbe performs an HTTP probe through the connection and measures TTFB.
-// It sends a minimal HTTP request and waits for the first byte of response.
-func httpProbe(conn net.Conn, host string) (time.Duration, error) {
-	// Build HTTP request
-	req := fmt.Sprintf("GET /generate_204 HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: Mozilla/5.0\r\n\r\n", host)
+// httpProbe performs a scheme-aware HTTP probe through an already established
+// node connection. A probe succeeds only after a valid 204 response is parsed.
+func httpProbe(ctx context.Context, conn net.Conn, target monitor.ProbeTarget, tlsConfig *tls.Config) (time.Duration, error) {
+	deadline := time.Now().Add(10 * time.Second)
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	_ = conn.SetDeadline(deadline)
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancel()
 
-	// Try to set write deadline (ignore errors for connections that don't support it)
-	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-
-	// Record time just before sending request
 	start := time.Now()
-
-	// Send HTTP request
-	if _, err := conn.Write([]byte(req)); err != nil {
-		return 0, fmt.Errorf("write request: %w", err)
+	probeConn := conn
+	if target.Scheme == "https" {
+		config := &tls.Config{MinVersion: tls.VersionTLS12}
+		if tlsConfig != nil {
+			config = tlsConfig.Clone()
+			if config.MinVersion == 0 {
+				config.MinVersion = tls.VersionTLS12
+			}
+		}
+		config.ServerName = target.ServerName
+		config.NextProtos = []string{"http/1.1"}
+		tlsConn := tls.Client(conn, config)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			return 0, fmt.Errorf("TLS handshake: %w", err)
+		}
+		probeConn = tlsConn
 	}
 
-	// Try to set read deadline (ignore errors for connections that don't support it)
-	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-
-	// Read first byte (TTFB - Time To First Byte)
-	reader := bufio.NewReader(conn)
-	_, err := reader.ReadByte()
+	requestURL := target.Scheme + "://" + target.Host + target.RequestURI
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
 	if err != nil {
-		return 0, fmt.Errorf("read response: %w", err)
+		return 0, fmt.Errorf("build probe request: %w", err)
 	}
-
-	// Calculate TTFB
-	ttfb := time.Since(start)
-	return ttfb, nil
+	request.Header.Set("Connection", "close")
+	request.Header.Set("User-Agent", "EasyProxies/health-check")
+	if err := request.Write(probeConn); err != nil {
+		return 0, fmt.Errorf("write probe request: %w", err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(probeConn), request)
+	if err != nil {
+		return 0, fmt.Errorf("read probe response: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		return 0, fmt.Errorf("unexpected probe status: %s", response.Status)
+	}
+	return time.Since(start), nil
 }
 
 func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Context) (time.Duration, error) {
 	if p.monitor == nil {
 		return nil
 	}
-	// 仅在创建时检查是否有探测目标，实际目标在执行时动态获取
-	if _, ok := p.monitor.DestinationForProbe(); !ok {
-		return nil
-	}
 	return func(ctx context.Context) (time.Duration, error) {
 		// 每次执行时动态获取最新的探测目标
-		destination, ok := p.monitor.DestinationForProbe()
+		target, ok := p.monitor.TargetForProbe()
 		if !ok {
 			return 0, E.New("probe target not configured")
 		}
 
 		start := time.Now()
-		conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
+		conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, target.Destination)
 		if err != nil {
 			return 0, err
 		}
 		defer conn.Close()
 
-		// Perform HTTP probe to measure actual latency (TTFB)
-		_, err = httpProbe(conn, destination.AddrString())
+		// Validate the complete HTTP response headers and expected status.
+		_, err = httpProbe(ctx, conn, target, nil)
 		if err != nil {
 			return 0, err
 		}
@@ -914,13 +946,9 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 	if p.monitor == nil {
 		return nil
 	}
-	// 仅在创建时检查是否有探测目标，实际目标在执行时动态获取
-	if _, ok := p.monitor.DestinationForProbe(); !ok {
-		return nil
-	}
 	return func(ctx context.Context) (time.Duration, error) {
 		// 每次执行时动态获取最新的探测目标
-		destination, ok := p.monitor.DestinationForProbe()
+		target, ok := p.monitor.TargetForProbe()
 		if !ok {
 			return 0, E.New("probe target not configured")
 		}
@@ -949,19 +977,19 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 		}
 
 		start := time.Now()
-		conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
+		conn, err := member.outbound.DialContext(ctx, N.NetworkTCP, target.Destination)
 		if err != nil {
 			return 0, err
 		}
 		defer conn.Close()
 
-		// Perform HTTP probe to measure actual latency (TTFB)
-		_, err = httpProbe(conn, destination.AddrString())
+		// Validate the complete HTTP response headers and expected status.
+		_, err = httpProbe(ctx, conn, target, nil)
 		if err != nil {
 			return 0, err
 		}
 
-		// Total duration = dial time + TTFB
+		// Total duration includes dial, optional TLS handshake, and response headers.
 		duration := time.Since(start)
 		return duration, nil
 	}
@@ -1038,17 +1066,22 @@ func (p *poolOutbound) makeDialerByTagFunc(tag string) monitor.DialerFunc {
 
 type trackedConn struct {
 	net.Conn
-	once      sync.Once
-	release   func()
-	onTraffic func(upload, download int64)
-	onError   func(error)
-	errorOnce sync.Once
+	once                 sync.Once
+	release              func()
+	onTraffic            func(upload, download int64)
+	onError              func(error)
+	errorOnce            sync.Once
+	onEstablishedSuccess func()
+	successOnce          sync.Once
 }
 
 func (c *trackedConn) Read(b []byte) (int, error) {
 	n, err := c.Conn.Read(b)
 	if n > 0 && c.onTraffic != nil {
 		c.onTraffic(0, int64(n))
+	}
+	if n > 0 && c.onEstablishedSuccess != nil {
+		c.successOnce.Do(c.onEstablishedSuccess)
 	}
 	c.recordIOError(err)
 	return n, err
@@ -1098,17 +1131,22 @@ func (c *trackedConn) Close() error {
 
 type trackedPacketConn struct {
 	net.PacketConn
-	once      sync.Once
-	release   func()
-	onTraffic func(upload, download int64)
-	onError   func(error)
-	errorOnce sync.Once
+	once                 sync.Once
+	release              func()
+	onTraffic            func(upload, download int64)
+	onError              func(error)
+	errorOnce            sync.Once
+	onEstablishedSuccess func()
+	successOnce          sync.Once
 }
 
 func (c *trackedPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
 	n, addr, err := c.PacketConn.ReadFrom(b)
 	if n > 0 && c.onTraffic != nil {
 		c.onTraffic(0, int64(n))
+	}
+	if n > 0 && c.onEstablishedSuccess != nil {
+		c.successOnce.Do(c.onEstablishedSuccess)
 	}
 	c.recordIOError(err)
 	return n, addr, err

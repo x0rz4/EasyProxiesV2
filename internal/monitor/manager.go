@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"runtime"
 	"sort"
 	"strconv"
@@ -26,6 +27,17 @@ type Config struct {
 	ProxyPassword  string // 代理池的密码（用于导出）
 	ExternalIP     string // 外部 IP 地址，用于导出时替换 0.0.0.0
 	SkipCertVerify bool   // 全局跳过 SSL 证书验证
+}
+
+// ProbeTarget is the complete HTTP endpoint used by node health checks.
+// Keeping the scheme and request URI is essential: HTTPS must perform a real
+// TLS handshake, and configured paths must not be silently replaced.
+type ProbeTarget struct {
+	Scheme      string
+	Host        string
+	ServerName  string
+	RequestURI  string
+	Destination M.Socksaddr
 }
 
 // NodeInfo is static metadata about a proxy entry.
@@ -153,15 +165,15 @@ type entry struct {
 
 // Manager aggregates all node states for the UI/API.
 type Manager struct {
-	cfg        Config
-	reloadGen  uint64 // current reload generation
-	probeDst   M.Socksaddr
-	probeReady bool
-	mu         sync.RWMutex
-	nodes      map[string]*entry
-	ctx        context.Context
-	cancel     context.CancelFunc
-	logger     Logger
+	cfg         Config
+	reloadGen   uint64 // current reload generation
+	probeTarget ProbeTarget
+	probeReady  bool
+	mu          sync.RWMutex
+	nodes       map[string]*entry
+	ctx         context.Context
+	cancel      context.CancelFunc
+	logger      Logger
 
 	// periodic health check control
 	healthMu          sync.Mutex
@@ -207,31 +219,13 @@ func NewManager(cfg Config) (*Manager, error) {
 		healthSubscribers: make(map[uint64]func(HealthResultEvent)),
 		groupSchedules:    make(map[int64]groupHealthSchedule),
 	}
-	if cfg.ProbeTarget != "" {
-		target := cfg.ProbeTarget
-		// Strip URL scheme if present (e.g., "https://www.google.com:443" -> "www.google.com:443")
-		if strings.HasPrefix(target, "https://") {
-			target = strings.TrimPrefix(target, "https://")
-		} else if strings.HasPrefix(target, "http://") {
-			target = strings.TrimPrefix(target, "http://")
-		}
-		// Remove trailing path if present
-		if idx := strings.Index(target, "/"); idx != -1 {
-			target = target[:idx]
-		}
-		host, port, err := net.SplitHostPort(target)
+	if strings.TrimSpace(cfg.ProbeTarget) != "" {
+		target, err := parseProbeTarget(cfg.ProbeTarget)
 		if err != nil {
-			// If no port specified, use default based on original scheme
-			if strings.HasPrefix(cfg.ProbeTarget, "https://") {
-				host = target
-				port = "443"
-			} else {
-				host = target
-				port = "80"
-			}
+			cancel()
+			return nil, err
 		}
-		parsed := M.ParseSocksaddrHostPort(host, parsePort(port))
-		m.probeDst = parsed
+		m.probeTarget = target
 		m.probeReady = true
 	}
 	go m.startTrafficSpeedSampler()
@@ -247,12 +241,6 @@ func (m *Manager) SetLogger(logger Logger) {
 // interval: how often to check (e.g., 30 * time.Second)
 // timeout: timeout for each probe (e.g., 10 * time.Second)
 func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
-	if !m.probeReady {
-		if m.logger != nil {
-			m.logger.Warn("probe target not configured, periodic health check disabled")
-		}
-		return
-	}
 	if interval <= 0 {
 		interval = 2 * time.Hour
 	}
@@ -382,7 +370,7 @@ func (m *Manager) probeDue(tag string, lastCheck, now time.Time) bool {
 // RequestProbeAllOnce triggers a full probe round at most once concurrently.
 // If another full probe is already running, it returns immediately.
 func (m *Manager) RequestProbeAllOnce(timeout time.Duration) {
-	if !m.probeReady {
+	if _, ready := m.TargetForProbe(); !ready {
 		return
 	}
 	if m.probeAllInFlight.Swap(true) {
@@ -397,7 +385,7 @@ func (m *Manager) RequestProbeAllOnce(timeout time.Duration) {
 // RequestDueProbesOnce checks only nodes whose effective management/group
 // interval has elapsed. A full and a due round never overlap.
 func (m *Manager) RequestDueProbesOnce(timeout time.Duration) {
-	if !m.probeReady {
+	if _, ready := m.TargetForProbe(); !ready {
 		return
 	}
 	if m.probeAllInFlight.Swap(true) {
@@ -519,14 +507,6 @@ func (m *Manager) sampleTrafficSpeeds(now time.Time) {
 	}
 }
 
-func parsePort(value string) uint16 {
-	p, err := strconv.Atoi(value)
-	if err != nil || p <= 0 || p > 65535 {
-		return 80
-	}
-	return uint16(p)
-}
-
 // BeginReload bumps the generation counter. Nodes registered after this call
 // will be marked with the new generation. Call SweepStaleNodes after reload
 // to remove nodes that were not re-registered (disabled/deleted nodes).
@@ -600,7 +580,18 @@ func (m *Manager) DestinationForProbe() (M.Socksaddr, bool) {
 	if !m.probeReady {
 		return M.Socksaddr{}, false
 	}
-	return m.probeDst, true
+	return m.probeTarget.Destination, true
+}
+
+// TargetForProbe returns the full endpoint needed for a scheme-aware HTTP
+// health check. Callers should prefer this over DestinationForProbe.
+func (m *Manager) TargetForProbe() (ProbeTarget, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if !m.probeReady {
+		return ProbeTarget{}, false
+	}
+	return m.probeTarget, true
 }
 
 // UpdateProbeTarget dynamically updates the probe destination at runtime.
@@ -608,40 +599,79 @@ func (m *Manager) UpdateProbeTarget(target string) error {
 	target = strings.TrimSpace(target)
 	if target == "" {
 		m.mu.Lock()
-		m.probeDst = M.Socksaddr{}
+		m.probeTarget = ProbeTarget{}
 		m.probeReady = false
 		m.cfg.ProbeTarget = ""
 		m.mu.Unlock()
 		return nil
 	}
-	defaultPort := "80"
-	if strings.HasPrefix(target, "https://") {
-		defaultPort = "443"
-		target = strings.TrimPrefix(target, "https://")
-	} else if strings.HasPrefix(target, "http://") {
-		target = strings.TrimPrefix(target, "http://")
-	}
-	// Remove trailing path if present
-	if idx := strings.Index(target, "/"); idx != -1 {
-		target = target[:idx]
-	}
-
-	host, port, err := net.SplitHostPort(target)
+	parsed, err := parseProbeTarget(target)
 	if err != nil {
-		// If no port specified, use the scheme's default port.
-		host = target
-		port = defaultPort
+		return err
 	}
-
-	parsed := M.ParseSocksaddrHostPort(host, parsePort(port))
 
 	m.mu.Lock()
-	m.probeDst = parsed
+	m.probeTarget = parsed
 	m.probeReady = true
 	m.cfg.ProbeTarget = target
 	m.mu.Unlock()
+	m.healthMu.Lock()
+	timeout := m.healthTimeout
+	m.healthMu.Unlock()
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	m.RequestProbeAllOnce(timeout)
 
 	return nil
+}
+
+func parseProbeTarget(raw string) (ProbeTarget, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ProbeTarget{}, errors.New("probe target is empty")
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "http://" + raw
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return ProbeTarget{}, fmt.Errorf("parse probe target: %w", err)
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return ProbeTarget{}, fmt.Errorf("unsupported probe target scheme %q", parsed.Scheme)
+	}
+	if parsed.User != nil {
+		return ProbeTarget{}, errors.New("probe target must not contain credentials")
+	}
+	hostname := parsed.Hostname()
+	if hostname == "" {
+		return ProbeTarget{}, errors.New("probe target is missing host")
+	}
+	port := uint16(80)
+	if scheme == "https" {
+		port = 443
+	}
+	if rawPort := parsed.Port(); rawPort != "" {
+		value, parseErr := strconv.ParseUint(rawPort, 10, 16)
+		if parseErr != nil || value == 0 {
+			return ProbeTarget{}, fmt.Errorf("probe target has invalid port %q", rawPort)
+		}
+		port = uint16(value)
+	}
+	requestURI := parsed.EscapedPath()
+	if requestURI == "" {
+		requestURI = "/generate_204"
+	}
+	if parsed.RawQuery != "" {
+		requestURI += "?" + parsed.RawQuery
+	}
+	destination := M.ParseSocksaddrHostPort(hostname, port)
+	if !destination.IsValid() {
+		return ProbeTarget{}, errors.New("probe target destination is invalid")
+	}
+	return ProbeTarget{Scheme: scheme, Host: parsed.Host, ServerName: hostname, RequestURI: requestURI, Destination: destination}, nil
 }
 
 // Snapshot returns a sorted copy of current node states.

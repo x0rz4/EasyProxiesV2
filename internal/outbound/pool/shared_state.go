@@ -107,13 +107,18 @@ func (s *sharedMemberState) recordFailure(cause error, threshold int, duration t
 }
 
 func (s *sharedMemberState) recordSuccess(destination string) {
-	s.mu.Lock()
-	s.failures = 0
-	s.mu.Unlock()
-
 	if entry := s.entry.Load(); entry != nil {
 		entry.RecordSuccess(destination)
 	}
+}
+
+// recordEstablishedSuccess clears passive failures only after response bytes
+// have actually arrived. A successful dial alone is not proof that the proxy
+// can carry application traffic.
+func (s *sharedMemberState) recordEstablishedSuccess() {
+	s.mu.Lock()
+	s.failures = 0
+	s.mu.Unlock()
 }
 
 // isBlacklisted checks if the node is currently blacklisted, auto-clearing if expired.

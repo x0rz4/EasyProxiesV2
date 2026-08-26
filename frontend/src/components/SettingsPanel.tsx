@@ -599,11 +599,11 @@ export default function SettingsPanel() {
             <input
               type="text"
               className="input input-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
-              placeholder="http://www.google.com"
+              placeholder="https://example.com/generate_204"
               value={settings.management_probe_target}
               onChange={(e) => updateField('management_probe_target', e.target.value)}
             />
-            <p className="label text-base-content/50 mt-1">健康检查的目标地址</p>
+            <p className="label text-base-content/50 mt-1">必须返回 HTTP 204；HTTPS 会校验 TLS/SNI，未填路径时默认使用 /generate_204</p>
           </fieldset>
 
           <fieldset className="fieldset">

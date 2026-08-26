@@ -40,6 +40,11 @@ func TestSettingsEntrySwitchRoundTrip(t *testing.T) {
 		SubRefreshInterval: "1h", SubRefreshTimeout: "30s", SubRefreshHealthCheckTimeout: "1m", SubRefreshDrainTimeout: "30s",
 		SubRefreshMinAvailableNodes: 1, GeoIPAutoUpdateInterval: "24h",
 	}
+	invalidRequest := request
+	invalidRequest.ManagementProbeTarget = "ftp://example.com/check"
+	if _, err := server.updateAllSettings(t.Context(), invalidRequest); err == nil {
+		t.Fatal("settings API accepted an invalid probe target")
+	}
 	if _, err := server.updateAllSettings(t.Context(), request); err != nil {
 		t.Fatal(err)
 	}
@@ -113,10 +118,31 @@ func TestUpdateProbeTargetClearAndHTTPSDefaultPort(t *testing.T) {
 	if !ok || dst.Port != 443 {
 		t.Fatalf("HTTPS destination=%v ready=%v, want port 443", dst, ok)
 	}
+	target, ok := mgr.TargetForProbe()
+	if !ok || target.Scheme != "https" || target.ServerName != "secure.example" || target.RequestURI != "/path" {
+		t.Fatalf("HTTPS target=%+v ready=%v", target, ok)
+	}
 	if err := mgr.UpdateProbeTarget(""); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := mgr.DestinationForProbe(); ok {
 		t.Fatal("probe destination remained ready after clearing target")
+	}
+}
+
+func TestProbeTargetValidationAndDefaults(t *testing.T) {
+	mgr, err := NewManager(Config{ProbeTarget: "example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	target, ok := mgr.TargetForProbe()
+	if !ok || target.Scheme != "http" || target.Destination.Port != 80 || target.RequestURI != "/generate_204" {
+		t.Fatalf("default target=%+v ready=%v", target, ok)
+	}
+	for _, invalid := range []string{"ftp://example.com/check", "http://example.com:0/check", "http://user:pass@example.com/check"} {
+		if err := mgr.UpdateProbeTarget(invalid); err == nil {
+			t.Fatalf("invalid target %q was accepted", invalid)
+		}
 	}
 }

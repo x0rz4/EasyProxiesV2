@@ -521,6 +521,11 @@ func (s *Server) updateAllSettings(ctx context.Context, req allSettingsRequest) 
 	); err != nil {
 		return SettingsUpdateResult{}, settingsValidationError{fmt.Errorf("参数验证失败: %w", err)}
 	}
+	if target := strings.TrimSpace(req.ManagementProbeTarget); target != "" {
+		if _, err := parseProbeTarget(target); err != nil {
+			return SettingsUpdateResult{}, settingsValidationError{fmt.Errorf("参数验证失败: 探测目标无效: %w", err)}
+		}
+	}
 
 	s.cfgMu.RLock()
 	c := s.cfgSrc

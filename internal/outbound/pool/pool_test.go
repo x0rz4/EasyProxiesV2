@@ -2,9 +2,15 @@ package pool
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,6 +23,221 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
+
+func testProbeTarget(t *testing.T, raw string) monitor.ProbeTarget {
+	t.Helper()
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.ParseUint(parsed.Port(), 10, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestURI := parsed.RequestURI()
+	if requestURI == "" {
+		requestURI = "/generate_204"
+	}
+	return monitor.ProbeTarget{
+		Scheme: parsed.Scheme, Host: parsed.Host, ServerName: parsed.Hostname(), RequestURI: requestURI,
+		Destination: M.ParseSocksaddrHostPort(parsed.Hostname(), uint16(port)),
+	}
+}
+
+func TestHTTPProbeRequiresValid204Response(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/ok":
+			w.WriteHeader(http.StatusNoContent)
+		case "/redirect":
+			http.Redirect(w, r, "/portal", http.StatusFound)
+		default:
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("captive portal"))
+		}
+	}))
+	defer server.Close()
+
+	tests := []struct {
+		name    string
+		path    string
+		wantErr bool
+	}{
+		{name: "204", path: "/ok"},
+		{name: "200 portal", path: "/portal", wantErr: true},
+		{name: "302 redirect", path: "/redirect", wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			target := testProbeTarget(t, server.URL+tc.path)
+			conn, err := net.Dial("tcp", target.Destination.String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			_, err = httpProbe(t.Context(), conn, target, nil)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("httpProbe error=%v, wantErr=%v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestHTTPProbeRejectsNonHTTPBytes(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	go func() {
+		reader := make([]byte, 1024)
+		_, _ = server.Read(reader)
+		_, _ = server.Write([]byte("Xnot-http\r\n"))
+	}()
+	target := monitor.ProbeTarget{Scheme: "http", Host: "example.com", ServerName: "example.com",
+		RequestURI: "/generate_204", Destination: M.ParseSocksaddr("example.com:80")}
+	if _, err := httpProbe(t.Context(), client, target, nil); err == nil {
+		t.Fatal("non-HTTP response passed health probe")
+	}
+}
+
+func TestHTTPSProbePerformsTLSAndPreservesRequestURI(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/connectivity" || r.URL.Query().Get("source") != "test" {
+			http.Error(w, "wrong target", http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	target := testProbeTarget(t, server.URL+"/connectivity?source=test")
+	roots := x509.NewCertPool()
+	roots.AddCert(server.Certificate())
+	conn, err := net.Dial("tcp", target.Destination.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := httpProbe(t.Context(), conn, target, &tls.Config{RootCAs: roots}); err != nil {
+		t.Fatal(err)
+	}
+	untrustedConn, err := net.Dial("tcp", target.Destination.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer untrustedConn.Close()
+	if _, err := httpProbe(t.Context(), untrustedConn, target, nil); err == nil {
+		t.Fatal("HTTPS probe accepted an untrusted certificate")
+	}
+}
+
+func TestHTTPProbeHonorsContextDeadline(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	go func() {
+		buffer := make([]byte, 1024)
+		_, _ = server.Read(buffer)
+	}()
+	target := monitor.ProbeTarget{Scheme: "http", Host: "example.com", ServerName: "example.com",
+		RequestURI: "/generate_204", Destination: M.ParseSocksaddr("example.com:80")}
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	if _, err := httpProbe(ctx, client, target, nil); err == nil {
+		t.Fatal("stalled response passed health probe")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("probe ignored context deadline: %s", elapsed)
+	}
+}
+
+func TestProbeFunctionSupportsTargetConfiguredAfterPoolCreation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	mgr, err := monitor.NewManager(monitor.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	member := &memberState{tag: "node", outbound: &fakeOutbound{dial: func(_ context.Context, _ string, destination M.Socksaddr) (net.Conn, error) {
+		return net.Dial("tcp", destination.String())
+	}}}
+	p := &poolOutbound{monitor: mgr}
+	probe := p.makeProbeFunc(member)
+	if probe == nil {
+		t.Fatal("pool created without a target has no dynamic probe function")
+	}
+	if err := mgr.UpdateProbeTarget(server.URL + "/generate_204"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := probe(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBasePoolExcludesActiveProbeFailures(t *testing.T) {
+	mgr, err := monitor.NewManager(monitor.Config{ProbeTarget: "http://example.com/generate_204"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	mgr.Register(monitor.NodeInfo{Tag: "healthy"}).RecordSuccessWithLatency(time.Millisecond)
+	mgr.Register(monitor.NodeInfo{Tag: "failed"}).MarkInitialCheckDone(false)
+	healthy := &memberState{tag: "healthy", shared: acquireSharedState("healthy")}
+	failed := &memberState{tag: "failed", shared: acquireSharedState("failed")}
+	p := &poolOutbound{monitor: mgr, members: []*memberState{healthy, failed}}
+	got := p.availableMembersLocked(time.Now(), "", nil)
+	if len(got) != 1 || got[0] != healthy {
+		t.Fatalf("available members=%v, want only healthy", memberTags(got))
+	}
+}
+
+func TestDialSuccessDoesNotClearPassiveFailuresBeforeResponse(t *testing.T) {
+	ResetSharedStateStore()
+	t.Cleanup(ResetSharedStateStore)
+	state := acquireSharedState("node")
+	state.recordFailure(errors.New("reset"), 3, time.Minute, "example.com:443")
+	state.recordSuccess("example.com:443")
+	if state.failures != 1 {
+		t.Fatalf("dial success cleared passive failures: %d", state.failures)
+	}
+	left, right := net.Pipe()
+	defer right.Close()
+	p := &poolOutbound{logger: boxlog.NewNOPFactory().Logger()}
+	conn := p.wrapConn(left, &memberState{tag: "node", shared: state}, "example.com:443")
+	defer conn.Close()
+	go func() { _, _ = right.Write([]byte("response")) }()
+	buffer := make([]byte, 8)
+	if _, err := conn.Read(buffer); err != nil {
+		t.Fatal(err)
+	}
+	if state.failures != 0 {
+		t.Fatalf("response bytes did not clear passive failures: %d", state.failures)
+	}
+}
+
+func TestEstablishedIOFailuresAccumulateAcrossSuccessfulDials(t *testing.T) {
+	ResetSharedStateStore()
+	t.Cleanup(ResetSharedStateStore)
+	member := &memberState{tag: "node", shared: acquireSharedState("node")}
+	p := &poolOutbound{logger: boxlog.NewNOPFactory().Logger(), options: Options{FailureThreshold: 3, BlacklistDuration: time.Minute}}
+	for range 3 {
+		p.recordSuccess(member, "example.com:443")
+		p.recordEstablishedIOError(member, errors.New("remote reset"), "example.com:443")
+	}
+	if !member.shared.isBlacklisted(time.Now()) {
+		t.Fatal("established I/O failures never reached blacklist threshold")
+	}
+}
+
+func memberTags(members []*memberState) []string {
+	tags := make([]string, len(members))
+	for i, member := range members {
+		tags[i] = member.tag
+	}
+	return tags
+}
 
 type halfCloseConn struct {
 	net.Conn
