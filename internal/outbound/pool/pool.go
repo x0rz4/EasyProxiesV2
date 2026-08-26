@@ -211,6 +211,21 @@ func normalizeOptions(options Options) Options {
 	default:
 		options.Mode = modeSequential
 	}
+	if options.GroupID != 0 {
+		// The runtime registry treats every InitialGroupState entry as a member.
+		// Intersect it with Members and fill missing entries so stale persisted
+		// state can never recreate an excluded member.
+		initialState := make(map[string]group.GroupInitialState, len(options.Members))
+		for _, tag := range options.Members {
+			if state, ok := options.InitialGroupState[tag]; ok {
+				state.FailureHistory = append([]int64(nil), state.FailureHistory...)
+				initialState[tag] = state
+				continue
+			}
+			initialState[tag] = group.GroupInitialState{NodeID: options.Metadata[tag].NodeID}
+		}
+		options.InitialGroupState = initialState
+	}
 	return options
 }
 

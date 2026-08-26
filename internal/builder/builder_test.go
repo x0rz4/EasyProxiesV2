@@ -179,6 +179,35 @@ func TestBuildCreatesIndependentGroupListenerSelectorAndPool(t *testing.T) {
 	}
 }
 
+func TestBuildGroupFiltersExcludedPersistedState(t *testing.T) {
+	cfg := &config.Config{Pool: config.PoolConfig{Mode: "random", FailureThreshold: 3, BlacklistDuration: time.Hour},
+		Nodes: []config.NodeConfig{{ID: 1, Name: "kept", URI: "http://kept.example:80", Region: "hk"},
+			{ID: 2, Name: "excluded", URI: "http://excluded.example:80", Region: "hk"}},
+		Groups: []config.GroupPoolConfig{{ID: 17, Name: "HK", BindAddress: "127.0.0.1", BindPort: 10017,
+			Protocol: "mixed", DispatchMode: "fixed", Regions: []string{"hk"}, ExcludedNodeIDs: []int64{2},
+			FailureWindow: 5 * time.Minute, FailureThreshold: 3, Enabled: true,
+			NodeStates: []config.GroupNodeStateConfig{{NodeID: 1, FailureHistory: []int64{1}}, {NodeID: 2, Evicted: true, LastError: "auth failed"}}}}}
+	opts, err := BuildGroup(cfg, 17)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, outbound := range opts.Outbounds {
+		if outbound.Tag != "group-pool-17" {
+			continue
+		}
+		poolOptions := outbound.Options.(*poolout.Options)
+		if len(poolOptions.Members) != 1 || len(poolOptions.InitialGroupState) != 1 {
+			t.Fatalf("members=%v initial=%v", poolOptions.Members, poolOptions.InitialGroupState)
+		}
+		memberTag := poolOptions.Members[0]
+		if poolOptions.Metadata[memberTag].NodeID != 1 || poolOptions.InitialGroupState[memberTag].NodeID != 1 {
+			t.Fatalf("excluded state leaked into group: members=%v initial=%v metadata=%v", poolOptions.Members, poolOptions.InitialGroupState, poolOptions.Metadata)
+		}
+		return
+	}
+	t.Fatal("group pool outbound not found")
+}
+
 func TestBuildLeavesLowestLatencyGroupWithoutSyntheticCurrent(t *testing.T) {
 	cfg := &config.Config{Listener: config.ListenerConfig{Enabled: true, Address: "127.0.0.1", Port: 2323, Protocol: "http"},
 		Pool: config.PoolConfig{Mode: "random", FailureThreshold: 3, BlacklistDuration: time.Hour},

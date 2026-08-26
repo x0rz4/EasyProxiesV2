@@ -44,6 +44,29 @@ func testProbeTarget(t *testing.T, raw string) monitor.ProbeTarget {
 	}
 }
 
+func TestNormalizeOptionsAlignsInitialStateWithMembers(t *testing.T) {
+	originalHistory := []int64{1, 2}
+	options := normalizeOptions(Options{GroupID: 9, Members: []string{"node-a", "node-b"},
+		Metadata: map[string]MemberMeta{"node-a": {NodeID: 1}, "node-b": {NodeID: 2}},
+		InitialGroupState: map[string]group.GroupInitialState{
+			"node-a": {NodeID: 1, FailureHistory: originalHistory},
+			"stale":  {NodeID: 3, Evicted: true},
+		}})
+	if len(options.InitialGroupState) != 2 {
+		t.Fatalf("initial state=%v", options.InitialGroupState)
+	}
+	if _, ok := options.InitialGroupState["stale"]; ok {
+		t.Fatal("stale initial state was retained")
+	}
+	if options.InitialGroupState["node-b"].NodeID != 2 {
+		t.Fatalf("missing member was not initialized: %v", options.InitialGroupState["node-b"])
+	}
+	originalHistory[0] = 99
+	if options.InitialGroupState["node-a"].FailureHistory[0] != 1 {
+		t.Fatal("failure history was not defensively copied")
+	}
+}
+
 func TestHTTPProbeRequiresValid204Response(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

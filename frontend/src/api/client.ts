@@ -170,6 +170,10 @@ export async function removeGroupMember(groupId: number, nodeId: number) {
   return request(`/api/groups/${groupId}/members/${nodeId}`, { method: 'DELETE' })
 }
 
+export async function unexcludeGroupMember(groupId: number, nodeId: number) {
+  return request(`/api/groups/${groupId}/exclusions/${nodeId}`, { method: 'DELETE' })
+}
+
 export async function resetGroupSubscriptionToken(groupId: number): Promise<{ message: string; token: string }> {
   return request(`/api/groups/${groupId}/subscription/reset-token`, { method: 'POST' })
 }

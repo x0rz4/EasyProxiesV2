@@ -88,7 +88,7 @@ func TestGroupNodeOptionsUseManagedAvailableNodes(t *testing.T) {
 	for _, snapshot := range mgr.Snapshot() {
 		monitorByTag[snapshot.Tag] = snapshot
 	}
-	options, err := server.groupNodeOptions(ctx, []store.GroupPool{{ExplicitNodeIDs: []int64{unavailable.ID}}}, monitorByTag)
+	options, err := server.groupNodeOptions(ctx, []store.GroupPool{{ExplicitNodeIDs: []int64{unavailable.ID}, ExcludedNodeIDs: []int64{pending.ID}}}, monitorByTag)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +102,10 @@ func TestGroupNodeOptionsUseManagedAvailableNodes(t *testing.T) {
 	if option, ok := byID[unavailable.ID]; !ok || option.Selectable || option.Status != "unavailable" {
 		t.Fatalf("referenced unavailable option = %+v, present=%v", option, ok)
 	}
-	for _, node := range []*store.Node{pending, disabled, hiddenSubscription} {
+	if option, ok := byID[pending.ID]; !ok || option.Selectable || option.Status != "pending" {
+		t.Fatalf("excluded pending option = %+v, present=%v", option, ok)
+	}
+	for _, node := range []*store.Node{disabled, hiddenSubscription} {
 		if _, ok := byID[node.ID]; ok {
 			t.Fatalf("non-selectable unreferenced node %q leaked into options", node.Name)
 		}
@@ -206,6 +209,54 @@ func TestUpdateGroupAPIReportsRemovedUnavailableNodes(t *testing.T) {
 	}
 }
 
+func TestUpdateGroupPersistsAutoExcludedEvictedNode(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "groups-auto-exclude-evicted.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	node := createGroupTestNode(t, ctx, db, "evicted", store.NodeSourceManual, true)
+	groupPool := &store.GroupPool{Name: "HK", BindAddress: "127.0.0.1", BindPort: 12093, Protocol: "mixed",
+		DispatchMode: "fixed", Regions: []string{"hk"}, ExplicitNodeIDs: []int64{node.ID},
+		FailureWindowSeconds: 300, FailureThreshold: 3, HealthCheckSeconds: 60, Enabled: true}
+	if err := db.CreateGroupPool(ctx, groupPool); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertGroupNodeState(ctx, &store.GroupNodeState{GroupID: groupPool.ID, NodeID: node.ID,
+		FailureHistory: []int64{1, 2, 3}, Evicted: true, LastError: "authentication required"}); err != nil {
+		t.Fatal(err)
+	}
+	excludedNodeIDs := []int64{node.ID}
+	body, err := json.Marshal(groupPoolInput{Name: "HK", BindAddress: "127.0.0.1", BindPort: groupPool.BindPort,
+		Protocol: "mixed", DispatchMode: "fixed", Regions: []string{"hk"}, ExcludedNodeIDs: &excludedNodeIDs,
+		FailureWindowSeconds: 300, FailureThreshold: 3, HealthCheckSeconds: 60})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeManager := &isolatedGroupRuntimeManager{}
+	server := &Server{store: db, nodeMgr: runtimeManager}
+	response := httptest.NewRecorder()
+	server.handleGroupItem(response, httptest.NewRequest(http.MethodPut,
+		"/api/groups/"+strconv.FormatInt(groupPool.ID, 10), bytes.NewReader(body)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	updated, err := db.GetGroupPool(ctx, groupPool.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.ExplicitNodeIDs) != 0 || len(updated.ExcludedNodeIDs) != 1 || updated.ExcludedNodeIDs[0] != node.ID {
+		t.Fatalf("stored membership rules = explicit %v excluded %v", updated.ExplicitNodeIDs, updated.ExcludedNodeIDs)
+	}
+	if len(updated.NodeStates) != 1 || !updated.NodeStates[0].Evicted || updated.NodeStates[0].NodeID != node.ID {
+		t.Fatalf("evicted state was unexpectedly cleared: %+v", updated.NodeStates)
+	}
+	if runtimeManager.applies.Load() != 1 {
+		t.Fatalf("runtime applies=%d, want 1", runtimeManager.applies.Load())
+	}
+}
+
 func TestProbeFailureReturnsErrorStatus(t *testing.T) {
 	mgr, err := NewManager(Config{})
 	if err != nil {
@@ -305,6 +356,140 @@ func TestRemoveRunningMemberPersistsGroupExclusion(t *testing.T) {
 	}
 	if updated.CurrentActiveNodeID != 0 || nodeManager.reloads.Load() != 1 {
 		t.Fatalf("current=%d reloads=%d", updated.CurrentActiveNodeID, nodeManager.reloads.Load())
+	}
+}
+
+func TestUnexcludeGroupMemberRebuildsRuntime(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "group-unexclude.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	node := createGroupTestNode(t, ctx, db, "excluded-node", store.NodeSourceManual, true)
+	groupPool := &store.GroupPool{Name: "HK", BindAddress: "127.0.0.1", BindPort: 12098, Protocol: "mixed",
+		DispatchMode: "fixed", Regions: []string{"hk"}, ExcludedNodeIDs: []int64{node.ID},
+		FailureWindowSeconds: 300, FailureThreshold: 3, HealthCheckSeconds: 60, Enabled: true}
+	if err := db.CreateGroupPool(ctx, groupPool); err != nil {
+		t.Fatal(err)
+	}
+	runtimeManager := &isolatedGroupRuntimeManager{}
+	server := &Server{store: db, nodeMgr: runtimeManager}
+	response := httptest.NewRecorder()
+	server.handleGroupItem(response, httptest.NewRequest(http.MethodDelete,
+		"/api/groups/"+strconv.FormatInt(groupPool.ID, 10)+"/exclusions/"+strconv.FormatInt(node.ID, 10), nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	updated, err := db.GetGroupPool(ctx, groupPool.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.ExcludedNodeIDs) != 0 || runtimeManager.applies.Load() != 1 {
+		t.Fatalf("excluded=%v applies=%d", updated.ExcludedNodeIDs, runtimeManager.applies.Load())
+	}
+}
+
+func TestUnexcludeGroupMemberRuntimeFailureRollsBack(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "group-unexclude-rollback.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	node := createGroupTestNode(t, ctx, db, "excluded-node", store.NodeSourceManual, true)
+	groupPool := &store.GroupPool{Name: "HK", BindAddress: "127.0.0.1", BindPort: 12099, Protocol: "mixed",
+		DispatchMode: "fixed", ExcludedNodeIDs: []int64{node.ID}, FailureWindowSeconds: 300,
+		FailureThreshold: 3, HealthCheckSeconds: 60, Enabled: true}
+	if err := db.CreateGroupPool(ctx, groupPool); err != nil {
+		t.Fatal(err)
+	}
+	runtimeManager := &isolatedGroupRuntimeManager{applyErr: errors.New("group start failed")}
+	server := &Server{store: db, nodeMgr: runtimeManager}
+	response := httptest.NewRecorder()
+	server.handleGroupItem(response, httptest.NewRequest(http.MethodDelete,
+		"/api/groups/"+strconv.FormatInt(groupPool.ID, 10)+"/exclusions/"+strconv.FormatInt(node.ID, 10), nil))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	updated, err := db.GetGroupPool(ctx, groupPool.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.ExcludedNodeIDs) != 1 || updated.ExcludedNodeIDs[0] != node.ID {
+		t.Fatalf("rollback lost exclusion: %v", updated.ExcludedNodeIDs)
+	}
+}
+
+type serialGroupRuntimeManager struct {
+	reloadNodeManager
+	active atomic.Int32
+	max    atomic.Int32
+}
+
+func (m *serialGroupRuntimeManager) ApplyGroupRuntime(context.Context, *store.GroupPool, *store.GroupPool) error {
+	active := m.active.Add(1)
+	for {
+		current := m.max.Load()
+		if active <= current || m.max.CompareAndSwap(current, active) {
+			break
+		}
+	}
+	time.Sleep(20 * time.Millisecond)
+	m.active.Add(-1)
+	return nil
+}
+
+func (m *serialGroupRuntimeManager) ActivateGroupMember(context.Context, int64, int64) error {
+	return nil
+}
+
+func (m *serialGroupRuntimeManager) GroupRuntimeStatus(int64) GroupRuntimeStatus {
+	return GroupRuntimeStatus{Status: "ready"}
+}
+
+func TestConcurrentGroupExclusionMutationsAreSerialized(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "group-exclusion-concurrency.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	first := createGroupTestNode(t, ctx, db, "first-excluded", store.NodeSourceManual, true)
+	second := createGroupTestNode(t, ctx, db, "second-excluded", store.NodeSourceManual, true)
+	groupPool := &store.GroupPool{Name: "HK", BindAddress: "127.0.0.1", BindPort: 12100, Protocol: "mixed",
+		DispatchMode: "fixed", ExcludedNodeIDs: []int64{first.ID, second.ID}, FailureWindowSeconds: 300,
+		FailureThreshold: 3, HealthCheckSeconds: 60, Enabled: true}
+	if err := db.CreateGroupPool(ctx, groupPool); err != nil {
+		t.Fatal(err)
+	}
+	runtimeManager := &serialGroupRuntimeManager{}
+	server := &Server{store: db, nodeMgr: runtimeManager}
+	responses := make(chan *httptest.ResponseRecorder, 2)
+	var wg sync.WaitGroup
+	for _, nodeID := range []int64{first.ID, second.ID} {
+		wg.Add(1)
+		go func(nodeID int64) {
+			defer wg.Done()
+			response := httptest.NewRecorder()
+			server.handleGroupItem(response, httptest.NewRequest(http.MethodDelete,
+				"/api/groups/"+strconv.FormatInt(groupPool.ID, 10)+"/exclusions/"+strconv.FormatInt(nodeID, 10), nil))
+			responses <- response
+		}(nodeID)
+	}
+	wg.Wait()
+	close(responses)
+	for response := range responses {
+		if response.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+		}
+	}
+	updated, err := db.GetGroupPool(ctx, groupPool.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.ExcludedNodeIDs) != 0 || runtimeManager.max.Load() != 1 {
+		t.Fatalf("excluded=%v max concurrent applies=%d", updated.ExcludedNodeIDs, runtimeManager.max.Load())
 	}
 }
 

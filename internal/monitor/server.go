@@ -2535,7 +2535,7 @@ func (s *Server) handleGroupItem(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "无效的分组 ID")
 		return
 	}
-	mutationRequest := (len(parts) == 3 && parts[1] == "members" && r.Method == http.MethodDelete) ||
+	mutationRequest := (len(parts) == 3 && (parts[1] == "members" || parts[1] == "exclusions") && r.Method == http.MethodDelete) ||
 		(len(parts) == 1 && (r.Method == http.MethodPut || r.Method == http.MethodDelete))
 	if mutationRequest {
 		operationLock := s.groupOperationLock(groupID)
@@ -2639,6 +2639,44 @@ func (s *Server) handleGroupItem(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, map[string]any{"message": "节点已从当前分组移除", "group_id": groupID, "node_id": nodeID,
+			"reloaded": true, "reload_error": ""})
+		return
+	}
+	if len(parts) == 3 && parts[1] == "exclusions" && r.Method == http.MethodDelete {
+		nodeID, err := strconv.ParseInt(parts[2], 10, 64)
+		if err != nil || nodeID <= 0 {
+			writeAPIError(w, http.StatusBadRequest, "无效的节点 ID")
+			return
+		}
+		s.groupMutationMu.Lock()
+		groupPool, err := s.store.GetGroupPool(r.Context(), groupID)
+		if err != nil || groupPool == nil {
+			s.groupMutationMu.Unlock()
+			writeAPIError(w, http.StatusNotFound, "分组不存在")
+			return
+		}
+		if !containsInt64(groupPool.ExcludedNodeIDs, nodeID) {
+			s.groupMutationMu.Unlock()
+			writeJSON(w, map[string]any{"message": "节点未处于排除名单", "group_id": groupID, "node_id": nodeID,
+				"reloaded": true, "reload_error": ""})
+			return
+		}
+		originalGroup := cloneGroupPool(groupPool)
+		groupPool.ExcludedNodeIDs = removeInt64(groupPool.ExcludedNodeIDs, nodeID)
+		err = s.store.UpdateGroupPool(r.Context(), groupPool)
+		s.groupMutationMu.Unlock()
+		if err != nil {
+			writeAPIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		reloadError := s.applyGroupRuntimeMutation(r.Context(), originalGroup, groupPool)
+		if reloadError != "" {
+			rolledBack := s.store.UpdateGroupPool(r.Context(), originalGroup) == nil
+			w.WriteHeader(http.StatusConflict)
+			writeJSON(w, map[string]any{"error": reloadError, "reloaded": false, "reload_error": reloadError, "rolled_back": rolledBack})
+			return
+		}
+		writeJSON(w, map[string]any{"message": "节点已取消排除", "group_id": groupID, "node_id": nodeID,
 			"reloaded": true, "reload_error": ""})
 		return
 	}
@@ -2794,6 +2832,9 @@ func (s *Server) groupNodeOptions(ctx context.Context, groups []store.GroupPool,
 	referenced := make(map[int64]struct{})
 	for _, groupPool := range groups {
 		for _, nodeID := range groupPool.ExplicitNodeIDs {
+			referenced[nodeID] = struct{}{}
+		}
+		for _, nodeID := range groupPool.ExcludedNodeIDs {
 			referenced[nodeID] = struct{}{}
 		}
 	}

@@ -8,7 +8,7 @@ import { toast } from 'sonner'
 import type { GroupMember, GroupNodeOption, GroupPool, GroupPoolPayload, GroupMemberStatus } from '../types'
 import {
   activateGroupMember, createGroupPool, deleteGroupPool, listGroupPools, probeNode, removeGroupMember,
-  resetGroupSubscriptionToken, restoreGroupMember, updateGroupPool,
+  resetGroupSubscriptionToken, restoreGroupMember, unexcludeGroupMember, updateGroupPool,
 } from '../api/client'
 import { cn } from '../utils/cn'
 import { controlClass, PageContent, PageHeader, PageLayout, surfaceClass } from './ui/PageLayout'
@@ -109,6 +109,7 @@ export default function GroupPoolsPanel() {
   const [busy, setBusy] = useState<string | null>(null)
   const [expandedGroups, setExpandedGroups] = useState<Set<number>>(() => new Set())
   const [removedDraftNodes, setRemovedDraftNodes] = useState<string[]>([])
+  const [pendingAutoExcludedIDs, setPendingAutoExcludedIDs] = useState<Set<number>>(() => new Set())
   const [draftNodeCache, setDraftNodeCache] = useState<Record<number, GroupNodeOption>>({})
   const [probingNodeIDs, setProbingNodeIDs] = useState<Set<number>>(() => new Set())
   const [latencyOverrides, setLatencyOverrides] = useState<Record<number, number>>({})
@@ -130,37 +131,66 @@ export default function GroupPoolsPanel() {
     }).filter((node): node is GroupNodeOption => Boolean(node))
   }, [nodes, form.explicit_node_ids, draftNodeCache])
 
+  const excludedDraftNodes = useMemo(() => {
+    const nodeByID = new Map(nodes.map((node) => [node.id, node]))
+    const runtimeByID = new Map((editing?.members || []).map((member) => [member.node_id, member]))
+    return form.excluded_node_ids.map((id) => {
+      const node = nodeByID.get(id)
+      const member = runtimeByID.get(id)
+      return {
+        id,
+        name: node?.name || member?.name || member?.tag || `节点 #${id}`,
+        region: node?.region || member?.region || '',
+        status: node?.status,
+        pending: pendingAutoExcludedIDs.has(id),
+      }
+    })
+  }, [nodes, editing?.members, form.excluded_node_ids, pendingAutoExcludedIDs])
+
   const openCreate = () => {
-    setEditing(null); setForm(emptyPayload()); setRegionsText(''); setNodeSearch(''); setRemovedDraftNodes([]); setDraftNodeCache({}); setEditorOpen(true)
+    setEditing(null); setForm(emptyPayload()); setRegionsText(''); setNodeSearch(''); setRemovedDraftNodes([]); setPendingAutoExcludedIDs(new Set()); setDraftNodeCache({}); setEditorOpen(true)
   }
   const openEdit = (group: GroupPool) => {
     const nodeByID = new Map(nodes.map((node) => [node.id, node]))
-    const keptIDs = group.explicit_node_ids.filter((id) => nodeByID.get(id)?.selectable)
+    const evictedIDs = group.members.filter((member) => member.status === 'EVICTED').map((member) => member.node_id)
+    const evictedSet = new Set(evictedIDs)
+    const excludedIDs = [...new Set([...(group.excluded_node_ids || []), ...evictedIDs])]
+    const keptIDs = group.explicit_node_ids.filter((id) => nodeByID.get(id)?.selectable && !evictedSet.has(id))
     const removedNames = group.explicit_node_ids.filter((id) => !nodeByID.get(id)?.selectable).map((id) =>
       nodeByID.get(id)?.name || group.members.find((member) => member.node_id === id)?.name || `节点 #${id}`)
     const cache = Object.fromEntries(keptIDs.map((id) => [id, nodeByID.get(id)]).filter((entry): entry is [number, GroupNodeOption] => Boolean(entry[1])))
-    setEditing(group); setForm({ ...payloadFromGroup(group), explicit_node_ids: keptIDs }); setRegionsText((group.regions || []).join(', '));
-    setNodeSearch(''); setRemovedDraftNodes(removedNames); setDraftNodeCache(cache); setEditorOpen(true)
+    setEditing(group); setForm({ ...payloadFromGroup(group), explicit_node_ids: keptIDs, excluded_node_ids: excludedIDs }); setRegionsText((group.regions || []).join(', '));
+    setNodeSearch(''); setRemovedDraftNodes(removedNames); setPendingAutoExcludedIDs(new Set(evictedIDs.filter((id) => !group.excluded_node_ids.includes(id)))); setDraftNodeCache(cache); setEditorOpen(true)
   }
-  const closeEditor = () => { setEditorOpen(false); setEditing(null); setRemovedDraftNodes([]); setBatchProbeProgress(null) }
+  const closeEditor = () => { setEditorOpen(false); setEditing(null); setRemovedDraftNodes([]); setPendingAutoExcludedIDs(new Set()); setBatchProbeProgress(null) }
 
   const refresh = async () => {
     await queryClient.invalidateQueries({ queryKey: ['groupPools'] })
     await queryClient.invalidateQueries({ queryKey: ['nodes'] })
   }
   const save = async () => {
-    const selectableIDs = new Set(nodes.filter((node) => node.selectable).map((node) => node.id))
-    const keptNodeIDs = form.explicit_node_ids.filter((id) => selectableIDs.has(id))
-    const locallyRemoved = form.explicit_node_ids.length - keptNodeIDs.length
-    const payload = {
-      ...form,
-      name: form.name.trim(),
-      regions: regionsText.split(/[,，\s]+/).map((value) => value.trim().toLowerCase()).filter(Boolean),
-      explicit_node_ids: keptNodeIDs,
-    }
-    if (!payload.name) return
+    const name = form.name.trim()
+    if (!name) return
     setBusy('save')
     try {
+      // Re-read immediately before saving so an eviction that happened while
+      // the editor was open is persisted even if the polling cache is stale.
+      const latestSnapshot = editing ? await listGroupPools() : data
+      const latestGroup = editing ? latestSnapshot?.groups.find((group) => group.id === editing.id) : undefined
+      const latestEvictedIDs = latestGroup?.members.filter((member) => member.status === 'EVICTED').map((member) => member.node_id) || []
+      const excludedNodeIDs = [...new Set([...form.excluded_node_ids, ...latestEvictedIDs])]
+      const excludedSet = new Set(excludedNodeIDs)
+      const latestNodes = latestSnapshot?.nodes || nodes
+      const selectableIDs = new Set(latestNodes.filter((node) => node.selectable).map((node) => node.id))
+      const keptNodeIDs = form.explicit_node_ids.filter((id) => selectableIDs.has(id) && !excludedSet.has(id))
+      const locallyRemoved = form.explicit_node_ids.length - keptNodeIDs.length
+      const payload = {
+        ...form,
+        name,
+        regions: regionsText.split(/[,，\s]+/).map((value) => value.trim().toLowerCase()).filter(Boolean),
+        explicit_node_ids: keptNodeIDs,
+        excluded_node_ids: excludedNodeIDs,
+      }
       const result = editing ? await updateGroupPool(editing.id, payload) : await createGroupPool(payload)
       const removedCount = locallyRemoved + (result.removed_unavailable_node_ids?.length || 0)
       toast.success(editing ? '分组池已更新' : '分组池已创建并加载', removedCount > 0
@@ -192,6 +222,34 @@ export default function GroupPoolsPanel() {
     const regions = new Set(regionsText.split(/[,，\s]+/).map((value) => value.trim().toLowerCase()).filter(Boolean))
     if (node.region && regions.has(node.region.toLowerCase())) {
       toast.info('已取消手动指定', { description: `${node.name} 仍匹配地区规则，会继续自动入池` })
+    }
+  }
+
+  const removeRuntimeMemberImmediately = async (member: GroupMember) => {
+    if (!editing || !window.confirm(`确认立即将“${member.name || member.tag}”从分组“${editing.name}”移除？\n节点本身不会从节点管理中删除。`)) return
+    const key = `remove-member-${editing.id}-${member.node_id}`
+    setBusy(key)
+    try {
+      await removeGroupMember(editing.id, member.node_id)
+      setForm((current) => ({ ...current,
+        explicit_node_ids: current.explicit_node_ids.filter((id) => id !== member.node_id),
+        excluded_node_ids: [...new Set([...current.excluded_node_ids, member.node_id])],
+      }))
+      setPendingAutoExcludedIDs((current) => { const next = new Set(current); next.delete(member.node_id); return next })
+      setEditing((current) => current ? { ...current,
+        members: current.members.filter((item) => item.node_id !== member.node_id),
+        member_count: Math.max(0, current.member_count - 1),
+        evicted_count: Math.max(0, current.evicted_count - (member.status === 'EVICTED' ? 1 : 0)),
+        alive_count: Math.max(0, current.alive_count - (member.status === 'ALIVE' ? 1 : 0)),
+        explicit_node_ids: current.explicit_node_ids.filter((id) => id !== member.node_id),
+        excluded_node_ids: [...new Set([...current.excluded_node_ids, member.node_id])],
+      } : null)
+      toast.success('节点已从当前分组移除')
+      await refresh()
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : '移除成员失败')
+    } finally {
+      setBusy(null)
     }
   }
 
@@ -281,6 +339,7 @@ export default function GroupPoolsPanel() {
         ) : (
           <section className="grid items-start gap-5 xl:grid-cols-2">
             {groups.map((group) => <GroupCard key={group.id} group={group} busy={busy}
+              nodeOptions={nodes}
               expanded={expandedGroups.has(group.id)}
               onToggleExpanded={() => setExpandedGroups((current) => { const next = new Set(current); if (next.has(group.id)) next.delete(group.id); else next.add(group.id); return next })}
               onEdit={() => openEdit(group)} onDelete={() => setDeleteTarget(group)}
@@ -288,6 +347,7 @@ export default function GroupPoolsPanel() {
 				onResetToken={() => void run(`token-${group.id}`, () => resetGroupSubscriptionToken(group.id), '订阅 Token 已重置，旧链接已失效')}
               onRestore={(nodeId) => void run(`restore-${group.id}-${nodeId}`, () => restoreGroupMember(group.id, nodeId), '节点已恢复入池')}
               onActivate={(nodeId) => void run(`activate-${group.id}-${nodeId}`, () => activateGroupMember(group.id, nodeId), '当前出口已立即切换')}
+              onUnexclude={(nodeId) => void run(`unexclude-${group.id}-${nodeId}`, () => unexcludeGroupMember(group.id, nodeId), '节点已取消排除')}
               onRemoveMember={(member) => {
                 if (!window.confirm(`确认将“${member.name || member.tag}”从分组“${group.name}”移除？\n节点本身不会从节点管理中删除。`)) return
                 void run(`remove-member-${group.id}-${member.node_id}`, () => removeGroupMember(group.id, member.node_id), '节点已从当前分组移除')
@@ -370,8 +430,17 @@ export default function GroupPoolsPanel() {
                 <div className="mt-3 grid max-h-80 gap-2 overflow-y-auto pr-1 md:grid-cols-2">
                   {editing.members.filter(member => !form.excluded_node_ids.includes(member.node_id)).map((member) => <RuntimeMemberRow key={member.node_id} member={member} manual={form.explicit_node_ids.includes(member.node_id)}
                     regional={Boolean(member.region && regionsText.split(/[,，\s]+/).some((region) => region.toLowerCase() === member.region?.toLowerCase()))}
-                    latency={latencyOverrides[member.node_id] ?? member.latency_ms} probing={probingNodeIDs.has(member.node_id)} onProbe={() => void probeOption({ id: member.node_id, name: member.name || member.tag, tag: member.tag })} onExclude={() => { setForm((current) => ({ ...current, explicit_node_ids: current.explicit_node_ids.filter((id) => id !== member.node_id), excluded_node_ids: [...new Set([...current.excluded_node_ids, member.node_id])] })); toast.success(`已排除节点 ${member.name || member.tag}`, { description: '保存后生效' }) }} onActivate={() => { void run(`activate-${editing.id}-${member.node_id}`, () => activateGroupMember(editing.id, member.node_id), '当前出口已立即切换').then(() => { setEditing((current) => current ? { ...current, members: current.members.map(m => ({ ...m, is_active: m.node_id === member.node_id })) } : null) }) }} isActivateBusy={busy === `activate-${editing.id}-${member.node_id}` || editing.runtime_status !== 'ready'} />)}
+                    latency={latencyOverrides[member.node_id] ?? member.latency_ms} probing={probingNodeIDs.has(member.node_id)} onProbe={() => void probeOption({ id: member.node_id, name: member.name || member.tag, tag: member.tag })} onExclude={() => void removeRuntimeMemberImmediately(member)} onActivate={() => { void run(`activate-${editing.id}-${member.node_id}`, () => activateGroupMember(editing.id, member.node_id), '当前出口已立即切换').then(() => { setEditing((current) => current ? { ...current, members: current.members.map(m => ({ ...m, is_active: m.node_id === member.node_id })) } : null) }) }} isActivateBusy={busy === `activate-${editing.id}-${member.node_id}` || editing.runtime_status !== 'ready'} isRemoveBusy={busy === `remove-member-${editing.id}-${member.node_id}`} />)}
                   {editing.members.filter(member => !form.excluded_node_ids.includes(member.node_id)).length === 0 && <div className="md:col-span-2"><EmptyMemberList message="当前没有运行成员" /></div>}
+                </div>
+              </div>}
+
+              {editing && <div className="mt-4 rounded-2xl border border-error/20 bg-error/5 p-4">
+                <div className="flex items-start justify-between gap-3"><div><h5 className="text-sm font-bold">已排除节点</h5><p className="mt-0.5 text-xs text-base-content/50">排除优先于地区规则；待保存项会在保存后从运行成员中移除</p></div><span className="badge badge-error badge-outline badge-sm">{excludedDraftNodes.length}</span></div>
+                {pendingAutoExcludedIDs.size > 0 && <div className="alert alert-warning alert-soft mt-3 py-2 text-xs"><span>检测到 {pendingAutoExcludedIDs.size} 个已踢出节点，已自动加入待排除名单。</span></div>}
+                <div className="mt-3 grid max-h-72 gap-2 overflow-y-auto pr-1 md:grid-cols-2">
+                  {excludedDraftNodes.map((node) => <ExcludedDraftRow key={node.id} node={node} onUndo={node.pending ? undefined : () => setForm((current) => ({ ...current, excluded_node_ids: current.excluded_node_ids.filter((id) => id !== node.id) }))} />)}
+                  {excludedDraftNodes.length === 0 && <div className="md:col-span-2"><EmptyMemberList message="当前没有排除节点" /></div>}
                 </div>
               </div>}
             </section>
@@ -421,7 +490,7 @@ function NodeOptionRow({ node, latency, probing, action, onAction, onProbe }: {
   </div>
 }
 
-function RuntimeMemberRow({ member, manual, regional, latency, probing, onProbe, onExclude, onActivate, isActivateBusy }: {
+function RuntimeMemberRow({ member, manual, regional, latency, probing, onProbe, onExclude, onActivate, isActivateBusy, isRemoveBusy }: {
   member: GroupMember
   manual: boolean
   regional: boolean
@@ -431,6 +500,7 @@ function RuntimeMemberRow({ member, manual, regional, latency, probing, onProbe,
   onExclude: () => void
   onActivate?: () => void
   isActivateBusy?: boolean
+  isRemoveBusy?: boolean
 }) {
   const style = statusStyle[member.status]
   return <div className="flex min-w-0 items-center gap-2 rounded-xl border border-base-200 bg-base-100/70 px-3 py-2.5">
@@ -441,12 +511,23 @@ function RuntimeMemberRow({ member, manual, regional, latency, probing, onProbe,
       </button>
     )}
     <button type="button" className="btn btn-ghost btn-xs btn-square text-primary" onClick={onProbe} disabled={!member.tag || probing} aria-label={`测试 ${member.name || member.tag} 延迟`} title="测试延迟">{probing ? <span className="loading loading-spinner loading-xs" /> : <Activity className="h-3.5 w-3.5" />}</button>
-    <button type="button" className="btn btn-ghost btn-xs btn-square text-error" onClick={onExclude} aria-label={`排除节点 ${member.name || member.tag}`} title="排除此节点"><Trash2 className="h-3.5 w-3.5" /></button>
+    <button type="button" className="btn btn-ghost btn-xs btn-square text-error" onClick={onExclude} disabled={isRemoveBusy} aria-label={`移除节点 ${member.name || member.tag}`} title="立即从此分组移除">{isRemoveBusy ? <span className="loading loading-spinner loading-xs" /> : <Trash2 className="h-3.5 w-3.5" />}</button>
   </div>
 }
 
-function GroupCard({ group, busy, expanded, onToggleExpanded, onEdit, onDelete, onToggle, onResetToken, onRestore, onActivate, onRemoveMember }: { group: GroupPool; busy: string | null; expanded: boolean; onToggleExpanded: () => void; onEdit: () => void; onDelete: () => void; onToggle: () => void; onResetToken: () => void; onRestore: (nodeId: number) => void; onActivate: (nodeId: number) => void; onRemoveMember: (member: GroupMember) => void }) {
+function ExcludedDraftRow({ node, onUndo }: { node: { id: number; name: string; region: string; status?: GroupNodeOption['status']; pending: boolean }; onUndo?: () => void }) {
+  const style = node.status ? nodeStatusStyle[node.status] : nodeStatusStyle.pending
+  return <div className="flex min-w-0 items-center gap-2 rounded-xl border border-error/15 bg-base-100/80 px-3 py-2.5">
+    <ShieldOff className="h-4 w-4 shrink-0 text-error" />
+    <div className="min-w-0 flex-1"><div className="flex min-w-0 items-center gap-2"><span className="truncate text-sm font-medium">{node.name}</span>{node.region && <span className="shrink-0 text-[10px] font-bold uppercase text-base-content/45">{node.region}</span>}</div><div className="mt-1 flex items-center gap-1.5"><span className="badge badge-error badge-outline badge-xs">{node.pending ? '待保存排除' : '已排除'}</span><span className={cn('badge badge-xs', style.badge)}>{style.label}</span></div></div>
+    {onUndo && <button type="button" className="btn btn-ghost btn-xs text-primary" onClick={onUndo} title="取消排除，保存后按地区或手动规则重新匹配"><RotateCcw className="h-3.5 w-3.5" />取消排除</button>}
+  </div>
+}
+
+function GroupCard({ group, nodeOptions, busy, expanded, onToggleExpanded, onEdit, onDelete, onToggle, onResetToken, onRestore, onActivate, onUnexclude, onRemoveMember }: { group: GroupPool; nodeOptions: GroupNodeOption[]; busy: string | null; expanded: boolean; onToggleExpanded: () => void; onEdit: () => void; onDelete: () => void; onToggle: () => void; onResetToken: () => void; onRestore: (nodeId: number) => void; onActivate: (nodeId: number) => void; onUnexclude: (nodeId: number) => void; onRemoveMember: (member: GroupMember) => void }) {
   const active = group.members.find((member) => member.is_active)
+	const nodeByID = new Map(nodeOptions.map((node) => [node.id, node]))
+	const excludedNodes = (group.excluded_node_ids || []).map((id) => nodeByID.get(id) || { id, name: `节点 #${id}`, region: '', status: 'pending' as const })
 	const runtimeStyle = runtimeStatusStyle[group.runtime_status] || runtimeStatusStyle.stopped
 	const runtimeUpdating = group.runtime_status === 'starting' || group.runtime_status === 'reconfiguring'
 	const runtimeReady = group.runtime_status === 'ready'
@@ -464,7 +545,7 @@ function GroupCard({ group, busy, expanded, onToggleExpanded, onEdit, onDelete, 
   return <article className={cn(surfaceClass, 'overflow-hidden transition-colors', !group.enabled && 'opacity-70')}>
     <div className="border-b border-base-200 p-5">
       <div className="flex items-start gap-3"><div className={cn('flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl', runtimeReady ? 'bg-primary/10 text-primary' : 'bg-base-200 text-base-content/40')}><Layers3 className="h-5 w-5" /></div><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><h3 className="truncate text-lg font-bold">{group.name}</h3><span className={cn('badge badge-sm', runtimeStyle.badge)}>{runtimeStyle.label}</span><span className="badge badge-outline badge-sm">{dispatchModeLabel[group.dispatch_mode]}</span></div><div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-base-content/55"><code className="font-semibold text-primary">{group.bind_address}:{group.bind_port}</code><span className="uppercase">{group.protocol}</span><span>{group.failure_window_seconds / 60} 分钟 / {group.failure_threshold} 次踢出</span></div>{group.runtime_error && <p className="mt-1 truncate text-xs text-error" title={group.runtime_error}>{group.runtime_error}</p>}</div><div className="dropdown dropdown-end"><button tabIndex={0} className="btn btn-ghost btn-sm btn-square" aria-label="分组操作" disabled={runtimeUpdating}><Pencil className="h-4 w-4" /></button><ul tabIndex={0} className="dropdown-content z-20 mt-1 w-36 rounded-box border border-base-300 bg-base-100 p-1.5 shadow-xl"><li><button className="flex w-full cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-sm hover:bg-base-200" onClick={onEdit} disabled={runtimeUpdating}><Pencil className="h-4 w-4" />编辑</button></li><li><button className="flex w-full cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-sm hover:bg-base-200" onClick={onToggle} disabled={runtimeUpdating}><Power className="h-4 w-4" />{group.enabled ? '停用' : '启用'}</button></li><li><button className="flex w-full cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-sm text-error hover:bg-error/10" onClick={onDelete} disabled={runtimeUpdating}><Trash2 className="h-4 w-4" />删除</button></li></ul></div></div>
-      <div className="mt-4 grid grid-cols-3 gap-2"><MiniMetric label="成员" value={group.member_count} /><MiniMetric label="健康" value={group.alive_count} tone="text-success" /><MiniMetric label="踢出" value={group.evicted_count} tone={group.evicted_count ? 'text-error' : ''} /></div>
+      <div className="mt-4 grid grid-cols-4 gap-2"><MiniMetric label="成员" value={group.member_count} /><MiniMetric label="健康" value={group.alive_count} tone="text-success" /><MiniMetric label="踢出" value={group.evicted_count} tone={group.evicted_count ? 'text-error' : ''} /><MiniMetric label="排除" value={excludedNodes.length} tone={excludedNodes.length ? 'text-error' : ''} /></div>
       {(group.regions?.length > 0 || group.explicit_node_ids?.length > 0) && <div className="mt-4 flex flex-wrap gap-1.5">{group.regions?.map((region) => <span key={region} className="badge badge-primary badge-outline badge-sm uppercase">{region}</span>)}{group.explicit_node_ids?.length > 0 && <span className="badge badge-ghost badge-sm">手动 {group.explicit_node_ids.length} 个</span>}</div>}
 		<div className={cn('mt-4 rounded-xl border p-3', group.subscription_enabled ? 'border-info/20 bg-info/5' : 'border-base-200 bg-base-200/25')}>
 			<div className="flex items-center gap-2"><Link2 className={cn('h-4 w-4', group.subscription_enabled ? 'text-info' : 'text-base-content/35')} /><span className="text-xs font-bold">订阅输出</span><span className={cn('badge badge-xs', group.subscription_enabled ? 'badge-info' : 'badge-ghost')}>{group.subscription_enabled ? '已启用' : '已关闭'}</span>{group.subscription_enabled && <span className="ml-auto flex items-center gap-1 font-mono text-[10px] text-base-content/40"><KeyRound className="h-3 w-3" />••••{group.subscription_token?.slice(-6)}</span>}</div>
@@ -476,6 +557,7 @@ function GroupCard({ group, busy, expanded, onToggleExpanded, onEdit, onDelete, 
       {group.dispatch_mode !== 'random' && <div className={cn('mb-3 flex items-center gap-3 rounded-xl border px-3 py-2.5', active ? 'border-success/25 bg-success/5' : 'border-warning/25 bg-warning/5')}><Activity className={cn('h-4 w-4 shrink-0', active ? 'text-success' : 'text-warning')} /><div className="min-w-0 flex-1"><p className="text-[11px] font-semibold uppercase tracking-wider text-base-content/45">当前主出口</p><p className="truncate text-sm font-semibold">{active?.name || '等待首个连接选择'}</p></div>{active?.latency_ms && active.latency_ms > 0 ? <span className="text-xs font-mono text-base-content/55">{active.latency_ms} ms</span> : null}</div>}
       <div className="space-y-2">{(expanded ? group.members : group.members.slice(0, 8)).map((member) => { const style = statusStyle[member.status]; const StatusIcon = style.icon; return <div key={member.node_id} className="flex min-w-0 items-center gap-2 rounded-xl border border-base-200 bg-base-200/20 px-3 py-2.5"><StatusIcon className={cn('h-4 w-4 shrink-0', member.status === 'ALIVE' ? 'text-success' : member.status === 'SUSPECT' ? 'text-warning' : 'text-error')} /><div className="min-w-0 flex-1"><div className="flex items-center gap-2"><span className="truncate text-sm font-medium">{member.name || member.tag}</span>{member.region && <span className="text-[10px] font-bold uppercase text-base-content/40">{member.region}</span>}</div>{member.last_error && <p className="mt-0.5 truncate text-[11px] text-error/75" title={member.last_error}>{member.last_error}</p>}</div><span className={cn('badge badge-sm', style.badge)}>{style.label}</span>{member.latency_ms > 0 && <span className="hidden w-14 text-right font-mono text-xs text-base-content/45 sm:block">{member.latency_ms} ms</span>}<div className="flex shrink-0 items-center gap-1">{member.status === 'ALIVE' && !member.is_active && <button className="btn btn-ghost btn-xs btn-square text-primary" disabled={!runtimeReady || busy === `activate-${group.id}-${member.node_id}`} onClick={() => onActivate(member.node_id)} title={group.dispatch_mode === 'random' ? '立即切换；random 模式下后续连接仍会随机选择' : '强制设为当前出口'} aria-label={`将 ${member.name || member.tag} 设为当前出口`}><Crosshair className="h-3.5 w-3.5" /></button>}{member.status === 'EVICTED' && <button className="btn btn-ghost btn-xs gap-1 text-primary" disabled={!runtimeReady || busy === `restore-${group.id}-${member.node_id}`} onClick={() => onRestore(member.node_id)} title="恢复入池"><RotateCcw className="h-3 w-3" /><span className="hidden sm:inline">恢复</span></button>}<button className="btn btn-ghost btn-xs btn-square text-error" disabled={!runtimeReady || busy === `remove-member-${group.id}-${member.node_id}`} onClick={() => onRemoveMember(member)} title="从此分组移除" aria-label={`从分组移除 ${member.name || member.tag}`}><Trash2 className="h-3.5 w-3.5" /></button></div></div> })}</div>
       {group.member_count === 0 && <div className="rounded-xl border border-dashed border-warning/40 bg-warning/5 px-4 py-8 text-center"><CircleAlert className="mx-auto h-6 w-6 text-warning" /><p className="mt-2 text-sm font-medium">当前没有匹配的有效节点</p><p className="mt-1 text-xs text-base-content/45">检查地区码、手动成员或节点启用状态</p></div>}
+      {excludedNodes.length > 0 && <div className="mt-4 rounded-xl border border-error/15 bg-error/5 p-3"><div className="mb-2 flex items-center justify-between"><div className="flex items-center gap-2"><ShieldOff className="h-4 w-4 text-error" /><span className="text-xs font-bold">已排除节点</span></div><span className="badge badge-error badge-outline badge-xs">{excludedNodes.length}</span></div><div className="space-y-1.5">{excludedNodes.map((node) => <div key={node.id} className="flex min-w-0 items-center gap-2 rounded-lg bg-base-100/75 px-2.5 py-2"><div className="min-w-0 flex-1"><div className="flex min-w-0 items-center gap-2"><span className="truncate text-xs font-medium">{node.name}</span>{node.region && <span className="text-[10px] font-bold uppercase text-base-content/40">{node.region}</span>}</div></div><button className="btn btn-ghost btn-xs text-primary" disabled={busy === `unexclude-${group.id}-${node.id}`} onClick={() => onUnexclude(node.id)} title="仅取消排除；原健康踢出状态不会清除">{busy === `unexclude-${group.id}-${node.id}` ? <span className="loading loading-spinner loading-xs" /> : <RotateCcw className="h-3.5 w-3.5" />}取消排除</button></div>)}</div><p className="mt-2 text-[10px] leading-4 text-base-content/45">取消排除只恢复成员规则；如节点仍显示已踢出，请再执行“恢复”。</p></div>}
       {group.member_count > 8 && <button type="button" className="mt-3 flex min-h-9 w-full cursor-pointer items-center justify-center gap-1.5 rounded-lg text-xs font-medium text-base-content/55 transition-colors hover:bg-base-200/60 hover:text-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary" onClick={onToggleExpanded} aria-expanded={expanded}>
         <ChevronDown className={cn('h-3.5 w-3.5 transition-transform duration-200', expanded && 'rotate-180')} />{expanded ? '收起成员' : `展开其余 ${group.member_count - 8} 个成员`}
       </button>}

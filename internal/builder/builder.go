@@ -285,19 +285,23 @@ func Build(cfg *config.Config) (option.Options, error) {
 			continue
 		}
 
-		stateByTag := make(map[string]groupruntime.GroupInitialState)
+		// InitialGroupState must describe the final member topology exactly.
+		// Persisted states can outlive a membership rule change; feeding those
+		// stale entries to group.Register would recreate excluded members in the
+		// runtime snapshot even though they are absent from the actual pool.
+		stateByNodeID := make(map[int64]config.GroupNodeStateConfig, len(group.NodeStates))
 		for _, state := range group.NodeStates {
-			tag := nodeTagsByID[state.NodeID]
-			if tag == "" {
-				continue
-			}
-			stateByTag[tag] = groupruntime.GroupInitialState{NodeID: state.NodeID,
-				FailureHistory: state.FailureHistory, Evicted: state.Evicted,
-				LastError: state.LastError, EvictedAt: state.EvictedAt}
+			stateByNodeID[state.NodeID] = state
 		}
+		stateByTag := make(map[string]groupruntime.GroupInitialState, len(members))
 		for _, tag := range members {
-			if _, ok := stateByTag[tag]; !ok {
-				stateByTag[tag] = groupruntime.GroupInitialState{NodeID: metadata[tag].NodeID}
+			nodeID := metadata[tag].NodeID
+			if state, ok := stateByNodeID[nodeID]; ok {
+				stateByTag[tag] = groupruntime.GroupInitialState{NodeID: nodeID,
+					FailureHistory: append([]int64(nil), state.FailureHistory...), Evicted: state.Evicted,
+					LastError: state.LastError, EvictedAt: state.EvictedAt}
+			} else {
+				stateByTag[tag] = groupruntime.GroupInitialState{NodeID: nodeID}
 			}
 		}
 		preferredTag := nodeTagsByID[group.CurrentActiveNodeID]
