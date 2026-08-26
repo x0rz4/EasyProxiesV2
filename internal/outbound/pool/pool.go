@@ -156,6 +156,7 @@ func newPool(ctx context.Context, _ adapter.Router, logger log.ContextLogger, ta
 
 			meta := normalized.Metadata[memberTag]
 			info := monitor.NodeInfo{
+				NodeID:        meta.NodeID,
 				Tag:           memberTag,
 				Name:          meta.Name,
 				URI:           meta.URI,
@@ -323,7 +324,7 @@ func (p *poolOutbound) initializeMembersLocked() error {
 				entry = p.monitor.HandleForTag(tag)
 			} else {
 				entry = p.monitor.Register(monitor.NodeInfo{
-					Tag: tag, Name: meta.Name, URI: meta.URI, Mode: meta.Mode,
+					NodeID: meta.NodeID, Tag: tag, Name: meta.Name, URI: meta.URI, Mode: meta.Mode,
 					ListenAddress: meta.ListenAddress, Port: meta.Port, Region: meta.Region, Country: meta.Country,
 				})
 			}

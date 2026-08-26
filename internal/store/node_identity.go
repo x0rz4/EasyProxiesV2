@@ -150,6 +150,9 @@ func mergeNodeReferences(tx *sql.Tx, winnerID, loserID int64) error {
 	if err := mergeUnlockResult(tx, winnerID, loserID); err != nil {
 		return err
 	}
+	if err := mergeDetectionResults(tx, winnerID, loserID); err != nil {
+		return err
+	}
 	if err := rewriteGroupReferences(tx, winnerID, loserID); err != nil {
 		return err
 	}
@@ -157,6 +160,35 @@ func mergeNodeReferences(tx *sql.Tx, winnerID, loserID int64) error {
 		return err
 	}
 	_, err := tx.Exec(`DELETE FROM nodes WHERE id=?`, loserID)
+	return err
+}
+
+func mergeDetectionResults(tx *sql.Tx, winnerID, loserID int64) error {
+	var winnerTime, loserTime string
+	_ = tx.QueryRow(`SELECT updated_at FROM node_detection_results WHERE node_id=?`, winnerID).Scan(&winnerTime)
+	_ = tx.QueryRow(`SELECT updated_at FROM node_detection_results WHERE node_id=?`, loserID).Scan(&loserTime)
+	if loserTime != "" && loserTime > winnerTime {
+		if _, err := tx.Exec(`DELETE FROM node_detection_results WHERE node_id=?`, winnerID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE node_detection_results SET node_id=? WHERE node_id=?`, winnerID, loserID); err != nil {
+			return err
+		}
+	} else if _, err := tx.Exec(`DELETE FROM node_detection_results WHERE node_id=?`, loserID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO node_ip_quality_results(node_id,provider,task_id,status,ip,family,country,country_code,asn,org,isp,
+		is_broadcast,is_residential,fraud_score,proxy,hosting,mobile,reason,checked_at,updated_at)
+		SELECT ?,provider,task_id,status,ip,family,country,country_code,asn,org,isp,is_broadcast,is_residential,fraud_score,
+		proxy,hosting,mobile,reason,checked_at,updated_at FROM node_ip_quality_results WHERE node_id=?
+		ON CONFLICT(node_id,provider) DO UPDATE SET task_id=excluded.task_id,status=excluded.status,ip=excluded.ip,family=excluded.family,
+		country=excluded.country,country_code=excluded.country_code,asn=excluded.asn,org=excluded.org,isp=excluded.isp,
+		is_broadcast=excluded.is_broadcast,is_residential=excluded.is_residential,fraud_score=excluded.fraud_score,
+		proxy=excluded.proxy,hosting=excluded.hosting,mobile=excluded.mobile,reason=excluded.reason,checked_at=excluded.checked_at,
+		updated_at=excluded.updated_at WHERE excluded.checked_at > node_ip_quality_results.checked_at`, winnerID, loserID); err != nil {
+		return err
+	}
+	_, err := tx.Exec(`DELETE FROM node_ip_quality_results WHERE node_id=?`, loserID)
 	return err
 }
 

@@ -28,6 +28,7 @@ import (
 	"easy_proxies/internal/group"
 	json "easy_proxies/internal/jsonx"
 	"easy_proxies/internal/nodecodec"
+	"easy_proxies/internal/nodedetect"
 	"easy_proxies/internal/store"
 	"easy_proxies/internal/unlock"
 
@@ -184,6 +185,7 @@ type Server struct {
 	geoLookupMu    sync.Mutex    // protects lazy open/reload of geoLookup
 	geoLookupPath  string        // path the cached geoLookup was opened from
 	geoLookupMtime time.Time     // mtime of the db file when geoLookup was opened
+	nodeChecks     *nodeCheckManager
 }
 
 // NewServer constructs a server; it can be nil when disabled.
@@ -219,6 +221,10 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 	mux.HandleFunc("/api/settings", s.withAuth(s.handleSettings))
 	mux.HandleFunc("/api/operations/probe-settings", s.withAuth(s.handleProbeSettings))
 	mux.HandleFunc("/api/operations/probe-status", s.withAuth(s.handleProbeStatus))
+	mux.HandleFunc("/api/operations/node-check-settings", s.withAuth(s.handleNodeCheckSettings))
+	mux.HandleFunc("/api/node-check/results", s.withAuth(s.handleNodeCheckResults))
+	mux.HandleFunc("/api/node-check/tasks", s.withAuth(s.handleNodeCheckTasks))
+	mux.HandleFunc("/api/node-check/tasks/", s.withAuth(s.handleNodeCheckTaskItem))
 	mux.HandleFunc("/api/nodes", s.withAuth(s.handleNodes))
 	mux.HandleFunc("/api/nodes/config", s.withAuth(s.handleConfigNodes))
 	mux.HandleFunc("/api/nodes/config/batch-toggle", s.withAuth(s.handleConfigNodesBatchToggle))
@@ -325,6 +331,15 @@ func (s *Server) geoipLookupForCheck() *geoip.Lookup {
 func (s *Server) SetStore(st store.Store) {
 	if s != nil {
 		s.store = st
+		s.nodeChecks = newNodeCheckManager(s)
+		if st != nil {
+			if err := st.InterruptRunningNodeDetectionTasks(context.Background()); err != nil && s.logger != nil {
+				s.logger.Printf("[node-check] interrupt stale tasks: %v", err)
+			}
+			if err := st.PruneNodeDetectionTasks(context.Background(), 20); err != nil && s.logger != nil {
+				s.logger.Printf("[node-check] prune task history: %v", err)
+			}
+		}
 	}
 }
 
@@ -915,6 +930,9 @@ func (s *Server) Shutdown(ctx context.Context) {
 	if s == nil || s.srv == nil {
 		return
 	}
+	if s.nodeChecks != nil {
+		s.nodeChecks.shutdown()
+	}
 	// Signal background goroutines to stop
 	select {
 	case <-s.done:
@@ -1146,13 +1164,15 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Wrap dialer slightly to fit signature
-		wrappedDialer := func(ctx context.Context, network, addr string) (interface{}, error) {
-			return dialer(ctx, network, addr)
+		options := nodedetect.SpeedOptions{}
+		s.cfgMu.RLock()
+		if s.cfgSrc != nil {
+			settings := s.cfgSrc.Snapshot().Management.NodeCheck
+			options = nodedetect.SpeedOptions{URL: settings.SpeedURL, Duration: settings.SpeedDuration, RequestTimeout: settings.SpeedRequestTimeout, MaxBytes: settings.MaxDownloadBytes, PeakSampleInterval: settings.PeakSampleInterval}
 		}
-
-		runner := &SpeedtestRunner{}
-		err = runner.Run(r.Context(), wrappedDialer, func(mbps float64, isDone bool) {
+		s.cfgMu.RUnlock()
+		runner := &SpeedtestRunner{Options: options}
+		result, runErr := runner.Run(r.Context(), dialer, func(mbps float64, isDone bool) {
 			if isDone {
 				fmt.Fprintf(w, "event: done\ndata: {\"mbps\": %.2f}\n\n", mbps)
 			} else {
@@ -1160,9 +1180,29 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 			}
 			flusher.Flush()
 		})
-		if err != nil {
-			fmt.Fprintf(w, "event: error\ndata: %s\n\n", err.Error())
+		if runErr != nil {
+			if s.store != nil {
+				if snapshot := s.mgr.SnapshotForTag(tag); snapshot != nil && snapshot.NodeID > 0 {
+					now := time.Now().UTC()
+					failed := &store.NodeDetectionResult{NodeID: snapshot.NodeID, TaskID: "legacy-speedtest", LatencyStatus: "untested", SpeedStatus: "failed", BytesDownloaded: result.BytesDownloaded, SpeedDurationMs: result.DurationMs, SpeedError: runErr.Error(), SpeedCheckedAt: now, ExitIPStatus: "untested"}
+					if result.BytesDownloaded > 0 {
+						average, peak := result.AverageBytesPerSecond, result.PeakBytesPerSecond
+						failed.AverageBytesPerSecond, failed.PeakBytesPerSecond = &average, &peak
+					}
+					_ = s.store.UpsertNodeDetectionResult(context.Background(), failed)
+				}
+			}
+			payload, _ := json.Marshal(map[string]string{"error": runErr.Error()})
+			fmt.Fprintf(w, "event: error\ndata: %s\n\n", payload)
 			flusher.Flush()
+			return
+		}
+		if s.store != nil {
+			if snapshot := s.mgr.SnapshotForTag(tag); snapshot != nil && snapshot.NodeID > 0 {
+				now := time.Now().UTC()
+				average, peak := result.AverageBytesPerSecond, result.PeakBytesPerSecond
+				_ = s.store.UpsertNodeDetectionResult(context.Background(), &store.NodeDetectionResult{NodeID: snapshot.NodeID, TaskID: "legacy-speedtest", LatencyStatus: "untested", SpeedStatus: "success", AverageBytesPerSecond: &average, PeakBytesPerSecond: &peak, BytesDownloaded: result.BytesDownloaded, SpeedDurationMs: result.DurationMs, SpeedCheckedAt: now, ExitIPStatus: "untested"})
+			}
 		}
 	case "unlock":
 		if r.Method != http.MethodPost {
@@ -1624,6 +1664,9 @@ func (s *Server) persistUnlockResult(snap *Snapshot, result *unlock.Result) {
 // falling back to the node name, reusing the resolution pattern used by
 // flushStatsToStore. Returns (0, false) when the node is not in the store.
 func (s *Server) nodeIDForSnapshot(snap Snapshot) (int64, bool) {
+	if snap.NodeID > 0 {
+		return snap.NodeID, true
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	if snap.URI != "" {

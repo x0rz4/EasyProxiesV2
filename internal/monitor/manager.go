@@ -150,6 +150,7 @@ type ProbeTarget struct {
 
 // NodeInfo is static metadata about a proxy entry.
 type NodeInfo struct {
+	NodeID        int64  `json:"node_id"`
 	Tag           string `json:"tag"`
 	Name          string `json:"name"`
 	URI           string `json:"uri"`

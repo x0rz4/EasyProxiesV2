@@ -27,6 +27,11 @@ import type {
   GroupPoolsResponse,
   GroupPoolPayload,
   GroupPoolMutationResponse,
+  NodeCheckSettings,
+  NodeCheckStages,
+  NodeCheckTask,
+  NodeCheckEvent,
+  NodeCheckResultItem,
 } from '../types'
 
 // ---- Token management ----
@@ -145,6 +150,81 @@ export async function fetchNodes(): Promise<NodesResponse> {
 
 export async function fetchProbeSettings(): Promise<ProbeOperationsSettings> {
   return request<ProbeOperationsSettings>('/api/operations/probe-settings')
+}
+
+export async function fetchNodeCheckSettings(): Promise<NodeCheckSettings> {
+  return request<NodeCheckSettings>('/api/operations/node-check-settings')
+}
+
+export async function updateNodeCheckSettings(settings: NodeCheckSettings): Promise<NodeCheckSettings> {
+  return request<NodeCheckSettings>('/api/operations/node-check-settings', { method: 'PUT', body: JSON.stringify(settings) })
+}
+
+export async function fetchNodeCheckResults(): Promise<{ results: NodeCheckResultItem[] }> {
+  return request('/api/node-check/results')
+}
+
+export async function fetchNodeCheckTasks(): Promise<{ tasks: NodeCheckTask[] }> {
+  return request('/api/node-check/tasks')
+}
+
+export async function createNodeCheckTask(nodeIds: number[], stages: NodeCheckStages, settings?: NodeCheckSettings): Promise<NodeCheckTask> {
+  const response = await request<{ task: NodeCheckTask }>('/api/node-check/tasks', { method: 'POST', body: JSON.stringify({ node_ids: nodeIds, stages, settings }) })
+  return response.task
+}
+
+export async function cancelNodeCheckTask(taskId: string): Promise<void> {
+  await request(`/api/node-check/tasks/${encodeURIComponent(taskId)}`, { method: 'DELETE' })
+}
+
+export function streamNodeCheckTask(taskId: string, onEvent: (event: NodeCheckEvent) => void, onError?: (error: Error) => void): AbortController {
+  const controller = new AbortController()
+  void (async () => {
+    while (!controller.signal.aborted) {
+      let terminal = false
+      try {
+        const headers: Record<string, string> = {}
+        if (authToken) headers.Authorization = `Bearer ${authToken}`
+        const response = await fetch(`/api/node-check/tasks/${encodeURIComponent(taskId)}/events`, { headers, credentials: 'include', signal: controller.signal })
+        if (!response.ok) throw new ApiError(`连接检测任务失败: HTTP ${response.status}`, response.status)
+        const reader = response.body?.getReader()
+        if (!reader) throw new Error('No response body')
+        const decoder = new TextDecoder()
+        let buffer = ''
+        while (!controller.signal.aborted) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buffer += decoder.decode(value, { stream: true })
+          const blocks = buffer.split('\n\n')
+          buffer = blocks.pop() || ''
+          for (const block of blocks) {
+            const data = block.split('\n').find((line) => line.startsWith('data: '))
+            if (!data) continue
+            try {
+              const event = JSON.parse(data.slice(6)) as NodeCheckEvent
+              onEvent(event)
+              terminal = event.type === 'done' || Boolean(event.task && ['completed', 'failed', 'cancelled', 'interrupted'].includes(event.task.status))
+            } catch { /* ignore malformed event */ }
+          }
+        }
+        if (terminal || controller.signal.aborted) return
+      } catch (error) {
+        if (controller.signal.aborted) return
+        if (error instanceof ApiError) { onError?.(error); return }
+      }
+      // The task continues server-side. Reconnect and receive a fresh aggregate
+      // snapshot after transient network errors or an intermediary timeout.
+      await new Promise<void>((resolve) => {
+        const onAbort = () => { window.clearTimeout(timer); resolve() }
+        const timer = window.setTimeout(() => {
+          controller.signal.removeEventListener('abort', onAbort)
+          resolve()
+        }, 1000)
+        controller.signal.addEventListener('abort', onAbort, { once: true })
+      })
+    }
+  })()
+  return controller
 }
 
 export async function updateProbeSettings(settings: ProbeOperationsSettings): Promise<ProbeOperationsSettings> {

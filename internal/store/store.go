@@ -149,6 +149,16 @@ type Store interface {
 	// node that has one, keyed by node ID.
 	ListUnlockResults(ctx context.Context) (map[int64]*UnlockResult, error)
 
+	// --- Manual node diagnostics ---
+	UpsertNodeDetectionResult(ctx context.Context, result *NodeDetectionResult) error
+	ListNodeDetectionResults(ctx context.Context) (map[int64]*NodeDetectionResult, error)
+	UpsertNodeIPQualityResult(ctx context.Context, result *NodeIPQualityResult) error
+	ListNodeIPQualityResults(ctx context.Context) (map[int64][]NodeIPQualityResult, error)
+	UpsertNodeDetectionTask(ctx context.Context, task *NodeDetectionTask) error
+	ListNodeDetectionTasks(ctx context.Context, limit int) ([]NodeDetectionTask, error)
+	InterruptRunningNodeDetectionTasks(ctx context.Context) error
+	PruneNodeDetectionTasks(ctx context.Context, keep int) error
+
 	// --- Group pools ---
 	ListGroupPools(ctx context.Context) ([]GroupPool, error)
 	GetGroupPool(ctx context.Context, id int64) (*GroupPool, error)
@@ -405,6 +415,68 @@ type UnlockResult struct {
 	CheckedAt  time.Time             `json:"checked_at"`
 	ResultJSON string                `json:"result_json,omitempty"`
 	UpdatedAt  time.Time             `json:"updated_at"`
+}
+
+// NodeDetectionResult stores the latest routing-neutral diagnostic result.
+type NodeDetectionResult struct {
+	NodeID                int64     `json:"node_id"`
+	TaskID                string    `json:"task_id,omitempty"`
+	LatencyStatus         string    `json:"latency_status"`
+	LatencyMs             *int64    `json:"latency_ms"`
+	LatencyError          string    `json:"latency_error,omitempty"`
+	LatencyCheckedAt      time.Time `json:"latency_checked_at,omitempty"`
+	SpeedStatus           string    `json:"speed_status"`
+	AverageBytesPerSecond *int64    `json:"average_bytes_per_second"`
+	PeakBytesPerSecond    *int64    `json:"peak_bytes_per_second"`
+	BytesDownloaded       int64     `json:"bytes_downloaded"`
+	SpeedDurationMs       int64     `json:"speed_duration_ms"`
+	SpeedError            string    `json:"speed_error,omitempty"`
+	SpeedCheckedAt        time.Time `json:"speed_checked_at,omitempty"`
+	ExitIP                string    `json:"exit_ip,omitempty"`
+	ExitIPFamily          string    `json:"exit_ip_family,omitempty"`
+	ExitIPStatus          string    `json:"exit_ip_status"`
+	ExitIPError           string    `json:"exit_ip_error,omitempty"`
+	ExitIPCheckedAt       time.Time `json:"exit_ip_checked_at,omitempty"`
+	UpdatedAt             time.Time `json:"updated_at"`
+}
+
+type NodeIPQualityResult struct {
+	NodeID        int64     `json:"node_id"`
+	TaskID        string    `json:"task_id,omitempty"`
+	Provider      string    `json:"provider"`
+	Status        string    `json:"status"`
+	IP            string    `json:"ip,omitempty"`
+	Family        string    `json:"family,omitempty"`
+	Country       string    `json:"country,omitempty"`
+	CountryCode   string    `json:"country_code,omitempty"`
+	ASN           string    `json:"asn,omitempty"`
+	Org           string    `json:"org,omitempty"`
+	ISP           string    `json:"isp,omitempty"`
+	IsBroadcast   *bool     `json:"is_broadcast"`
+	IsResidential *bool     `json:"is_residential"`
+	FraudScore    *int      `json:"fraud_score"`
+	Proxy         *bool     `json:"proxy"`
+	Hosting       *bool     `json:"hosting"`
+	Mobile        *bool     `json:"mobile"`
+	Reason        string    `json:"reason,omitempty"`
+	CheckedAt     time.Time `json:"checked_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+type NodeDetectionTask struct {
+	ID              string    `json:"id"`
+	Status          string    `json:"status"`
+	StagesJSON      string    `json:"-"`
+	SettingsJSON    string    `json:"-"`
+	StatsJSON       string    `json:"-"`
+	TotalNodes      int       `json:"total_nodes"`
+	CompletedNodes  int       `json:"completed_nodes"`
+	DownloadedBytes int64     `json:"downloaded_bytes"`
+	Error           string    `json:"error,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
+	StartedAt       time.Time `json:"started_at,omitempty"`
+	FinishedAt      time.Time `json:"finished_at,omitempty"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 // Node source constants (matching config.NodeSource values).

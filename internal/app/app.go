@@ -433,7 +433,10 @@ func flushStatsToStore(ctx context.Context, boxMgr *boxmgr.Manager, s store.Stor
 
 	var updates []store.StatsUpdate
 	for _, snap := range snapshots {
-		nodeID, ok := uriToID[snap.URI]
+		nodeID, ok := snap.NodeID, snap.NodeID > 0
+		if !ok {
+			nodeID, ok = uriToID[snap.URI]
+		}
 		if !ok {
 			if identity, identityErr := nodecodec.ParseURI(snap.URI); identityErr == nil {
 				nodeID, ok = identityToID[identity.Hash]

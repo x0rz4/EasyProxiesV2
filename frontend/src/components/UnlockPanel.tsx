@@ -2,9 +2,13 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import type {
   NodeSnapshot,
   UnlockResult,
-  UnlockSSEEvent,
+  NodeCheckResultItem,
+  NodeCheckSettings,
+  NodeCheckStages,
+  NodeCheckTask,
+  NodeCheckEvent,
 } from '../types'
-import { fetchNodes, unlockNode, unlockAllNodes, fetchUnlockResults } from '../api/client'
+import { cancelNodeCheckTask, createNodeCheckTask, fetchNodeCheckResults, fetchNodeCheckSettings, fetchNodeCheckTasks, fetchNodes, fetchUnlockResults, streamNodeCheckTask, unlockNode, updateNodeCheckSettings } from '../api/client'
 import { regionFlag } from '../utils/region'
 import { PageContent, PageHeader, PageLayout, surfaceClass } from './ui/PageLayout'
 import UnlockDrawer from './UnlockDrawer'
@@ -12,11 +16,13 @@ import {
   ShieldCheck, X, Play, RefreshCw, ArrowUpDown, ArrowUp, ArrowDown,
   Search, Sparkles, AlertTriangle, CheckCircle2, XCircle, RotateCcw,
   Globe2,
+  Gauge, Settings2, Wifi, Database, Save,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { cn } from '../utils/cn'
 
-type StatusFilterType = '' | 'unlocked' | 'pure_ip' | 'locked' | 'mixed' | 'failed' | 'untested'
+type StatusFilterType = '' | 'unlocked' | 'residential' | 'broadcast' | 'proxy' | 'quality_success' | 'quality_failed' | 'speed_fast' | 'speed_failed' | 'fraud_high' | 'locked' | 'mixed' | 'failed' | 'untested'
+type DiagnosticSortKey = 'name' | 'latency' | 'speed' | 'fraud'
 
 const unlockBadgeClasses: Record<string, string> = {
   netflix: 'bg-[#E50914] text-white',
@@ -39,6 +45,15 @@ export default function UnlockPanel() {
   const [errors, setErrors] = useState<Record<string, string>>({})
   // Per-node in-flight state. Either set (batch) or tag (single).
   const [checking, setChecking] = useState<Record<string, boolean>>({})
+  const [diagnostics, setDiagnostics] = useState<Record<number, NodeCheckResultItem>>({})
+  const [checkSettings, setCheckSettings] = useState<NodeCheckSettings | null>(null)
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
+  const [checkDialogOpen, setCheckDialogOpen] = useState(false)
+  const [checkStages, setCheckStages] = useState<NodeCheckStages>({ latency: true, speed: true, quality: true, unlock: true })
+  const [checkScope, setCheckScope] = useState<'selected' | 'filtered'>('filtered')
+  const [activeTask, setActiveTask] = useState<NodeCheckTask | null>(null)
+  const [taskHistory, setTaskHistory] = useState<NodeCheckTask[]>([])
+  const taskAbortRef = useRef<AbortController | null>(null)
 
   // Drawer state
   const [drawerOpen, setDrawerOpen] = useState(false)
@@ -55,10 +70,10 @@ export default function UnlockPanel() {
   const [countryFilter, setCountryFilter] = useState('')
 
   // Sorting
-  const [sortKey, setSortKey] = useState<'name' | 'latency' | null>(null)
+  const [sortKey, setSortKey] = useState<DiagnosticSortKey | null>(null)
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc')
 
-  const handleSort = (key: 'name' | 'latency') => {
+  const handleSort = (key: DiagnosticSortKey) => {
     if (sortKey === key) {
       setSortDir(sortDir === 'asc' ? 'desc' : 'asc')
     } else {
@@ -84,6 +99,17 @@ export default function UnlockPanel() {
       } catch {
         /* persisted results are optional */
       }
+      try {
+        const [savedDiagnostics, settings, tasks] = await Promise.all([fetchNodeCheckResults(), fetchNodeCheckSettings(), fetchNodeCheckTasks()])
+        setDiagnostics(Object.fromEntries(savedDiagnostics.results.map((item) => [item.node_id, item])))
+        setCheckSettings(settings)
+        setCheckStages((current) => ({ ...current, quality: settings.ippure_enabled || settings.ip_api_enabled }))
+        const running = tasks.tasks.find((task) => task.status === 'pending' || task.status === 'running')
+        setTaskHistory(tasks.tasks)
+        if (running) setActiveTask(running)
+      } catch {
+        /* diagnostics are optional while migrating older databases */
+      }
     } catch (err) {
       toast.error(err instanceof Error ? err.message : '加载节点失败')
     } finally {
@@ -100,6 +126,7 @@ export default function UnlockPanel() {
     return () => {
       // Abort any in-flight batch on unmount.
       batchAbortRef.current?.abort()
+      taskAbortRef.current?.abort()
     }
   }, [])
 
@@ -126,51 +153,75 @@ export default function UnlockPanel() {
     }
   }, [])
 
-  // ---- Batch unlock (SSE) ----
-  const runBatch = useCallback(() => {
-    if (batchRunning) return
+  const refreshCheckResults = useCallback(async () => {
+    const [savedDiagnostics, savedUnlock, tasks] = await Promise.all([fetchNodeCheckResults(), fetchUnlockResults(), fetchNodeCheckTasks()])
+    setDiagnostics(Object.fromEntries(savedDiagnostics.results.map((item) => [item.node_id, item])))
+    setResults(savedUnlock.results || {})
+    setTaskHistory(tasks.tasks)
+  }, [])
+
+  const connectTask = useCallback((task: NodeCheckTask) => {
+    taskAbortRef.current?.abort()
+    setActiveTask(task)
     setBatchRunning(true)
-    setBatchProgress({ current: 0, total: nodes.length })
-
-    const checkingMap: Record<string, boolean> = {}
-    for (const n of nodes) checkingMap[n.tag] = true
-    setChecking(checkingMap)
-
-    batchAbortRef.current = unlockAllNodes(
-      (ev: UnlockSSEEvent) => {
-        if (ev.type === 'start') {
-          setBatchProgress({ current: 0, total: ev.total })
-        } else if (ev.type === 'progress') {
-          setBatchProgress({ current: ev.current, total: ev.total })
-          if (ev.status === 'error' || !ev.result) {
-            return
-          }
-          const tag = ev.result.tag
-          setResults((s) => ({ ...s, [tag]: ev.result! }))
-          setChecking((s) => {
-            const next = { ...s }
-            delete next[tag]
-            return next
-          })
-        } else if (ev.type === 'complete') {
-          setBatchRunning(false)
-          setChecking({})
-          toast.success('批量检测完成')
-        }
-      },
-      () => {
+    setBatchProgress({ current: 0, total: task.total_nodes })
+    taskAbortRef.current = streamNodeCheckTask(task.id, (event: NodeCheckEvent) => {
+      if (event.task) {
+        setActiveTask(event.task)
+        const completed = Object.values(event.task.stats).reduce((sum, stage) => sum + stage.completed, 0)
+        const total = Object.values(event.task.stats).reduce((sum, stage) => sum + stage.total, 0)
+        setBatchProgress({ current: completed, total })
+      }
+      if (event.type === 'result' && event.tag) {
+        setChecking((current) => { const next = { ...current }; delete next[event.tag!]; return next })
+      }
+      if (event.type === 'done') {
+        taskAbortRef.current = null
         setBatchRunning(false)
         setChecking({})
-      },
-    )
-  }, [batchRunning, nodes])
+        void refreshCheckResults()
+        toast.success(event.task?.status === 'cancelled' ? '综合检测已取消' : '综合检测完成')
+      }
+    }, (error) => {
+      taskAbortRef.current = null
+      setBatchRunning(false)
+      toast.error(error.message)
+    })
+  }, [refreshCheckResults])
+
+  useEffect(() => {
+    if (activeTask && (activeTask.status === 'pending' || activeTask.status === 'running') && !taskAbortRef.current) connectTask(activeTask)
+  }, [activeTask, connectTask])
+
+  const launchTask = useCallback(async (nodeIds: number[], stages: NodeCheckStages, settings?: NodeCheckSettings) => {
+    if (nodeIds.length === 0) { toast.error('请选择至少一个节点'); return }
+    try {
+      const task = await createNodeCheckTask(nodeIds, stages, settings)
+      const checkingMap: Record<string, boolean> = {}
+      nodes.filter((node) => nodeIds.includes(node.node_id)).forEach((node) => { checkingMap[node.tag] = true })
+      setChecking(checkingMap)
+      setCheckDialogOpen(false)
+      connectTask(task)
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : '创建检测任务失败')
+    }
+  }, [connectTask, nodes])
+
+  // Quick unlock uses the same task scheduler as comprehensive diagnostics.
+  const runBatch = useCallback(() => {
+    void launchTask(nodes.map((node) => node.node_id), { latency: false, speed: false, quality: false, unlock: true })
+  }, [launchTask, nodes])
 
   const stopBatch = useCallback(() => {
+    if (activeTask) void cancelNodeCheckTask(activeTask.id)
+    taskAbortRef.current?.abort()
+    taskAbortRef.current = null
     batchAbortRef.current?.abort()
     batchAbortRef.current = null
     setBatchRunning(false)
     setChecking({})
-  }, [])
+    setActiveTask((current) => current ? { ...current, status: 'cancelled' } : current)
+  }, [activeTask])
 
   // ---- Summary metrics ----
   const summary = useMemo(() => {
@@ -180,10 +231,14 @@ export default function UnlockPanel() {
     let failed = 0
     let pureIp = 0
     let testedCount = 0
+    let qualityTested = 0
 
     for (const node of nodes) {
       const r = results[node.tag]
       const err = errors[node.tag]
+      const quality = diagnostics[node.node_id]?.quality || []
+      if (quality.some((item) => item.status === 'success' || item.status === 'partial')) qualityTested++
+      if (quality.some((item) => item.is_residential === true)) pureIp++
       if (!r && !err) continue
 
       testedCount++
@@ -192,10 +247,6 @@ export default function UnlockPanel() {
         continue
       }
       if (!r) continue
-
-      if (r.ip?.pure) {
-        pureIp++
-      }
 
       const statuses = r.services?.map((s) => s.status) || []
       const isAllUnlocked = statuses.length > 0 && statuses.every((s) => s === 'unlocked')
@@ -220,11 +271,12 @@ export default function UnlockPanel() {
       untested,
       unlocked,
       pureIp,
+      qualityTested,
       locked,
       mixed,
       failed,
     }
-  }, [nodes, results, errors])
+  }, [nodes, results, errors, diagnostics])
 
   // ---- Countries breakdown ----
   const countries = useMemo(() => {
@@ -251,7 +303,9 @@ export default function UnlockPanel() {
 
       if (q) {
         const r = results[n.tag]
-        const hay = `${n.name} ${n.region || ''} ${n.country || ''} ${n.tag} ${r?.ip?.ip || ''} ${r?.ip?.org || ''} ${r?.ip?.asn || ''}`.toLowerCase()
+        const diagnostic = diagnostics[n.node_id]
+        const qualityText = diagnostic?.quality.map((item) => `${item.ip || ''} ${item.asn || ''} ${item.org || ''} ${item.isp || ''}`).join(' ') || ''
+        const hay = `${n.name} ${n.region || ''} ${n.country || ''} ${n.tag} ${r?.ip?.ip || ''} ${diagnostic?.detection?.exit_ip || ''} ${qualityText}`.toLowerCase()
         if (!hay.includes(q)) return false
       }
 
@@ -264,11 +318,31 @@ export default function UnlockPanel() {
         if (statusFilter === 'failed') {
           return Boolean(err || r?.error)
         }
-        if (!r || r.error || err) return false
-
-        if (statusFilter === 'pure_ip') {
-          return Boolean(r.ip?.pure)
+        if (statusFilter === 'residential') {
+          return diagnostics[n.node_id]?.quality.some((item) => item.is_residential === true) || false
         }
+        if (statusFilter === 'broadcast') {
+          return diagnostics[n.node_id]?.quality.some((item) => item.is_broadcast === true) || false
+        }
+        if (statusFilter === 'proxy') {
+          return diagnostics[n.node_id]?.quality.some((item) => item.proxy === true || item.hosting === true) || false
+        }
+        if (statusFilter === 'quality_success') {
+          return diagnostics[n.node_id]?.quality.some((item) => item.status === 'success' || item.status === 'partial') || false
+        }
+        if (statusFilter === 'quality_failed') {
+          return diagnostics[n.node_id]?.quality.some((item) => item.status === 'failed') || false
+        }
+        if (statusFilter === 'speed_fast') {
+          return (diagnostics[n.node_id]?.detection?.average_bytes_per_second || 0) >= 5 * 1024 * 1024
+        }
+        if (statusFilter === 'speed_failed') {
+          return diagnostics[n.node_id]?.detection?.speed_status === 'failed'
+        }
+        if (statusFilter === 'fraud_high') {
+          return diagnostics[n.node_id]?.quality.some((item) => item.fraud_score != null && item.fraud_score >= 71) || false
+        }
+        if (!r || r.error || err) return false
         const statuses = r.services?.map((s) => s.status) || []
         if (statusFilter === 'unlocked') {
           return statuses.length > 0 && statuses.every((s) => s === 'unlocked')
@@ -286,7 +360,7 @@ export default function UnlockPanel() {
       }
       return true
     })
-  }, [nodes, filter, statusFilter, countryFilter, results, errors])
+  }, [nodes, filter, statusFilter, countryFilter, results, errors, diagnostics])
 
   const sortedNodes = useMemo(() => {
     if (!sortKey) return filteredNodes
@@ -295,13 +369,21 @@ export default function UnlockPanel() {
       if (sortKey === 'name') {
         cmp = a.name.localeCompare(b.name)
       } else if (sortKey === 'latency') {
-        const valA = a.last_latency_ms < 0 ? Infinity : a.last_latency_ms
-        const valB = b.last_latency_ms < 0 ? Infinity : b.last_latency_ms
+        const valA = diagnostics[a.node_id]?.detection?.latency_ms ?? Infinity
+        const valB = diagnostics[b.node_id]?.detection?.latency_ms ?? Infinity
+        cmp = valA - valB
+      } else if (sortKey === 'speed') {
+        const valA = diagnostics[a.node_id]?.detection?.average_bytes_per_second ?? -1
+        const valB = diagnostics[b.node_id]?.detection?.average_bytes_per_second ?? -1
+        cmp = valA - valB
+      } else if (sortKey === 'fraud') {
+        const valA = diagnostics[a.node_id]?.quality.find((item) => item.provider === 'ippure')?.fraud_score ?? Infinity
+        const valB = diagnostics[b.node_id]?.quality.find((item) => item.provider === 'ippure')?.fraud_score ?? Infinity
         cmp = valA - valB
       }
       return sortDir === 'asc' ? cmp : -cmp
     })
-  }, [filteredNodes, sortKey, sortDir])
+  }, [filteredNodes, sortKey, sortDir, diagnostics])
 
   const progressPct =
     batchProgress.total > 0
@@ -319,12 +401,20 @@ export default function UnlockPanel() {
     setCountryFilter('')
     setStatusFilter('')
   }
+  const allFilteredSelected = sortedNodes.length > 0 && sortedNodes.every((node) => selectedIds.has(node.node_id))
+  const toggleAllFiltered = () => setSelectedIds((current) => {
+    const next = new Set(current)
+    if (allFilteredSelected) sortedNodes.forEach((node) => next.delete(node.node_id))
+    else sortedNodes.forEach((node) => next.add(node.node_id))
+    return next
+  })
+  const taskTargets = checkScope === 'selected' ? nodes.filter((node) => selectedIds.has(node.node_id)) : sortedNodes
 
   return (
     <PageLayout>
       <PageHeader
         title="解锁检测"
-        description="通过节点出口发送特定请求，检测 Netflix、Disney+、ChatGPT 解锁状态及原生 IP 纯净度"
+        description="手动检测节点延迟、下载速度、独立 IP 质量来源与流媒体解锁；结果不影响路由健康"
         icon={<ShieldCheck className="h-5 w-5" />}
         actions={
           <div className="flex items-center gap-2">
@@ -334,14 +424,14 @@ export default function UnlockPanel() {
                 停止检测
               </button>
             ) : (
-              <button
-                className="btn btn-primary btn-sm gap-2 shadow-sm lg:btn-md"
-                onClick={runBatch}
-                disabled={loading || nodes.length === 0}
-              >
-                <Play className="h-4 w-4 fill-current" />
-                全部检测
-              </button>
+              <>
+                <button className="btn btn-primary btn-sm gap-2 shadow-sm lg:btn-md" onClick={() => setCheckDialogOpen(true)} disabled={loading || nodes.length === 0}>
+                  <Gauge className="h-4 w-4" />综合检测
+                </button>
+                <button className="btn btn-ghost btn-sm gap-2 border border-base-300 lg:btn-md" onClick={runBatch} disabled={loading || nodes.length === 0}>
+                  <Play className="h-4 w-4" />快速解锁
+                </button>
+              </>
             )}
             <button
               className="btn btn-ghost btn-sm gap-2 border border-base-300 shadow-sm lg:btn-md"
@@ -366,7 +456,7 @@ export default function UnlockPanel() {
                   <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary opacity-75" />
                   <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-primary" />
                 </span>
-                <span className="text-sm font-bold text-primary">正在批量检测流媒体解锁与 IP 纯净度…</span>
+                <span className="text-sm font-bold text-primary">综合检测任务运行中</span>
               </div>
               <div className="flex items-center gap-3 font-mono text-xs text-base-content/60">
                 <span>{batchProgress.current} / {batchProgress.total} 节点</span>
@@ -379,13 +469,35 @@ export default function UnlockPanel() {
                 style={{ width: `${progressPct}%` }}
               />
             </div>
+            {activeTask && (
+              <div className="mt-3 flex flex-wrap gap-2 text-xs" aria-live="polite">
+                {Object.entries(activeTask.stats).map(([phase, stat]) => (
+                  <span key={phase} className="badge badge-ghost gap-1.5">
+                    {phaseLabel(phase)} {stat.completed}/{stat.total}
+                    <span className="text-success">{stat.success}</span>
+                    {stat.failed > 0 && <span className="text-error">{stat.failed}</span>}
+                    {stat.skipped > 0 && <span className="text-base-content/45">跳过 {stat.skipped}</span>}
+                  </span>
+                ))}
+                <span className="badge badge-outline">流量 {formatBytes(activeTask.downloaded_bytes)}</span>
+              </div>
+            )}
           </div>
+        )}
+
+        {taskHistory.length > 0 && !batchRunning && (
+          <details className={cn(surfaceClass, 'mb-5 overflow-hidden')}>
+            <summary className="cursor-pointer px-4 py-3 text-sm font-semibold transition-colors hover:bg-base-200/50">最近检测任务（{taskHistory.length}）</summary>
+            <div className="max-h-64 overflow-auto border-t border-base-200">
+              <table className="table table-sm"><thead><tr><th>时间</th><th>状态</th><th>节点</th><th>流量</th><th>阶段</th></tr></thead><tbody>{taskHistory.map((task) => <tr key={task.id}><td className="text-xs">{new Date(task.created_at).toLocaleString('zh-CN')}</td><td><span className={cn('badge badge-sm', task.status === 'completed' ? 'badge-success' : task.status === 'running' ? 'badge-warning' : task.status === 'cancelled' || task.status === 'interrupted' ? 'badge-ghost' : 'badge-error')}>{taskStatusLabel(task.status)}</span></td><td className="font-mono text-xs">{task.completed_nodes}/{task.total_nodes}</td><td className="font-mono text-xs">{formatBytes(task.downloaded_bytes)}</td><td className="text-xs">{Object.entries(task.stages).filter(([, enabled]) => enabled).map(([phase]) => phaseLabel(phase)).join('、')}</td></tr>)}</tbody></table>
+            </div>
+          </details>
         )}
 
         {/* ---- Redesigned Status Summary Cards ---- */}
         <section className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
           <SummaryCard
-            label="已检测 / 节点"
+            label="解锁已检测 / 节点"
             value={nodes.length > 0 ? `${summary.tested} / ${summary.total}` : '0'}
             hint={
               nodes.length === 0
@@ -401,18 +513,18 @@ export default function UnlockPanel() {
             onClick={() => setStatusFilter('')}
           />
           <SummaryCard
-            label="原生 IP (纯净)"
+            label="住宅 IP"
             value={summary.pureIp}
             hint={
-              summary.tested > 0
-                ? `原生率 ${Math.round((summary.pureIp / summary.tested) * 100)}% · 纯净出口`
-                : '纯净住宅/机房原生'
+              summary.qualityTested > 0
+                ? `住宅率 ${Math.round((summary.pureIp / summary.qualityTested) * 100)}% · 来自质量源`
+                : '需启用 IP 质量提供商'
             }
             icon={<Sparkles className="h-5 w-5" />}
             toneBg="bg-cyan-500/10"
             toneText="text-cyan-600 dark:text-cyan-400"
-            active={statusFilter === 'pure_ip'}
-            onClick={() => setStatusFilter(statusFilter === 'pure_ip' ? '' : 'pure_ip')}
+            active={statusFilter === 'residential'}
+            onClick={() => setStatusFilter(statusFilter === 'residential' ? '' : 'residential')}
           />
           <SummaryCard
             label="完整解锁"
@@ -508,30 +620,79 @@ export default function UnlockPanel() {
                   count={nodes.length}
                 />
                 <FilterChip
-                  active={statusFilter === 'pure_ip'}
-                  onClick={() => setStatusFilter(statusFilter === 'pure_ip' ? '' : 'pure_ip')}
-                  label="✨ 原生 IP"
+                  active={statusFilter === 'residential'}
+                  onClick={() => setStatusFilter(statusFilter === 'residential' ? '' : 'residential')}
+                  label="住宅 IP"
                   count={summary.pureIp}
                   tone="cyan"
                 />
                 <FilterChip
+                  active={statusFilter === 'broadcast'}
+                  onClick={() => setStatusFilter(statusFilter === 'broadcast' ? '' : 'broadcast')}
+                  label="广播 IP"
+                  count={nodes.filter((node) => diagnostics[node.node_id]?.quality.some((item) => item.is_broadcast === true)).length}
+                  tone="warning"
+                />
+                <FilterChip
+                  active={statusFilter === 'proxy'}
+                  onClick={() => setStatusFilter(statusFilter === 'proxy' ? '' : 'proxy')}
+                  label="代理 / 托管"
+                  count={nodes.filter((node) => diagnostics[node.node_id]?.quality.some((item) => item.proxy === true || item.hosting === true)).length}
+                  tone="warning"
+                />
+                <FilterChip
+                  active={statusFilter === 'quality_success'}
+                  onClick={() => setStatusFilter(statusFilter === 'quality_success' ? '' : 'quality_success')}
+                  label="质量已测"
+                  count={nodes.filter((node) => diagnostics[node.node_id]?.quality.some((item) => item.status === 'success' || item.status === 'partial')).length}
+                  tone="success"
+                />
+                <FilterChip
+                  active={statusFilter === 'quality_failed'}
+                  onClick={() => setStatusFilter(statusFilter === 'quality_failed' ? '' : 'quality_failed')}
+                  label="质量失败"
+                  count={nodes.filter((node) => diagnostics[node.node_id]?.quality.some((item) => item.status === 'failed')).length}
+                  tone="error"
+                />
+                <FilterChip
+                  active={statusFilter === 'speed_fast'}
+                  onClick={() => setStatusFilter(statusFilter === 'speed_fast' ? '' : 'speed_fast')}
+                  label="≥5 MB/s"
+                  count={nodes.filter((node) => (diagnostics[node.node_id]?.detection?.average_bytes_per_second || 0) >= 5 * 1024 * 1024).length}
+                  tone="success"
+                />
+                <FilterChip
+                  active={statusFilter === 'speed_failed'}
+                  onClick={() => setStatusFilter(statusFilter === 'speed_failed' ? '' : 'speed_failed')}
+                  label="测速失败"
+                  count={nodes.filter((node) => diagnostics[node.node_id]?.detection?.speed_status === 'failed').length}
+                  tone="error"
+                />
+                <FilterChip
+                  active={statusFilter === 'fraud_high'}
+                  onClick={() => setStatusFilter(statusFilter === 'fraud_high' ? '' : 'fraud_high')}
+                  label="欺诈分 ≥71"
+                  count={nodes.filter((node) => diagnostics[node.node_id]?.quality.some((item) => item.fraud_score != null && item.fraud_score >= 71)).length}
+                  tone="error"
+                />
+                <FilterChip
                   active={statusFilter === 'unlocked'}
                   onClick={() => setStatusFilter(statusFilter === 'unlocked' ? '' : 'unlocked')}
-                  label="✅ 全解锁"
+                  label="全解锁"
                   count={summary.unlocked}
                   tone="success"
                 />
                 <FilterChip
                   active={statusFilter === 'locked'}
                   onClick={() => setStatusFilter(statusFilter === 'locked' ? '' : 'locked')}
-                  label="⚠️ 受限 / 部分"
+                  label="受限 / 部分"
                   count={summary.locked + summary.mixed}
                   tone="warning"
                 />
                 <FilterChip
                   active={statusFilter === 'failed'}
                   onClick={() => setStatusFilter(statusFilter === 'failed' ? '' : 'failed')}
-                  label="❌ 失败"
+                  label="解锁失败"
                   count={summary.failed}
                   tone="error"
                 />
@@ -539,7 +700,7 @@ export default function UnlockPanel() {
                   <FilterChip
                     active={statusFilter === 'untested'}
                     onClick={() => setStatusFilter(statusFilter === 'untested' ? '' : 'untested')}
-                    label="⏳ 未检测"
+                    label="未检测"
                     count={summary.untested}
                     tone="ghost"
                   />
@@ -572,7 +733,7 @@ export default function UnlockPanel() {
             <table className="table table-sm w-full relative">
               <thead className="sticky top-0 z-10 border-b border-base-200 bg-base-100 text-xs font-semibold uppercase tracking-wider text-base-content/60 backdrop-blur-md">
                 <tr>
-                  <th className="w-12 text-center">#</th>
+                  <th className="w-12 text-center"><input type="checkbox" className="checkbox checkbox-sm" checked={allFilteredSelected} onChange={toggleAllFiltered} aria-label="选择当前筛选节点" /></th>
                   <th
                     className="w-56 cursor-pointer select-none transition-colors hover:bg-base-200/60"
                     onClick={() => handleSort('name')}
@@ -587,12 +748,17 @@ export default function UnlockPanel() {
                     onClick={() => handleSort('latency')}
                   >
                     <div className="flex items-center gap-1.5">
-                      <span>延迟</span>
+                      <span>检测延迟</span>
                       <SortIcon active={sortKey === 'latency'} dir={sortDir} />
                     </div>
                   </th>
+                  <th className="w-32 cursor-pointer select-none transition-colors hover:bg-base-200/60" onClick={() => handleSort('speed')}>
+                    <div className="flex items-center gap-1.5"><span>平均 / 峰值</span><SortIcon active={sortKey === 'speed'} dir={sortDir} /></div>
+                  </th>
                   <th className="w-52">出口 IP / 运营商</th>
-                  <th className="w-32">IP 属性</th>
+                  <th className="w-44 cursor-pointer select-none transition-colors hover:bg-base-200/60" onClick={() => handleSort('fraud')}>
+                    <div className="flex items-center gap-1.5"><span>IP 质量</span><SortIcon active={sortKey === 'fraud'} dir={sortDir} /></div>
+                  </th>
                   <th className="min-w-[240px]">解锁状态</th>
                   <th className="w-24 text-right pr-4">操作</th>
                 </tr>
@@ -600,7 +766,7 @@ export default function UnlockPanel() {
               <tbody className="divide-y divide-base-200/60 text-sm">
                 {loading && (
                   <tr>
-                    <td colSpan={7} className="py-16 text-center text-base-content/50">
+                    <td colSpan={8} className="py-16 text-center text-base-content/50">
                       <span className="loading loading-spinner loading-md text-primary mr-2" />
                       正在加载节点与检测数据…
                     </td>
@@ -608,7 +774,7 @@ export default function UnlockPanel() {
                 )}
                 {!loading && sortedNodes.length === 0 && (
                   <tr>
-                    <td colSpan={7} className="py-16 text-center text-base-content/50">
+                    <td colSpan={8} className="py-16 text-center text-base-content/50">
                       <div className="flex flex-col items-center justify-center gap-2">
                         <Globe2 className="h-8 w-8 text-base-content/30" />
                         <p className="font-medium text-base-content/70">
@@ -634,9 +800,12 @@ export default function UnlockPanel() {
                     index={i}
                     node={n}
                     result={results[n.tag]}
+                    diagnostic={diagnostics[n.node_id]}
                     nodeError={errors[n.tag]}
                     checking={Boolean(checking[n.tag])}
                     isSelected={selectedNode?.tag === n.tag}
+                    checked={selectedIds.has(n.node_id)}
+                    onToggle={() => setSelectedIds((current) => { const next = new Set(current); if (next.has(n.node_id)) next.delete(n.node_id); else next.add(n.node_id); return next })}
                     onClick={() => openDrawer(n)}
                     onCheck={(e) => {
                       e.stopPropagation()
@@ -653,9 +822,30 @@ export default function UnlockPanel() {
       <UnlockDrawer
         node={selectedNode}
         result={selectedNode ? results[selectedNode.tag] || null : null}
+        diagnostic={selectedNode ? diagnostics[selectedNode.node_id] || null : null}
         isOpen={drawerOpen}
         onClose={() => setDrawerOpen(false)}
       />
+
+      {checkDialogOpen && checkSettings && (
+        <NodeCheckDialog
+          settings={checkSettings}
+          stages={checkStages}
+          scope={checkScope}
+          selectedCount={selectedIds.size}
+          filteredCount={sortedNodes.length}
+          targetCount={taskTargets.length}
+          onStagesChange={setCheckStages}
+          onScopeChange={setCheckScope}
+          onSettingsChange={setCheckSettings}
+          onSaveSettings={async () => {
+            try { const saved = await updateNodeCheckSettings(checkSettings); setCheckSettings(saved); toast.success('综合检测设置已保存') }
+            catch (error) { toast.error(error instanceof Error ? error.message : '保存设置失败') }
+          }}
+          onClose={() => setCheckDialogOpen(false)}
+          onStart={() => void launchTask(taskTargets.map((node) => node.node_id), checkStages, checkSettings)}
+        />
+      )}
     </PageLayout>
   )
 }
@@ -757,53 +947,126 @@ function FilterChip({
   )
 }
 
+function NodeCheckDialog({ settings, stages, scope, selectedCount, filteredCount, targetCount, onStagesChange, onScopeChange, onSettingsChange, onSaveSettings, onClose, onStart }: {
+  settings: NodeCheckSettings
+  stages: NodeCheckStages
+  scope: 'selected' | 'filtered'
+  selectedCount: number
+  filteredCount: number
+  targetCount: number
+  onStagesChange: (value: NodeCheckStages) => void
+  onScopeChange: (value: 'selected' | 'filtered') => void
+  onSettingsChange: (value: NodeCheckSettings) => void
+  onSaveSettings: () => Promise<void>
+  onClose: () => void
+  onStart: () => void
+}) {
+  const [showSettings, setShowSettings] = useState(false)
+  const closeRef = useRef<HTMLButtonElement>(null)
+  useEffect(() => {
+    closeRef.current?.focus()
+    const handler = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose() }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [onClose])
+  const providerEnabled = settings.ippure_enabled || settings.ip_api_enabled
+  const effectiveStages = { ...stages, quality: stages.quality && providerEnabled }
+  const canStart = targetCount > 0 && Object.values(effectiveStages).some(Boolean)
+  const updateSetting = <K extends keyof NodeCheckSettings>(key: K, value: NodeCheckSettings[K]) => onSettingsChange({ ...settings, [key]: value })
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/50 p-0 backdrop-blur-sm sm:items-center sm:p-6" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
+      <section role="dialog" aria-modal="true" aria-labelledby="node-check-title" className="max-h-[92vh] w-full overflow-y-auto rounded-t-2xl bg-base-100 shadow-2xl sm:max-w-3xl sm:rounded-2xl">
+        <header className="sticky top-0 z-10 flex items-center justify-between border-b border-base-200 bg-base-100/95 px-5 py-4 backdrop-blur">
+          <div><h2 id="node-check-title" className="flex items-center gap-2 text-lg font-bold"><Gauge className="h-5 w-5 text-primary" />节点综合检测</h2><p className="mt-1 text-xs text-base-content/55">手动诊断不会修改节点健康、黑名单或分组出口</p></div>
+          <button ref={closeRef} className="btn btn-ghost btn-sm btn-square" onClick={onClose} aria-label="关闭综合检测"><X className="h-4 w-4" /></button>
+        </header>
+        <div className="space-y-5 p-5 sm:p-6">
+          <fieldset><legend className="mb-2 text-sm font-semibold">检测范围</legend><div className="grid gap-2 sm:grid-cols-2">
+            <label className={cn('flex cursor-pointer items-center gap-3 rounded-xl border p-3 transition-colors', scope === 'filtered' ? 'border-primary bg-primary/5' : 'border-base-300')}><input type="radio" className="radio radio-primary radio-sm" checked={scope === 'filtered'} onChange={() => onScopeChange('filtered')} /><span><strong className="block text-sm">当前筛选结果</strong><span className="text-xs text-base-content/50">{filteredCount} 个节点</span></span></label>
+            <label className={cn('flex cursor-pointer items-center gap-3 rounded-xl border p-3 transition-colors', scope === 'selected' ? 'border-primary bg-primary/5' : 'border-base-300', selectedCount === 0 && 'opacity-50')}><input type="radio" className="radio radio-primary radio-sm" checked={scope === 'selected'} disabled={selectedCount === 0} onChange={() => onScopeChange('selected')} /><span><strong className="block text-sm">已勾选节点</strong><span className="text-xs text-base-content/50">{selectedCount} 个节点</span></span></label>
+          </div></fieldset>
+          <fieldset><legend className="mb-2 text-sm font-semibold">检测项目</legend><div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+            {([['latency','检测延迟',Wifi],['speed','下载速度',Gauge],['quality','IP 质量',Database],['unlock','流媒体解锁',ShieldCheck]] as const).map(([key,label,Icon]) => <label key={key} className={cn('flex cursor-pointer items-center gap-2 rounded-xl border border-base-300 p-3', key === 'quality' && !providerEnabled && 'cursor-not-allowed opacity-45')}><input type="checkbox" className="checkbox checkbox-primary checkbox-sm" checked={key === 'quality' ? stages[key] && providerEnabled : stages[key]} disabled={key === 'quality' && !providerEnabled} onChange={(event) => onStagesChange({ ...stages, [key]: event.target.checked })} /><Icon className="h-4 w-4 text-primary" /><span className="text-sm font-medium">{label}</span></label>)}
+          </div>{!providerEnabled && <p className="mt-2 text-xs text-warning">IP 质量提供商默认关闭；请在下方设置中确认隐私与许可后启用。</p>}</fieldset>
+          <div className="grid gap-3 rounded-xl border border-base-200 bg-base-200/30 p-4 sm:grid-cols-3"><div><div className="text-xs text-base-content/50">目标节点</div><div className="mt-1 text-xl font-bold tabular-nums">{targetCount}</div></div><div><div className="text-xs text-base-content/50">最坏下载流量</div><div className="mt-1 text-xl font-bold tabular-nums">{stages.speed ? formatBytes(targetCount * settings.max_download_bytes) : '0 B'}</div></div><div><div className="text-xs text-base-content/50">下载并发</div><div className="mt-1 text-xl font-bold tabular-nums">{settings.speed_concurrency}</div></div></div>
+          <button type="button" className="btn btn-ghost btn-sm gap-2" onClick={() => setShowSettings((value) => !value)} aria-expanded={showSettings}><Settings2 className="h-4 w-4" />检测参数</button>
+          {showSettings && <div className="grid gap-4 rounded-xl border border-base-300 p-4 sm:grid-cols-2">
+            <CheckField id="check-latency-url" label="延迟 URL"><input id="check-latency-url" className="input input-bordered w-full font-mono text-xs" value={settings.latency_url} onChange={(event) => updateSetting('latency_url', event.target.value)} /></CheckField>
+            <CheckField id="check-speed-url" label="测速 URL"><input id="check-speed-url" className="input input-bordered w-full font-mono text-xs" value={settings.speed_url} onChange={(event) => updateSetting('speed_url', event.target.value)} /></CheckField>
+            <CheckField id="check-landing-ip-url" label="出口 IP URL"><input id="check-landing-ip-url" className="input input-bordered w-full font-mono text-xs" value={settings.landing_ip_url} onChange={(event) => updateSetting('landing_ip_url', event.target.value)} /></CheckField>
+            <CheckField id="latency-timeout" label="延迟超时"><input id="latency-timeout" className="input input-bordered w-full" value={settings.latency_timeout} onChange={(event) => updateSetting('latency_timeout', event.target.value)} /></CheckField>
+            <CheckField id="speed-duration" label="测速持续时间"><input id="speed-duration" className="input input-bordered w-full" value={settings.speed_duration} onChange={(event) => updateSetting('speed_duration', event.target.value)} /></CheckField>
+            <CheckField id="speed-request-timeout" label="测速请求超时"><input id="speed-request-timeout" className="input input-bordered w-full" value={settings.speed_request_timeout} onChange={(event) => updateSetting('speed_request_timeout', event.target.value)} /></CheckField>
+            <CheckField id="quality-timeout" label="质量检测超时"><input id="quality-timeout" className="input input-bordered w-full" value={settings.quality_timeout} onChange={(event) => updateSetting('quality_timeout', event.target.value)} /></CheckField>
+            <CheckField id="peak-sample-interval" label="峰值采样窗口 (50-500ms)"><input id="peak-sample-interval" className="input input-bordered w-full" value={settings.peak_sample_interval} onChange={(event) => updateSetting('peak_sample_interval', event.target.value)} /></CheckField>
+            <CheckField id="max-download" label="单节点最大字节"><input id="max-download" type="number" min={10240} className="input input-bordered w-full" value={settings.max_download_bytes} onChange={(event) => updateSetting('max_download_bytes', Number(event.target.value))} /></CheckField>
+            <CheckField id="latency-concurrency" label="延迟并发 (1-128)"><input id="latency-concurrency" type="number" min={1} max={128} className="input input-bordered w-full" value={settings.latency_concurrency} onChange={(event) => updateSetting('latency_concurrency', Number(event.target.value))} /></CheckField>
+            <CheckField id="speed-concurrency" label="测速并发 (1-8)"><input id="speed-concurrency" type="number" min={1} max={8} className="input input-bordered w-full" value={settings.speed_concurrency} onChange={(event) => updateSetting('speed_concurrency', Number(event.target.value))} /></CheckField>
+            <CheckField id="quality-concurrency" label="质量并发 (1-10)"><input id="quality-concurrency" type="number" min={1} max={10} className="input input-bordered w-full" value={settings.quality_concurrency} onChange={(event) => updateSetting('quality_concurrency', Number(event.target.value))} /></CheckField>
+            <label className="flex cursor-pointer items-center gap-3 rounded-xl border border-base-300 p-3"><input type="checkbox" className="toggle toggle-primary toggle-sm" checked={settings.include_handshake} onChange={(event) => updateSetting('include_handshake', event.target.checked)} /><span><strong className="block text-sm">延迟包含首次握手</strong><span className="text-xs text-base-content/50">关闭时先预热，再记录第二次请求</span></span></label>
+            <label className="flex cursor-pointer items-center gap-3 rounded-xl border border-base-300 p-3"><input type="checkbox" className="toggle toggle-primary toggle-sm" checked={settings.ippure_enabled} onChange={(event) => updateSetting('ippure_enabled', event.target.checked)} /><span className="text-sm font-medium">启用 ippure</span></label>
+            <CheckField id="ippure-url" label="ippure 兼容 URL"><input id="ippure-url" className="input input-bordered w-full font-mono text-xs" value={settings.ippure_url} disabled={!settings.ippure_enabled} onChange={(event) => updateSetting('ippure_url', event.target.value)} /></CheckField>
+            <label className="sm:col-span-2 flex cursor-pointer items-start gap-3 rounded-xl border border-warning/40 bg-warning/5 p-3"><input type="checkbox" className="toggle toggle-warning toggle-sm mt-0.5" checked={settings.ip_api_enabled} onChange={(event) => updateSetting('ip_api_enabled', event.target.checked)} /><span><strong className="block text-sm">启用 ip-api</strong><span className="text-xs text-base-content/55">免费接口为 HTTP、仅限非商业使用；系统会批量查询并遵守 X-Rl/X-Ttl 限流。</span></span></label>
+            <CheckField id="ip-api-url" label="ip-api 批量接口"><input id="ip-api-url" className="input input-bordered w-full font-mono text-xs" value={settings.ip_api_base_url} disabled={!settings.ip_api_enabled} onChange={(event) => updateSetting('ip_api_base_url', event.target.value)} /></CheckField>
+            <button type="button" className="btn btn-outline btn-sm gap-2 sm:col-span-2 sm:justify-self-end" onClick={() => void onSaveSettings()}><Save className="h-4 w-4" />保存默认参数</button>
+          </div>}
+        </div>
+        <footer className="sticky bottom-0 flex items-center justify-between gap-3 border-t border-base-200 bg-base-100 px-5 py-4"><span className="text-xs text-base-content/50">任务启动后关闭页面也会继续运行</span><div className="flex gap-2"><button className="btn btn-ghost btn-sm" onClick={onClose}>取消</button><button className="btn btn-primary btn-sm gap-2" disabled={!canStart} onClick={onStart}><Play className="h-4 w-4" />开始检测</button></div></footer>
+      </section>
+    </div>
+  )
+}
+
+function CheckField({ id, label, children }: { id: string; label: string; children: React.ReactNode }) { return <fieldset><label htmlFor={id} className="mb-1.5 block text-xs font-semibold text-base-content/65">{label}</label>{children}</fieldset> }
+
+function QualityBadges({ item, drift }: { item: NodeCheckResultItem['quality'][number]; drift: boolean }) {
+  if (item.status === 'disabled') return <span className="text-[10px] text-base-content/35">{item.provider} 未启用</span>
+  if (item.status === 'untested') return <span className="text-[10px] text-base-content/35">{item.provider} 未检测</span>
+  if (item.status === 'failed') return <span className="badge badge-error badge-outline badge-xs" title={item.reason}>{item.provider} 失败</span>
+  return <div className="flex flex-wrap items-center gap-1"><span className="badge badge-ghost badge-xs">{item.provider}</span>{item.status === 'partial' && <span className="badge badge-warning badge-outline badge-xs">信息不全</span>}{item.is_residential != null && <span className={cn('badge badge-xs', item.is_residential ? 'badge-success' : 'badge-ghost')}>{item.is_residential ? '住宅' : '机房'}</span>}{item.is_broadcast != null && <span className={cn('badge badge-xs', item.is_broadcast ? 'badge-warning' : 'badge-success')}>{item.is_broadcast ? '广播' : '原生'}</span>}{item.proxy === true && <span className="badge badge-warning badge-xs">代理</span>}{item.hosting === true && <span className="badge badge-warning badge-xs">托管</span>}{item.fraud_score != null && <span className={cn('badge badge-xs border-none', fraudClass(item.fraud_score))} title={`${item.fraud_score} · ${fraudLabel(item.fraud_score)}`}>{item.fraud_score} {fraudLabel(item.fraud_score)}</span>}{drift && <span className="badge badge-error badge-xs">漂移</span>}</div>
+}
+
+function fraudClass(score: number) { if (score <= 10) return 'bg-emerald-600 text-white'; if (score <= 30) return 'bg-green-500 text-white'; if (score <= 50) return 'bg-lime-500 text-lime-950'; if (score <= 70) return 'bg-amber-400 text-amber-950'; if (score <= 89) return 'bg-orange-500 text-white'; return 'bg-red-600 text-white' }
+function fraudLabel(score: number) { if (score <= 10) return '极佳'; if (score <= 30) return '优秀'; if (score <= 50) return '良好'; if (score <= 70) return '中等'; if (score <= 89) return '差'; return '极差' }
+function speedColor(bytesPerSecond: number) { const mb = bytesPerSecond / 1024 / 1024; return mb >= 5 ? 'text-success' : mb >= 1 ? 'text-warning' : 'text-error' }
+function formatSpeed(bytesPerSecond: number) { return `${(bytesPerSecond / 1024 / 1024).toFixed(2)} MB/s` }
+function formatBytes(bytes: number) { if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(2)} GB`; if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`; if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`; return `${bytes} B` }
+function phaseLabel(phase: string) { return ({ latency: '延迟', speed: '测速', quality: '质量', unlock: '解锁' } as Record<string, string>)[phase] || phase }
+function taskStatusLabel(status: NodeCheckTask['status']) { return ({ pending: '等待中', running: '运行中', completed: '已完成', failed: '失败', cancelled: '已取消', interrupted: '已中断' } as Record<NodeCheckTask['status'], string>)[status] }
+
 function UnlockRow({
   index,
   node,
   result,
+  diagnostic,
   nodeError,
   checking,
   isSelected,
+  checked,
+  onToggle,
   onClick,
   onCheck,
 }: {
   index: number
   node: NodeSnapshot
   result?: UnlockResult
+  diagnostic?: NodeCheckResultItem
   nodeError?: string
   checking: boolean
   isSelected: boolean
+  checked: boolean
+  onToggle: () => void
   onClick: () => void
   onCheck: (e: React.MouseEvent) => void
 }) {
   const err = nodeError || result?.error
 
   const renderIpRisk = () => {
-    if (!result && !err) return <span className="text-xs text-base-content/30">—</span>
-    if (err) return <span className="text-xs text-base-content/30">—</span>
-
+    const quality = diagnostic?.quality || []
+    if (quality.length === 0) return <span className="text-xs text-base-content/30">未检测</span>
     return (
-      <div className="flex flex-wrap items-center gap-1.5">
-        {result?.ip?.pure ? (
-          <span className="badge badge-success badge-sm gap-1 border-none font-semibold text-[10px] text-white">
-            <Sparkles className="h-2.5 w-2.5" />
-            原生IP
-          </span>
-        ) : (
-          <span className="badge badge-ghost badge-sm border-base-300 text-[10px] text-base-content/60">
-            广播IP
-          </span>
-        )}
-        {result?.ip?.risk_level === 'High' && (
-          <span className="badge badge-error badge-sm border-none font-bold text-[10px] text-white">
-            高风险
-          </span>
-        )}
-        {result?.ip?.risk_level === 'Medium' && (
-          <span className="badge badge-warning badge-sm border-none font-bold text-[10px]">
-            中风险
-          </span>
-        )}
+      <div className="flex flex-col gap-1">
+        {quality.map((item) => <QualityBadges key={item.provider} item={item} drift={Boolean(diagnostic?.exit_ip_drift)} />)}
       </div>
     )
   }
@@ -878,11 +1141,7 @@ function UnlockRow({
       onClick={onClick}
     >
       <td className="text-center font-mono text-xs text-base-content/40">
-        {checking ? (
-          <span className="loading loading-spinner loading-xs text-primary" />
-        ) : (
-          index + 1
-        )}
+        <input type="checkbox" className="checkbox checkbox-sm" checked={checked} onClick={(event) => event.stopPropagation()} onChange={onToggle} aria-label={`选择 ${node.name}`} />
       </td>
       <td className="max-w-[220px]">
         <div className="flex items-center gap-2">
@@ -891,7 +1150,7 @@ function UnlockRow({
           </span>
           <div className="min-w-0 flex-1">
             <div className="truncate font-semibold text-base-content" title={node.name}>
-              {node.name}
+              <span className="mr-1.5 font-mono text-[10px] text-base-content/35">{index + 1}</span>{node.name}
             </div>
             {node.tags && node.tags.length > 0 && (
               <div className="mt-0.5 flex flex-wrap gap-1">
@@ -906,32 +1165,37 @@ function UnlockRow({
         </div>
       </td>
       <td className="w-24">
-        {node.last_latency_ms > 0 ? (
+        {diagnostic?.detection?.latency_ms != null ? (
           <span
             className={cn(
               'font-mono text-xs font-semibold tabular-nums',
-              node.last_latency_ms <= 100
+              diagnostic.detection.latency_ms < 200
                 ? 'text-success'
-                : node.last_latency_ms <= 300
+                : diagnostic.detection.latency_ms < 500
                   ? 'text-warning'
                   : 'text-error',
             )}
           >
-            {node.last_latency_ms} ms
+            {diagnostic.detection.latency_ms} ms
           </span>
         ) : (
           <span className="font-mono text-xs text-base-content/35">—</span>
         )}
       </td>
+      <td className="w-32">
+        {diagnostic?.detection?.average_bytes_per_second != null ? (
+          <div className="font-mono text-xs tabular-nums" title={`${((diagnostic.detection.average_bytes_per_second * 8) / 1_000_000).toFixed(2)} Mbps`}><div className={speedColor(diagnostic.detection.average_bytes_per_second)}>{formatSpeed(diagnostic.detection.average_bytes_per_second)}</div><div className="text-[10px] text-base-content/45">峰值 {formatSpeed(diagnostic.detection.peak_bytes_per_second || 0)} · {((diagnostic.detection.average_bytes_per_second * 8) / 1_000_000).toFixed(1)} Mbps</div></div>
+        ) : <span className="text-xs text-base-content/35">—</span>}
+      </td>
       <td className="max-w-[200px]">
-        {result?.ip?.ip ? (
+        {(diagnostic?.detection?.exit_ip || result?.ip?.ip) ? (
           <div className="flex flex-col min-w-0">
-            <span className="font-mono text-xs font-bold text-base-content/85">{result.ip.ip}</span>
+            <span className="font-mono text-xs font-bold text-base-content/85">{diagnostic?.detection?.exit_ip || result?.ip?.ip}</span>
             <span
               className="truncate text-[10px] text-base-content/50"
-              title={`${result.ip.iso_code || ''} ${result.ip.asn || ''} ${result.ip.org || ''}`}
+              title={diagnostic?.quality.map((item) => `${item.asn || ''} ${item.org || item.isp || ''}`).join(' ')}
             >
-              {result.ip.iso_code} {result.ip.asn} {result.ip.org}
+              {diagnostic?.quality.find((item) => item.provider === 'ip-api')?.country_code || result?.ip?.iso_code} {diagnostic?.quality.find((item) => item.provider === 'ip-api')?.asn}
             </span>
           </div>
         ) : (

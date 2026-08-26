@@ -54,7 +54,8 @@ export default function DebugPanel() {
   })
 
   useEffect(() => {
-    if (debugData) {
+    if (!debugData) return
+    const timer = window.setTimeout(() => {
       setNodes(debugData.nodes)
       const history = debugData.nodes.flatMap((node) => (node.timeline ?? []).map((event) => ({
         nodeTag: node.tag,
@@ -62,7 +63,8 @@ export default function DebugPanel() {
         event,
       })))
       setLogs((current) => mergeLogs(current, history))
-    }
+    }, 0)
+    return () => window.clearTimeout(timer)
   }, [debugData])
 
   useEffect(() => {

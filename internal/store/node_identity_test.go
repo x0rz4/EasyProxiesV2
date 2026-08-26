@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestIdentityReconcileMergesHistoricalReferences(t *testing.T) {
@@ -48,6 +49,14 @@ func TestIdentityReconcileMergesHistoricalReferences(t *testing.T) {
 	if err := db.UpsertGroupNodeState(ctx, &GroupNodeState{GroupID: group.ID, NodeID: secondID, FailureHistory: []int64{1, 2}, Evicted: true}); err != nil {
 		t.Fatal(err)
 	}
+	speed := int64(12345)
+	if err := db.UpsertNodeDetectionResult(ctx, &NodeDetectionResult{NodeID: secondID, TaskID: "duplicate", LatencyStatus: "untested", SpeedStatus: "success", AverageBytesPerSecond: &speed, ExitIPStatus: "untested", SpeedCheckedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	residential := true
+	if err := db.UpsertNodeIPQualityResult(ctx, &NodeIPQualityResult{NodeID: secondID, Provider: "ippure", Status: "success", IsResidential: &residential, CheckedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
 	if err := opened.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -86,5 +95,10 @@ func TestIdentityReconcileMergesHistoricalReferences(t *testing.T) {
 	}
 	if len(mergedGroup.NodeStates) != 1 || mergedGroup.NodeStates[0].NodeID != winner.ID || !mergedGroup.NodeStates[0].Evicted {
 		t.Fatalf("states=%+v", mergedGroup.NodeStates)
+	}
+	detections, _ := reopened.ListNodeDetectionResults(ctx)
+	quality, _ := reopened.ListNodeIPQualityResults(ctx)
+	if detections[winner.ID] == nil || detections[winner.ID].AverageBytesPerSecond == nil || *detections[winner.ID].AverageBytesPerSecond != speed || len(quality[winner.ID]) != 1 || quality[winner.ID][0].IsResidential == nil || !*quality[winner.ID][0].IsResidential {
+		t.Fatalf("diagnostics were not merged: detection=%+v quality=%+v", detections[winner.ID], quality[winner.ID])
 	}
 }

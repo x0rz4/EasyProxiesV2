@@ -1383,6 +1383,220 @@ func servicesFromStatuses(netflix, disneyPlus, chatgpt string) []UnlockServiceRe
 	}
 }
 
+// ===================== Manual node diagnostics =====================
+
+func nullableInt64(value *int64) any {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
+func nullableInt(value *int) any {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
+func nullableBool(value *bool) any {
+	if value == nil {
+		return nil
+	}
+	return boolToInt(*value)
+}
+
+func (s *sqliteStore) UpsertNodeDetectionResult(ctx context.Context, result *NodeDetectionResult) error {
+	if result == nil {
+		return errors.New("upsert node detection result: nil result")
+	}
+	now := time.Now().UTC()
+	_, err := s.conn().ExecContext(ctx, `INSERT INTO node_detection_results (
+		node_id,task_id,latency_status,latency_ms,latency_error,latency_checked_at,
+		speed_status,average_bytes_per_second,peak_bytes_per_second,bytes_downloaded,
+		speed_duration_ms,speed_error,speed_checked_at,exit_ip,exit_ip_family,
+		exit_ip_status,exit_ip_error,exit_ip_checked_at,updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(node_id) DO UPDATE SET
+		task_id=excluded.task_id,
+		latency_status=CASE WHEN excluded.latency_status='untested' THEN node_detection_results.latency_status ELSE excluded.latency_status END,
+		latency_ms=CASE WHEN excluded.latency_status='untested' THEN node_detection_results.latency_ms ELSE excluded.latency_ms END,
+		latency_error=CASE WHEN excluded.latency_status='untested' THEN node_detection_results.latency_error ELSE excluded.latency_error END,
+		latency_checked_at=CASE WHEN excluded.latency_status='untested' THEN node_detection_results.latency_checked_at ELSE excluded.latency_checked_at END,
+		speed_status=CASE WHEN excluded.speed_status='untested' THEN node_detection_results.speed_status ELSE excluded.speed_status END,
+		average_bytes_per_second=CASE WHEN excluded.speed_status='untested' THEN node_detection_results.average_bytes_per_second ELSE excluded.average_bytes_per_second END,
+		peak_bytes_per_second=CASE WHEN excluded.speed_status='untested' THEN node_detection_results.peak_bytes_per_second ELSE excluded.peak_bytes_per_second END,
+		bytes_downloaded=CASE WHEN excluded.speed_status='untested' THEN node_detection_results.bytes_downloaded ELSE excluded.bytes_downloaded END,
+		speed_duration_ms=CASE WHEN excluded.speed_status='untested' THEN node_detection_results.speed_duration_ms ELSE excluded.speed_duration_ms END,
+		speed_error=CASE WHEN excluded.speed_status='untested' THEN node_detection_results.speed_error ELSE excluded.speed_error END,
+		speed_checked_at=CASE WHEN excluded.speed_status='untested' THEN node_detection_results.speed_checked_at ELSE excluded.speed_checked_at END,
+		exit_ip=CASE WHEN excluded.exit_ip_status='untested' THEN node_detection_results.exit_ip ELSE excluded.exit_ip END,
+		exit_ip_family=CASE WHEN excluded.exit_ip_status='untested' THEN node_detection_results.exit_ip_family ELSE excluded.exit_ip_family END,
+		exit_ip_status=CASE WHEN excluded.exit_ip_status='untested' THEN node_detection_results.exit_ip_status ELSE excluded.exit_ip_status END,
+		exit_ip_error=CASE WHEN excluded.exit_ip_status='untested' THEN node_detection_results.exit_ip_error ELSE excluded.exit_ip_error END,
+		exit_ip_checked_at=CASE WHEN excluded.exit_ip_status='untested' THEN node_detection_results.exit_ip_checked_at ELSE excluded.exit_ip_checked_at END,
+		updated_at=excluded.updated_at`,
+		result.NodeID, result.TaskID, result.LatencyStatus, nullableInt64(result.LatencyMs), result.LatencyError, formatTime(result.LatencyCheckedAt),
+		result.SpeedStatus, nullableInt64(result.AverageBytesPerSecond), nullableInt64(result.PeakBytesPerSecond), result.BytesDownloaded,
+		result.SpeedDurationMs, result.SpeedError, formatTime(result.SpeedCheckedAt), result.ExitIP, result.ExitIPFamily,
+		result.ExitIPStatus, result.ExitIPError, formatTime(result.ExitIPCheckedAt), formatTime(now))
+	if err != nil {
+		return fmt.Errorf("upsert node detection result %d: %w", result.NodeID, err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) ListNodeDetectionResults(ctx context.Context) (map[int64]*NodeDetectionResult, error) {
+	rows, err := s.conn().QueryContext(ctx, `SELECT node_id,task_id,latency_status,latency_ms,latency_error,latency_checked_at,
+		speed_status,average_bytes_per_second,peak_bytes_per_second,bytes_downloaded,speed_duration_ms,speed_error,speed_checked_at,
+		exit_ip,exit_ip_family,exit_ip_status,exit_ip_error,exit_ip_checked_at,updated_at FROM node_detection_results`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make(map[int64]*NodeDetectionResult)
+	for rows.Next() {
+		var item NodeDetectionResult
+		var latency, average, peak sql.NullInt64
+		var latencyAt, speedAt, exitAt, updatedAt string
+		if err := rows.Scan(&item.NodeID, &item.TaskID, &item.LatencyStatus, &latency, &item.LatencyError, &latencyAt,
+			&item.SpeedStatus, &average, &peak, &item.BytesDownloaded, &item.SpeedDurationMs, &item.SpeedError, &speedAt,
+			&item.ExitIP, &item.ExitIPFamily, &item.ExitIPStatus, &item.ExitIPError, &exitAt, &updatedAt); err != nil {
+			return nil, err
+		}
+		if latency.Valid {
+			value := latency.Int64
+			item.LatencyMs = &value
+		}
+		if average.Valid {
+			value := average.Int64
+			item.AverageBytesPerSecond = &value
+		}
+		if peak.Valid {
+			value := peak.Int64
+			item.PeakBytesPerSecond = &value
+		}
+		item.LatencyCheckedAt, item.SpeedCheckedAt = parseTime(latencyAt), parseTime(speedAt)
+		item.ExitIPCheckedAt, item.UpdatedAt = parseTime(exitAt), parseTime(updatedAt)
+		copyItem := item
+		result[item.NodeID] = &copyItem
+	}
+	return result, rows.Err()
+}
+
+func (s *sqliteStore) UpsertNodeIPQualityResult(ctx context.Context, result *NodeIPQualityResult) error {
+	if result == nil {
+		return errors.New("upsert node IP quality result: nil result")
+	}
+	now := time.Now().UTC()
+	_, err := s.conn().ExecContext(ctx, `INSERT INTO node_ip_quality_results (
+		node_id,provider,task_id,status,ip,family,country,country_code,asn,org,isp,is_broadcast,is_residential,
+		fraud_score,proxy,hosting,mobile,reason,checked_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(node_id,provider) DO UPDATE SET task_id=excluded.task_id,status=excluded.status,ip=excluded.ip,
+		family=excluded.family,country=excluded.country,country_code=excluded.country_code,asn=excluded.asn,org=excluded.org,
+		isp=excluded.isp,is_broadcast=excluded.is_broadcast,is_residential=excluded.is_residential,fraud_score=excluded.fraud_score,
+		proxy=excluded.proxy,hosting=excluded.hosting,mobile=excluded.mobile,reason=excluded.reason,
+		checked_at=excluded.checked_at,updated_at=excluded.updated_at`,
+		result.NodeID, result.Provider, result.TaskID, result.Status, result.IP, result.Family, result.Country, result.CountryCode,
+		result.ASN, result.Org, result.ISP, nullableBool(result.IsBroadcast), nullableBool(result.IsResidential), nullableInt(result.FraudScore),
+		nullableBool(result.Proxy), nullableBool(result.Hosting), nullableBool(result.Mobile), result.Reason, formatTime(result.CheckedAt), formatTime(now))
+	return err
+}
+
+func (s *sqliteStore) ListNodeIPQualityResults(ctx context.Context) (map[int64][]NodeIPQualityResult, error) {
+	rows, err := s.conn().QueryContext(ctx, `SELECT node_id,provider,task_id,status,ip,family,country,country_code,asn,org,isp,
+		is_broadcast,is_residential,fraud_score,proxy,hosting,mobile,reason,checked_at,updated_at
+		FROM node_ip_quality_results ORDER BY node_id,provider`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[int64][]NodeIPQualityResult)
+	for rows.Next() {
+		var item NodeIPQualityResult
+		var broadcast, residential, fraud, proxy, hosting, mobile sql.NullInt64
+		var checkedAt, updatedAt string
+		if err := rows.Scan(&item.NodeID, &item.Provider, &item.TaskID, &item.Status, &item.IP, &item.Family, &item.Country, &item.CountryCode,
+			&item.ASN, &item.Org, &item.ISP, &broadcast, &residential, &fraud, &proxy, &hosting, &mobile, &item.Reason, &checkedAt, &updatedAt); err != nil {
+			return nil, err
+		}
+		item.IsBroadcast, item.IsResidential = nullBoolPointer(broadcast), nullBoolPointer(residential)
+		item.Proxy, item.Hosting, item.Mobile = nullBoolPointer(proxy), nullBoolPointer(hosting), nullBoolPointer(mobile)
+		if fraud.Valid {
+			value := int(fraud.Int64)
+			item.FraudScore = &value
+		}
+		item.CheckedAt, item.UpdatedAt = parseTime(checkedAt), parseTime(updatedAt)
+		out[item.NodeID] = append(out[item.NodeID], item)
+	}
+	return out, rows.Err()
+}
+
+func nullBoolPointer(value sql.NullInt64) *bool {
+	if !value.Valid {
+		return nil
+	}
+	result := value.Int64 != 0
+	return &result
+}
+
+func (s *sqliteStore) UpsertNodeDetectionTask(ctx context.Context, task *NodeDetectionTask) error {
+	if task == nil {
+		return errors.New("upsert node detection task: nil task")
+	}
+	now := time.Now().UTC()
+	if task.CreatedAt.IsZero() {
+		task.CreatedAt = now
+	}
+	_, err := s.conn().ExecContext(ctx, `INSERT INTO node_detection_tasks
+		(id,status,stages_json,settings_json,stats_json,total_nodes,completed_nodes,downloaded_bytes,error,created_at,started_at,finished_at,updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,stages_json=excluded.stages_json,
+		settings_json=excluded.settings_json,stats_json=excluded.stats_json,total_nodes=excluded.total_nodes,
+		completed_nodes=excluded.completed_nodes,downloaded_bytes=excluded.downloaded_bytes,error=excluded.error,
+		started_at=excluded.started_at,finished_at=excluded.finished_at,updated_at=excluded.updated_at`,
+		task.ID, task.Status, task.StagesJSON, task.SettingsJSON, task.StatsJSON, task.TotalNodes, task.CompletedNodes, task.DownloadedBytes,
+		task.Error, formatTime(task.CreatedAt), formatTime(task.StartedAt), formatTime(task.FinishedAt), formatTime(now))
+	return err
+}
+
+func (s *sqliteStore) ListNodeDetectionTasks(ctx context.Context, limit int) ([]NodeDetectionTask, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	rows, err := s.conn().QueryContext(ctx, `SELECT id,status,stages_json,settings_json,stats_json,total_nodes,completed_nodes,
+		downloaded_bytes,error,created_at,started_at,finished_at,updated_at FROM node_detection_tasks ORDER BY created_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []NodeDetectionTask
+	for rows.Next() {
+		var item NodeDetectionTask
+		var createdAt, startedAt, finishedAt, updatedAt string
+		if err := rows.Scan(&item.ID, &item.Status, &item.StagesJSON, &item.SettingsJSON, &item.StatsJSON, &item.TotalNodes, &item.CompletedNodes,
+			&item.DownloadedBytes, &item.Error, &createdAt, &startedAt, &finishedAt, &updatedAt); err != nil {
+			return nil, err
+		}
+		item.CreatedAt, item.StartedAt, item.FinishedAt, item.UpdatedAt = parseTime(createdAt), parseTime(startedAt), parseTime(finishedAt), parseTime(updatedAt)
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (s *sqliteStore) InterruptRunningNodeDetectionTasks(ctx context.Context) error {
+	now := formatTime(time.Now().UTC())
+	_, err := s.conn().ExecContext(ctx, `UPDATE node_detection_tasks SET status='interrupted',error='application restarted',finished_at=?,updated_at=? WHERE status IN ('pending','running')`, now, now)
+	return err
+}
+
+func (s *sqliteStore) PruneNodeDetectionTasks(ctx context.Context, keep int) error {
+	if keep < 1 {
+		keep = 20
+	}
+	_, err := s.conn().ExecContext(ctx, `DELETE FROM node_detection_tasks WHERE id NOT IN (SELECT id FROM node_detection_tasks ORDER BY created_at DESC LIMIT ?)`, keep)
+	return err
+}
+
 // ===================== Group pool operations =====================
 
 const groupPoolColumns = `id, name, bind_address, bind_port, protocol, username, password,

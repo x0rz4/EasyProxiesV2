@@ -37,16 +37,8 @@ func probeExitIP(runtime Runtime, geo *geoip.Lookup) IPInfo {
 	if info.IP == "" {
 		return info
 	}
-	risk := fetchIPQualityRisk(runtime.Context, runtime.Client, info.IP, runtime.Timeout)
-	info.ASN, info.Org = risk.ASN, risk.Org
-	info.IPType, info.UsageType = risk.IPType, risk.UsageType
-	info.FraudScore, info.RiskLevel = risk.FraudScore, risk.RiskLevel
-	if risk.Country != "" && info.Country == "" {
-		info.Country = risk.Country
-	}
-	// A valid IP and country only prove that the exit is reachable. Mark it as
-	// pure exclusively when the risk source identifies an ISP/mobile network;
-	// otherwise datacenter and VPN exits would all become false positives.
-	info.Pure = risk.Pure
+	// IP quality is intentionally handled by the independent node diagnostics
+	// providers. Reachability and geography alone cannot prove purity or assign
+	// a fraud score, so legacy fields remain unknown here.
 	return info
 }

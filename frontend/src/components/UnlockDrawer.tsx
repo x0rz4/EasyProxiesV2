@@ -1,21 +1,26 @@
 import { useState, useRef } from 'react'
-import type { NodeSnapshot, UnlockResult } from '../types'
+import type { NodeCheckResultItem, NodeSnapshot, UnlockResult } from '../types'
 import { regionFlag } from '../utils/region'
+import { Globe2, ShieldCheck, Tv } from 'lucide-react'
 
 interface UnlockDrawerProps {
   node: NodeSnapshot | null
   result: UnlockResult | null
+  diagnostic: NodeCheckResultItem | null
   isOpen: boolean
   onClose: () => void
 }
 
-export default function UnlockDrawer({ node, result, isOpen, onClose }: UnlockDrawerProps) {
+export default function UnlockDrawer({ node, result, diagnostic, isOpen, onClose }: UnlockDrawerProps) {
   const [speed, setSpeed] = useState<number | null>(null)
   const [speedTesting, setSpeedTesting] = useState(false)
   const [speedError, setSpeedError] = useState('')
   const esRef = useRef<EventSource | null>(null)
 
   if (!isOpen || !node) return null
+
+  const ipApi = diagnostic?.quality.find((item) => item.provider === 'ip-api')
+  const detectedIP = diagnostic?.detection?.exit_ip || result?.ip.ip || ''
 
   const handleSpeedtest = () => {
     if (speedTesting) return
@@ -87,32 +92,34 @@ export default function UnlockDrawer({ node, result, isOpen, onClose }: UnlockDr
           {/* Section 1: Basic Network */}
           <section>
             <h3 className="text-md font-bold mb-4 flex items-center gap-2">
-              <span className="text-primary">🌐</span> 基础网络信息
+              <Globe2 className="h-4 w-4 text-primary" /> 基础网络信息
             </h3>
-            {result ? (
+            {result || diagnostic?.detection ? (
               <div className="bg-base-200 rounded-xl p-4 space-y-3 text-sm font-mono">
                 <div className="flex justify-between">
                   <span className="opacity-60">出口 IP</span>
-                  <span className="font-bold">{result.ip.ip || '-'}</span>
+                  <span className="font-bold">{detectedIP || '-'}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="opacity-60">归属地</span>
-                  <span>{regionFlag(result.ip.iso_code || '')} {result.ip.country || '-'}</span>
+                  <span>{regionFlag(ipApi?.country_code || result?.ip.iso_code || '')} {ipApi?.country || result?.ip.country || '-'}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="opacity-60">ASN</span>
-                  <span>{result.ip.asn || '-'}</span>
+                  <span>{ipApi?.asn || result?.ip.asn || '-'}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="opacity-60">ISP/Org</span>
-                  <span className="text-right truncate max-w-[200px]">{result.ip.org || '-'}</span>
+                  <span className="text-right truncate max-w-[200px]">{ipApi?.org || ipApi?.isp || result?.ip.org || '-'}</span>
                 </div>
+                <div className="flex justify-between"><span className="opacity-60">检测延迟</span><span>{diagnostic?.detection?.latency_ms == null ? '未检测' : `${diagnostic.detection.latency_ms} ms`}</span></div>
+                <div className="flex justify-between"><span className="opacity-60">平均 / 峰值</span><span className="text-right">{diagnostic?.detection?.average_bytes_per_second == null ? '未检测' : `${formatBytesSpeed(diagnostic.detection.average_bytes_per_second)} / ${formatBytesSpeed(diagnostic.detection.peak_bytes_per_second || 0)}`}</span></div>
                 <div className="flex justify-between items-center">
                   <span className="opacity-60">IP 类型</span>
                   <div className="flex gap-2">
-                    {result.ip.pure && <span className="badge badge-sm badge-success">原生 IP</span>}
-                    {result.ip.ip_type && <span className="badge badge-sm badge-outline">{result.ip.ip_type}</span>}
-                    {result.ip.usage_type && <span className="badge badge-sm badge-outline">{result.ip.usage_type}</span>}
+                    {result?.ip.ip_type && <span className="badge badge-sm badge-outline">{result.ip.ip_type}</span>}
+                    {result?.ip.usage_type && <span className="badge badge-sm badge-outline">{result.ip.usage_type}</span>}
+                    {!result?.ip.ip_type && !result?.ip.usage_type && <span className="text-xs opacity-50">以独立质量源结果为准</span>}
                   </div>
                 </div>
               </div>
@@ -121,42 +128,36 @@ export default function UnlockDrawer({ node, result, isOpen, onClose }: UnlockDr
             )}
           </section>
 
-          {/* Section 2: Security Radar */}
+          {/* Section 2: Provider-specific IP quality */}
           <section>
             <h3 className="text-md font-bold mb-4 flex items-center gap-2">
-              <span className="text-error">🛡️</span> 安全雷达
+              <ShieldCheck className="h-4 w-4 text-error" /> IP 质量（独立来源）
             </h3>
-            {result ? (
-              <div className="bg-base-200 rounded-xl p-4 space-y-4 text-sm">
-                <div>
-                  <div className="flex justify-between mb-1">
-                    <span>欺诈分数 (Fraud Score)</span>
-                    <span className="font-bold font-mono">{result.ip.fraud_score ?? 0}</span>
+            {diagnostic?.quality?.length ? (
+              <div className="space-y-3">
+                {diagnostic.quality.map((quality) => (
+                  <div key={quality.provider} className="rounded-xl bg-base-200 p-4 text-sm">
+                    <div className="mb-3 flex items-center justify-between"><strong>{quality.provider}</strong><span className={`badge badge-sm ${quality.status === 'success' ? 'badge-success' : quality.status === 'partial' ? 'badge-warning' : quality.status === 'failed' ? 'badge-error' : 'badge-ghost'}`}>{quality.status === 'success' ? '完整' : quality.status === 'partial' ? '信息不全' : quality.status === 'failed' ? '失败' : quality.status === 'disabled' ? '未启用' : '未检测'}</span></div>
+                    <div className="grid grid-cols-2 gap-2 text-xs">
+                      <span className="text-base-content/55">住宅</span><span>{quality.is_residential == null ? '未检测' : quality.is_residential ? '是' : '否'}</span>
+                      <span className="text-base-content/55">广播</span><span>{quality.is_broadcast == null ? '未检测' : quality.is_broadcast ? '是' : '否'}</span>
+                      <span className="text-base-content/55">代理 / 托管</span><span>{quality.proxy == null && quality.hosting == null ? '未检测' : quality.proxy || quality.hosting ? '是' : '否'}</span>
+                      <span className="text-base-content/55">欺诈分</span><span className="font-mono">{quality.fraud_score == null ? '未检测' : `${quality.fraud_score} · ${fraudGrade(quality.fraud_score)}`}</span>
+                    </div>
+                    {quality.reason && <p className="mt-2 text-xs text-error">{quality.reason}</p>}
                   </div>
-                  <progress 
-                    className={`progress w-full ${result.ip.fraud_score && result.ip.fraud_score > 50 ? 'progress-error' : 'progress-success'}`} 
-                    value={result.ip.fraud_score ?? 0} 
-                    max="100"
-                  />
-                </div>
-                <div className="flex justify-between items-center">
-                  <span>风险等级</span>
-                  <span className={`badge ${
-                    result.ip.risk_level === 'High' ? 'badge-error' :
-                    result.ip.risk_level === 'Medium' ? 'badge-warning' :
-                    result.ip.risk_level === 'Low' ? 'badge-success' : 'badge-ghost'
-                  }`}>{result.ip.risk_level || '未知'}</span>
-                </div>
+                ))}
+                {diagnostic.exit_ip_drift && <div role="alert" className="alert alert-warning py-2 text-xs">不同来源检测到的出口 IP 不一致，可能发生出口漂移。</div>}
               </div>
             ) : (
-              <div className="text-sm opacity-50 text-center py-4 bg-base-200 rounded-xl">暂无检测结果</div>
+              <div className="text-sm opacity-50 text-center py-4 bg-base-200 rounded-xl">质量提供商未启用或尚未检测</div>
             )}
           </section>
 
           {/* Section 3: Entertainment & Services */}
           <section>
             <h3 className="text-md font-bold mb-4 flex items-center gap-2">
-              <span className="text-secondary">🎬</span> 流媒体及 AI 服务
+              <Tv className="h-4 w-4 text-secondary" /> 流媒体及 AI 服务
             </h3>
             {result ? (
               <div className="grid grid-cols-2 gap-3">
@@ -191,9 +192,10 @@ export default function UnlockDrawer({ node, result, isOpen, onClose }: UnlockDr
         <div className="p-4 border-t border-base-200 bg-base-200/50 space-y-3">
           <div className="flex justify-between items-center">
             <span className="text-sm font-bold opacity-70">下行测速 (Speedtest)</span>
-            {speed !== null && (
-              <span className="text-xl font-mono font-bold text-primary">
-                {speed.toFixed(2)} <span className="text-sm font-normal opacity-60">Mbps</span>
+            {(speed !== null || diagnostic?.detection?.average_bytes_per_second != null) && (
+              <span className="text-right font-mono font-bold text-primary">
+                <span className="block text-xl">{speed !== null ? `${speed.toFixed(2)} Mbps` : formatBytesSpeed(diagnostic?.detection?.average_bytes_per_second || 0)}</span>
+                {speed == null && <span className="block text-xs font-normal opacity-60">{(((diagnostic?.detection?.average_bytes_per_second || 0) * 8) / 1_000_000).toFixed(2)} Mbps · 峰值 {formatBytesSpeed(diagnostic?.detection?.peak_bytes_per_second || 0)}</span>}
               </span>
             )}
           </div>
@@ -218,4 +220,17 @@ export default function UnlockDrawer({ node, result, isOpen, onClose }: UnlockDr
       </div>
     </>
   )
+}
+
+function formatBytesSpeed(bytesPerSecond: number) {
+  return `${(bytesPerSecond / 1024 / 1024).toFixed(2)} MB/s`
+}
+
+function fraudGrade(score: number) {
+  if (score <= 10) return '极佳'
+  if (score <= 30) return '优秀'
+  if (score <= 50) return '良好'
+  if (score <= 70) return '中等'
+  if (score <= 89) return '差'
+  return '极差'
 }

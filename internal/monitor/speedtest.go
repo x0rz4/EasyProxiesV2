@@ -2,86 +2,28 @@ package monitor
 
 import (
 	"context"
-	"fmt"
-	"io"
-	"net"
-	"net/http"
 	"time"
+
+	"easy_proxies/internal/nodedetect"
 )
 
-// SpeedtestRunner runs a quick download speed test and streams results to a callback.
+// SpeedtestRunner is the compatibility wrapper for the legacy single-node SSE
+// endpoint. New callers should use the comprehensive node-check task API.
 type SpeedtestRunner struct {
-	dialer func(ctx context.Context, network, addr string) (interface{}, error)
+	Options nodedetect.SpeedOptions
 }
 
-// Run executes the speedtest. The callback is called periodically with the current Mbps.
-func (r *SpeedtestRunner) Run(ctx context.Context, dialer func(ctx context.Context, network, addr string) (interface{}, error), callback func(mbps float64, isDone bool)) error {
-	transport := &http.Transport{
-		DialContext: func(dialCtx context.Context, network, addr string) (net.Conn, error) {
-			conn, err := dialer(dialCtx, network, addr)
-			if err != nil {
-				return nil, err
-			}
-			return conn.(net.Conn), nil
-		},
-		DisableKeepAlives: true,
+func (r *SpeedtestRunner) Run(ctx context.Context, dialer DialerFunc, callback func(mbps float64, done bool)) (nodedetect.SpeedResult, error) {
+	options := r.Options
+	if options.URL == "" {
+		options = nodedetect.SpeedOptions{URL: "https://speed.cloudflare.com/__down?bytes=100000000", Duration: 5 * time.Second, RequestTimeout: 8 * time.Second, MaxBytes: 100_000_000, PeakSampleInterval: 100 * time.Millisecond}
 	}
-
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   15 * time.Second, // Max 15s for the test
-	}
-
-	// 25MB payload
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://speed.cloudflare.com/__down?bytes=25000000", nil)
+	result, err := nodedetect.MeasureSpeed(ctx, nodedetect.DialFunc(dialer), options, func(progress nodedetect.SpeedProgress) {
+		callback(float64(progress.AverageBytesPerSecond)*8/1_000_000, false)
+	})
 	if err != nil {
-		return err
+		return result, err
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-
-	start := time.Now()
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("speedtest failed to connect: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("speedtest returned HTTP %d", resp.StatusCode)
-	}
-
-	buf := make([]byte, 32*1024)
-	var totalBytes int64
-	lastReport := time.Now()
-
-	for {
-		n, err := resp.Body.Read(buf)
-		totalBytes += int64(n)
-
-		now := time.Now()
-		if now.Sub(lastReport) >= 500*time.Millisecond {
-			elapsed := now.Sub(start).Seconds()
-			if elapsed > 0 {
-				mbps := (float64(totalBytes) * 8) / (1000 * 1000) / elapsed
-				callback(mbps, false)
-			}
-			lastReport = now
-		}
-
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return fmt.Errorf("speedtest read error: %w", err)
-		}
-	}
-
-	elapsed := time.Since(start).Seconds()
-	var finalMbps float64
-	if elapsed > 0 {
-		finalMbps = (float64(totalBytes) * 8) / (1000 * 1000) / elapsed
-	}
-	callback(finalMbps, true)
-
-	return nil
+	callback(float64(result.AverageBytesPerSecond)*8/1_000_000, true)
+	return result, nil
 }

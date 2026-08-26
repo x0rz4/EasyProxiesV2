@@ -1,6 +1,7 @@
 // ---- Node & Snapshot types (maps to monitor.Snapshot) ----
 
 export interface NodeInfo {
+  node_id: number
   tag: string
   name: string
   uri: string
@@ -434,6 +435,136 @@ export interface ProbeSSEComplete {
 }
 
 export type ProbeSSEEvent = ProbeSSEStart | ProbeSSEProgress | ProbeSSEComplete
+
+// ---- Manual node diagnostics ----
+
+export interface NodeCheckSettings {
+  latency_url: string
+  speed_url: string
+  landing_ip_url: string
+  latency_timeout: string
+  speed_duration: string
+  speed_request_timeout: string
+  quality_timeout: string
+  max_download_bytes: number
+  peak_sample_interval: string
+  latency_concurrency: number
+  speed_concurrency: number
+  quality_concurrency: number
+  include_handshake: boolean
+  ippure_enabled: boolean
+  ippure_url: string
+  ip_api_enabled: boolean
+  ip_api_base_url: string
+}
+
+export interface NodeCheckStages {
+  latency: boolean
+  speed: boolean
+  quality: boolean
+  unlock: boolean
+}
+
+export type NodeCheckStatus = 'untested' | 'success' | 'partial' | 'failed' | 'disabled' | 'skipped'
+
+export interface NodeDetectionResult {
+  node_id: number
+  task_id?: string
+  latency_status: NodeCheckStatus
+  latency_ms: number | null
+  latency_error?: string
+  latency_checked_at?: string
+  speed_status: NodeCheckStatus
+  average_bytes_per_second: number | null
+  peak_bytes_per_second: number | null
+  bytes_downloaded: number
+  speed_duration_ms: number
+  speed_error?: string
+  speed_checked_at?: string
+  exit_ip?: string
+  exit_ip_family?: string
+  exit_ip_status: NodeCheckStatus
+  exit_ip_error?: string
+  exit_ip_checked_at?: string
+  updated_at: string
+}
+
+export interface NodeIPQualityResult {
+  node_id: number
+  task_id?: string
+  provider: 'ippure' | 'ip-api' | string
+  status: NodeCheckStatus
+  ip?: string
+  family?: string
+  country?: string
+  country_code?: string
+  asn?: string
+  org?: string
+  isp?: string
+  is_broadcast: boolean | null
+  is_residential: boolean | null
+  fraud_score: number | null
+  proxy: boolean | null
+  hosting: boolean | null
+  mobile: boolean | null
+  reason?: string
+  checked_at: string
+}
+
+export interface NodeCheckResultItem {
+  node_id: number
+  detection?: NodeDetectionResult
+  quality: NodeIPQualityResult[]
+  exit_ip_drift: boolean
+}
+
+export interface NodeCheckStageStats {
+  total: number
+  completed: number
+  success: number
+  failed: number
+  skipped: number
+}
+
+export interface NodeCheckTask {
+  id: string
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted'
+  stages: NodeCheckStages
+  settings: Record<string, string | number | boolean>
+  stats: Record<string, NodeCheckStageStats>
+  total_nodes: number
+  completed_nodes: number
+  downloaded_bytes: number
+  error?: string
+  created_at: string
+  started_at?: string
+  finished_at?: string
+}
+
+export interface NodeCheckEvent {
+  sequence: number
+  type: 'task' | 'progress' | 'result' | 'done'
+  task?: NodeCheckTask
+  phase?: 'latency' | 'speed' | 'quality' | 'unlock'
+  node_id?: number
+  tag?: string
+  name?: string
+  status?: string
+  error?: string
+  latency_ms?: number
+  speed?: {
+    average_bytes_per_second: number
+    peak_bytes_per_second: number
+    bytes_downloaded: number
+    duration_ms: number
+  }
+  speed_progress?: {
+    bytes_downloaded: number
+    elapsed_ms: number
+    average_bytes_per_second: number
+  }
+  quality?: NodeIPQualityResult
+}
 
 export interface ProbeOperationsSettings {
   probe_target: string

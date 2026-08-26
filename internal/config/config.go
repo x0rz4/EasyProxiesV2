@@ -123,17 +123,40 @@ type MultiPortConfig struct {
 
 // ManagementConfig controls the monitoring HTTP endpoint.
 type ManagementConfig struct {
-	Enabled              *bool         `yaml:"enabled"`
-	Listen               string        `yaml:"listen"`
-	ProbeTarget          string        `yaml:"probe_target"`
-	Password             string        `yaml:"password"` // WebUI 访问密码，为空则不需要密码
-	HealthCheckInterval  time.Duration `yaml:"health_check_interval"`
-	ProbeConcurrency     int           `yaml:"probe_concurrency"`
-	StartupProbeTimeout  time.Duration `yaml:"startup_probe_timeout"`
-	RoutineProbeTimeout  time.Duration `yaml:"routine_probe_timeout"`
-	ProbeDialTimeout     time.Duration `yaml:"probe_dial_timeout"`
-	ProbeResponseTimeout time.Duration `yaml:"probe_response_timeout"`
-	RoutineProbeRetries  *int          `yaml:"routine_probe_retries"`
+	Enabled              *bool           `yaml:"enabled"`
+	Listen               string          `yaml:"listen"`
+	ProbeTarget          string          `yaml:"probe_target"`
+	Password             string          `yaml:"password"` // WebUI 访问密码，为空则不需要密码
+	HealthCheckInterval  time.Duration   `yaml:"health_check_interval"`
+	ProbeConcurrency     int             `yaml:"probe_concurrency"`
+	StartupProbeTimeout  time.Duration   `yaml:"startup_probe_timeout"`
+	RoutineProbeTimeout  time.Duration   `yaml:"routine_probe_timeout"`
+	ProbeDialTimeout     time.Duration   `yaml:"probe_dial_timeout"`
+	ProbeResponseTimeout time.Duration   `yaml:"probe_response_timeout"`
+	RoutineProbeRetries  *int            `yaml:"routine_probe_retries"`
+	NodeCheck            NodeCheckConfig `yaml:"node_check"`
+}
+
+// NodeCheckConfig controls manually-triggered diagnostics. These checks are
+// intentionally separate from health probes and never affect routing state.
+type NodeCheckConfig struct {
+	LatencyURL          string        `yaml:"latency_url"`
+	SpeedURL            string        `yaml:"speed_url"`
+	LandingIPURL        string        `yaml:"landing_ip_url"`
+	LatencyTimeout      time.Duration `yaml:"latency_timeout"`
+	SpeedDuration       time.Duration `yaml:"speed_duration"`
+	SpeedRequestTimeout time.Duration `yaml:"speed_request_timeout"`
+	QualityTimeout      time.Duration `yaml:"quality_timeout"`
+	MaxDownloadBytes    int64         `yaml:"max_download_bytes"`
+	PeakSampleInterval  time.Duration `yaml:"peak_sample_interval"`
+	LatencyConcurrency  int           `yaml:"latency_concurrency"`
+	SpeedConcurrency    int           `yaml:"speed_concurrency"`
+	QualityConcurrency  int           `yaml:"quality_concurrency"`
+	IncludeHandshake    bool          `yaml:"include_handshake"`
+	IPPureEnabled       bool          `yaml:"ippure_enabled"`
+	IPPureURL           string        `yaml:"ippure_url"`
+	IPAPIEnabled        bool          `yaml:"ip_api_enabled"`
+	IPAPIBaseURL        string        `yaml:"ip_api_base_url"`
 }
 
 // SubscriptionRefreshConfig controls subscription auto-refresh and reload settings.
@@ -385,6 +408,49 @@ func (c *Config) applyDefaults() error {
 	if c.Management.RoutineProbeRetries == nil {
 		defaultRetries := 1
 		c.Management.RoutineProbeRetries = &defaultRetries
+	}
+	check := &c.Management.NodeCheck
+	if check.LatencyURL == "" {
+		check.LatencyURL = "https://cp.cloudflare.com/generate_204"
+	}
+	if check.SpeedURL == "" {
+		check.SpeedURL = "https://speed.cloudflare.com/__down?bytes=100000000"
+	}
+	if check.LandingIPURL == "" {
+		check.LandingIPURL = "https://api.ipify.org"
+	}
+	if check.LatencyTimeout <= 0 {
+		check.LatencyTimeout = 5 * time.Second
+	}
+	if check.SpeedDuration <= 0 {
+		check.SpeedDuration = 5 * time.Second
+	}
+	if check.SpeedRequestTimeout <= 0 {
+		check.SpeedRequestTimeout = 8 * time.Second
+	}
+	if check.QualityTimeout <= 0 {
+		check.QualityTimeout = 5 * time.Second
+	}
+	if check.MaxDownloadBytes <= 0 {
+		check.MaxDownloadBytes = 100_000_000
+	}
+	if check.PeakSampleInterval <= 0 {
+		check.PeakSampleInterval = 100 * time.Millisecond
+	}
+	if check.LatencyConcurrency <= 0 {
+		check.LatencyConcurrency = 20
+	}
+	if check.SpeedConcurrency <= 0 {
+		check.SpeedConcurrency = 2
+	}
+	if check.QualityConcurrency <= 0 {
+		check.QualityConcurrency = 5
+	}
+	if check.IPAPIBaseURL == "" {
+		check.IPAPIBaseURL = "http://ip-api.com/batch"
+	}
+	if err := ValidateNodeCheckConfig(*check); err != nil {
+		return err
 	}
 	if err := ValidateManagementProbeSettings(c.Management.ProbeConcurrency,
 		c.Management.StartupProbeTimeout, c.Management.RoutineProbeTimeout,
@@ -668,6 +734,43 @@ func (c *Config) RoutineProbeRetryCount() int {
 		return 1
 	}
 	return *c.Management.RoutineProbeRetries
+}
+
+// ValidateNodeCheckConfig validates manually-triggered diagnostic limits.
+func ValidateNodeCheckConfig(c NodeCheckConfig) error {
+	for name, raw := range map[string]string{
+		"延迟测试 URL":   c.LatencyURL,
+		"下载测速 URL":   c.SpeedURL,
+		"出口 IP URL":  c.LandingIPURL,
+		"ip-api URL": c.IPAPIBaseURL,
+	} {
+		u, err := url.Parse(strings.TrimSpace(raw))
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("%s 必须是有效的 HTTP/HTTPS URL", name)
+		}
+	}
+	if c.IPPureEnabled {
+		u, err := url.Parse(strings.TrimSpace(c.IPPureURL))
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return errors.New("启用 ippure 时必须配置有效的 HTTP/HTTPS URL")
+		}
+	}
+	if c.LatencyConcurrency < 1 || c.LatencyConcurrency > 128 {
+		return errors.New("检测延迟并发必须为 1-128")
+	}
+	if c.SpeedConcurrency < 1 || c.SpeedConcurrency > 8 {
+		return errors.New("下载测速并发必须为 1-8")
+	}
+	if c.QualityConcurrency < 1 || c.QualityConcurrency > 10 {
+		return errors.New("IP 质量并发必须为 1-10")
+	}
+	if c.MaxDownloadBytes < 10*1024 || c.MaxDownloadBytes > 1024*1024*1024 {
+		return errors.New("单节点最大下载量必须为 10KB-1GB")
+	}
+	if c.PeakSampleInterval < 50*time.Millisecond || c.PeakSampleInterval > 500*time.Millisecond {
+		return errors.New("峰值采样间隔必须为 50-500ms")
+	}
+	return nil
 }
 
 // ValidateManagementProbeSettings validates the operational probe policy.

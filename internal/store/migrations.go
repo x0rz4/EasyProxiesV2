@@ -249,6 +249,75 @@ ALTER TABLE subscriptions ADD COLUMN format TEXT NOT NULL DEFAULT 'auto';
 ALTER TABLE subscriptions ADD COLUMN user_agent TEXT NOT NULL DEFAULT '';
 `,
 		},
+		{
+			Version:     11,
+			Description: "add manual node diagnostics",
+			Up: `
+CREATE TABLE node_detection_results (
+    node_id INTEGER PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL DEFAULT '',
+    latency_status TEXT NOT NULL DEFAULT 'untested',
+    latency_ms INTEGER,
+    latency_error TEXT NOT NULL DEFAULT '',
+    latency_checked_at TEXT NOT NULL DEFAULT '',
+    speed_status TEXT NOT NULL DEFAULT 'untested',
+    average_bytes_per_second INTEGER,
+    peak_bytes_per_second INTEGER,
+    bytes_downloaded INTEGER NOT NULL DEFAULT 0,
+    speed_duration_ms INTEGER NOT NULL DEFAULT 0,
+    speed_error TEXT NOT NULL DEFAULT '',
+    speed_checked_at TEXT NOT NULL DEFAULT '',
+    exit_ip TEXT NOT NULL DEFAULT '',
+    exit_ip_family TEXT NOT NULL DEFAULT '',
+    exit_ip_status TEXT NOT NULL DEFAULT 'untested',
+    exit_ip_error TEXT NOT NULL DEFAULT '',
+    exit_ip_checked_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE node_ip_quality_results (
+    node_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    task_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'untested',
+    ip TEXT NOT NULL DEFAULT '',
+    family TEXT NOT NULL DEFAULT '',
+    country TEXT NOT NULL DEFAULT '',
+    country_code TEXT NOT NULL DEFAULT '',
+    asn TEXT NOT NULL DEFAULT '',
+    org TEXT NOT NULL DEFAULT '',
+    isp TEXT NOT NULL DEFAULT '',
+    is_broadcast INTEGER,
+    is_residential INTEGER,
+    fraud_score INTEGER,
+    proxy INTEGER,
+    hosting INTEGER,
+    mobile INTEGER,
+    reason TEXT NOT NULL DEFAULT '',
+    checked_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (node_id, provider)
+);
+CREATE INDEX idx_node_quality_provider_status ON node_ip_quality_results(provider, status);
+
+CREATE TABLE node_detection_tasks (
+    id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    stages_json TEXT NOT NULL DEFAULT '{}',
+    settings_json TEXT NOT NULL DEFAULT '{}',
+    stats_json TEXT NOT NULL DEFAULT '{}',
+    total_nodes INTEGER NOT NULL DEFAULT 0,
+    completed_nodes INTEGER NOT NULL DEFAULT 0,
+    downloaded_bytes INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    started_at TEXT NOT NULL DEFAULT '',
+    finished_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX idx_node_detection_tasks_created ON node_detection_tasks(created_at DESC);
+`,
+		},
 	}
 }
 
