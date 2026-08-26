@@ -18,6 +18,18 @@ import { cn } from '../utils/cn'
 
 type StatusFilterType = '' | 'unlocked' | 'pure_ip' | 'locked' | 'mixed' | 'failed' | 'untested'
 
+const unlockBadgeClasses: Record<string, string> = {
+  netflix: 'bg-[#E50914] text-white',
+  disney_plus: 'bg-[#113CCF] text-white',
+  chatgpt: 'bg-[#10A37F] text-white',
+  gemini: 'bg-[#4285F4] text-white',
+  claude: 'bg-[#D97757] text-white',
+  youtube: 'bg-[#FF0000] text-white',
+  bahamut: 'bg-[#00A0E9] text-white',
+  amazon: 'bg-[#00A8E1] text-white',
+  tiktok: 'bg-neutral-900 text-white',
+}
+
 export default function UnlockPanel() {
   const [nodes, setNodes] = useState<NodeSnapshot[]>([])
   const [loading, setLoading] = useState(true)
@@ -188,7 +200,7 @@ export default function UnlockPanel() {
       const statuses = r.services?.map((s) => s.status) || []
       const isAllUnlocked = statuses.length > 0 && statuses.every((s) => s === 'unlocked')
       const hasUnlocked = statuses.some((s) => s === 'unlocked')
-      const hasLocked = statuses.some((s) => s === 'locked' || s === 'originals_only')
+      const hasLocked = statuses.some((s) => s === 'locked' || s === 'partial' || s === 'originals_only')
 
       if (isAllUnlocked) {
         unlocked++
@@ -262,13 +274,13 @@ export default function UnlockPanel() {
           return statuses.length > 0 && statuses.every((s) => s === 'unlocked')
         }
         if (statusFilter === 'locked') {
-          const hasLocked = statuses.some((s) => s === 'locked' || s === 'originals_only')
+          const hasLocked = statuses.some((s) => s === 'locked' || s === 'partial' || s === 'originals_only')
           const hasUnlocked = statuses.some((s) => s === 'unlocked')
           return hasLocked || hasUnlocked
         }
         if (statusFilter === 'mixed') {
           const hasUnlocked = statuses.some((s) => s === 'unlocked')
-          const hasLocked = statuses.some((s) => s === 'locked' || s === 'originals_only')
+          const hasLocked = statuses.some((s) => s === 'locked' || s === 'partial' || s === 'originals_only')
           return hasUnlocked && hasLocked
         }
       }
@@ -815,32 +827,14 @@ function UnlockRow({
 
     const services = result?.services || []
     const unlockedList = services.filter((s) => s.status === 'unlocked')
+    const partialList = services.filter((s) => s.status === 'partial')
     const originalsList = services.filter((s) => s.status === 'originals_only')
 
     return (
       <div className="flex flex-wrap items-center gap-1.5">
-        {services.slice(0, 5).map((svc) => {
+        {services.slice(0, 7).map((svc) => {
           if (svc.status === 'unlocked') {
-            const isNetflix = svc.name === 'netflix'
-            const isDisney = svc.name === 'disney_plus'
-            const isChatgpt = svc.name === 'chatgpt'
-            const isYT = svc.name === 'youtube'
-            const isAmazon = svc.name === 'amazon'
-            const isTikTok = svc.name === 'tiktok'
-
-            const colorClass = isNetflix
-              ? 'bg-[#E50914] text-white'
-              : isDisney
-                ? 'bg-[#113CCF] text-white'
-                : isChatgpt
-                  ? 'bg-[#10A37F] text-white'
-                  : isYT
-                    ? 'bg-[#FF0000] text-white'
-                    : isAmazon
-                      ? 'bg-[#00A8E1] text-white'
-                      : isTikTok
-                        ? 'bg-neutral-900 text-white'
-                        : 'badge-primary text-primary-content'
+            const colorClass = unlockBadgeClasses[svc.name] ?? 'badge-primary text-primary-content'
 
             return (
               <span key={svc.name} className={cn('badge badge-sm border-none font-semibold text-[10px]', colorClass)}>
@@ -855,14 +849,21 @@ function UnlockRow({
               </span>
             )
           }
+          if (svc.status === 'partial') {
+            return (
+              <span key={svc.name} className="badge badge-warning badge-outline badge-sm text-[10px]">
+                {svc.display_name} 部分可用
+              </span>
+            )
+          }
           return null
         })}
-        {services.length > 5 && (
+        {services.length > 7 && (
           <span className="badge badge-ghost badge-sm text-[10px] text-base-content/50">
-            +{services.length - 5}
+            +{services.length - 7}
           </span>
         )}
-        {unlockedList.length === 0 && originalsList.length === 0 && (
+        {unlockedList.length === 0 && partialList.length === 0 && originalsList.length === 0 && (
           <span className="text-xs text-base-content/40">无完全解锁项</span>
         )}
       </div>

@@ -18,6 +18,7 @@ import type {
   ProbeOperationsSettings,
   ProbeOperationsStatus,
   UnlockResult,
+  UnlockMetaResponse,
   UnlockResultsResponse,
   UnlockSSEEvent,
   TrafficStreamEvent,
@@ -218,6 +219,11 @@ export async function unlockNode(tag: string): Promise<UnlockResult> {
 /** Fetch the last persisted unlock detection result for every node. */
 export async function fetchUnlockResults(): Promise<UnlockResultsResponse> {
   return request<UnlockResultsResponse>('/api/nodes/unlock-results')
+}
+
+/** Fetch registered unlock provider and status metadata. */
+export async function fetchUnlockMeta(): Promise<UnlockMetaResponse> {
+  return request<UnlockMetaResponse>('/api/nodes/unlock-meta')
 }
 
 /** Probe all nodes with SSE progress updates */

@@ -766,3 +766,5 @@ Mutation 成功后精确失效规则、groups 和相关 nodes 查询。排序使
 6. 第一版 runtime 是暂时完整 reload，还是等 group 增量 snapshot 一起上线；为避免新增功能放大中断，建议至少做到一次规则运行只 reload 一次，并尽快接增量路径。
 
 以上决策确认后，可以按 P0 → P1 → P2 并行拆分后端模型、API 与前端静态页面，但 assignments 接入 group runtime 必须等 effective membership resolver 完成后再合并。
+
+参考https://github.com/ZeroDeng01/sublinkPro/blob/main/docs/features/tags.zh-CN.md 的打标系统。

@@ -9,27 +9,15 @@ import (
 	json "easy_proxies/internal/jsonx"
 )
 
-// fetchIPQualityRisk fetches risk and fraud information from IPQuality's backend
-// or equivalent proxy for various databases. It must be called using the proxy client.
+// fetchIPQualityRisk performs a best-effort network-type lookup through the
+// node's proxy client. The returned fraud score is a local coarse heuristic,
+// not a score supplied by ip-api.com.
 func fetchIPQualityRisk(ctx context.Context, client *http.Client, ip string, timeout time.Duration) IPInfo {
 	info := IPInfo{IP: ip}
-
-	// Wait, we can fetch multiple DBs, but IPQuality's endpoint returns a large
-	// structure if we use a specific query, or we can just fetch Scamalytics
-	// for the fraud score.
-	// We'll fetch from https://ipinfo.check.place/$IP?db=scamalytics
-	// Example response for Scamalytics:
-	// {"ip":"...","score":"15","risk":"low"} (hypothetical, as we can't see the exact JSON)
-
-	// Since we don't know the exact JSON schema of ipinfo.check.place, we can
-	// fallback to a known free API like ip-api.com for ASN/Org, and just
-	// set placeholder or best-effort RiskLevel.
-	// Let's use ip-api.com as a reliable fallback for ASN/Org/UsageType.
 
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	// Use ip-api.com for ASN/Org details
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, fmt.Sprintf("http://ip-api.com/json/%s?fields=status,message,country,countryCode,regionName,isp,org,as,mobile,proxy,hosting", ip), nil)
 	if err == nil {
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
@@ -70,7 +58,8 @@ func fetchIPQualityRisk(ctx context.Context, client *http.Client, ip string, tim
 						info.UsageType = "ISP"
 					}
 
-					// Basic heuristic risk
+					// Keep the score deliberately coarse: it only separates a
+					// provider-declared hosting/proxy exit from ISP/mobile access.
 					if data.Hosting || data.Proxy {
 						info.FraudScore = 50
 						info.RiskLevel = "Medium"
@@ -83,7 +72,7 @@ func fetchIPQualityRisk(ctx context.Context, client *http.Client, ip string, tim
 		}
 	}
 
-	// Basic purity heuristic
+	// Purity is only asserted from an explicit non-hosting classification.
 	info.Pure = info.UsageType == "ISP" || info.UsageType == "Mobile"
 
 	return info

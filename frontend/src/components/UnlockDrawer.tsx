@@ -40,7 +40,9 @@ export default function UnlockDrawer({ node, result, isOpen, onClose }: UnlockDr
 
     es.addEventListener('error', (e) => {
       // e.data might not exist on native EventSource error events unless we sent it
-      const errMessage = (e as any).data ? (e as any).data : '测速连接断开'
+      const errMessage = e instanceof MessageEvent && typeof e.data === 'string' && e.data
+        ? e.data
+        : '测速连接断开'
       setSpeedError(errMessage)
       setSpeedTesting(false)
       es.close()
@@ -159,14 +161,16 @@ export default function UnlockDrawer({ node, result, isOpen, onClose }: UnlockDr
             {result ? (
               <div className="grid grid-cols-2 gap-3">
                 {result.services.map(svc => (
-                  <div key={svc.name} className="bg-base-200 rounded-xl p-3 flex flex-col justify-center items-center gap-1 text-center">
+                  <div key={svc.name} className="bg-base-200 rounded-xl p-3 flex flex-col justify-center items-center gap-1 text-center" title={svc.description}>
                     <span className="font-bold text-sm">{svc.display_name}</span>
                     <span className={`badge badge-sm ${
                       svc.status === 'unlocked' ? 'badge-success' :
+                      svc.status === 'partial' ? 'badge-warning' :
                       svc.status === 'originals_only' ? 'badge-warning' :
                       svc.status === 'locked' ? 'badge-error' : 'badge-ghost'
                     }`}>
                       {svc.status === 'unlocked' ? '解锁' :
+                       svc.status === 'partial' ? '部分可用' :
                        svc.status === 'originals_only' ? '仅自制' :
                        svc.status === 'locked' ? '未解锁' : '失败'}
                     </span>

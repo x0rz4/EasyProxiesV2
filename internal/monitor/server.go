@@ -226,6 +226,7 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 	mux.HandleFunc("/api/nodes/config/", s.withAuth(s.handleConfigNodeItem))
 	mux.HandleFunc("/api/nodes/probe-all", s.withAuth(s.handleProbeAll))
 	mux.HandleFunc("/api/nodes/unlock-all", s.withAuth(s.handleUnlockAll))
+	mux.HandleFunc("/api/nodes/unlock-meta", s.withAuth(s.handleUnlockMeta))
 	mux.HandleFunc("/api/nodes/unlock-results", s.withAuth(s.handleUnlockResults))
 	mux.HandleFunc("/api/nodes/traffic/stream", s.withAuth(s.handleTrafficStream))
 	mux.HandleFunc("/api/nodes/", s.withAuth(s.handleNodeAction))
@@ -1446,6 +1447,19 @@ func (s *Server) handleUnlockResults(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"results": out})
 }
 
+// handleUnlockMeta exposes detector and status metadata independently from a
+// live node check so clients can render new registered modules dynamically.
+func (s *Server) handleUnlockMeta(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, map[string]any{
+		"providers": unlock.ListProviderMetas(),
+		"statuses":  unlock.ListStatusMetas(),
+	})
+}
+
 func (s *Server) handleTrafficStream(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -1570,6 +1584,8 @@ func (s *Server) persistUnlockResult(snap *Snapshot, result *unlock.Result) {
 		stored.Services = append(stored.Services, store.UnlockServiceResult{
 			Name:        svc.Name,
 			DisplayName: svc.DisplayName,
+			Category:    svc.Category,
+			Description: svc.Description,
 			Status:      svc.Status,
 			Region:      svc.Region,
 			Detail:      svc.Detail,

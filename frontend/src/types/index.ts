@@ -472,11 +472,36 @@ export interface ProbeOperationsStatus {
 
 // A single streaming/AI service unlock result.
 export interface UnlockServiceResult {
-  name: 'netflix' | 'disney_plus' | 'chatgpt' | 'youtube' | 'tiktok' | 'amazon' | 'reddit'
+  name: 'netflix' | 'disney_plus' | 'chatgpt' | 'gemini' | 'claude' | 'youtube' | 'bahamut' | 'tiktok' | 'amazon' | 'reddit'
   display_name: string
-  status: 'unlocked' | 'originals_only' | 'locked' | 'failed'
+  category?: 'streaming' | 'ai' | 'social' | 'custom'
+  description?: string
+  status: 'unlocked' | 'partial' | 'originals_only' | 'locked' | 'failed'
   region?: string
   detail?: string
+}
+
+export interface UnlockProviderMeta {
+  value: UnlockServiceResult['name'] | string
+  label: string
+  description?: string
+  category?: 'streaming' | 'ai' | 'social' | 'custom'
+  aliases?: string[]
+  order: number
+}
+
+export interface UnlockStatusMeta {
+  value: UnlockServiceResult['status'] | string
+  label: string
+  short_label?: string
+  description?: string
+  color?: string
+  severity?: string
+}
+
+export interface UnlockMetaResponse {
+  providers: UnlockProviderMeta[]
+  statuses: UnlockStatusMeta[]
 }
 
 // Native IP purity info for the node's exit IP.

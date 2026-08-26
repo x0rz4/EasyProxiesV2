@@ -369,6 +369,8 @@ type SubscriptionStatus struct {
 type UnlockServiceResult struct {
 	Name        string `json:"name"`
 	DisplayName string `json:"display_name"`
+	Category    string `json:"category,omitempty"`
+	Description string `json:"description,omitempty"`
 	Status      string `json:"status"`
 	Region      string `json:"region,omitempty"`
 	Detail      string `json:"detail,omitempty"`
