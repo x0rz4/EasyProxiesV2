@@ -110,6 +110,7 @@ export default function GroupPoolsPanel() {
   const [expandedGroups, setExpandedGroups] = useState<Set<number>>(() => new Set())
   const [removedDraftNodes, setRemovedDraftNodes] = useState<string[]>([])
   const [pendingAutoExcludedIDs, setPendingAutoExcludedIDs] = useState<Set<number>>(() => new Set())
+  const [manualEvictionOverrideIDs, setManualEvictionOverrideIDs] = useState<Set<number>>(() => new Set())
   const [draftNodeCache, setDraftNodeCache] = useState<Record<number, GroupNodeOption>>({})
   const [probingNodeIDs, setProbingNodeIDs] = useState<Set<number>>(() => new Set())
   const [latencyOverrides, setLatencyOverrides] = useState<Record<number, number>>({})
@@ -148,7 +149,7 @@ export default function GroupPoolsPanel() {
   }, [nodes, editing?.members, form.excluded_node_ids, pendingAutoExcludedIDs])
 
   const openCreate = () => {
-    setEditing(null); setForm(emptyPayload()); setRegionsText(''); setNodeSearch(''); setRemovedDraftNodes([]); setPendingAutoExcludedIDs(new Set()); setDraftNodeCache({}); setEditorOpen(true)
+    setEditing(null); setForm(emptyPayload()); setRegionsText(''); setNodeSearch(''); setRemovedDraftNodes([]); setPendingAutoExcludedIDs(new Set()); setManualEvictionOverrideIDs(new Set()); setDraftNodeCache({}); setEditorOpen(true)
   }
   const openEdit = (group: GroupPool) => {
     const nodeByID = new Map(nodes.map((node) => [node.id, node]))
@@ -160,9 +161,9 @@ export default function GroupPoolsPanel() {
       nodeByID.get(id)?.name || group.members.find((member) => member.node_id === id)?.name || `节点 #${id}`)
     const cache = Object.fromEntries(keptIDs.map((id) => [id, nodeByID.get(id)]).filter((entry): entry is [number, GroupNodeOption] => Boolean(entry[1])))
     setEditing(group); setForm({ ...payloadFromGroup(group), explicit_node_ids: keptIDs, excluded_node_ids: excludedIDs }); setRegionsText((group.regions || []).join(', '));
-    setNodeSearch(''); setRemovedDraftNodes(removedNames); setPendingAutoExcludedIDs(new Set(evictedIDs.filter((id) => !group.excluded_node_ids.includes(id)))); setDraftNodeCache(cache); setEditorOpen(true)
+    setNodeSearch(''); setRemovedDraftNodes(removedNames); setPendingAutoExcludedIDs(new Set(evictedIDs.filter((id) => !group.excluded_node_ids.includes(id)))); setManualEvictionOverrideIDs(new Set()); setDraftNodeCache(cache); setEditorOpen(true)
   }
-  const closeEditor = () => { setEditorOpen(false); setEditing(null); setRemovedDraftNodes([]); setPendingAutoExcludedIDs(new Set()); setBatchProbeProgress(null) }
+  const closeEditor = () => { setEditorOpen(false); setEditing(null); setRemovedDraftNodes([]); setPendingAutoExcludedIDs(new Set()); setManualEvictionOverrideIDs(new Set()); setBatchProbeProgress(null) }
 
   const refresh = async () => {
     await queryClient.invalidateQueries({ queryKey: ['groupPools'] })
@@ -177,7 +178,9 @@ export default function GroupPoolsPanel() {
       // the editor was open is persisted even if the polling cache is stale.
       const latestSnapshot = editing ? await listGroupPools() : data
       const latestGroup = editing ? latestSnapshot?.groups.find((group) => group.id === editing.id) : undefined
-      const latestEvictedIDs = latestGroup?.members.filter((member) => member.status === 'EVICTED').map((member) => member.node_id) || []
+      const latestEvictedIDs = latestGroup?.members
+        .filter((member) => member.status === 'EVICTED' && !manualEvictionOverrideIDs.has(member.node_id))
+        .map((member) => member.node_id) || []
       const excludedNodeIDs = [...new Set([...form.excluded_node_ids, ...latestEvictedIDs])]
       const excludedSet = new Set(excludedNodeIDs)
       const latestNodes = latestSnapshot?.nodes || nodes
@@ -219,6 +222,7 @@ export default function GroupPoolsPanel() {
 
   const removeManualNode = (node: GroupNodeOption) => {
     setForm((current) => ({ ...current, explicit_node_ids: current.explicit_node_ids.filter((id) => id !== node.id) }))
+    setManualEvictionOverrideIDs((current) => { const next = new Set(current); next.delete(node.id); return next })
     const regions = new Set(regionsText.split(/[,，\s]+/).map((value) => value.trim().toLowerCase()).filter(Boolean))
     if (node.region && regions.has(node.region.toLowerCase())) {
       toast.info('已取消手动指定', { description: `${node.name} 仍匹配地区规则，会继续自动入池` })
@@ -236,6 +240,7 @@ export default function GroupPoolsPanel() {
         excluded_node_ids: [...new Set([...current.excluded_node_ids, member.node_id])],
       }))
       setPendingAutoExcludedIDs((current) => { const next = new Set(current); next.delete(member.node_id); return next })
+      setManualEvictionOverrideIDs((current) => { const next = new Set(current); next.delete(member.node_id); return next })
       setEditing((current) => current ? { ...current,
         members: current.members.filter((item) => item.node_id !== member.node_id),
         member_count: Math.max(0, current.member_count - 1),
@@ -267,7 +272,10 @@ export default function GroupPoolsPanel() {
         if (!current.explicit_node_ids.includes(node.id)) return current
         return { ...current, explicit_node_ids: current.explicit_node_ids.filter((id) => id !== node.id) }
       })
-      if (removed) setRemovedDraftNodes((current) => current.includes(node.name) ? current : [...current, node.name])
+      if (removed) {
+        setRemovedDraftNodes((current) => current.includes(node.name) ? current : [...current, node.name])
+        setManualEvictionOverrideIDs((current) => { const next = new Set(current); next.delete(node.id); return next })
+      }
       if (!quiet) toast.error(error instanceof Error ? error.message : '延迟测试失败', removed
         ? { description: `${node.name} 已从当前编辑草稿移除` } : undefined)
       return false
@@ -419,7 +427,7 @@ export default function GroupPoolsPanel() {
                   <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"><div><h5 className="text-sm font-bold">可添加节点</h5><p className="mt-0.5 text-xs text-base-content/50">仅显示节点管理状态为“可用”的节点</p></div><label className="input input-sm flex w-full items-center gap-2 sm:w-56"><Search className="h-3.5 w-3.5 text-base-content/40" /><input className="min-w-0 grow" value={nodeSearch} onChange={(e) => setNodeSearch(e.target.value)} placeholder="搜索节点或地区" aria-label="搜索可添加节点" /></label></div>
                   <div className="mt-3 max-h-72 space-y-2 overflow-y-auto pr-1">
                     {filteredNodes.map((node) => <NodeOptionRow key={node.id} node={node} latency={latencyOverrides[node.id] ?? node.latency_ms} probing={probingNodeIDs.has(node.id)}
-                      action="add" onAction={() => { setDraftNodeCache((current) => ({ ...current, [node.id]: node })); setForm((current) => ({ ...current, explicit_node_ids: [...current.explicit_node_ids, node.id], excluded_node_ids: current.excluded_node_ids.filter((id) => id !== node.id) })) }} onProbe={() => void probeOption(node)} />)}
+                      action="add" onAction={() => { setDraftNodeCache((current) => ({ ...current, [node.id]: node })); setForm((current) => ({ ...current, explicit_node_ids: [...current.explicit_node_ids, node.id], excluded_node_ids: current.excluded_node_ids.filter((id) => id !== node.id) })); setPendingAutoExcludedIDs((current) => { const next = new Set(current); next.delete(node.id); return next }); setManualEvictionOverrideIDs((current) => new Set(current).add(node.id)) }} onProbe={() => void probeOption(node)} />)}
                     {filteredNodes.length === 0 && <EmptyMemberList message={nodeSearch ? '没有匹配的可用节点' : '当前没有其他可用节点'} />}
                   </div>
                 </div>
@@ -439,7 +447,7 @@ export default function GroupPoolsPanel() {
                 <div className="flex items-start justify-between gap-3"><div><h5 className="text-sm font-bold">已排除节点</h5><p className="mt-0.5 text-xs text-base-content/50">排除优先于地区规则；待保存项会在保存后从运行成员中移除</p></div><span className="badge badge-error badge-outline badge-sm">{excludedDraftNodes.length}</span></div>
                 {pendingAutoExcludedIDs.size > 0 && <div className="alert alert-warning alert-soft mt-3 py-2 text-xs"><span>检测到 {pendingAutoExcludedIDs.size} 个已踢出节点，已自动加入待排除名单。</span></div>}
                 <div className="mt-3 grid max-h-72 gap-2 overflow-y-auto pr-1 md:grid-cols-2">
-                  {excludedDraftNodes.map((node) => <ExcludedDraftRow key={node.id} node={node} onUndo={node.pending ? undefined : () => setForm((current) => ({ ...current, excluded_node_ids: current.excluded_node_ids.filter((id) => id !== node.id) }))} />)}
+                  {excludedDraftNodes.map((node) => <ExcludedDraftRow key={node.id} node={node} onUndo={node.pending ? undefined : () => { setForm((current) => ({ ...current, excluded_node_ids: current.excluded_node_ids.filter((id) => id !== node.id) })); setManualEvictionOverrideIDs((current) => new Set(current).add(node.id)) }} />)}
                   {excludedDraftNodes.length === 0 && <div className="md:col-span-2"><EmptyMemberList message="当前没有排除节点" /></div>}
                 </div>
               </div>}
