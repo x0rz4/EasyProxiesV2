@@ -282,7 +282,7 @@ export default function UnlockPanel() {
   const countries = useMemo(() => {
     const counts = new Map<string, number>()
     for (const n of nodes) {
-      const code = n.country || n.region
+      const code = landingCountryCode(diagnostics[n.node_id], results[n.tag])
       if (code) {
         counts.set(code.toUpperCase(), (counts.get(code.toUpperCase()) || 0) + 1)
       }
@@ -290,14 +290,14 @@ export default function UnlockPanel() {
     return Array.from(counts.entries())
       .sort((a, b) => b[1] - a[1])
       .map(([code, count]) => ({ code, count }))
-  }, [nodes])
+  }, [nodes, diagnostics, results])
 
   // ---- Filtered and sorted data ----
   const filteredNodes = useMemo(() => {
     const q = filter.trim().toLowerCase()
     return nodes.filter((n) => {
       if (countryFilter) {
-        const c = (n.country || n.region || '').toUpperCase()
+        const c = landingCountryCode(diagnostics[n.node_id], results[n.tag])
         if (c !== countryFilter.toUpperCase()) return false
       }
 
@@ -305,7 +305,8 @@ export default function UnlockPanel() {
         const r = results[n.tag]
         const diagnostic = diagnostics[n.node_id]
         const qualityText = diagnostic?.quality.map((item) => `${item.ip || ''} ${item.asn || ''} ${item.org || ''} ${item.isp || ''}`).join(' ') || ''
-        const hay = `${n.name} ${n.region || ''} ${n.country || ''} ${n.tag} ${r?.ip?.ip || ''} ${diagnostic?.detection?.exit_ip || ''} ${qualityText}`.toLowerCase()
+        const landingCountry = `${diagnostic?.detection?.exit_country || ''} ${landingCountryCode(diagnostic, r)}`
+        const hay = `${n.name} ${n.tag} ${r?.ip?.ip || ''} ${diagnostic?.detection?.exit_ip || ''} ${landingCountry} ${qualityText}`.toLowerCase()
         if (!hay.includes(q)) return false
       }
 
@@ -575,7 +576,7 @@ export default function UnlockPanel() {
                 <input
                   type="text"
                   className="input input-md w-full rounded-xl border border-base-300/70 bg-base-200/40 pl-10 pr-9 text-sm transition-colors focus:border-primary/50 focus:bg-base-100 focus:outline-none"
-                  placeholder="搜索节点名称、地区代号 (如 HK/JP)、Tag 或 IP 地址…"
+                  placeholder="搜索节点名称、落地国家 (如 HK/JP)、Tag 或出口 IP…"
                   value={filter}
                   onChange={(e) => setFilter(e.target.value)}
                 />
@@ -597,9 +598,9 @@ export default function UnlockPanel() {
                   className="select select-md w-full rounded-xl border border-base-300/70 bg-base-200/40 text-sm font-medium focus:border-primary/50 focus:bg-base-100"
                   value={countryFilter}
                   onChange={(e) => setCountryFilter(e.target.value)}
-                  aria-label="筛选国家和地区"
+                  aria-label="筛选落地国家和地区"
                 >
-                  <option value="">🌐 全部国家 / 地区 ({nodes.length})</option>
+                  <option value="">🌐 全部落地国家 / 地区 ({nodes.length})</option>
                   {countries.map(({ code, count }) => (
                     <option key={code} value={code}>
                       {regionFlag(code)} {code} ({count} 个节点)
@@ -993,7 +994,7 @@ function NodeCheckDialog({ settings, stages, scope, selectedCount, filteredCount
           {showSettings && <div className="grid gap-4 rounded-xl border border-base-300 p-4 sm:grid-cols-2">
             <CheckField id="check-latency-url" label="延迟 URL"><input id="check-latency-url" className="input input-bordered w-full font-mono text-xs" value={settings.latency_url} onChange={(event) => updateSetting('latency_url', event.target.value)} /></CheckField>
             <CheckField id="check-speed-url" label="测速 URL"><input id="check-speed-url" className="input input-bordered w-full font-mono text-xs" value={settings.speed_url} onChange={(event) => updateSetting('speed_url', event.target.value)} /></CheckField>
-            <CheckField id="check-landing-ip-url" label="出口 IP URL"><input id="check-landing-ip-url" className="input input-bordered w-full font-mono text-xs" value={settings.landing_ip_url} onChange={(event) => updateSetting('landing_ip_url', event.target.value)} /></CheckField>
+            <CheckField id="check-landing-ip-url" label="出口 IP URL（经节点隧道请求）"><input id="check-landing-ip-url" className="input input-bordered w-full font-mono text-xs" value={settings.landing_ip_url} onChange={(event) => updateSetting('landing_ip_url', event.target.value)} /></CheckField>
             <CheckField id="latency-timeout" label="延迟超时"><input id="latency-timeout" className="input input-bordered w-full" value={settings.latency_timeout} onChange={(event) => updateSetting('latency_timeout', event.target.value)} /></CheckField>
             <CheckField id="speed-duration" label="测速持续时间"><input id="speed-duration" className="input input-bordered w-full" value={settings.speed_duration} onChange={(event) => updateSetting('speed_duration', event.target.value)} /></CheckField>
             <CheckField id="speed-request-timeout" label="测速请求超时"><input id="speed-request-timeout" className="input input-bordered w-full" value={settings.speed_request_timeout} onChange={(event) => updateSetting('speed_request_timeout', event.target.value)} /></CheckField>
@@ -1024,6 +1025,13 @@ function QualityBadges({ item, drift }: { item: NodeCheckResultItem['quality'][n
   if (item.status === 'untested') return <span className="text-[10px] text-base-content/35">{item.provider} 未检测</span>
   if (item.status === 'failed') return <span className="badge badge-error badge-outline badge-xs" title={item.reason}>{item.provider} 失败</span>
   return <div className="flex flex-wrap items-center gap-1"><span className="badge badge-ghost badge-xs">{item.provider}</span>{item.status === 'partial' && <span className="badge badge-warning badge-outline badge-xs">信息不全</span>}{item.is_residential != null && <span className={cn('badge badge-xs', item.is_residential ? 'badge-success' : 'badge-ghost')}>{item.is_residential ? '住宅' : '机房'}</span>}{item.is_broadcast != null && <span className={cn('badge badge-xs', item.is_broadcast ? 'badge-warning' : 'badge-success')}>{item.is_broadcast ? '广播' : '原生'}</span>}{item.proxy === true && <span className="badge badge-warning badge-xs">代理</span>}{item.hosting === true && <span className="badge badge-warning badge-xs">托管</span>}{item.fraud_score != null && <span className={cn('badge badge-xs border-none', fraudClass(item.fraud_score))} title={`${item.fraud_score} · ${fraudLabel(item.fraud_score)}`}>{item.fraud_score} {fraudLabel(item.fraud_score)}</span>}{drift && <span className="badge badge-error badge-xs">漂移</span>}</div>
+}
+
+function landingCountryCode(diagnostic?: NodeCheckResultItem, result?: UnlockResult) {
+  return (diagnostic?.detection?.exit_country_code
+    || diagnostic?.quality.find((item) => item.provider === 'ip-api' && item.country_code)?.country_code
+    || result?.ip?.iso_code
+    || '').toUpperCase()
 }
 
 function fraudClass(score: number) { if (score <= 10) return 'bg-emerald-600 text-white'; if (score <= 30) return 'bg-green-500 text-white'; if (score <= 50) return 'bg-lime-500 text-lime-950'; if (score <= 70) return 'bg-amber-400 text-amber-950'; if (score <= 89) return 'bg-orange-500 text-white'; return 'bg-red-600 text-white' }
@@ -1060,6 +1068,7 @@ function UnlockRow({
   onCheck: (e: React.MouseEvent) => void
 }) {
   const err = nodeError || result?.error
+  const exitCountryCode = landingCountryCode(diagnostic, result)
 
   const renderIpRisk = () => {
     const quality = diagnostic?.quality || []
@@ -1145,8 +1154,8 @@ function UnlockRow({
       </td>
       <td className="max-w-[220px]">
         <div className="flex items-center gap-2">
-          <span className="text-lg leading-none shrink-0" title={node.region || node.country}>
-            {regionFlag(node.country || node.region || '')}
+          <span className="text-lg leading-none shrink-0" title={exitCountryCode ? `落地国家 ${exitCountryCode}` : '尚未检测落地国家'}>
+            {regionFlag(exitCountryCode)}
           </span>
           <div className="min-w-0 flex-1">
             <div className="truncate font-semibold text-base-content" title={node.name}>
@@ -1195,7 +1204,7 @@ function UnlockRow({
               className="truncate text-[10px] text-base-content/50"
               title={diagnostic?.quality.map((item) => `${item.asn || ''} ${item.org || item.isp || ''}`).join(' ')}
             >
-              {diagnostic?.quality.find((item) => item.provider === 'ip-api')?.country_code || result?.ip?.iso_code} {diagnostic?.quality.find((item) => item.provider === 'ip-api')?.asn}
+              {diagnostic?.detection?.exit_country_code || diagnostic?.quality.find((item) => item.provider === 'ip-api')?.country_code || result?.ip?.iso_code} {diagnostic?.quality.find((item) => item.provider === 'ip-api')?.asn}
             </span>
           </div>
         ) : (

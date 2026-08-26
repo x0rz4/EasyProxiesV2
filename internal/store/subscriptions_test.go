@@ -227,6 +227,9 @@ func TestCommitSnapshotReconcilesUniqueLogicalNodeInPlace(t *testing.T) {
 	if err := db.UpsertNodeStats(ctx, &NodeStats{NodeID: oldNode.ID, SuccessCount: 8, LastLatencyMs: 66}); err != nil {
 		t.Fatal(err)
 	}
+	if err := db.UpsertNodeDetectionResult(ctx, &NodeDetectionResult{NodeID: oldNode.ID, LatencyStatus: "untested", SpeedStatus: "untested", ExitIPStatus: "success", ExitIP: "1.1.1.1"}); err != nil {
+		t.Fatal(err)
+	}
 	group := &GroupPool{
 		Name: "HK", BindAddress: "127.0.0.1", BindPort: 10088, Protocol: "mixed", DispatchMode: "fixed",
 		ExplicitNodeIDs: []int64{oldNode.ID}, CurrentActiveNodeID: oldNode.ID, Enabled: true,
@@ -260,6 +263,13 @@ func TestCommitSnapshotReconcilesUniqueLogicalNodeInPlace(t *testing.T) {
 	storedGroup, _ := db.GetGroupPool(ctx, group.ID)
 	if storedGroup == nil || storedGroup.CurrentActiveNodeID != oldNode.ID || len(storedGroup.ExplicitNodeIDs) != 1 || storedGroup.ExplicitNodeIDs[0] != oldNode.ID {
 		t.Fatalf("logical replacement lost group references: %+v", storedGroup)
+	}
+	detection, err := db.ListNodeDetectionResults(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detection[oldNode.ID] != nil {
+		t.Fatalf("logical connection replacement retained stale landing IP: %+v", detection[oldNode.ID])
 	}
 }
 

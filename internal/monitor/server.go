@@ -283,7 +283,9 @@ func (s *Server) SetGeoipLookup(l *geoip.Lookup) {
 	}
 }
 
-// geoipLookupForCheck returns a GeoIP lookup suitable for an unlock check.
+// geoipLookupForCheck returns a GeoIP lookup suitable for landing-IP checks.
+// Landing country is foundational node metadata used by groups, so an
+// available database may be used even when the optional GeoIP listener is off.
 // It first prefers the runtime lookup injected via SetGeoipLookup (kept live
 // by the builder); when none is available it lazily opens one from the
 // configured database path, re-opening if the on-disk file changed (e.g.
@@ -296,7 +298,7 @@ func (s *Server) geoipLookupForCheck() *geoip.Lookup {
 		return nil
 	}
 	dbPath := s.geoipDatabasePath()
-	if dbPath == "" || !s.geoipEnabled() {
+	if dbPath == "" {
 		return nil
 	}
 

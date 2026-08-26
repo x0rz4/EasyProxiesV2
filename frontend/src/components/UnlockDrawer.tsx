@@ -21,6 +21,7 @@ export default function UnlockDrawer({ node, result, diagnostic, isOpen, onClose
 
   const ipApi = diagnostic?.quality.find((item) => item.provider === 'ip-api')
   const detectedIP = diagnostic?.detection?.exit_ip || result?.ip.ip || ''
+  const exitCountryCode = diagnostic?.detection?.exit_country_code || ipApi?.country_code || result?.ip.iso_code || ''
 
   const handleSpeedtest = () => {
     if (speedTesting) return
@@ -76,7 +77,7 @@ export default function UnlockDrawer({ node, result, diagnostic, isOpen, onClose
           <div>
             <h2 className="text-lg font-bold truncate max-w-[300px]">{node.name}</h2>
             <div className="text-sm opacity-60 flex items-center gap-2 mt-1">
-              <span>{regionFlag(node.region || '')} {node.region?.toUpperCase() || '未知'}</span>
+              <span>{regionFlag(exitCountryCode)} 落地 {exitCountryCode.toUpperCase() || '未检测'}</span>
               <span>•</span>
               <span className="font-mono">{node.tag}</span>
             </div>
@@ -102,7 +103,7 @@ export default function UnlockDrawer({ node, result, diagnostic, isOpen, onClose
                 </div>
                 <div className="flex justify-between">
                   <span className="opacity-60">归属地</span>
-                  <span>{regionFlag(ipApi?.country_code || result?.ip.iso_code || '')} {ipApi?.country || result?.ip.country || '-'}</span>
+                  <span>{regionFlag(diagnostic?.detection?.exit_country_code || ipApi?.country_code || result?.ip.iso_code || '')} {diagnostic?.detection?.exit_country || ipApi?.country || result?.ip.country || '未检测'}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="opacity-60">ASN</span>

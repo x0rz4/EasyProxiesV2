@@ -250,6 +250,13 @@ func (s *sqliteStore) CreateNode(ctx context.Context, node *Node) error {
 }
 
 func (s *sqliteStore) UpdateNode(ctx context.Context, node *Node) error {
+	var previousIdentity string
+	if err := s.conn().QueryRowContext(ctx, "SELECT identity_hash FROM nodes WHERE id=?", node.ID).Scan(&previousIdentity); err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("node %d not found", node.ID)
+		}
+		return fmt.Errorf("lookup node %d identity: %w", node.ID, err)
+	}
 	if err := populateNodeIdentity(node, true); err != nil {
 		return err
 	}
@@ -281,6 +288,29 @@ func (s *sqliteStore) UpdateNode(ctx context.Context, node *Node) error {
 	affected, _ := result.RowsAffected()
 	if affected == 0 {
 		return fmt.Errorf("node %d not found", node.ID)
+	}
+	if previousIdentity != "" && previousIdentity != node.IdentityHash {
+		if err := s.clearNodeDetectionCache(ctx, node.ID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *sqliteStore) UpdateNodeLocation(ctx context.Context, nodeID int64, region, country string) error {
+	result, err := s.conn().ExecContext(ctx, `UPDATE nodes SET region=?,country=?,updated_at=? WHERE id=?`,
+		strings.ToLower(strings.TrimSpace(region)), strings.TrimSpace(country), formatTime(time.Now().UTC()), nodeID)
+	if err != nil {
+		return fmt.Errorf("update node %d landing location: %w", nodeID, err)
+	}
+	return requireAffected(result, fmt.Sprintf("node %d not found", nodeID))
+}
+
+func (s *sqliteStore) clearNodeDetectionCache(ctx context.Context, nodeID int64) error {
+	for _, table := range []string{"node_detection_results", "node_ip_quality_results", "node_unlock_results"} {
+		if _, err := s.conn().ExecContext(ctx, "DELETE FROM "+table+" WHERE node_id=?", nodeID); err != nil {
+			return fmt.Errorf("clear node %d cached detection from %s: %w", nodeID, table, err)
+		}
 	}
 	return nil
 }
@@ -751,6 +781,7 @@ func (s *sqliteStore) reconcileSubscriptionLogicalNodes(ctx context.Context, sub
 			// a later duplicate already owns the incoming identity, merge it
 			// first; deleting it releases the unique hash before the update.
 			targetID = eligible[0].id
+			previousIdentity := eligible[0].identityHash
 			for _, candidate := range eligible[1:] {
 				if err := mergeNodeReferences(s.tx, targetID, candidate.id); err != nil {
 					return fmt.Errorf("merge stale logical node %d into %d: %w", candidate.id, targetID, err)
@@ -764,6 +795,11 @@ func (s *sqliteStore) reconcileSubscriptionLogicalNodes(ctx context.Context, sub
 				input.Region, input.Region, input.Country, input.Country,
 				input.IdentityHash, input.CanonicalJSON, formatTime(time.Now().UTC()), targetID); err != nil {
 				return fmt.Errorf("update logical subscription node %d: %w", targetID, err)
+			}
+			if previousIdentity != "" && previousIdentity != input.IdentityHash {
+				if err := s.clearNodeDetectionCache(ctx, targetID); err != nil {
+					return err
+				}
 			}
 			continue
 		}
@@ -1414,9 +1450,9 @@ func (s *sqliteStore) UpsertNodeDetectionResult(ctx context.Context, result *Nod
 	_, err := s.conn().ExecContext(ctx, `INSERT INTO node_detection_results (
 		node_id,task_id,latency_status,latency_ms,latency_error,latency_checked_at,
 		speed_status,average_bytes_per_second,peak_bytes_per_second,bytes_downloaded,
-		speed_duration_ms,speed_error,speed_checked_at,exit_ip,exit_ip_family,
+		speed_duration_ms,speed_error,speed_checked_at,exit_ip,exit_ip_family,exit_country,exit_country_code,
 		exit_ip_status,exit_ip_error,exit_ip_checked_at,updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(node_id) DO UPDATE SET
 		task_id=excluded.task_id,
 		latency_status=CASE WHEN excluded.latency_status='untested' THEN node_detection_results.latency_status ELSE excluded.latency_status END,
@@ -1432,13 +1468,15 @@ func (s *sqliteStore) UpsertNodeDetectionResult(ctx context.Context, result *Nod
 		speed_checked_at=CASE WHEN excluded.speed_status='untested' THEN node_detection_results.speed_checked_at ELSE excluded.speed_checked_at END,
 		exit_ip=CASE WHEN excluded.exit_ip_status='untested' THEN node_detection_results.exit_ip ELSE excluded.exit_ip END,
 		exit_ip_family=CASE WHEN excluded.exit_ip_status='untested' THEN node_detection_results.exit_ip_family ELSE excluded.exit_ip_family END,
+		exit_country=CASE WHEN excluded.exit_ip_status='untested' THEN node_detection_results.exit_country ELSE excluded.exit_country END,
+		exit_country_code=CASE WHEN excluded.exit_ip_status='untested' THEN node_detection_results.exit_country_code ELSE excluded.exit_country_code END,
 		exit_ip_status=CASE WHEN excluded.exit_ip_status='untested' THEN node_detection_results.exit_ip_status ELSE excluded.exit_ip_status END,
 		exit_ip_error=CASE WHEN excluded.exit_ip_status='untested' THEN node_detection_results.exit_ip_error ELSE excluded.exit_ip_error END,
 		exit_ip_checked_at=CASE WHEN excluded.exit_ip_status='untested' THEN node_detection_results.exit_ip_checked_at ELSE excluded.exit_ip_checked_at END,
 		updated_at=excluded.updated_at`,
 		result.NodeID, result.TaskID, result.LatencyStatus, nullableInt64(result.LatencyMs), result.LatencyError, formatTime(result.LatencyCheckedAt),
 		result.SpeedStatus, nullableInt64(result.AverageBytesPerSecond), nullableInt64(result.PeakBytesPerSecond), result.BytesDownloaded,
-		result.SpeedDurationMs, result.SpeedError, formatTime(result.SpeedCheckedAt), result.ExitIP, result.ExitIPFamily,
+		result.SpeedDurationMs, result.SpeedError, formatTime(result.SpeedCheckedAt), result.ExitIP, result.ExitIPFamily, result.ExitCountry, result.ExitCountryCode,
 		result.ExitIPStatus, result.ExitIPError, formatTime(result.ExitIPCheckedAt), formatTime(now))
 	if err != nil {
 		return fmt.Errorf("upsert node detection result %d: %w", result.NodeID, err)
@@ -1449,7 +1487,7 @@ func (s *sqliteStore) UpsertNodeDetectionResult(ctx context.Context, result *Nod
 func (s *sqliteStore) ListNodeDetectionResults(ctx context.Context) (map[int64]*NodeDetectionResult, error) {
 	rows, err := s.conn().QueryContext(ctx, `SELECT node_id,task_id,latency_status,latency_ms,latency_error,latency_checked_at,
 		speed_status,average_bytes_per_second,peak_bytes_per_second,bytes_downloaded,speed_duration_ms,speed_error,speed_checked_at,
-		exit_ip,exit_ip_family,exit_ip_status,exit_ip_error,exit_ip_checked_at,updated_at FROM node_detection_results`)
+		exit_ip,exit_ip_family,exit_country,exit_country_code,exit_ip_status,exit_ip_error,exit_ip_checked_at,updated_at FROM node_detection_results`)
 	if err != nil {
 		return nil, err
 	}
@@ -1461,7 +1499,7 @@ func (s *sqliteStore) ListNodeDetectionResults(ctx context.Context) (map[int64]*
 		var latencyAt, speedAt, exitAt, updatedAt string
 		if err := rows.Scan(&item.NodeID, &item.TaskID, &item.LatencyStatus, &latency, &item.LatencyError, &latencyAt,
 			&item.SpeedStatus, &average, &peak, &item.BytesDownloaded, &item.SpeedDurationMs, &item.SpeedError, &speedAt,
-			&item.ExitIP, &item.ExitIPFamily, &item.ExitIPStatus, &item.ExitIPError, &exitAt, &updatedAt); err != nil {
+			&item.ExitIP, &item.ExitIPFamily, &item.ExitCountry, &item.ExitCountryCode, &item.ExitIPStatus, &item.ExitIPError, &exitAt, &updatedAt); err != nil {
 			return nil, err
 		}
 		if latency.Valid {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -378,6 +379,24 @@ func (m *nodeCheckManager) runQuality(task *nodeCheckTask) {
 	sem := make(chan struct{}, task.settings.QualityConcurrency)
 	outcomes := make(map[int64][]string)
 	var outcomesMu sync.Mutex
+	var locationMu sync.Mutex
+	locationChanged := false
+	markLocation := func(node Snapshot, region, country string) {
+		region = strings.ToLower(strings.TrimSpace(region))
+		country = strings.TrimSpace(country)
+		if region == "" {
+			return
+		}
+		if err := m.server.store.UpdateNodeLocation(context.Background(), node.NodeID, region, country); err != nil {
+			return
+		}
+		m.server.mgr.UpdateNodeLocation(node.NodeID, region, country)
+		if node.Region != region || node.Country != country {
+			locationMu.Lock()
+			locationChanged = true
+			locationMu.Unlock()
+		}
+	}
 	recordOutcome := func(nodeID int64, status string) {
 		outcomesMu.Lock()
 		outcomes[nodeID] = append(outcomes[nodeID], status)
@@ -402,11 +421,18 @@ func (m *nodeCheckManager) runQuality(task *nodeCheckTask) {
 			if err != nil {
 				result.ExitIPStatus, result.ExitIPError = "failed", err.Error()
 			} else {
+				if lookup := m.server.geoipLookupForCheck(); lookup != nil {
+					region := lookup.LookupIP(ip)
+					result.ExitCountry = region.Country
+					result.ExitCountryCode = strings.ToUpper(strings.TrimSpace(region.ISOCode))
+				}
 				task.mu.Lock()
 				task.landingIPs[node.NodeID] = ip
 				task.mu.Unlock()
 			}
-			_ = m.server.store.UpsertNodeDetectionResult(context.Background(), result)
+			if saveErr := m.server.store.UpsertNodeDetectionResult(context.Background(), result); saveErr == nil && result.ExitIPStatus == "success" {
+				markLocation(node, result.ExitCountryCode, result.ExitCountry)
+			}
 		}(node)
 	}
 	wg.Wait()
@@ -461,6 +487,17 @@ func (m *nodeCheckManager) runQuality(task *nodeCheckTask) {
 			if !ok {
 				quality = ipquality.Result{Provider: "ip-api", Status: ipquality.StatusFailed, IP: ip, Reason: "exit IP unavailable", CheckedAt: time.Now().UTC()}
 			}
+			if ip != "" && quality.Status == ipquality.StatusSuccess && quality.CountryCode != "" && sameDetectedIP(ip, quality.IP) {
+				now := time.Now().UTC()
+				saveErr := m.server.store.UpsertNodeDetectionResult(context.Background(), &store.NodeDetectionResult{
+					NodeID: node.NodeID, TaskID: task.snapshot.ID, LatencyStatus: "untested", SpeedStatus: "untested",
+					ExitIP: ip, ExitIPFamily: detectIPFamily(ip), ExitCountry: quality.Country,
+					ExitCountryCode: strings.ToUpper(strings.TrimSpace(quality.CountryCode)), ExitIPStatus: "success", ExitIPCheckedAt: now,
+				})
+				if saveErr == nil {
+					markLocation(node, quality.CountryCode, quality.Country)
+				}
+			}
 			m.saveQuality(task, node, quality)
 			recordOutcome(node.NodeID, quality.Status)
 		}
@@ -486,6 +523,17 @@ func (m *nodeCheckManager) runQuality(task *nodeCheckTask) {
 		}
 		task.updateStage("quality", stageStatus)
 		task.publish(nodeCheckEvent{Type: "task", Phase: "quality", NodeID: node.NodeID, Tag: node.Tag, Name: node.Name, Status: stageStatus})
+	}
+	locationMu.Lock()
+	shouldReload := locationChanged
+	locationMu.Unlock()
+	if shouldReload && m.server.nodeMgr != nil {
+		reloadCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := m.server.nodeMgr.TriggerReload(reloadCtx)
+		cancel()
+		if err != nil {
+			task.publish(nodeCheckEvent{Type: "task", Phase: "quality", Status: "warning", Error: "落地地区已保存，但分组刷新失败: " + err.Error()})
+		}
 	}
 	m.persist(task)
 }

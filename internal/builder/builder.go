@@ -34,27 +34,6 @@ func Build(cfg *config.Config) (option.Options, error) {
 	var failedNodes []string
 	usedTags := make(map[string]int) // Track tag usage for uniqueness
 
-	// Initialize GeoIP lookup if enabled
-	var geoLookup *geoip.Lookup
-	if cfg.GeoIP.Enabled && cfg.GeoIP.DatabasePath != "" {
-		var err error
-		// Use auto-update if enabled
-		if cfg.GeoIP.AutoUpdateEnabled {
-			interval := cfg.GeoIP.AutoUpdateInterval
-			if interval == 0 {
-				interval = 24 * time.Hour // Default to 24 hours
-			}
-			geoLookup, err = geoip.NewWithAutoUpdate(cfg.GeoIP.DatabasePath, interval)
-		} else {
-			geoLookup, err = geoip.New(cfg.GeoIP.DatabasePath)
-		}
-		if err != nil {
-			log.Printf("⚠️  GeoIP database load failed: %v (region routing disabled)", err)
-		} else {
-			log.Printf("✅ GeoIP database loaded: %s", cfg.GeoIP.DatabasePath)
-		}
-	}
-
 	// Track nodes by region for GeoIP routing.
 	// Region codes are open-ended (any lowercased ISO country code can appear),
 	// so this map is grown on demand instead of pre-seeded with a fixed set.
@@ -99,16 +78,13 @@ func Build(cfg *config.Config) (option.Options, error) {
 			meta.Port = cfg.Listener.Port
 		}
 
-		// GeoIP lookup for region classification
+		// Region is authoritative only after the node has been dialed and its
+		// public landing IP has been classified. Never infer it from the proxy
+		// server address in the URI: relay/CDN endpoints may exit elsewhere.
 		if node.Region != "" {
 			meta.Region = strings.ToLower(node.Region)
 			meta.Country = node.Country
 			regionMembers[meta.Region] = append(regionMembers[meta.Region], tag)
-		} else if geoLookup != nil && geoLookup.IsEnabled() {
-			regionInfo := geoLookup.LookupURI(node.URI)
-			meta.Region = regionInfo.Code
-			meta.Country = regionInfo.Country
-			regionMembers[regionInfo.Code] = append(regionMembers[regionInfo.Code], tag)
 		} else {
 			meta.Region = geoip.RegionOther
 			meta.Country = "Unknown"
@@ -119,11 +95,6 @@ func Build(cfg *config.Config) (option.Options, error) {
 		if node.ID != 0 {
 			nodeTagsByID[node.ID] = tag
 		}
-	}
-
-	// Close GeoIP database after lookup
-	if geoLookup != nil {
-		geoLookup.Close()
 	}
 
 	// Check if we have at least one valid node

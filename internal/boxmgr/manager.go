@@ -90,6 +90,7 @@ type Manager struct {
 
 	groupSlotsMu sync.Mutex
 	groupSlots   map[int64]*groupRuntimeSlot
+	landingMu    sync.Mutex
 }
 
 type groupRuntimeSlot struct {
@@ -141,6 +142,7 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.baseCtx = ctx
 	cfg := m.cfg
 	m.mu.Unlock()
+	m.applyCachedNodeLocations(ctx, cfg)
 
 	// Try to start, with automatic port conflict resolution
 	var instance *box.Box
@@ -164,6 +166,26 @@ func (m *Manager) Start(ctx context.Context) error {
 			return fmt.Errorf("start sing-box: %w", err)
 		}
 		break // Success
+	}
+
+	// The first instance supplies per-node dialers. Only uncached or previously
+	// failed nodes are queried through their own tunnel. If classification
+	// changes topology metadata, rebuild the base once before any group starts.
+	if m.detectMissingNodeLocations(ctx, cfg) {
+		if err := instance.Close(); err != nil {
+			m.logger.Warnf("close provisional base after landing IP detection: %v", err)
+		}
+		m.monitorMgr.BeginReload()
+		var err error
+		instance, err = m.createBaseBox(ctx, cfg)
+		if err != nil {
+			return fmt.Errorf("rebuild base with landing locations: %w", err)
+		}
+		if err = instance.Start(); err != nil {
+			_ = instance.Close()
+			return fmt.Errorf("start base with landing locations: %w", err)
+		}
+		m.monitorMgr.SweepStaleNodes()
 	}
 
 	m.mu.Lock()
@@ -219,6 +241,14 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 		return errors.New("new config is nil")
 	}
 
+	m.mu.RLock()
+	locationCtx := m.baseCtx
+	m.mu.RUnlock()
+	if locationCtx == nil {
+		locationCtx = context.Background()
+	}
+	m.applyCachedNodeLocations(locationCtx, newCfg)
+
 	m.mu.Lock()
 	if m.currentBox == nil && !m.idle {
 		m.mu.Unlock()
@@ -229,6 +259,12 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 	oldCfg := m.cfg
 	if oldBox != nil && runtimeConfigEqual(oldCfg, newCfg) {
 		m.mu.Unlock()
+		// A failed/missing cache can be retried against the current runtime. A
+		// newly discovered country then flows through the regular controlled
+		// reload so affected group membership is recalculated.
+		if m.detectMissingNodeLocations(locationCtx, newCfg) {
+			return m.Reload(newCfg)
+		}
 		m.logger.Infof("reload skipped: runtime configuration unchanged")
 		return nil
 	}
@@ -283,6 +319,30 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 			return fmt.Errorf("start new box: %w", err)
 		}
 		break // Success
+	}
+
+	// New subscription nodes only have dialers after the provisional base has
+	// started. Resolve their landing locations now, then rebuild this base once;
+	// group runtimes are synchronized only after the authoritative metadata is
+	// present, so they never observe a URI-host-derived country.
+	if m.detectMissingNodeLocations(ctx, newCfg) {
+		if err := instance.Close(); err != nil {
+			m.logger.Warnf("close provisional reloaded base after landing IP detection: %v", err)
+		}
+		if m.monitorMgr != nil {
+			m.monitorMgr.BeginReload()
+		}
+		var err error
+		instance, err = m.createBaseBox(ctx, newCfg)
+		if err != nil {
+			m.rollbackToOldConfig(ctx, oldCfg)
+			return fmt.Errorf("rebuild base with landing locations: %w", err)
+		}
+		if err = instance.Start(); err != nil {
+			_ = instance.Close()
+			m.rollbackToOldConfig(ctx, oldCfg)
+			return fmt.Errorf("start base with landing locations: %w", err)
+		}
 	}
 
 	// Sweep stale monitor entries (disabled/removed nodes) now that the new box

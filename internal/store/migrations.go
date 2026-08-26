@@ -318,6 +318,14 @@ CREATE TABLE node_detection_tasks (
 CREATE INDEX idx_node_detection_tasks_created ON node_detection_tasks(created_at DESC);
 `,
 		},
+		{
+			Version:     12,
+			Description: "store landing IP country for node diagnostics",
+			Up: `
+ALTER TABLE node_detection_results ADD COLUMN exit_country TEXT NOT NULL DEFAULT '';
+ALTER TABLE node_detection_results ADD COLUMN exit_country_code TEXT NOT NULL DEFAULT '';
+`,
+		},
 	}
 }
 

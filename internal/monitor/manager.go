@@ -906,6 +906,26 @@ func (m *Manager) Snapshot() []Snapshot {
 	return m.SnapshotFiltered(false)
 }
 
+// UpdateNodeLocation refreshes the landing-IP-derived location metadata for
+// every runtime registration of a stable node ID. It does not alter health,
+// failure counters, or routing availability.
+func (m *Manager) UpdateNodeLocation(nodeID int64, region, country string) {
+	m.mu.RLock()
+	entries := make([]*entry, 0, len(m.nodes))
+	for _, item := range m.nodes {
+		entries = append(entries, item)
+	}
+	m.mu.RUnlock()
+	for _, item := range entries {
+		item.mu.Lock()
+		if item.info.NodeID == nodeID {
+			item.info.Region = strings.ToLower(strings.TrimSpace(region))
+			item.info.Country = strings.TrimSpace(country)
+		}
+		item.mu.Unlock()
+	}
+}
+
 // SnapshotForTag returns a snapshot of a single node by tag, or nil if the
 // node is not registered.
 func (m *Manager) SnapshotForTag(tag string) *Snapshot {

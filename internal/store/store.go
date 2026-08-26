@@ -34,6 +34,9 @@ type Store interface {
 
 	// UpdateNode updates an existing node by ID.
 	UpdateNode(ctx context.Context, node *Node) error
+	// UpdateNodeLocation stores the authoritative landing-IP classification
+	// without changing connection settings or administrator state.
+	UpdateNodeLocation(ctx context.Context, nodeID int64, region, country string) error
 
 	// DeleteNode removes a node by ID (cascading to stats/timeline).
 	DeleteNode(ctx context.Context, id int64) error
@@ -434,6 +437,8 @@ type NodeDetectionResult struct {
 	SpeedCheckedAt        time.Time `json:"speed_checked_at,omitempty"`
 	ExitIP                string    `json:"exit_ip,omitempty"`
 	ExitIPFamily          string    `json:"exit_ip_family,omitempty"`
+	ExitCountry           string    `json:"exit_country,omitempty"`
+	ExitCountryCode       string    `json:"exit_country_code,omitempty"`
 	ExitIPStatus          string    `json:"exit_ip_status"`
 	ExitIPError           string    `json:"exit_ip_error,omitempty"`
 	ExitIPCheckedAt       time.Time `json:"exit_ip_checked_at,omitempty"`

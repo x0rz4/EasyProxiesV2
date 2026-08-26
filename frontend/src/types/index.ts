@@ -483,6 +483,8 @@ export interface NodeDetectionResult {
   speed_checked_at?: string
   exit_ip?: string
   exit_ip_family?: string
+  exit_country?: string
+  exit_country_code?: string
   exit_ip_status: NodeCheckStatus
   exit_ip_error?: string
   exit_ip_checked_at?: string
