@@ -37,6 +37,7 @@ func probeExitIP(runtime Runtime, geo *geoip.Lookup) IPInfo {
 	if info.IP == "" {
 		return info
 	}
+	info = mergeIPMetadata(info, fetchIPMetadata(runtime, info.IP))
 	// IP quality is intentionally handled by the independent node diagnostics
 	// providers. Reachability and geography alone cannot prove purity or assign
 	// a fraud score, so legacy fields remain unknown here.

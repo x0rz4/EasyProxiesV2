@@ -1,6 +1,7 @@
 import { useState, useRef } from 'react'
 import type { NodeCheckResultItem, NodeSnapshot, UnlockResult } from '../types'
 import { regionFlag } from '../utils/region'
+import { displayLatency, unlockNetworkInfo } from '../utils/unlockDisplay'
 import { Globe2, ShieldCheck, Tv } from 'lucide-react'
 
 interface UnlockDrawerProps {
@@ -19,9 +20,12 @@ export default function UnlockDrawer({ node, result, diagnostic, isOpen, onClose
 
   if (!isOpen || !node) return null
 
-  const ipApi = diagnostic?.quality.find((item) => item.provider === 'ip-api')
   const detectedIP = diagnostic?.detection?.exit_ip || result?.ip.ip || ''
-  const exitCountryCode = diagnostic?.detection?.exit_country_code || ipApi?.country_code || result?.ip.iso_code || ''
+  const network = unlockNetworkInfo(diagnostic, result)
+  const latency = displayLatency(node, diagnostic)
+  const countryLabel = network.countryCode && network.country && network.country.toUpperCase() !== network.countryCode
+    ? `${network.country} (${network.countryCode})`
+    : network.country || network.countryCode || '未检测'
 
   const handleSpeedtest = () => {
     if (speedTesting) return
@@ -77,7 +81,7 @@ export default function UnlockDrawer({ node, result, diagnostic, isOpen, onClose
           <div>
             <h2 className="text-lg font-bold truncate max-w-[300px]">{node.name}</h2>
             <div className="text-sm opacity-60 flex items-center gap-2 mt-1">
-              <span>{regionFlag(exitCountryCode)} 落地 {exitCountryCode.toUpperCase() || '未检测'}</span>
+              <span>{regionFlag(network.countryCode)} 落地 {network.countryCode || '未检测'}</span>
               <span>•</span>
               <span className="font-mono">{node.tag}</span>
             </div>
@@ -103,17 +107,17 @@ export default function UnlockDrawer({ node, result, diagnostic, isOpen, onClose
                 </div>
                 <div className="flex justify-between">
                   <span className="opacity-60">归属地</span>
-                  <span>{regionFlag(diagnostic?.detection?.exit_country_code || ipApi?.country_code || result?.ip.iso_code || '')} {diagnostic?.detection?.exit_country || ipApi?.country || result?.ip.country || '未检测'}</span>
+                  <span>{regionFlag(network.countryCode)} {countryLabel}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="opacity-60">ASN</span>
-                  <span>{ipApi?.asn || result?.ip.asn || '-'}</span>
+                  <span>{network.asn || '-'}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="opacity-60">ISP/Org</span>
-                  <span className="text-right truncate max-w-[200px]">{ipApi?.org || ipApi?.isp || result?.ip.org || '-'}</span>
+                  <span className="text-right truncate max-w-[200px]" title={network.organization || undefined}>{network.organization || '-'}</span>
                 </div>
-                <div className="flex justify-between"><span className="opacity-60">检测延迟</span><span>{diagnostic?.detection?.latency_ms == null ? '未检测' : `${diagnostic.detection.latency_ms} ms`}</span></div>
+                <div className="flex justify-between"><span className="opacity-60">检测延迟</span><span>{latency.value == null ? '未检测' : <>{latency.value} ms <span className="ml-1 text-[10px] opacity-50">{latency.source}</span></>}</span></div>
                 <div className="flex justify-between"><span className="opacity-60">平均 / 峰值</span><span className="text-right">{diagnostic?.detection?.average_bytes_per_second == null ? '未检测' : `${formatBytesSpeed(diagnostic.detection.average_bytes_per_second)} / ${formatBytesSpeed(diagnostic.detection.peak_bytes_per_second || 0)}`}</span></div>
                 <div className="flex justify-between items-center">
                   <span className="opacity-60">IP 类型</span>

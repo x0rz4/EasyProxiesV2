@@ -12,6 +12,7 @@ import type {
 import { cancelNodeCheckTask, createNodeCheckTask, fetchConfigNodes, fetchNodeCheckResults, fetchNodeCheckSettings, fetchNodeCheckTasks, fetchNodes, fetchUnlockResults, streamNodeCheckTask, unlockNode, updateNodeCheckSettings } from '../api/client'
 import { createFuzzySearcher, searchAllTokens } from '../utils/fuzzySearch'
 import { regionFlag } from '../utils/region'
+import { displayLatency, unlockNetworkInfo } from '../utils/unlockDisplay'
 import { PageContent, PageHeader, PageLayout, surfaceClass } from './ui/PageLayout'
 import UnlockDrawer from './UnlockDrawer'
 import {
@@ -315,7 +316,7 @@ export default function UnlockPanel() {
   const countries = useMemo(() => {
     const counts = new Map<string, number>()
     for (const n of nodes) {
-      const code = landingCountryCode(diagnostics[n.node_id], results[n.tag])
+      const code = unlockNetworkInfo(diagnostics[n.node_id], results[n.tag]).countryCode
       if (code) {
         counts.set(code.toUpperCase(), (counts.get(code.toUpperCase()) || 0) + 1)
       }
@@ -339,7 +340,7 @@ export default function UnlockPanel() {
   const filterableNodes = useMemo(() => {
     return nodes.filter((n) => {
       if (countryFilter) {
-        const c = landingCountryCode(diagnostics[n.node_id], results[n.tag])
+        const c = unlockNetworkInfo(diagnostics[n.node_id], results[n.tag]).countryCode
         if (c !== countryFilter.toUpperCase()) return false
       }
 
@@ -400,6 +401,7 @@ export default function UnlockPanel() {
     const config = nodeConfigByID.get(node.node_id)
     const result = results[node.tag]
     const diagnostic = diagnostics[node.node_id]
+    const network = unlockNetworkInfo(diagnostic, result)
     return {
       node,
       config,
@@ -408,9 +410,9 @@ export default function UnlockPanel() {
       uri: config?.uri || node.uri,
       tagNames: config?.tags || [],
       exitIp: `${diagnostic?.detection?.exit_ip || ''} ${result?.ip?.ip || ''}`,
-      landingCountry: `${diagnostic?.detection?.exit_country || ''} ${landingCountryCode(diagnostic, result)} ${result?.ip?.country || ''}`,
+      landingCountry: `${network.country} ${network.countryCode}`,
       configuredRegion: `${config?.country || ''} ${config?.region || ''} ${node.country || ''} ${node.region || ''}`,
-      qualityText: diagnostic?.quality.map((item) => `${item.ip || ''} ${item.asn || ''} ${item.org || ''} ${item.isp || ''}`).join(' ') || '',
+      qualityText: `${network.asn} ${network.organization} ${diagnostic?.quality.map((item) => `${item.ip || ''} ${item.asn || ''} ${item.org || ''} ${item.isp || ''}`).join(' ') || ''}`,
       source: `${config?.source || ''} ${sourceLabel(config?.source)}`,
       port: String(config?.port || node.port || ''),
     }
@@ -436,8 +438,12 @@ export default function UnlockPanel() {
       if (sortKey === 'name') {
         cmp = a.name.localeCompare(b.name)
       } else if (sortKey === 'latency') {
-        const valA = diagnostics[a.node_id]?.detection?.latency_ms ?? Infinity
-        const valB = diagnostics[b.node_id]?.detection?.latency_ms ?? Infinity
+        const valA = displayLatency(a, diagnostics[a.node_id]).value
+        const valB = displayLatency(b, diagnostics[b.node_id]).value
+        if (valA == null || valB == null) {
+          if (valA == null && valB == null) return 0
+          return valA == null ? 1 : -1
+        }
         cmp = valA - valB
       } else if (sortKey === 'speed') {
         const valA = diagnostics[a.node_id]?.detection?.average_bytes_per_second ?? -1
@@ -1114,13 +1120,6 @@ function QualityBadges({ item, drift }: { item: NodeCheckResultItem['quality'][n
   return <div className="flex flex-wrap items-center gap-1"><span className="badge badge-ghost badge-xs">{item.provider}</span>{item.status === 'partial' && <span className="badge badge-warning badge-outline badge-xs">信息不全</span>}{item.is_residential != null && <span className={cn('badge badge-xs', item.is_residential ? 'badge-success' : 'badge-ghost')}>{item.is_residential ? '住宅' : '机房'}</span>}{item.is_broadcast != null && <span className={cn('badge badge-xs', item.is_broadcast ? 'badge-warning' : 'badge-success')}>{item.is_broadcast ? '广播' : '原生'}</span>}{item.proxy === true && <span className="badge badge-warning badge-xs">代理</span>}{item.hosting === true && <span className="badge badge-warning badge-xs">托管</span>}{item.fraud_score != null && <span className={cn('badge badge-xs border-none', fraudClass(item.fraud_score))} title={`${item.fraud_score} · ${fraudLabel(item.fraud_score)}`}>{item.fraud_score} {fraudLabel(item.fraud_score)}</span>}{drift && <span className="badge badge-error badge-xs">漂移</span>}</div>
 }
 
-function landingCountryCode(diagnostic?: NodeCheckResultItem, result?: UnlockResult) {
-  return (diagnostic?.detection?.exit_country_code
-    || diagnostic?.quality.find((item) => item.provider === 'ip-api' && item.country_code)?.country_code
-    || result?.ip?.iso_code
-    || '').toUpperCase()
-}
-
 function fraudClass(score: number) { if (score <= 10) return 'bg-emerald-600 text-white'; if (score <= 30) return 'bg-green-500 text-white'; if (score <= 50) return 'bg-lime-500 text-lime-950'; if (score <= 70) return 'bg-amber-400 text-amber-950'; if (score <= 89) return 'bg-orange-500 text-white'; return 'bg-red-600 text-white' }
 function fraudLabel(score: number) { if (score <= 10) return '极佳'; if (score <= 30) return '优秀'; if (score <= 50) return '良好'; if (score <= 70) return '中等'; if (score <= 89) return '差'; return '极差' }
 function speedColor(bytesPerSecond: number) { const mb = bytesPerSecond / 1024 / 1024; return mb >= 5 ? 'text-success' : mb >= 1 ? 'text-warning' : 'text-error' }
@@ -1157,12 +1156,13 @@ function UnlockRow({
   onCheck: (e: React.MouseEvent) => void
 }) {
   const err = nodeError || result?.error
-  const exitCountryCode = landingCountryCode(diagnostic, result)
+  const network = unlockNetworkInfo(diagnostic, result)
+  const exitCountryCode = network.countryCode
+  const latency = displayLatency(node, diagnostic)
   const configuredRegion = config?.region || node.region || config?.country || node.country || ''
   const configuredTags = config?.tags || []
   const port = config?.port ?? node.port
   const source = config?.source ? sourceLabel(config.source) : ''
-  const ipQuality = diagnostic?.quality.find((item) => item.provider === 'ip-api')
 
   const renderIpRisk = () => {
     const quality = diagnostic?.quality || []
@@ -1271,19 +1271,22 @@ function UnlockRow({
         </div>
       </td>
       <td className="w-24">
-        {diagnostic?.detection?.latency_ms != null ? (
-          <span
-            className={cn(
-              'font-mono text-xs font-semibold tabular-nums',
-              diagnostic.detection.latency_ms < 200
-                ? 'text-success'
-                : diagnostic.detection.latency_ms < 500
-                  ? 'text-warning'
-                  : 'text-error',
-            )}
-          >
-            {diagnostic.detection.latency_ms} ms
-          </span>
+        {latency.value != null ? (
+          <div title={`${latency.source}延迟`}>
+            <span
+              className={cn(
+                'font-mono text-xs font-semibold tabular-nums',
+                latency.value < 200
+                  ? 'text-success'
+                  : latency.value < 500
+                    ? 'text-warning'
+                    : 'text-error',
+              )}
+            >
+              {latency.value} ms
+            </span>
+            <div className="mt-0.5 text-[10px] text-base-content/40">{latency.source}</div>
+          </div>
         ) : (
           <span className="font-mono text-xs text-base-content/35">—</span>
         )}
@@ -1302,9 +1305,9 @@ function UnlockRow({
             </span>
             <span
               className="truncate text-[10px] text-base-content/50"
-              title={diagnostic?.quality.map((item) => `${item.asn || ''} ${item.org || item.isp || ''}`).join(' ')}
+              title={`${network.asn} ${network.organization}`.trim() || undefined}
             >
-              {exitCountryCode} {ipQuality?.asn} {ipQuality?.org || ipQuality?.isp}
+              {exitCountryCode} {network.asn} {network.organization}
             </span>
           </div>
         ) : (
