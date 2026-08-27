@@ -89,6 +89,18 @@ type nodeCheckTask struct {
 	landingIPs map[int64]string
 }
 
+// nodeIDs returns the store IDs of the task's nodes. task.nodes is fixed at
+// construction, so no lock is needed.
+func (t *nodeCheckTask) nodeIDs() []int64 {
+	ids := make([]int64, 0, len(t.nodes))
+	for _, node := range t.nodes {
+		if node.NodeID > 0 {
+			ids = append(ids, node.NodeID)
+		}
+	}
+	return ids
+}
+
 func (t *nodeCheckTask) copySnapshot() nodeCheckTaskSnapshot {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -267,6 +279,10 @@ func (m *nodeCheckManager) run(task *nodeCheckTask) {
 	final := task.copySnapshotLocked()
 	task.mu.Unlock()
 	m.persist(task)
+	// Per-stage enqueues cover the facts each stage wrote; this is the backstop for
+	// a node whose stage failed early, and it costs nothing extra because the queue
+	// coalesces it with everything already pending.
+	m.server.enqueueRetag(task.nodeIDs()...)
 	task.publish(nodeCheckEvent{Type: "done", Task: &final})
 	m.mu.Lock()
 	if m.active == task {
@@ -311,6 +327,7 @@ func (m *nodeCheckManager) runLatency(task *nodeCheckTask) {
 				task.mu.Unlock()
 			}
 			_ = m.server.store.UpsertNodeDetectionResult(context.Background(), result)
+			m.server.enqueueRetag(node.NodeID)
 			task.updateStage("latency", status)
 			event := nodeCheckEvent{Type: "result", Phase: "latency", NodeID: node.NodeID, Tag: node.Tag, Name: node.Name, Status: status, Error: errText, LatencyMs: result.LatencyMs}
 			task.publish(event)
@@ -367,6 +384,7 @@ func (m *nodeCheckManager) runSpeed(task *nodeCheckTask) {
 				status, errText, result.SpeedStatus, result.SpeedError = "failed", err.Error(), "failed", err.Error()
 			}
 			_ = m.server.store.UpsertNodeDetectionResult(context.Background(), result)
+			m.server.enqueueRetag(node.NodeID)
 			task.updateStage("speed", status)
 			task.publish(nodeCheckEvent{Type: "result", Phase: "speed", NodeID: node.NodeID, Tag: node.Tag, Name: node.Name, Status: status, Error: errText, Speed: &speed, DownloadedBytes: speed.BytesDownloaded})
 			m.persist(task)
@@ -433,6 +451,7 @@ func (m *nodeCheckManager) runQuality(task *nodeCheckTask) {
 			if saveErr := m.server.store.UpsertNodeDetectionResult(context.Background(), result); saveErr == nil && result.ExitIPStatus == "success" {
 				markLocation(node, result.ExitCountryCode, result.ExitCountry)
 			}
+			m.server.enqueueRetag(node.NodeID)
 		}(node)
 	}
 	wg.Wait()
@@ -538,9 +557,13 @@ func (m *nodeCheckManager) runQuality(task *nodeCheckTask) {
 	m.persist(task)
 }
 
+// saveQuality persists one provider's IP-quality result. Every quality write in
+// this file funnels through here, so this is also the one place the tag queue has
+// to hear about a new ipq.* fact.
 func (m *nodeCheckManager) saveQuality(task *nodeCheckTask, node Snapshot, quality ipquality.Result) {
 	result := store.NodeIPQualityResult{NodeID: node.NodeID, TaskID: task.snapshot.ID, Provider: quality.Provider, Status: quality.Status, IP: quality.IP, Family: quality.Family, Country: quality.Country, CountryCode: quality.CountryCode, ASN: quality.ASN, Org: quality.Org, ISP: quality.ISP, IsBroadcast: quality.IsBroadcast, IsResidential: quality.IsResidential, FraudScore: quality.FraudScore, Proxy: quality.Proxy, Hosting: quality.Hosting, Mobile: quality.Mobile, Reason: quality.Reason, CheckedAt: quality.CheckedAt}
 	_ = m.server.store.UpsertNodeIPQualityResult(context.Background(), &result)
+	m.server.enqueueRetag(node.NodeID)
 	task.publish(nodeCheckEvent{Type: "result", Phase: "quality", NodeID: node.NodeID, Tag: node.Tag, Name: node.Name, Status: quality.Status, Error: quality.Reason, Quality: &result})
 }
 

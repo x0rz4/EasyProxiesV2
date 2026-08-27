@@ -29,6 +29,7 @@ import (
 	json "easy_proxies/internal/jsonx"
 	"easy_proxies/internal/nodecodec"
 	"easy_proxies/internal/nodedetect"
+	"easy_proxies/internal/nodetag"
 	"easy_proxies/internal/store"
 	"easy_proxies/internal/unlock"
 
@@ -188,6 +189,17 @@ type Server struct {
 	geoLookupPath  string        // path the cached geoLookup was opened from
 	geoLookupMtime time.Time     // mtime of the db file when geoLookup was opened
 	nodeChecks     *nodeCheckManager
+	retag          RetagQueue       // optional, nil disables automatic re-tagging
+	tagSvc         *nodetag.Service // optional, backs the tag API
+}
+
+// RetagQueue is the slice of *nodetag.Queue the detection pipeline drives. It is
+// an interface so a test can observe enqueues without a store-backed service;
+// every method is safe on a nil implementation, which is what lets probe
+// goroutines call it without knowing the shutdown order.
+type RetagQueue interface {
+	Enqueue(nodeIDs ...int64)
+	EnqueueAll()
 }
 
 // NewServer constructs a server; it can be nil when disabled.
@@ -362,6 +374,41 @@ func (s *Server) SetStore(st store.Store) {
 			}
 		}
 	}
+}
+
+// SetRetagQueue binds the queue that recomputes auto tags after a detection.
+// Nil means detections make no tag changes at all.
+func (s *Server) SetRetagQueue(queue RetagQueue) {
+	if s != nil {
+		s.retag = queue
+	}
+}
+
+// SetTagService binds the tagging service backing the tag API.
+func (s *Server) SetTagService(svc *nodetag.Service) {
+	if s != nil {
+		s.tagSvc = svc
+	}
+}
+
+// enqueueRetag asks for a recompute of the given nodes. It never blocks and is
+// a no-op when no queue is wired, so a detection path can call it
+// unconditionally.
+func (s *Server) enqueueRetag(nodeIDs ...int64) {
+	if s == nil || s.retag == nil || len(nodeIDs) == 0 {
+		return
+	}
+	s.retag.Enqueue(nodeIDs...)
+}
+
+// enqueueRetagAll asks for a recompute of every node. Node CRUD and a
+// subscription refresh use it because they change which nodes exist rather than
+// what is known about one node.
+func (s *Server) enqueueRetagAll() {
+	if s == nil || s.retag == nil {
+		return
+	}
+	s.retag.EnqueueAll()
 }
 
 // SetConfig binds the persistable config object for settings API.
@@ -1659,26 +1706,12 @@ func (s *Server) persistUnlockResult(snap *Snapshot, result *unlock.Result) {
 		s.logger.Printf("[unlock] failed to persist result for node %d (%s): %v", nodeID, snap.Tag, err)
 	}
 
-	// Auto-tagging logic
-	if node, err := s.store.GetNode(ctx, nodeID); err == nil && node != nil {
-		var newTags []string
-		if result.IP.Pure {
-			newTags = append(newTags, "原生IP")
-		}
-		if result.IP.RiskLevel == "High" || result.IP.RiskLevel == "Medium" {
-			newTags = append(newTags, "高风险")
-		}
-		for _, svc := range result.Services {
-			if svc.Status == unlock.StatusUnlocked {
-				newTags = append(newTags, svc.DisplayName+"解锁")
-			}
-		}
-
-		node.Tags = newTags
-		if err := s.store.UpdateNode(ctx, node); err != nil {
-			s.logger.Printf("[unlock] failed to update tags for node %d: %v", nodeID, err)
-		}
-	}
+	// The unlock facts this result carries — IP purity, risk level, per-service
+	// status — are what the 原生IP / 高风险 / <服务>解锁 tags are computed from.
+	// Writing those names here is what used to delete every hand-placed tag on the
+	// node, so the result is only persisted and the tagging service is asked to
+	// recompute from it.
+	s.enqueueRetag(nodeID)
 }
 
 // nodeIDForSnapshot resolves a monitor Snapshot to its store node ID by URI,
@@ -2109,6 +2142,10 @@ func (s *Server) handleSubscriptionRefresh(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// A refresh creates, updates and disables nodes, so which nodes exist changed
+	// and every one of them needs its auto tags re-derived.
+	s.enqueueRetagAll()
+
 	status := s.subRefresher.Status()
 	writeJSON(w, map[string]any{
 		"message":            "刷新成功",
@@ -2342,6 +2379,7 @@ func (s *Server) handleConfigNodes(w http.ResponseWriter, r *http.Request) {
 			s.respondNodeError(w, err)
 			return
 		}
+		s.enqueueRetagAll()
 		reloadError := s.reloadAfterGroupMutation(r.Context())
 		writeJSON(w, map[string]any{"node": node, "message": "节点已添加", "reloaded": reloadError == "", "reload_error": reloadError})
 	default:
@@ -2376,6 +2414,9 @@ func (s *Server) handleConfigNodeItem(w http.ResponseWriter, r *http.Request) {
 			s.respondNodeError(w, err)
 			return
 		}
+		// An edit can change the URI, which drops the cached detection facts an
+		// auto tag was derived from.
+		s.enqueueRetagAll()
 		reloadError := s.reloadAfterGroupMutation(r.Context())
 		writeJSON(w, map[string]any{"node": node, "message": "节点已更新", "reloaded": reloadError == "", "reload_error": reloadError})
 	case http.MethodPatch:
@@ -2396,6 +2437,7 @@ func (s *Server) handleConfigNodeItem(w http.ResponseWriter, r *http.Request) {
 			s.respondNodeError(w, err)
 			return
 		}
+		s.enqueueRetagAll()
 		action := "已启用"
 		if !*body.Enabled {
 			action = "已禁用"
@@ -2414,6 +2456,7 @@ func (s *Server) handleConfigNodeItem(w http.ResponseWriter, r *http.Request) {
 			s.respondNodeError(w, err)
 			return
 		}
+		s.enqueueRetagAll()
 		reloadError := s.reloadAfterGroupMutation(r.Context())
 		writeJSON(w, map[string]any{"message": "节点已删除", "reloaded": reloadError == "", "reload_error": reloadError})
 	default:
@@ -2460,7 +2503,9 @@ func (s *Server) handleConfigNodesBatchToggle(w http.ResponseWriter, r *http.Req
 	if !body.Enabled {
 		action = "禁用"
 	}
-
+	if successCount > 0 {
+		s.enqueueRetagAll()
+	}
 	// Auto-reload after batch toggle
 	reloadMsg := ""
 	if successCount > 0 {
@@ -2520,6 +2565,7 @@ func (s *Server) handleConfigNodesBatchDelete(w http.ResponseWriter, r *http.Req
 	// Auto-reload after batch delete
 	reloadMsg := ""
 	if successCount > 0 {
+		s.enqueueRetagAll()
 		if err := s.nodeMgr.TriggerReload(r.Context()); err != nil {
 			s.logger.Printf("auto-reload after batch delete failed: %v", err)
 			reloadMsg = "（自动重载失败，请手动重载）"

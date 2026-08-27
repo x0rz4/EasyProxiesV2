@@ -18,9 +18,39 @@ import (
 	"easy_proxies/internal/group"
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/nodecodec"
+	"easy_proxies/internal/nodefacts"
+	"easy_proxies/internal/nodetag"
 	"easy_proxies/internal/store"
 	"easy_proxies/internal/subscription"
+	"easy_proxies/internal/unlock"
 )
+
+// ipQualityFactProviders are the providers node checks write to
+// node_ip_quality_results. Unlike the unlock checkers there is no registry to
+// enumerate, so the two are named here and must be kept in step with
+// nodecheck.go's runQuality.
+var ipQualityFactProviders = []nodefacts.ProviderInfo{
+	{Name: "ippure", Label: "IPPure"},
+	{Name: "ip-api", Label: "ip-api"},
+}
+
+// newTagService assembles the tagging service. The unlock providers come from the
+// checker registry rather than a list here, so registering a new checker adds its
+// rule fields and its builtin template with no change in this file.
+func newTagService(dataStore store.Store) *nodetag.Service {
+	metas := unlock.ListProviderMetas()
+	unlockProviders := make([]nodefacts.ProviderInfo, 0, len(metas))
+	for _, meta := range metas {
+		unlockProviders = append(unlockProviders,
+			nodefacts.ProviderInfo{Name: meta.Value, Label: meta.Label})
+	}
+	registry := nodefacts.DefaultRegistry(
+		nodefacts.WithUnlockProviders(unlockProviders),
+		nodefacts.WithIPQualityProviders(ipQualityFactProviders))
+	return nodetag.NewService(dataStore,
+		nodetag.WithRegistry(registry),
+		nodetag.WithUnlockProviders(unlockProviders))
+}
 
 // Run builds the runtime components from config and blocks until shutdown.
 func Run(ctx context.Context, cfg *config.Config) error {
@@ -107,6 +137,22 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		server.SetConfig(cfg)
 		server.SetStore(dataStore)
 	}
+
+	// ── 5b. Automatic node tagging ──
+	// The queue is what keeps a detection from writing tags inline: detections
+	// persist facts, the queue coalesces them, and the service derives tags from
+	// the facts. Nothing is tagged until the builtin templates are seeded through
+	// POST /api/tags/templates, or an operator writes a rule.
+	tagService := newTagService(dataStore)
+	retagQueue := nodetag.NewQueue(tagService)
+	defer retagQueue.Close()
+	if server := boxMgr.MonitorServer(); server != nil {
+		server.SetTagService(tagService)
+		server.SetRetagQueue(retagQueue)
+	}
+	// Facts change while the process is down (a node was edited, a rule was
+	// imported), so the first run reconciles everything.
+	retagQueue.EnqueueAll()
 
 	// ── 6. Create and start SubscriptionManager ──
 	// Always created so it can dynamically respond to config changes
