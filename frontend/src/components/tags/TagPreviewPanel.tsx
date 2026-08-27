@@ -27,7 +27,7 @@ export default function TagPreviewPanel({ preview, loading, error }: TagPreviewP
         <Metric label="事实未知" value={preview.unknown_count} tone={preview.unknown_count ? 'text-error' : ''} />
       </div>
       <div className="flex items-center justify-between text-xs text-base-content/45"><span>总节点 {preview.total_nodes}</span><span>展示 {preview.samples.length} 个样本</span></div>
-      <div className="max-h-[52vh] space-y-2 overflow-y-auto pr-1">
+      <div className="space-y-2 pr-1">
         {preview.samples.map((sample) => (
           <article key={sample.node_id} className={cn('rounded-xl border p-3', sample.applied ? 'border-success/25 bg-success/5' : sample.matched ? 'border-warning/30 bg-warning/5' : 'border-base-300 bg-base-200/20')}>
             <div className="flex items-start gap-2">

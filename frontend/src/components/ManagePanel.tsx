@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react'
+import { useDeferredValue, useMemo, useState } from 'react'
 import type { ConfigNodeConfig, ConfigNodePayload, NodeSnapshot } from '../types'
 import {
   fetchConfigNodes, createConfigNode, updateConfigNode, deleteConfigNode,
@@ -12,6 +12,7 @@ import { PageContent, PageHeader, PageLayout } from './ui/PageLayout'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { cn } from '../utils/cn'
+import { createFuzzySearcher, searchAllTokens } from '../utils/fuzzySearch'
 import NodeTagPicker from './tags/NodeTagPicker'
 import {
   ArrowDown, ArrowUp, ArrowUpDown, Ban, Server, SlidersHorizontal, ChevronDown,
@@ -187,6 +188,7 @@ export default function ManagePanel() {
 
   // Filters
   const [filter, setFilter] = useState('')
+  const deferredFilter = useDeferredValue(filter)
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('')
   const [regionFilter, setRegionFilter] = useState('')
   const [sourceFilter, setSourceFilter] = useState('')
@@ -313,15 +315,6 @@ export default function ManagePanel() {
 
   const filteredNodes = useMemo(() => {
     return mergedNodes.filter(n => {
-      if (filter) {
-        const q = filter.toLowerCase()
-        if (!n.name.toLowerCase().includes(q) &&
-            !n.uri.toLowerCase().includes(q) &&
-            !(n.country || '').toLowerCase().includes(q) &&
-            !(n.region || '').toLowerCase().includes(q)) {
-          return false
-        }
-      }
       if (statusFilter && n.runtimeStatus !== statusFilter) return false
       if (regionFilter && n.region !== regionFilter) return false
       if (sourceFilter && n.source !== sourceFilter) return false
@@ -331,11 +324,28 @@ export default function ManagePanel() {
           !n.subscription_ids.includes(Number(subscriptionFilter))) return false
       return true
     })
-  }, [mergedNodes, filter, statusFilter, regionFilter, sourceFilter, typeFilter, subscriptionFilter])
+  }, [mergedNodes, statusFilter, regionFilter, sourceFilter, typeFilter, subscriptionFilter])
+
+  const nodeSearcher = useMemo(() => createFuzzySearcher(filteredNodes, [
+    { name: 'name', weight: 0.45 },
+    { name: 'uri', weight: 0.30 },
+    { name: 'country', weight: 0.15 },
+    { name: 'region', weight: 0.10 },
+  ]), [filteredNodes])
 
   const sortedNodes = useMemo(() => {
+    const query = deferredFilter.trim()
+    if (query) {
+      return searchAllTokens(nodeSearcher, query)
+        .sort((a, b) => {
+          const scoreDifference = a.score - b.score
+          if (Math.abs(scoreDifference) > Number.EPSILON) return scoreDifference
+          return compareManageNodes(a.item, b.item, sortKey, sortDir) || a.refIndex - b.refIndex
+        })
+        .map((result) => result.item)
+    }
     return [...filteredNodes].sort((a, b) => compareManageNodes(a, b, sortKey, sortDir))
-  }, [filteredNodes, sortKey, sortDir])
+  }, [deferredFilter, filteredNodes, nodeSearcher, sortKey, sortDir])
 
   const visibleSelectedNames = useMemo(
     () => sortedNodes.filter(node => selectedNodes.has(node.name)).map(node => node.name),
@@ -704,9 +714,11 @@ export default function ManagePanel() {
             <input
               type="text"
               className="input input-md w-full pl-11 bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
-              placeholder="搜索节点名称、URI 或 地区..."
+              placeholder="模糊搜索节点（支持多关键词）..."
               value={filter}
               onChange={(e) => setFilter(e.target.value)}
+              aria-label="模糊搜索节点名称、URI、国家或地区"
+              title="支持空格分隔的多关键词和轻微拼写错误"
             />
           </div>
 
@@ -860,6 +872,9 @@ export default function ManagePanel() {
                           ? '未找到匹配的节点数据'
                           : '暂无配置节点'}
                       </p>
+                      {filter.trim() && (
+                        <p className="text-sm text-base-content/50 mt-1">请尝试缩短关键词或检查拼写</p>
+                      )}
                       {!(filter || statusFilter || regionFilter || sourceFilter || typeFilter || subscriptionFilter !== 'all') && (
                         <p className="text-sm text-base-content/50 mt-1">请点击右上角「添加节点」或导入配置以开始</p>
                       )}

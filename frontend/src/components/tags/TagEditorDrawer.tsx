@@ -81,13 +81,13 @@ export default function TagEditorDrawer({ tag, mutexGroups, schema, saving, onCl
 
   return (
     <div className="modal modal-open" role="dialog" aria-modal="true" aria-label={tag ? '编辑标签' : '新建标签'}>
-      <div className="modal-box max-h-[94vh] w-11/12 max-w-7xl overflow-hidden p-0">
-        <header className="flex items-center justify-between border-b border-base-300 bg-base-100/95 px-5 py-4 backdrop-blur-xl">
+      <div className="modal-box flex h-[94dvh] max-h-[94vh] w-11/12 max-w-7xl flex-col overflow-hidden p-0">
+        <header className="flex shrink-0 items-center justify-between border-b border-base-300 bg-base-100/95 px-5 py-4 backdrop-blur-xl">
           <div><h3 className="text-lg font-bold">{tag ? '编辑标签' : '新建标签'}</h3><p className="mt-0.5 text-xs text-base-content/50">人工标签立即生效；自动标签由规则重算维护</p></div>
           <button type="button" className="btn btn-ghost btn-sm btn-square" onClick={onClose} aria-label="关闭"><X className="h-4 w-4" /></button>
         </header>
-        <div className="grid max-h-[calc(94vh-8.5rem)] overflow-y-auto xl:grid-cols-[minmax(0,1.45fr)_minmax(21rem,0.75fr)] xl:overflow-hidden">
-          <div className="space-y-5 p-5 sm:p-6 xl:overflow-y-auto">
+        <div className="grid min-h-0 flex-1 overflow-y-auto xl:grid-cols-[minmax(0,1.45fr)_minmax(21rem,0.75fr)] xl:overflow-hidden">
+          <div className="min-h-0 space-y-5 p-5 sm:p-6 xl:overflow-y-auto">
             <div className="grid gap-4 sm:grid-cols-2">
               <Field label="标签名称" hint="1–64 个字符，支持 emoji"><input ref={firstInput} className={cn('input w-full', controlClass)} value={form.name} maxLength={64} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="例如：香港低延迟" /></Field>
               <Field label="标签颜色"><div className="flex gap-2"><input type="color" className="h-10 w-14 cursor-pointer rounded-lg border border-base-300 bg-base-100 p-1" value={form.color || '#6366f1'} onChange={(event) => setForm({ ...form, color: event.target.value })} aria-label="标签颜色" /><input className={cn('input w-full font-mono', controlClass)} value={form.color || ''} onChange={(event) => setForm({ ...form, color: event.target.value })} /></div></Field>
@@ -98,9 +98,9 @@ export default function TagEditorDrawer({ tag, mutexGroups, schema, saving, onCl
             <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-primary/20 bg-primary/5 p-4"><input type="checkbox" className="toggle toggle-primary mt-0.5" checked={Boolean(form.auto_enabled)} onChange={(event) => setForm({ ...form, auto_enabled: event.target.checked })} /><span><strong className="block text-sm">启用自动打标</strong><span className="mt-0.5 block text-xs leading-5 text-base-content/50">关闭时保留规则但不自动分配；人工标签不受影响。</span></span></label>
             <ConditionBuilder value={rule} schema={schema} onChange={(next) => setForm({ ...form, rule: next })} />
           </div>
-          <aside className="border-t border-base-300 bg-base-200/20 p-5 sm:p-6 xl:overflow-y-auto xl:border-l xl:border-t-0"><div className="mb-4 flex items-center gap-2"><Eye className="h-4 w-4 text-primary" /><div><h4 className="text-sm font-bold">规则预览</h4><p className="text-[10px] text-base-content/45">停止输入 400ms 后自动试跑</p></div></div><TagPreviewPanel preview={preview} loading={previewLoading} error={previewError} /></aside>
+          <aside className="min-h-0 border-t border-base-300 bg-base-200/20 p-5 sm:p-6 xl:overflow-y-auto xl:border-l xl:border-t-0"><div className="mb-4 flex items-center gap-2"><Eye className="h-4 w-4 text-primary" /><div><h4 className="text-sm font-bold">规则预览</h4><p className="text-[10px] text-base-content/45">停止输入 400ms 后自动试跑</p></div></div><TagPreviewPanel preview={preview} loading={previewLoading} error={previewError} /></aside>
         </div>
-        <footer className="flex items-center justify-between gap-3 border-t border-base-300 bg-base-100/95 px-5 py-4 backdrop-blur-xl"><span className="hidden text-xs text-base-content/45 sm:block">规则版本只在条件真正变化时递增</span><div className="ml-auto flex gap-2"><button type="button" className="btn btn-ghost" onClick={onClose}>取消</button><button type="button" className="btn btn-primary min-w-28 gap-2" disabled={!canSave || saving} onClick={() => void onSave({ ...form, name: form.name.trim() })}>{saving ? <span className="loading loading-spinner loading-sm" /> : <Save className="h-4 w-4" />}{tag ? '保存修改' : '创建标签'}</button></div></footer>
+        <footer className="flex shrink-0 items-center justify-between gap-3 border-t border-base-300 bg-base-100/95 px-5 py-4 backdrop-blur-xl"><span className="hidden text-xs text-base-content/45 sm:block">规则版本只在条件真正变化时递增</span><div className="ml-auto flex gap-2"><button type="button" className="btn btn-ghost" onClick={onClose}>取消</button><button type="button" className="btn btn-primary min-w-28 gap-2" disabled={!canSave || saving} onClick={() => void onSave({ ...form, name: form.name.trim() })}>{saving ? <span className="loading loading-spinner loading-sm" /> : <Save className="h-4 w-4" />}{tag ? '保存修改' : '创建标签'}</button></div></footer>
       </div>
       <button className="modal-backdrop" onClick={onClose} aria-label="关闭标签编辑器" />
     </div>

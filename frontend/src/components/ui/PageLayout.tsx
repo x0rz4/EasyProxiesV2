@@ -3,6 +3,7 @@ import type { ReactNode } from 'react'
 interface PageLayoutProps {
   children: ReactNode
   fill?: boolean
+  className?: string
 }
 
 interface PageHeaderProps {
@@ -22,9 +23,9 @@ interface PageContentProps {
 export const surfaceClass = 'rounded-2xl border border-base-300/50 bg-base-100 shadow-sm'
 export const controlClass = 'bg-base-200/50 transition-colors focus:border-primary/50 focus:bg-base-100'
 
-export function PageLayout({ children, fill = false }: PageLayoutProps) {
+export function PageLayout({ children, fill = false, className = '' }: PageLayoutProps) {
   return (
-    <div className={`flex min-h-0 flex-col animate-in fade-in duration-500 ${fill ? 'h-[calc(100vh-4rem)]' : 'min-h-full'}`}>
+    <div className={`flex min-h-0 flex-col animate-in fade-in duration-500 ${fill ? 'h-[calc(100vh-4rem)]' : 'min-h-full'} ${className}`}>
       {children}
     </div>
   )

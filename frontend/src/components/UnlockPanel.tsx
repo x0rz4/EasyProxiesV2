@@ -1,5 +1,6 @@
-import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import type {
+  ConfigNodeConfig,
   NodeSnapshot,
   UnlockResult,
   NodeCheckResultItem,
@@ -8,7 +9,8 @@ import type {
   NodeCheckTask,
   NodeCheckEvent,
 } from '../types'
-import { cancelNodeCheckTask, createNodeCheckTask, fetchNodeCheckResults, fetchNodeCheckSettings, fetchNodeCheckTasks, fetchNodes, fetchUnlockResults, streamNodeCheckTask, unlockNode, updateNodeCheckSettings } from '../api/client'
+import { cancelNodeCheckTask, createNodeCheckTask, fetchConfigNodes, fetchNodeCheckResults, fetchNodeCheckSettings, fetchNodeCheckTasks, fetchNodes, fetchUnlockResults, streamNodeCheckTask, unlockNode, updateNodeCheckSettings } from '../api/client'
+import { createFuzzySearcher, searchAllTokens } from '../utils/fuzzySearch'
 import { regionFlag } from '../utils/region'
 import { PageContent, PageHeader, PageLayout, surfaceClass } from './ui/PageLayout'
 import UnlockDrawer from './UnlockDrawer'
@@ -24,6 +26,31 @@ import { cn } from '../utils/cn'
 type StatusFilterType = '' | 'unlocked' | 'residential' | 'broadcast' | 'proxy' | 'quality_success' | 'quality_failed' | 'speed_fast' | 'speed_failed' | 'fraud_high' | 'locked' | 'mixed' | 'failed' | 'untested'
 type DiagnosticSortKey = 'name' | 'latency' | 'speed' | 'fraud'
 
+interface UnlockSearchRecord {
+  node: NodeSnapshot
+  config?: ConfigNodeConfig
+  name: string
+  runtimeTag: string
+  uri: string
+  tagNames: string[]
+  exitIp: string
+  landingCountry: string
+  configuredRegion: string
+  qualityText: string
+  source: string
+  port: string
+}
+
+function sourceLabel(source?: string) {
+  switch (source) {
+    case 'inline': return '配置文件'
+    case 'nodes_file': return '节点文件'
+    case 'subscription': return '订阅'
+    case 'manual': return '手动添加'
+    default: return source || '-'
+  }
+}
+
 const unlockBadgeClasses: Record<string, string> = {
   netflix: 'bg-[#E50914] text-white',
   disney_plus: 'bg-[#113CCF] text-white',
@@ -38,6 +65,7 @@ const unlockBadgeClasses: Record<string, string> = {
 
 export default function UnlockPanel() {
   const [nodes, setNodes] = useState<NodeSnapshot[]>([])
+  const [configNodes, setConfigNodes] = useState<ConfigNodeConfig[]>([])
   const [loading, setLoading] = useState(true)
 
   // tag -> result. Results are kept across batch runs and single runs alike.
@@ -66,6 +94,7 @@ export default function UnlockPanel() {
 
   // Filter / search
   const [filter, setFilter] = useState('')
+  const deferredFilter = useDeferredValue(filter)
   const [statusFilter, setStatusFilter] = useState<StatusFilterType>('')
   const [countryFilter, setCountryFilter] = useState('')
 
@@ -85,10 +114,14 @@ export default function UnlockPanel() {
   // ---- Node list ----
   const loadNodes = useCallback(async () => {
     try {
-      const res = await fetchNodes()
+      const [res, configRes] = await Promise.all([
+        fetchNodes(),
+        fetchConfigNodes().catch(() => null),
+      ])
       // unlock-checked; the dialer is registered per member tag.
       const usable = (res.nodes || []).filter((n) => n.tag && n.initial_check_done && n.available && !n.blacklisted)
       setNodes(usable)
+      setConfigNodes(configRes?.nodes || [])
       // Load any previously persisted detection results so the user sees
       // last-saved state without re-running checks.
       try {
@@ -293,21 +326,21 @@ export default function UnlockPanel() {
   }, [nodes, diagnostics, results])
 
   // ---- Filtered and sorted data ----
-  const filteredNodes = useMemo(() => {
-    const q = filter.trim().toLowerCase()
+  const nodeConfigByID = useMemo(() => {
+    const byID = new Map(configNodes.filter((node) => node.id).map((node) => [node.id!, node]))
+    const byURI = new Map(configNodes.filter((node) => node.uri).map((node) => [node.uri, node]))
+    const byName = new Map(configNodes.map((node) => [node.name, node]))
+    return new Map(nodes.flatMap((node) => {
+      const config = byID.get(node.node_id) || byURI.get(node.uri) || byName.get(node.name)
+      return config ? [[node.node_id, config] as const] : []
+    }))
+  }, [configNodes, nodes])
+
+  const filterableNodes = useMemo(() => {
     return nodes.filter((n) => {
       if (countryFilter) {
         const c = landingCountryCode(diagnostics[n.node_id], results[n.tag])
         if (c !== countryFilter.toUpperCase()) return false
-      }
-
-      if (q) {
-        const r = results[n.tag]
-        const diagnostic = diagnostics[n.node_id]
-        const qualityText = diagnostic?.quality.map((item) => `${item.ip || ''} ${item.asn || ''} ${item.org || ''} ${item.isp || ''}`).join(' ') || ''
-        const landingCountry = `${diagnostic?.detection?.exit_country || ''} ${landingCountryCode(diagnostic, r)}`
-        const hay = `${n.name} ${n.tag} ${r?.ip?.ip || ''} ${diagnostic?.detection?.exit_ip || ''} ${landingCountry} ${qualityText}`.toLowerCase()
-        if (!hay.includes(q)) return false
       }
 
       if (statusFilter) {
@@ -361,11 +394,44 @@ export default function UnlockPanel() {
       }
       return true
     })
-  }, [nodes, filter, statusFilter, countryFilter, results, errors, diagnostics])
+  }, [nodes, statusFilter, countryFilter, results, errors, diagnostics])
+
+  const searchRecords = useMemo<UnlockSearchRecord[]>(() => filterableNodes.map((node) => {
+    const config = nodeConfigByID.get(node.node_id)
+    const result = results[node.tag]
+    const diagnostic = diagnostics[node.node_id]
+    return {
+      node,
+      config,
+      name: node.name,
+      runtimeTag: node.tag,
+      uri: config?.uri || node.uri,
+      tagNames: config?.tags || [],
+      exitIp: `${diagnostic?.detection?.exit_ip || ''} ${result?.ip?.ip || ''}`,
+      landingCountry: `${diagnostic?.detection?.exit_country || ''} ${landingCountryCode(diagnostic, result)} ${result?.ip?.country || ''}`,
+      configuredRegion: `${config?.country || ''} ${config?.region || ''} ${node.country || ''} ${node.region || ''}`,
+      qualityText: diagnostic?.quality.map((item) => `${item.ip || ''} ${item.asn || ''} ${item.org || ''} ${item.isp || ''}`).join(' ') || '',
+      source: `${config?.source || ''} ${sourceLabel(config?.source)}`,
+      port: String(config?.port || node.port || ''),
+    }
+  }), [diagnostics, filterableNodes, nodeConfigByID, results])
+
+  const nodeSearcher = useMemo(() => createFuzzySearcher(searchRecords, [
+    { name: 'name', weight: 0.24 },
+    { name: 'runtimeTag', weight: 0.10 },
+    { name: 'uri', weight: 0.10 },
+    { name: 'tagNames', weight: 0.12 },
+    { name: 'exitIp', weight: 0.12 },
+    { name: 'landingCountry', weight: 0.10 },
+    { name: 'configuredRegion', weight: 0.06 },
+    { name: 'qualityText', weight: 0.08 },
+    { name: 'source', weight: 0.04 },
+    { name: 'port', weight: 0.04 },
+  ]), [searchRecords])
 
   const sortedNodes = useMemo(() => {
-    if (!sortKey) return filteredNodes
-    return [...filteredNodes].sort((a, b) => {
+    const compareNodes = (a: NodeSnapshot, b: NodeSnapshot) => {
+      if (!sortKey) return 0
       let cmp = 0
       if (sortKey === 'name') {
         cmp = a.name.localeCompare(b.name)
@@ -383,8 +449,20 @@ export default function UnlockPanel() {
         cmp = valA - valB
       }
       return sortDir === 'asc' ? cmp : -cmp
-    })
-  }, [filteredNodes, sortKey, sortDir, diagnostics])
+    }
+
+    const query = deferredFilter.trim()
+    if (query) {
+      return searchAllTokens(nodeSearcher, query)
+        .sort((a, b) => {
+          const scoreDifference = a.score - b.score
+          if (Math.abs(scoreDifference) > Number.EPSILON) return scoreDifference
+          return compareNodes(a.item.node, b.item.node) || a.refIndex - b.refIndex
+        })
+        .map((result) => result.item.node)
+    }
+    return sortKey ? [...filterableNodes].sort(compareNodes) : filterableNodes
+  }, [deferredFilter, diagnostics, filterableNodes, nodeSearcher, sortDir, sortKey])
 
   const progressPct =
     batchProgress.total > 0
@@ -412,7 +490,7 @@ export default function UnlockPanel() {
   const taskTargets = checkScope === 'selected' ? nodes.filter((node) => selectedIds.has(node.node_id)) : sortedNodes
 
   return (
-    <PageLayout>
+    <PageLayout className="lg:h-[calc(100vh-4rem)] lg:min-h-0 lg:overflow-hidden">
       <PageHeader
         title="解锁检测"
         description="手动检测节点延迟、下载速度、独立 IP 质量来源与流媒体解锁；结果不影响路由健康"
@@ -447,13 +525,13 @@ export default function UnlockPanel() {
         }
       />
 
-      <PageContent fill>
-        <p className="mb-4 text-sm leading-6 text-base-content/55">
+      <PageContent fill className="lg:overflow-hidden">
+        <p className="mb-4 shrink-0 text-sm leading-6 text-base-content/55">
           原生 IP / 解锁标签现由“节点标签”页面中的规则产生；本页只负责检测并保存事实。
         </p>
         {/* ---- Batch progress banner ---- */}
         {batchRunning && (
-          <div className={cn(surfaceClass, 'mb-5 border-primary/30 bg-primary/5 p-4 sm:p-5')}>
+          <div className={cn(surfaceClass, 'mb-5 shrink-0 border-primary/30 bg-primary/5 p-4 sm:p-5')}>
             <div className="mb-2.5 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <span className="relative flex h-2.5 w-2.5">
@@ -490,7 +568,7 @@ export default function UnlockPanel() {
         )}
 
         {taskHistory.length > 0 && !batchRunning && (
-          <details className={cn(surfaceClass, 'mb-5 overflow-hidden')}>
+          <details className={cn(surfaceClass, 'mb-5 shrink-0 overflow-hidden')}>
             <summary className="cursor-pointer px-4 py-3 text-sm font-semibold transition-colors hover:bg-base-200/50">最近检测任务（{taskHistory.length}）</summary>
             <div className="max-h-64 overflow-auto border-t border-base-200">
               <table className="table table-sm"><thead><tr><th>时间</th><th>状态</th><th>节点</th><th>流量</th><th>阶段</th></tr></thead><tbody>{taskHistory.map((task) => <tr key={task.id}><td className="text-xs">{new Date(task.created_at).toLocaleString('zh-CN')}</td><td><span className={cn('badge badge-sm', task.status === 'completed' ? 'badge-success' : task.status === 'running' ? 'badge-warning' : task.status === 'cancelled' || task.status === 'interrupted' ? 'badge-ghost' : 'badge-error')}>{taskStatusLabel(task.status)}</span></td><td className="font-mono text-xs">{task.completed_nodes}/{task.total_nodes}</td><td className="font-mono text-xs">{formatBytes(task.downloaded_bytes)}</td><td className="text-xs">{Object.entries(task.stages).filter(([, enabled]) => enabled).map(([phase]) => phaseLabel(phase)).join('、')}</td></tr>)}</tbody></table>
@@ -499,7 +577,7 @@ export default function UnlockPanel() {
         )}
 
         {/* ---- Redesigned Status Summary Cards ---- */}
-        <section className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+        <section className="mb-5 grid shrink-0 grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
           <SummaryCard
             label="解锁已检测 / 节点"
             value={nodes.length > 0 ? `${summary.tested} / ${summary.total}` : '0'}
@@ -567,7 +645,7 @@ export default function UnlockPanel() {
         </section>
 
         {/* ---- Redesigned Search & Filter Toolbar ---- */}
-        <section className={cn(surfaceClass, 'mb-5 p-4 sm:p-5')}>
+        <section className={cn(surfaceClass, 'mb-5 shrink-0 p-4 sm:p-5')}>
           <div className="flex flex-col gap-4">
             {/* Row 1: Search input + Country selector */}
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
@@ -579,9 +657,11 @@ export default function UnlockPanel() {
                 <input
                   type="text"
                   className="input input-md w-full rounded-xl border border-base-300/70 bg-base-200/40 pl-10 pr-9 text-sm transition-colors focus:border-primary/50 focus:bg-base-100 focus:outline-none"
-                  placeholder="搜索节点名称、落地国家 (如 HK/JP)、Tag 或出口 IP…"
+                  placeholder="模糊搜索名称、标签、来源、出口 IP…（空格分隔多关键词）"
                   value={filter}
                   onChange={(e) => setFilter(e.target.value)}
+                  aria-label="模糊搜索节点，支持空格分隔的多关键词"
+                  title="支持空格分隔的多关键词和轻微拼写错误"
                 />
                 {filter && (
                   <button
@@ -739,7 +819,7 @@ export default function UnlockPanel() {
                 <tr>
                   <th className="w-12 text-center"><input type="checkbox" className="checkbox checkbox-sm" checked={allFilteredSelected} onChange={toggleAllFiltered} aria-label="选择当前筛选节点" /></th>
                   <th
-                    className="w-56 cursor-pointer select-none transition-colors hover:bg-base-200/60"
+                    className="w-72 cursor-pointer select-none transition-colors hover:bg-base-200/60"
                     onClick={() => handleSort('name')}
                   >
                     <div className="flex items-center gap-1.5">
@@ -784,6 +864,9 @@ export default function UnlockPanel() {
                         <p className="font-medium text-base-content/70">
                           {nodes.length === 0 ? '暂无可用节点' : '没有找到匹配的节点'}
                         </p>
+                        {nodes.length > 0 && filter.trim() && (
+                          <p className="text-xs text-base-content/45">请尝试缩短关键词或检查拼写</p>
+                        )}
                         {isFilterActive && (
                           <button
                             type="button"
@@ -803,6 +886,7 @@ export default function UnlockPanel() {
                     key={n.tag}
                     index={i}
                     node={n}
+                    config={nodeConfigByID.get(n.node_id)}
                     result={results[n.tag]}
                     diagnostic={diagnostics[n.node_id]}
                     nodeError={errors[n.tag]}
@@ -1048,6 +1132,7 @@ function taskStatusLabel(status: NodeCheckTask['status']) { return ({ pending: '
 function UnlockRow({
   index,
   node,
+  config,
   result,
   diagnostic,
   nodeError,
@@ -1060,6 +1145,7 @@ function UnlockRow({
 }: {
   index: number
   node: NodeSnapshot
+  config?: ConfigNodeConfig
   result?: UnlockResult
   diagnostic?: NodeCheckResultItem
   nodeError?: string
@@ -1072,6 +1158,11 @@ function UnlockRow({
 }) {
   const err = nodeError || result?.error
   const exitCountryCode = landingCountryCode(diagnostic, result)
+  const configuredRegion = config?.region || node.region || config?.country || node.country || ''
+  const configuredTags = config?.tags || []
+  const port = config?.port ?? node.port
+  const source = config?.source ? sourceLabel(config.source) : ''
+  const ipQuality = diagnostic?.quality.find((item) => item.provider === 'ip-api')
 
   const renderIpRisk = () => {
     const quality = diagnostic?.quality || []
@@ -1155,15 +1246,27 @@ function UnlockRow({
       <td className="text-center font-mono text-xs text-base-content/40">
         <input type="checkbox" className="checkbox checkbox-sm" checked={checked} onClick={(event) => event.stopPropagation()} onChange={onToggle} aria-label={`选择 ${node.name}`} />
       </td>
-      <td className="max-w-[220px]">
-        <div className="flex items-center gap-2">
-          <span className="text-lg leading-none shrink-0" title={exitCountryCode ? `落地国家 ${exitCountryCode}` : '尚未检测落地国家'}>
-            {regionFlag(exitCountryCode)}
+      <td className="min-w-[18rem] max-w-[320px]">
+        <div className="flex items-start gap-2">
+          <span className="mt-0.5 shrink-0 text-lg leading-none" title={configuredRegion ? `配置地区 ${configuredRegion}` : '未配置地区'}>
+            {regionFlag(configuredRegion)}
           </span>
           <div className="min-w-0 flex-1">
             <div className="truncate font-semibold text-base-content" title={node.name}>
               <span className="mr-1.5 font-mono text-[10px] text-base-content/35">{index + 1}</span>{node.name}
             </div>
+            {(configuredTags.length > 0 || port != null || source) && (
+              <div className="mt-1 flex min-w-0 flex-wrap items-center gap-1 text-[10px] text-base-content/50">
+                {configuredTags.slice(0, 2).map((tag) => (
+                  <span key={tag} className="badge badge-ghost badge-xs max-w-24 truncate" title={tag}>{tag}</span>
+                ))}
+                {configuredTags.length > 2 && (
+                  <span className="badge badge-ghost badge-xs" title={configuredTags.slice(2).join('、')}>+{configuredTags.length - 2}</span>
+                )}
+                {port != null && <span className="font-mono tabular-nums">:{port}</span>}
+                {source && <span className="badge badge-ghost badge-xs border-base-300 bg-transparent opacity-70">{source}</span>}
+              </div>
+            )}
           </div>
         </div>
       </td>
@@ -1193,12 +1296,15 @@ function UnlockRow({
       <td className="max-w-[200px]">
         {(diagnostic?.detection?.exit_ip || result?.ip?.ip) ? (
           <div className="flex flex-col min-w-0">
-            <span className="font-mono text-xs font-bold text-base-content/85">{diagnostic?.detection?.exit_ip || result?.ip?.ip}</span>
+            <span className="flex items-center gap-1.5 font-mono text-xs font-bold text-base-content/85">
+              {exitCountryCode && <span className="text-sm leading-none" title={`落地国家 ${exitCountryCode}`}>{regionFlag(exitCountryCode)}</span>}
+              <span>{diagnostic?.detection?.exit_ip || result?.ip?.ip}</span>
+            </span>
             <span
               className="truncate text-[10px] text-base-content/50"
               title={diagnostic?.quality.map((item) => `${item.asn || ''} ${item.org || item.isp || ''}`).join(' ')}
             >
-              {diagnostic?.detection?.exit_country_code || diagnostic?.quality.find((item) => item.provider === 'ip-api')?.country_code || result?.ip?.iso_code} {diagnostic?.quality.find((item) => item.provider === 'ip-api')?.asn}
+              {exitCountryCode} {ipQuality?.asn} {ipQuality?.org || ipQuality?.isp}
             </span>
           </div>
         ) : (

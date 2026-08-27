@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useDeferredValue, useMemo, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Activity, CheckCircle2, ChevronDown, CircleAlert, Copy, KeyRound, Layers3, Link2, Network, Pencil,
@@ -11,6 +11,7 @@ import {
   resetGroupSubscriptionToken, restoreGroupMember, updateGroupPool,
 } from '../api/client'
 import { cn } from '../utils/cn'
+import { createFuzzySearcher, searchAllTokens } from '../utils/fuzzySearch'
 import { controlClass, PageContent, PageHeader, PageLayout, surfaceClass } from './ui/PageLayout'
 import TagBadge from './tags/TagBadge'
 import TagMultiSelect from './tags/TagMultiSelect'
@@ -112,6 +113,7 @@ export default function GroupPoolsPanel() {
   const [form, setForm] = useState<GroupPoolPayload>(emptyPayload)
   const [regionsText, setRegionsText] = useState('')
   const [nodeSearch, setNodeSearch] = useState('')
+  const deferredNodeSearch = useDeferredValue(nodeSearch)
   const [deleteTarget, setDeleteTarget] = useState<GroupPool | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const [expandedGroups, setExpandedGroups] = useState<Set<number>>(() => new Set())
@@ -123,11 +125,19 @@ export default function GroupPoolsPanel() {
   const [latencyOverrides, setLatencyOverrides] = useState<Record<number, number>>({})
   const [batchProbeProgress, setBatchProbeProgress] = useState<{ current: number; total: number } | null>(null)
 
+  const eligibleNodes = useMemo(
+    () => nodes.filter((node) => node.selectable && !form.explicit_node_ids.includes(node.id) && !form.excluded_node_ids.includes(node.id)),
+    [nodes, form.explicit_node_ids, form.excluded_node_ids],
+  )
+  const nodeSearcher = useMemo(() => createFuzzySearcher(eligibleNodes, [
+    { name: 'name', weight: 0.60 },
+    { name: 'region', weight: 0.25 },
+    { name: 'country', weight: 0.15 },
+  ]), [eligibleNodes])
   const filteredNodes = useMemo(() => {
-    const keyword = nodeSearch.trim().toLowerCase()
-    return nodes.filter((node) => node.selectable && !form.explicit_node_ids.includes(node.id) && !form.excluded_node_ids.includes(node.id))
-      .filter((node) => !keyword || `${node.name} ${node.region || ''} ${node.country || ''}`.toLowerCase().includes(keyword))
-  }, [nodes, nodeSearch, form.explicit_node_ids, form.excluded_node_ids])
+    const query = deferredNodeSearch.trim()
+    return query ? searchAllTokens(nodeSearcher, query).map((result) => result.item) : eligibleNodes
+  }, [deferredNodeSearch, eligibleNodes, nodeSearcher])
 
   const selectedNodeOptions = useMemo(() => {
     const byID = new Map(nodes.map((node) => [node.id, node]))
@@ -439,13 +449,13 @@ export default function GroupPoolsPanel() {
                 </div>
 
                 <div className="rounded-2xl border border-base-300 bg-base-200/25 p-4">
-                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"><div><h5 className="text-sm font-bold">可添加节点</h5><p className="mt-0.5 text-xs text-base-content/50">仅显示节点管理状态为“可用”的节点</p></div><label className="input input-sm flex w-full items-center gap-2 sm:w-56"><Search className="h-3.5 w-3.5 text-base-content/40" /><input className="min-w-0 grow" value={nodeSearch} onChange={(e) => setNodeSearch(e.target.value)} placeholder="搜索节点或地区" aria-label="搜索可添加节点" /></label></div>
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"><div><h5 className="text-sm font-bold">可添加节点</h5><p className="mt-0.5 text-xs text-base-content/50">仅显示节点管理状态为“可用”的节点</p></div><label className="input input-sm flex w-full items-center gap-2 sm:w-64"><Search className="h-3.5 w-3.5 text-base-content/40" /><input className="min-w-0 grow" value={nodeSearch} onChange={(e) => setNodeSearch(e.target.value)} placeholder="模糊搜索（支持多关键词）" aria-label="模糊搜索可添加节点名称、国家或地区" title="支持空格分隔的多关键词和轻微拼写错误" /></label></div>
                   <div className="mt-3 max-h-72 space-y-2 overflow-y-auto pr-1">
                     {filteredNodes.map((node) => <NodeOptionRow key={node.id} node={node} latency={latencyOverrides[node.id] ?? node.latency_ms} probing={probingNodeIDs.has(node.id)}
                       action="add" onAction={() => { setDraftNodeCache((current) => ({ ...current, [node.id]: node })); setForm((current) => ({ ...current, explicit_node_ids: [...current.explicit_node_ids, node.id], excluded_node_ids: current.excluded_node_ids.filter((id) => id !== node.id) })); setPendingAutoExcludedIDs((current) => { const next = new Set(current); next.delete(node.id); return next }); setManualEvictionOverrideIDs((current) => new Set(current).add(node.id)) }}
                       onExclude={() => excludeDraftMember(node.id, node.name)}
                       onProbe={() => void probeOption(node)} />)}
-                    {filteredNodes.length === 0 && <EmptyMemberList message={nodeSearch ? '没有匹配的可用节点' : '当前没有其他可用节点'} />}
+                    {filteredNodes.length === 0 && <EmptyMemberList message={nodeSearch.trim() ? '没有匹配的可用节点，请尝试缩短关键词或检查拼写' : '当前没有其他可用节点'} />}
                   </div>
                 </div>
               </div>
