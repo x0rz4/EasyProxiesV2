@@ -66,7 +66,22 @@ func TestBuildBaseEntrySwitchCombinations(t *testing.T) {
 			if opts.Route == nil || len(opts.Route.Rules) != tt.wantRouteRules || opts.Route.Final != tt.wantFinal {
 				t.Fatalf("route=%+v, want rules=%d final=%q", opts.Route, tt.wantRouteRules, tt.wantFinal)
 			}
+			assertExplicitLocalDNS(t, opts)
 		})
+	}
+}
+
+func assertExplicitLocalDNS(t *testing.T, opts option.Options) {
+	t.Helper()
+	if opts.DNS == nil || opts.DNS.Final != "local" || len(opts.DNS.Servers) != 1 {
+		t.Fatalf("dns=%+v, want one explicit local server", opts.DNS)
+	}
+	server := opts.DNS.Servers[0]
+	if server.Tag != "local" || server.Type != C.DNSTypeLocal {
+		t.Fatalf("dns server=%+v, want local transport", server)
+	}
+	if opts.Route == nil || opts.Route.DefaultDomainResolver == nil || opts.Route.DefaultDomainResolver.Server != "local" {
+		t.Fatalf("route default domain resolver=%+v, want local", opts.Route)
 	}
 }
 
@@ -262,6 +277,7 @@ func TestBuildBaseAndGroupAreRuntimeIsolated(t *testing.T) {
 	if len(groupOptions.Inbounds) != 1 || groupOptions.Inbounds[0].Tag != "group-in-9" || groupOptions.Route.Final != "group-pool-9" {
 		t.Fatalf("isolated group topology: inbounds=%v final=%q", groupOptions.Inbounds, groupOptions.Route.Final)
 	}
+	assertExplicitLocalDNS(t, groupOptions)
 	for _, outbound := range groupOptions.Outbounds {
 		if outbound.Tag == "group-pool-9" {
 			poolOptions := outbound.Options.(*poolout.Options)

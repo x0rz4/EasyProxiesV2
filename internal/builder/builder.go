@@ -366,11 +366,23 @@ func Build(cfg *config.Config) (option.Options, error) {
 	}
 
 	opts := option.Options{
-		Log:       &option.LogOptions{Level: strings.ToLower(cfg.LogLevel)},
+		Log: &option.LogOptions{Level: strings.ToLower(cfg.LogLevel)},
+		DNS: &option.DNSOptions{RawDNSOptions: option.RawDNSOptions{
+			Servers: []option.DNSServerOptions{{
+				Type:    C.DNSTypeLocal,
+				Tag:     "local",
+				Options: &option.LocalDNSServerOptions{},
+			}},
+			Final: "local",
+		}},
 		Inbounds:  inbounds,
 		Outbounds: outbounds,
 		Route:     &route,
 	}
+	// sing-box 1.13 constructs outbound resolve dialers before installing its
+	// implicit local DNS fallback. Without an explicit resolver, domain-based
+	// proxy servers can capture a nil DNS transport and panic during probes.
+	opts.Route.DefaultDomainResolver = &option.DomainResolveOptions{Server: "local"}
 	return opts, nil
 }
 
@@ -444,7 +456,10 @@ func BuildGroup(cfg *config.Config, groupID int64) (option.Options, error) {
 	}
 	opts.Inbounds = filteredInbounds
 	opts.Outbounds = filteredOutbounds
-	opts.Route = &option.RouteOptions{Final: poolTag}
+	opts.Route = &option.RouteOptions{
+		Final:                 poolTag,
+		DefaultDomainResolver: &option.DomainResolveOptions{Server: "local"},
+	}
 	opts.Experimental = nil
 	opts.Services = nil
 	return opts, nil

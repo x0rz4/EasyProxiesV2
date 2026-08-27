@@ -8,8 +8,9 @@ import type {
   NodeCheckStages,
   NodeCheckTask,
   NodeCheckEvent,
+  Subscription,
 } from '../types'
-import { cancelNodeCheckTask, createNodeCheckTask, fetchConfigNodes, fetchNodeCheckResults, fetchNodeCheckSettings, fetchNodeCheckTasks, fetchNodes, fetchUnlockResults, streamNodeCheckTask, unlockNode, updateNodeCheckSettings } from '../api/client'
+import { cancelNodeCheckTask, createNodeCheckTask, fetchConfigNodes, fetchNodeCheckResults, fetchNodeCheckSettings, fetchNodeCheckTasks, fetchNodes, fetchUnlockResults, listSubscriptions, streamNodeCheckTask, unlockNode, updateNodeCheckSettings } from '../api/client'
 import { createFuzzySearcher, searchAllTokens } from '../utils/fuzzySearch'
 import { regionFlag } from '../utils/region'
 import { displayLatency, unlockNetworkInfo } from '../utils/unlockDisplay'
@@ -52,6 +53,14 @@ function sourceLabel(source?: string) {
   }
 }
 
+function nodeSourceLabel(config: ConfigNodeConfig | undefined, subscriptionNames: ReadonlyMap<number, string>) {
+  const names = (config?.subscription_ids || [])
+    .map((id) => subscriptionNames.get(id))
+    .filter((name): name is string => Boolean(name))
+  if (names.length > 0) return `订阅 · ${names.join('、')}`
+  return config?.source ? sourceLabel(config.source) : ''
+}
+
 const unlockBadgeClasses: Record<string, string> = {
   netflix: 'bg-[#E50914] text-white',
   disney_plus: 'bg-[#113CCF] text-white',
@@ -67,6 +76,7 @@ const unlockBadgeClasses: Record<string, string> = {
 export default function UnlockPanel() {
   const [nodes, setNodes] = useState<NodeSnapshot[]>([])
   const [configNodes, setConfigNodes] = useState<ConfigNodeConfig[]>([])
+  const [subscriptions, setSubscriptions] = useState<Subscription[]>([])
   const [loading, setLoading] = useState(true)
 
   // tag -> result. Results are kept across batch runs and single runs alike.
@@ -115,14 +125,16 @@ export default function UnlockPanel() {
   // ---- Node list ----
   const loadNodes = useCallback(async () => {
     try {
-      const [res, configRes] = await Promise.all([
+      const [res, configRes, subscriptionRes] = await Promise.all([
         fetchNodes(),
         fetchConfigNodes().catch(() => null),
+        listSubscriptions().catch(() => null),
       ])
       // unlock-checked; the dialer is registered per member tag.
       const usable = (res.nodes || []).filter((n) => n.tag && n.initial_check_done && n.available && !n.blacklisted)
       setNodes(usable)
       setConfigNodes(configRes?.nodes || [])
+      setSubscriptions(subscriptionRes?.subscriptions || [])
       // Load any previously persisted detection results so the user sees
       // last-saved state without re-running checks.
       try {
@@ -337,6 +349,11 @@ export default function UnlockPanel() {
     }))
   }, [configNodes, nodes])
 
+  const subscriptionNamesByID = useMemo(
+    () => new Map(subscriptions.map((subscription) => [subscription.id, subscription.name])),
+    [subscriptions],
+  )
+
   const filterableNodes = useMemo(() => {
     return nodes.filter((n) => {
       if (countryFilter) {
@@ -402,6 +419,7 @@ export default function UnlockPanel() {
     const result = results[node.tag]
     const diagnostic = diagnostics[node.node_id]
     const network = unlockNetworkInfo(diagnostic, result)
+    const source = nodeSourceLabel(config, subscriptionNamesByID)
     return {
       node,
       config,
@@ -413,10 +431,10 @@ export default function UnlockPanel() {
       landingCountry: `${network.country} ${network.countryCode}`,
       configuredRegion: `${config?.country || ''} ${config?.region || ''} ${node.country || ''} ${node.region || ''}`,
       qualityText: `${network.asn} ${network.organization} ${diagnostic?.quality.map((item) => `${item.ip || ''} ${item.asn || ''} ${item.org || ''} ${item.isp || ''}`).join(' ') || ''}`,
-      source: `${config?.source || ''} ${sourceLabel(config?.source)}`,
+      source: `${config?.source || ''} ${source}`,
       port: String(config?.port || node.port || ''),
     }
-  }), [diagnostics, filterableNodes, nodeConfigByID, results])
+  }), [diagnostics, filterableNodes, nodeConfigByID, results, subscriptionNamesByID])
 
   const nodeSearcher = useMemo(() => createFuzzySearcher(searchRecords, [
     { name: 'name', weight: 0.24 },
@@ -893,6 +911,7 @@ export default function UnlockPanel() {
                     index={i}
                     node={n}
                     config={nodeConfigByID.get(n.node_id)}
+                    source={nodeSourceLabel(nodeConfigByID.get(n.node_id), subscriptionNamesByID)}
                     result={results[n.tag]}
                     diagnostic={diagnostics[n.node_id]}
                     nodeError={errors[n.tag]}
@@ -1132,6 +1151,7 @@ function UnlockRow({
   index,
   node,
   config,
+  source,
   result,
   diagnostic,
   nodeError,
@@ -1145,6 +1165,7 @@ function UnlockRow({
   index: number
   node: NodeSnapshot
   config?: ConfigNodeConfig
+  source: string
   result?: UnlockResult
   diagnostic?: NodeCheckResultItem
   nodeError?: string
@@ -1161,8 +1182,6 @@ function UnlockRow({
   const latency = displayLatency(node, diagnostic)
   const configuredRegion = config?.region || node.region || config?.country || node.country || ''
   const configuredTags = config?.tags || []
-  const port = config?.port ?? node.port
-  const source = config?.source ? sourceLabel(config.source) : ''
 
   const renderIpRisk = () => {
     const quality = diagnostic?.quality || []
@@ -1255,7 +1274,7 @@ function UnlockRow({
             <div className="truncate font-semibold text-base-content" title={node.name}>
               <span className="mr-1.5 font-mono text-[10px] text-base-content/35">{index + 1}</span>{node.name}
             </div>
-            {(configuredTags.length > 0 || port != null || source) && (
+            {(configuredTags.length > 0 || source) && (
               <div className="mt-1 flex min-w-0 flex-wrap items-center gap-1 text-[10px] text-base-content/50">
                 {configuredTags.slice(0, 2).map((tag) => (
                   <span key={tag} className="badge badge-ghost badge-xs max-w-24 truncate" title={tag}>{tag}</span>
@@ -1263,8 +1282,7 @@ function UnlockRow({
                 {configuredTags.length > 2 && (
                   <span className="badge badge-ghost badge-xs" title={configuredTags.slice(2).join('、')}>+{configuredTags.length - 2}</span>
                 )}
-                {port != null && <span className="font-mono tabular-nums">:{port}</span>}
-                {source && <span className="badge badge-ghost badge-xs border-base-300 bg-transparent opacity-70">{source}</span>}
+                {source && <span className="badge badge-ghost badge-xs max-w-52 truncate border-base-300 bg-transparent opacity-70" title={source}>{source}</span>}
               </div>
             )}
           </div>
