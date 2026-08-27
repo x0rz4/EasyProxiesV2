@@ -18,38 +18,27 @@ import (
 	"easy_proxies/internal/group"
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/nodecodec"
-	"easy_proxies/internal/nodefacts"
 	"easy_proxies/internal/nodetag"
 	"easy_proxies/internal/store"
 	"easy_proxies/internal/subscription"
-	"easy_proxies/internal/unlock"
 )
-
-// ipQualityFactProviders are the providers node checks write to
-// node_ip_quality_results. Unlike the unlock checkers there is no registry to
-// enumerate, so the two are named here and must be kept in step with
-// nodecheck.go's runQuality.
-var ipQualityFactProviders = []nodefacts.ProviderInfo{
-	{Name: "ippure", Label: "IPPure"},
-	{Name: "ip-api", Label: "ip-api"},
-}
 
 // newTagService assembles the tagging service. The unlock providers come from the
 // checker registry rather than a list here, so registering a new checker adds its
 // rule fields and its builtin template with no change in this file.
-func newTagService(dataStore store.Store) *nodetag.Service {
-	metas := unlock.ListProviderMetas()
-	unlockProviders := make([]nodefacts.ProviderInfo, 0, len(metas))
-	for _, meta := range metas {
-		unlockProviders = append(unlockProviders,
-			nodefacts.ProviderInfo{Name: meta.Value, Label: meta.Label})
+//
+// notify receives the nodes whose visible tag set changed; passing nil leaves the
+// tagging service purely persistent, which is what the offline tests want.
+func newTagService(dataStore store.Store, notify func([]int64)) *nodetag.Service {
+	unlockProviders := monitor.TagUnlockFactProviders()
+	options := []nodetag.Option{
+		nodetag.WithRegistry(monitor.NewTagFactRegistry()),
+		nodetag.WithUnlockProviders(unlockProviders),
 	}
-	registry := nodefacts.DefaultRegistry(
-		nodefacts.WithUnlockProviders(unlockProviders),
-		nodefacts.WithIPQualityProviders(ipQualityFactProviders))
-	return nodetag.NewService(dataStore,
-		nodetag.WithRegistry(registry),
-		nodetag.WithUnlockProviders(unlockProviders))
+	if notify != nil {
+		options = append(options, nodetag.WithMembershipNotifier(notify))
+	}
+	return nodetag.NewService(dataStore, options...)
 }
 
 // Run builds the runtime components from config and blocks until shutdown.
@@ -89,6 +78,9 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	}
 	if err := loadGroupsFromStore(ctx, cfg, dataStore); err != nil {
 		return fmt.Errorf("load group pools: %w", err)
+	}
+	if err := loadTagNamesFromStore(ctx, cfg, dataStore); err != nil {
+		return fmt.Errorf("load tags: %w", err)
 	}
 
 	// ── 4. Build monitor config ──
@@ -143,7 +135,15 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	// persist facts, the queue coalesces them, and the service derives tags from
 	// the facts. Nothing is tagged until the builtin templates are seeded through
 	// POST /api/tags/templates, or an operator writes a rule.
-	tagService := newTagService(dataStore)
+	//
+	// A tag change reaches the runtime as a per-group rebuild, never as a full
+	// reload: only the groups whose member set actually moved are touched, so the
+	// other listeners keep their live connections.
+	tagService := newTagService(dataStore, func(nodeIDs []int64) {
+		if err := boxMgr.ApplyGroupMembershipChanges(ctx, nodeIDs); err != nil {
+			log.Printf("⚠️ Failed to apply group membership changes after retag: %v", err)
+		}
+	})
 	retagQueue := nodetag.NewQueue(tagService)
 	defer retagQueue.Close()
 	if server := boxMgr.MonitorServer(); server != nil {
@@ -383,6 +383,7 @@ func loadNodesFromStore(ctx context.Context, cfg *config.Config, s store.Store) 
 			Source:       config.NodeSource(n.Source),
 			Region:       n.Region,
 			Country:      n.Country,
+			Tags:         append([]string(nil), n.Tags...),
 			IdentityHash: n.IdentityHash, CanonicalJSON: n.CanonicalJSON,
 		})
 	}
@@ -397,7 +398,8 @@ func loadNodesFromStore(ctx context.Context, cfg *config.Config, s store.Store) 
 		seen[identityKey] = struct{}{}
 		configNodes = append(configNodes, config.NodeConfig{ID: n.ID, Name: n.Name, URI: n.URI, Port: n.Port,
 			Username: n.Username, Password: n.Password, Source: config.NodeSourceSubscription,
-			Region: n.Region, Country: n.Country, IdentityHash: n.IdentityHash, CanonicalJSON: n.CanonicalJSON})
+			Region: n.Region, Country: n.Country, Tags: append([]string(nil), n.Tags...),
+			IdentityHash: n.IdentityHash, CanonicalJSON: n.CanonicalJSON})
 	}
 
 	// Always replace cfg.Nodes when the DB is non-empty, including all-disabled state.
@@ -413,6 +415,22 @@ func loadGroupsFromStore(ctx context.Context, cfg *config.Config, s store.Store)
 		return err
 	}
 	cfg.Groups = boxmgr.GroupConfigsFromStore(groups)
+	return nil
+}
+
+// loadTagNamesFromStore fills the tag ID → name mapping group membership joins
+// through. A group's tag filter holds IDs while a node carries tag names, so
+// without this mapping a tag-filtered group would match nothing.
+func loadTagNamesFromStore(ctx context.Context, cfg *config.Config, s store.Store) error {
+	tags, err := s.ListTags(ctx)
+	if err != nil {
+		return err
+	}
+	tagNames := make(map[int64]string, len(tags))
+	for _, tag := range tags {
+		tagNames[tag.ID] = tag.Name
+	}
+	cfg.TagNames = tagNames
 	return nil
 }
 

@@ -5,18 +5,21 @@ import {
   Plus, Power, RefreshCw, RotateCcw, Search, ShieldOff, Trash2, X, Crosshair,
 } from 'lucide-react'
 import { toast } from 'sonner'
-import type { GroupMember, GroupNodeOption, GroupPool, GroupPoolPayload, GroupMemberStatus } from '../types'
+import type { GroupMember, GroupNodeOption, GroupPool, GroupPoolPayload, GroupMemberStatus, Tag } from '../types'
 import {
-  activateGroupMember, createGroupPool, deleteGroupPool, listGroupPools, probeNode, removeGroupMember,
+  activateGroupMember, createGroupPool, deleteGroupPool, fetchTags, listGroupPools, probeNode, removeGroupMember,
   resetGroupSubscriptionToken, restoreGroupMember, updateGroupPool,
 } from '../api/client'
 import { cn } from '../utils/cn'
 import { controlClass, PageContent, PageHeader, PageLayout, surfaceClass } from './ui/PageLayout'
+import TagBadge from './tags/TagBadge'
+import TagMultiSelect from './tags/TagMultiSelect'
 
 const emptyPayload = (): GroupPoolPayload => ({
   name: '', bind_address: '0.0.0.0', bind_port: 0, protocol: 'mixed', username: '', password: '',
   dispatch_mode: 'fixed', regions: [], explicit_node_ids: [], failure_window_seconds: 300,
   excluded_node_ids: [],
+  tag_whitelist: [], tag_blacklist: [], tag_filter_match: 'any',
   failure_threshold: 3, health_check_seconds: 60, enabled: true,
 	subscription_enabled: true, subscription_mode: 'entry', external_host: '',
 })
@@ -86,6 +89,8 @@ function payloadFromGroup(group: GroupPool): GroupPoolPayload {
     protocol: group.protocol, username: group.username || '', password: group.password || '',
     dispatch_mode: group.dispatch_mode, regions: group.regions || [],
     explicit_node_ids: group.explicit_node_ids || [], excluded_node_ids: group.excluded_node_ids || [], failure_window_seconds: group.failure_window_seconds,
+    tag_whitelist: group.tag_whitelist || [], tag_blacklist: group.tag_blacklist || [],
+    tag_filter_match: group.tag_filter_match || 'any',
     failure_threshold: group.failure_threshold, health_check_seconds: group.health_check_seconds,
     enabled: group.enabled,
 		subscription_enabled: group.subscription_enabled, subscription_mode: group.subscription_mode || 'entry',
@@ -98,8 +103,10 @@ export default function GroupPoolsPanel() {
   const { data, isLoading, isFetching, refetch } = useQuery({
     queryKey: ['groupPools'], queryFn: listGroupPools, refetchInterval: 10_000,
 	})
+	const { data: tagData } = useQuery({ queryKey: ['tags'], queryFn: fetchTags })
 	const groups = data?.groups || []
 	const nodes = useMemo(() => data?.nodes || [], [data?.nodes])
+	const tags = tagData?.tags || []
   const [editorOpen, setEditorOpen] = useState(false)
   const [editing, setEditing] = useState<GroupPool | null>(null)
   const [form, setForm] = useState<GroupPoolPayload>(emptyPayload)
@@ -168,6 +175,7 @@ export default function GroupPoolsPanel() {
   const refresh = async () => {
     await queryClient.invalidateQueries({ queryKey: ['groupPools'] })
     await queryClient.invalidateQueries({ queryKey: ['nodes'] })
+    await queryClient.invalidateQueries({ queryKey: ['tags'] })
   }
   const save = async () => {
     const name = form.name.trim()
@@ -332,6 +340,7 @@ export default function GroupPoolsPanel() {
           <section className="grid items-start gap-5 xl:grid-cols-2">
             {groups.map((group) => <GroupCard key={group.id} group={group} busy={busy}
               nodeOptions={nodes}
+              tags={tags}
               expanded={expandedGroups.has(group.id)}
               onToggleExpanded={() => setExpandedGroups((current) => { const next = new Set(current); if (next.has(group.id)) next.delete(group.id); else next.add(group.id); return next })}
               onEdit={() => openEdit(group)} onDelete={() => setDeleteTarget(group)}
@@ -376,6 +385,29 @@ export default function GroupPoolsPanel() {
             </div>
 
             <Field label="地区自动入池" hint="ISO 地区码，用逗号或空格分隔，例如 hk, jp, us"><input className={cn('input w-full font-mono', controlClass)} value={regionsText} onChange={(e) => setRegionsText(e.target.value)} placeholder="hk, jp" /></Field>
+
+            <section className="rounded-2xl border border-base-300 bg-base-200/25 p-4 sm:p-5" aria-labelledby="tag-filter-title">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+                <div>
+                  <h4 id="tag-filter-title" className="font-bold">标签筛选</h4>
+                  <p className="mt-1 text-xs leading-5 text-base-content/55">白名单与黑名单不能包含同一标签；手动指定的节点不受标签筛选限制。</p>
+                </div>
+                <Field label="白名单匹配方式">
+                  <select className={cn('select select-sm w-full sm:w-44', controlClass)} value={form.tag_filter_match} onChange={(event) => setForm({ ...form, tag_filter_match: event.target.value as GroupPoolPayload['tag_filter_match'] })}>
+                    <option value="any">匹配任一标签</option>
+                    <option value="all">匹配全部标签</option>
+                  </select>
+                </Field>
+              </div>
+              <div className="mt-4 grid gap-4 lg:grid-cols-2">
+                <Field label="标签白名单" hint="节点须按上方方式满足所选标签；留空表示不限">
+                  <TagMultiSelect tags={tags} value={form.tag_whitelist} disabledIds={form.tag_blacklist} onChange={(tag_whitelist) => setForm({ ...form, tag_whitelist })} placeholder="搜索白名单标签" compact />
+                </Field>
+                <Field label="标签黑名单" hint="命中任一所选标签的节点不会自动入池">
+                  <TagMultiSelect tags={tags} value={form.tag_blacklist} disabledIds={form.tag_whitelist} onChange={(tag_blacklist) => setForm({ ...form, tag_blacklist })} placeholder="搜索黑名单标签" compact />
+                </Field>
+              </div>
+            </section>
 
 			<div className="rounded-2xl border border-primary/20 bg-primary/5 p-4 sm:p-5">
 				<div className="flex items-start gap-3"><div className="rounded-xl bg-primary/10 p-2 text-primary"><Link2 className="h-4 w-4" /></div><div className="min-w-0 flex-1"><div className="flex items-center justify-between gap-3"><div><h4 className="font-bold">对外订阅</h4><p className="mt-0.5 text-xs leading-5 text-base-content/55">独立 Token 鉴权；members 会暴露真实上游地址</p></div><input type="checkbox" className="toggle toggle-primary" checked={form.subscription_enabled} onChange={(e) => setForm({ ...form, subscription_enabled: e.target.checked })} aria-label="启用分组订阅" /></div>
@@ -562,9 +594,10 @@ function ExcludedDraftRow({ node, onUndo }: { node: { id: number; name: string; 
   </div>
 }
 
-function GroupCard({ group, nodeOptions, busy, expanded, onToggleExpanded, onEdit, onDelete, onToggle, onResetToken, onRestore, onActivate, onRemoveMember }: { group: GroupPool; nodeOptions: GroupNodeOption[]; busy: string | null; expanded: boolean; onToggleExpanded: () => void; onEdit: () => void; onDelete: () => void; onToggle: () => void; onResetToken: () => void; onRestore: (nodeId: number) => void; onActivate: (nodeId: number) => void; onRemoveMember: (member: GroupMember) => void }) {
+function GroupCard({ group, nodeOptions, tags, busy, expanded, onToggleExpanded, onEdit, onDelete, onToggle, onResetToken, onRestore, onActivate, onRemoveMember }: { group: GroupPool; nodeOptions: GroupNodeOption[]; tags: Tag[]; busy: string | null; expanded: boolean; onToggleExpanded: () => void; onEdit: () => void; onDelete: () => void; onToggle: () => void; onResetToken: () => void; onRestore: (nodeId: number) => void; onActivate: (nodeId: number) => void; onRemoveMember: (member: GroupMember) => void }) {
   const active = group.members.find((member) => member.is_active)
 	const nodeByID = new Map(nodeOptions.map((node) => [node.id, node]))
+	const tagByID = new Map(tags.map((tag) => [tag.id, tag]))
 	const excludedNodes = (group.excluded_node_ids || []).map((id) => nodeByID.get(id) || { id, name: `节点 #${id}`, region: '', status: 'pending' as const })
 	const runtimeStyle = runtimeStatusStyle[group.runtime_status] || runtimeStatusStyle.stopped
 	const runtimeUpdating = group.runtime_status === 'starting' || group.runtime_status === 'reconfiguring'
@@ -585,6 +618,12 @@ function GroupCard({ group, nodeOptions, busy, expanded, onToggleExpanded, onEdi
       <div className="flex items-start gap-3"><div className={cn('flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl', runtimeReady ? 'bg-primary/10 text-primary' : 'bg-base-200 text-base-content/40')}><Layers3 className="h-5 w-5" /></div><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><h3 className="truncate text-lg font-bold">{group.name}</h3><span className={cn('badge badge-sm', runtimeStyle.badge)}>{runtimeStyle.label}</span><span className="badge badge-outline badge-sm">{dispatchModeLabel[group.dispatch_mode]}</span></div><div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-base-content/55"><code className="font-semibold text-primary">{group.bind_address}:{group.bind_port}</code><span className="uppercase">{group.protocol}</span><span>{group.failure_window_seconds / 60} 分钟 / {group.failure_threshold} 次踢出</span></div>{group.runtime_error && <p className="mt-1 truncate text-xs text-error" title={group.runtime_error}>{group.runtime_error}</p>}</div><div className="dropdown dropdown-end"><button tabIndex={0} className="btn btn-ghost btn-sm btn-square" aria-label="分组操作" disabled={runtimeUpdating}><Pencil className="h-4 w-4" /></button><ul tabIndex={0} className="dropdown-content z-20 mt-1 w-36 rounded-box border border-base-300 bg-base-100 p-1.5 shadow-xl"><li><button className="flex w-full cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-sm hover:bg-base-200" onClick={onEdit} disabled={runtimeUpdating}><Pencil className="h-4 w-4" />编辑</button></li><li><button className="flex w-full cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-sm hover:bg-base-200" onClick={onToggle} disabled={runtimeUpdating}><Power className="h-4 w-4" />{group.enabled ? '停用' : '启用'}</button></li><li><button className="flex w-full cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-sm text-error hover:bg-error/10" onClick={onDelete} disabled={runtimeUpdating}><Trash2 className="h-4 w-4" />删除</button></li></ul></div></div>
       <div className="mt-4 grid grid-cols-4 gap-2"><MiniMetric label="成员" value={group.member_count} /><MiniMetric label="健康" value={group.alive_count} tone="text-success" /><MiniMetric label="踢出" value={group.evicted_count} tone={group.evicted_count ? 'text-error' : ''} /><MiniMetric label="排除" value={excludedNodes.length} tone={excludedNodes.length ? 'text-error' : ''} /></div>
       {(group.regions?.length > 0 || group.explicit_node_ids?.length > 0) && <div className="mt-4 flex flex-wrap gap-1.5">{group.regions?.map((region) => <span key={region} className="badge badge-primary badge-outline badge-sm uppercase">{region}</span>)}{group.explicit_node_ids?.length > 0 && <span className="badge badge-ghost badge-sm">手动 {group.explicit_node_ids.length} 个</span>}</div>}
+      {(group.tag_whitelist?.length > 0 || group.tag_blacklist?.length > 0) && (
+        <div className="mt-3 space-y-2 rounded-xl border border-base-200 bg-base-200/25 px-3 py-2.5">
+          {group.tag_whitelist?.length > 0 && <div className="flex flex-wrap items-center gap-1.5"><span className="mr-1 text-[10px] font-bold text-success">白名单 · {group.tag_filter_match === 'all' ? '全部' : '任一'}</span>{group.tag_whitelist.map((id) => { const tag = tagByID.get(id); return tag ? <TagBadge key={id} tag={tag} compact /> : <span key={id} className="badge badge-ghost badge-xs">#{id}</span> })}</div>}
+          {group.tag_blacklist?.length > 0 && <div className="flex flex-wrap items-center gap-1.5"><span className="mr-1 text-[10px] font-bold text-error">黑名单</span>{group.tag_blacklist.map((id) => { const tag = tagByID.get(id); return tag ? <TagBadge key={id} tag={tag} compact muted /> : <span key={id} className="badge badge-ghost badge-xs">#{id}</span> })}</div>}
+        </div>
+      )}
 		<div className={cn('mt-4 rounded-xl border p-3', group.subscription_enabled ? 'border-info/20 bg-info/5' : 'border-base-200 bg-base-200/25')}>
 			<div className="flex items-center gap-2"><Link2 className={cn('h-4 w-4', group.subscription_enabled ? 'text-info' : 'text-base-content/35')} /><span className="text-xs font-bold">订阅输出</span><span className={cn('badge badge-xs', group.subscription_enabled ? 'badge-info' : 'badge-ghost')}>{group.subscription_enabled ? '已启用' : '已关闭'}</span>{group.subscription_enabled && <span className="ml-auto flex items-center gap-1 font-mono text-[10px] text-base-content/40"><KeyRound className="h-3 w-3" />••••{group.subscription_token?.slice(-6)}</span>}</div>
 			{group.subscription_enabled && <div className="mt-3 grid grid-cols-3 gap-1.5"><button className="btn btn-ghost btn-xs h-8 min-h-0 gap-1 border border-base-300 bg-base-100" onClick={() => void copySubscription('clash', 'entry')}><Copy className="h-3 w-3" />入口</button><button className="btn btn-ghost btn-xs h-8 min-h-0 gap-1 border border-base-300 bg-base-100" onClick={() => void copySubscription('clash', 'members')}><Copy className="h-3 w-3" />成员</button><button className="btn btn-ghost btn-xs h-8 min-h-0 gap-1 border border-base-300 bg-base-100" onClick={() => void copySubscription('base64', 'members')}><Copy className="h-3 w-3" />Base64</button></div>}

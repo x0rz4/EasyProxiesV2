@@ -29,10 +29,14 @@ import (
 type Config struct {
 	mu sync.RWMutex `yaml:"-"` // protects all fields for concurrent access
 
-	Listener            ListenerConfig            `yaml:"listener"`
-	MultiPort           MultiPortConfig           `yaml:"multi_port"`
-	Pool                PoolConfig                `yaml:"pool"`
-	Groups              []GroupPoolConfig         `yaml:"-"` // Runtime-only; persisted in SQLite.
+	Listener  ListenerConfig    `yaml:"listener"`
+	MultiPort MultiPortConfig   `yaml:"multi_port"`
+	Pool      PoolConfig        `yaml:"pool"`
+	Groups    []GroupPoolConfig `yaml:"-"` // Runtime-only; persisted in SQLite.
+	// TagNames maps tag ID → tag name. A group's tag whitelist and blacklist hold
+	// IDs while a node's Tags hold names, so this is the join between them. It is
+	// runtime-only metadata refreshed alongside Nodes.
+	TagNames            map[int64]string          `yaml:"-"`
 	Management          ManagementConfig          `yaml:"management"`
 	SubscriptionRefresh SubscriptionRefreshConfig `yaml:"subscription_refresh"`
 	GeoIP               GeoIPConfig               `yaml:"geoip"`
@@ -77,17 +81,24 @@ type PoolConfig struct {
 // GroupPoolConfig describes an independent listener backed by a dynamic subset
 // of the globally configured nodes. Definitions are persisted in SQLite.
 type GroupPoolConfig struct {
-	ID                  int64                  `yaml:"-" json:"id"`
-	Name                string                 `yaml:"-" json:"name"`
-	BindAddress         string                 `yaml:"-" json:"bind_address"`
-	BindPort            uint16                 `yaml:"-" json:"bind_port"`
-	Protocol            string                 `yaml:"-" json:"protocol"`
-	Username            string                 `yaml:"-" json:"username,omitempty"`
-	Password            string                 `yaml:"-" json:"password,omitempty"`
-	DispatchMode        string                 `yaml:"-" json:"dispatch_mode"`
-	Regions             []string               `yaml:"-" json:"regions"`
-	ExplicitNodeIDs     []int64                `yaml:"-" json:"explicit_node_ids"`
-	ExcludedNodeIDs     []int64                `yaml:"-" json:"excluded_node_ids"`
+	ID              int64    `yaml:"-" json:"id"`
+	Name            string   `yaml:"-" json:"name"`
+	BindAddress     string   `yaml:"-" json:"bind_address"`
+	BindPort        uint16   `yaml:"-" json:"bind_port"`
+	Protocol        string   `yaml:"-" json:"protocol"`
+	Username        string   `yaml:"-" json:"username,omitempty"`
+	Password        string   `yaml:"-" json:"password,omitempty"`
+	DispatchMode    string   `yaml:"-" json:"dispatch_mode"`
+	Regions         []string `yaml:"-" json:"regions"`
+	ExplicitNodeIDs []int64  `yaml:"-" json:"explicit_node_ids"`
+	ExcludedNodeIDs []int64  `yaml:"-" json:"excluded_node_ids"`
+	// TagWhitelist and TagBlacklist carry tag IDs, not names, so renaming a tag
+	// cannot silently change who is in the group. An empty whitelist means the
+	// group has no tag requirement.
+	TagWhitelist []int64 `yaml:"-" json:"tag_whitelist"`
+	TagBlacklist []int64 `yaml:"-" json:"tag_blacklist"`
+	// TagFilterMatch is "any" or "all" and applies to TagWhitelist only.
+	TagFilterMatch      string                 `yaml:"-" json:"tag_filter_match"`
 	FailureWindow       time.Duration          `yaml:"-" json:"-"`
 	FailureThreshold    int                    `yaml:"-" json:"failure_threshold"`
 	HealthCheckInterval time.Duration          `yaml:"-" json:"-"`
@@ -238,19 +249,23 @@ func NormalizeInboundProtocol(value string) (string, error) {
 
 // NodeConfig describes a single upstream proxy endpoint expressed as URI.
 type NodeConfig struct {
-	ID            int64      `yaml:"-" json:"id,omitempty"`
-	Name          string     `yaml:"name" json:"name"`
-	URI           string     `yaml:"uri" json:"uri"`
-	Port          uint16     `yaml:"port,omitempty" json:"port,omitempty"`
-	Username      string     `yaml:"username,omitempty" json:"username,omitempty"`
-	Password      string     `yaml:"password,omitempty" json:"password,omitempty"`
-	Source        NodeSource `yaml:"-" json:"source,omitempty"`   // Runtime only, not persisted in YAML
-	Disabled      bool       `yaml:"-" json:"disabled,omitempty"` // Runtime only, not persisted in YAML; true = node is disabled
-	Region        string     `yaml:"-" json:"region,omitempty"`
-	Country       string     `yaml:"-" json:"country,omitempty"`
-	IdentityHash  string     `yaml:"-" json:"-"`
-	CanonicalJSON string     `yaml:"-" json:"-"`
-	EndpointKey   string     `yaml:"-" json:"-"`
+	ID       int64      `yaml:"-" json:"id,omitempty"`
+	Name     string     `yaml:"name" json:"name"`
+	URI      string     `yaml:"uri" json:"uri"`
+	Port     uint16     `yaml:"port,omitempty" json:"port,omitempty"`
+	Username string     `yaml:"username,omitempty" json:"username,omitempty"`
+	Password string     `yaml:"password,omitempty" json:"password,omitempty"`
+	Source   NodeSource `yaml:"-" json:"source,omitempty"`   // Runtime only, not persisted in YAML
+	Disabled bool       `yaml:"-" json:"disabled,omitempty"` // Runtime only, not persisted in YAML; true = node is disabled
+	Region   string     `yaml:"-" json:"region,omitempty"`
+	Country  string     `yaml:"-" json:"country,omitempty"`
+	// Tags mirrors the nodes.tags projection (manual ∪ auto tag names). It is
+	// read-only runtime metadata: group membership matches against it, and the
+	// tagging service is the only writer of the column it comes from.
+	Tags          []string `yaml:"-" json:"tags,omitempty"`
+	IdentityHash  string   `yaml:"-" json:"-"`
+	CanonicalJSON string   `yaml:"-" json:"-"`
+	EndpointKey   string   `yaml:"-" json:"-"`
 }
 
 // NodeKey returns a unique identifier for the node based on its URI.
@@ -1897,10 +1912,19 @@ func (c *Config) Clone() *Config {
 	if c.Nodes != nil {
 		cloned.Nodes = make([]NodeConfig, len(c.Nodes))
 		copy(cloned.Nodes, c.Nodes)
+		for idx := range cloned.Nodes {
+			cloned.Nodes[idx].Tags = append([]string(nil), c.Nodes[idx].Tags...)
+		}
 	}
 	if c.Subscriptions != nil {
 		cloned.Subscriptions = make([]string, len(c.Subscriptions))
 		copy(cloned.Subscriptions, c.Subscriptions)
+	}
+	if c.TagNames != nil {
+		cloned.TagNames = make(map[int64]string, len(c.TagNames))
+		for tagID, name := range c.TagNames {
+			cloned.TagNames[tagID] = name
+		}
 	}
 	if c.Groups != nil {
 		cloned.Groups = make([]GroupPoolConfig, len(c.Groups))
@@ -1909,6 +1933,8 @@ func (c *Config) Clone() *Config {
 			cloned.Groups[idx].Regions = append([]string(nil), c.Groups[idx].Regions...)
 			cloned.Groups[idx].ExplicitNodeIDs = append([]int64(nil), c.Groups[idx].ExplicitNodeIDs...)
 			cloned.Groups[idx].ExcludedNodeIDs = append([]int64(nil), c.Groups[idx].ExcludedNodeIDs...)
+			cloned.Groups[idx].TagWhitelist = append([]int64(nil), c.Groups[idx].TagWhitelist...)
+			cloned.Groups[idx].TagBlacklist = append([]int64(nil), c.Groups[idx].TagBlacklist...)
 			cloned.Groups[idx].NodeStates = append([]GroupNodeStateConfig(nil), c.Groups[idx].NodeStates...)
 			for stateIdx := range cloned.Groups[idx].NodeStates {
 				cloned.Groups[idx].NodeStates[stateIdx].FailureHistory = append([]int64(nil), c.Groups[idx].NodeStates[stateIdx].FailureHistory...)

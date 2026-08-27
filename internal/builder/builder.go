@@ -15,6 +15,7 @@ import (
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/geoip"
 	groupruntime "easy_proxies/internal/group"
+	"easy_proxies/internal/groupmember"
 	json "easy_proxies/internal/jsonx"
 	"easy_proxies/internal/nodecodec"
 	poolout "easy_proxies/internal/outbound/pool"
@@ -31,6 +32,11 @@ func Build(cfg *config.Config) (option.Options, error) {
 	memberTags := make([]string, 0, len(cfg.Nodes))
 	metadata := make(map[string]poolout.MemberMeta)
 	nodeTagsByID := make(map[int64]string)
+	// nodeTagNamesByID carries the node's own tag names (the nodes.tags
+	// projection), which group membership matches against. It is kept out of
+	// poolout.MemberMeta on purpose: that struct is serialized into subscription
+	// output, and tags are an internal classification.
+	nodeTagNamesByID := make(map[int64][]string)
 	var failedNodes []string
 	usedTags := make(map[string]int) // Track tag usage for uniqueness
 
@@ -94,6 +100,9 @@ func Build(cfg *config.Config) (option.Options, error) {
 		metadata[tag] = meta
 		if node.ID != 0 {
 			nodeTagsByID[node.ID] = tag
+			if len(node.Tags) > 0 {
+				nodeTagNamesByID[node.ID] = node.Tags
+			}
 		}
 	}
 
@@ -224,28 +233,16 @@ func Build(cfg *config.Config) (option.Options, error) {
 		if !group.Enabled || group.ID == 0 || group.BindPort == 0 {
 			continue
 		}
-		regionSet := make(map[string]struct{}, len(group.Regions))
-		for _, region := range group.Regions {
-			regionSet[strings.ToLower(strings.TrimSpace(region))] = struct{}{}
-		}
-		explicitSet := make(map[int64]struct{}, len(group.ExplicitNodeIDs))
-		for _, nodeID := range group.ExplicitNodeIDs {
-			explicitSet[nodeID] = struct{}{}
-		}
-		excludedSet := make(map[int64]struct{}, len(group.ExcludedNodeIDs))
-		for _, nodeID := range group.ExcludedNodeIDs {
-			excludedSet[nodeID] = struct{}{}
-		}
+		// memberTags order decides members[0], which is this group's default
+		// outbound, so membership is asked as a per-node question rather than
+		// obtained as a ready-made list.
+		filter := groupmember.NewFilter(group, groupmember.WithTagNames(cfg.TagNames))
 		members := make([]string, 0)
 		groupMeta := make(map[string]poolout.MemberMeta)
 		for _, tag := range memberTags {
 			meta := metadata[tag]
-			if _, excluded := excludedSet[meta.NodeID]; excluded {
-				continue
-			}
-			_, explicit := explicitSet[meta.NodeID]
-			_, regional := regionSet[strings.ToLower(meta.Region)]
-			if !explicit && !regional {
+			if !filter.Allow(groupmember.Node{ID: meta.NodeID, Region: meta.Region,
+				Tags: nodeTagNamesByID[meta.NodeID]}) {
 				continue
 			}
 			members = append(members, tag)

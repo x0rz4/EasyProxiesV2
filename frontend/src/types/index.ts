@@ -10,7 +10,6 @@ export interface NodeInfo {
   port?: number
   region?: string
   country?: string
-  tags?: string[]
 }
 
 export interface TimelineEvent {
@@ -99,6 +98,9 @@ export interface GroupPool {
   regions: string[]
   explicit_node_ids: number[]
   excluded_node_ids: number[]
+  tag_whitelist: number[]
+  tag_blacklist: number[]
+  tag_filter_match: 'any' | 'all'
   failure_window_seconds: number
   failure_threshold: number
   health_check_seconds: number
@@ -136,6 +138,9 @@ export interface GroupPoolPayload {
   regions: string[]
   explicit_node_ids: number[]
   excluded_node_ids: number[]
+  tag_whitelist: number[]
+  tag_blacklist: number[]
+  tag_filter_match: 'any' | 'all'
   failure_window_seconds: number
   failure_threshold: number
   health_check_seconds: number
@@ -270,6 +275,7 @@ export interface ConfigNodePayload {
 }
 
 export interface ConfigNodeConfig {
+  id?: number
   name: string
   uri: string
   port: number
@@ -279,7 +285,143 @@ export interface ConfigNodeConfig {
   country?: string
   source?: string
   disabled?: boolean
+  tags?: string[]
   subscription_ids: number[]
+}
+
+// ---- Node tags ----
+
+export interface TagCondition {
+  match?: 'all' | 'any' | 'none'
+  children?: TagCondition[]
+  field?: string
+  op?: string
+  value?: unknown
+  values?: unknown[]
+  max_age_seconds?: number
+  negate?: boolean
+}
+
+export interface Tag {
+  id: number
+  name: string
+  color: string
+  description: string
+  mutex_group_id: number
+  priority: number
+  auto_enabled: boolean
+  rule_json: string
+  rule_version: number
+  builtin_key: string
+  created_at: string
+  updated_at: string
+  rule?: TagCondition
+  node_count: number
+  manual_count: number
+  auto_count: number
+  used_by_groups?: number[]
+}
+
+export interface TagMutexGroup {
+  id: number
+  name: string
+  description: string
+  created_at: string
+  updated_at: string
+}
+
+export interface TagsResponse {
+  tags: Tag[]
+  mutex_groups: TagMutexGroup[]
+}
+
+export interface TagOperatorDef {
+  value: string
+  label: string
+  value_arity: 'one' | 'many' | 'two' | 'none'
+}
+
+export interface TagFieldDef {
+  name: string
+  label: string
+  group: string
+  kind: 'string' | 'enum' | 'int' | 'bool' | 'set'
+  operators: string[]
+  supports_max_age: boolean
+  unit?: string
+  enum_key?: string
+  source?: string
+}
+
+export interface TagEnumOption {
+  value: string
+  label: string
+}
+
+export interface TagEnumSet {
+  options: TagEnumOption[]
+  free_input: boolean
+  note?: string
+}
+
+export interface TagSchema {
+  version: number
+  limits: {
+    max_conditions: number
+    max_depth: number
+    max_value_items: number
+    max_regex_length: number
+    max_rule_bytes: number
+  }
+  operators: TagOperatorDef[]
+  field_groups: string[]
+  fields: TagFieldDef[]
+  enums: Record<string, TagEnumSet>
+}
+
+export interface TagShadowNote {
+  tag_id: number
+  tag_name: string
+  mutex_group_id: number
+  reason: string
+  winner_tag_id?: number
+  winner_tag_name?: string
+}
+
+export interface TagPreviewNode {
+  node_id: number
+  name: string
+  region: string
+  matched: boolean
+  applied: boolean
+  shadowed?: TagShadowNote
+  facts: Record<string, string>
+}
+
+export interface TagPreviewResponse {
+  total_nodes: number
+  match_count: number
+  applied_count: number
+  shadowed_count: number
+  unknown_count: number
+  fields: string[]
+  samples: TagPreviewNode[]
+}
+
+export interface NodeTagAssignment {
+  node_id: number
+  manual_tag_ids: number[]
+  auto_tag_ids: number[]
+}
+
+export interface TagPayload {
+  name: string
+  color?: string
+  description?: string
+  mutex_group_id?: number
+  priority?: number
+  auto_enabled?: boolean
+  rule?: TagCondition | null
 }
 
 export interface ConfigNodesResponse {

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -610,4 +611,131 @@ func createGroupTestNode(t *testing.T, ctx context.Context, db store.Store, name
 		t.Fatal(err)
 	}
 	return node
+}
+
+func TestGroupFromInputNormalizesTagFilter(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "groups-tag-filter.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	vip := &store.Tag{Name: "vip"}
+	slow := &store.Tag{Name: "slow"}
+	for _, tag := range []*store.Tag{vip, slow} {
+		if err := db.CreateTag(ctx, tag); err != nil {
+			t.Fatal(err)
+		}
+	}
+	server := &Server{store: db}
+	base := func() groupPoolInput {
+		return groupPoolInput{Name: "HK", BindAddress: "127.0.0.1", BindPort: 12190, Protocol: "mixed",
+			DispatchMode: "fixed", Regions: []string{"hk"}}
+	}
+
+	input := base()
+	// Duplicates and non-positive IDs are noise from the UI; order is what the
+	// operator sees back, so it has to survive.
+	input.TagWhitelist = &[]int64{slow.ID, vip.ID, slow.ID, 0, -7}
+	input.TagFilterMatch = " ALL "
+	groupPool, _, err := server.groupFromInput(ctx, input, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(groupPool.TagWhitelist) != 2 || groupPool.TagWhitelist[0] != slow.ID || groupPool.TagWhitelist[1] != vip.ID {
+		t.Fatalf("whitelist = %v, want [%d %d]", groupPool.TagWhitelist, slow.ID, vip.ID)
+	}
+	if groupPool.TagFilterMatch != store.TagFilterMatchAll {
+		t.Fatalf("match mode = %q, want all", groupPool.TagFilterMatch)
+	}
+
+	// No tag filter at all still has to produce a usable default match mode.
+	plain, _, err := server.groupFromInput(ctx, base(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plain.TagWhitelist) != 0 || len(plain.TagBlacklist) != 0 ||
+		plain.TagFilterMatch != store.TagFilterMatchAny {
+		t.Fatalf("unfiltered group = %+v", plain)
+	}
+
+	// An omitted pointer keeps the stored filter; the existing match mode too.
+	existing := &store.GroupPool{ID: 5, TagWhitelist: []int64{vip.ID}, TagBlacklist: []int64{slow.ID},
+		TagFilterMatch: store.TagFilterMatchAll}
+	kept, _, err := server.groupFromInput(ctx, base(), existing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(kept.TagWhitelist) != 1 || kept.TagWhitelist[0] != vip.ID ||
+		len(kept.TagBlacklist) != 1 || kept.TagBlacklist[0] != slow.ID ||
+		kept.TagFilterMatch != store.TagFilterMatchAll {
+		t.Fatalf("partial update dropped the stored tag filter: %+v", kept)
+	}
+	// An explicit empty list is a clear, not an omission.
+	cleared := base()
+	cleared.TagWhitelist = &[]int64{}
+	clearedPool, _, err := server.groupFromInput(ctx, cleared, existing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(clearedPool.TagWhitelist) != 0 || len(clearedPool.TagBlacklist) != 1 {
+		t.Fatalf("explicit empty whitelist was not applied: %+v", clearedPool)
+	}
+}
+
+func TestGroupFromInputRejectsUnusableTagFilter(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "groups-tag-reject.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	vip := &store.Tag{Name: "vip"}
+	if err := db.CreateTag(ctx, vip); err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{store: db}
+	base := func() groupPoolInput {
+		return groupPoolInput{Name: "HK", BindAddress: "127.0.0.1", BindPort: 12191, Protocol: "mixed",
+			DispatchMode: "fixed", Regions: []string{"hk"}}
+	}
+
+	both := base()
+	both.TagWhitelist = &[]int64{vip.ID}
+	both.TagBlacklist = &[]int64{vip.ID}
+	if _, _, err := server.groupFromInput(ctx, both, nil); err == nil {
+		t.Fatal("a tag on both lists was accepted")
+	} else if !strings.Contains(err.Error(), "白名单与黑名单") {
+		t.Fatalf("unexpected intersection error: %v", err)
+	}
+
+	missing := base()
+	missing.TagWhitelist = &[]int64{vip.ID + 999}
+	if _, _, err := server.groupFromInput(ctx, missing, nil); err == nil {
+		t.Fatal("a nonexistent tag ID was accepted")
+	} else if !strings.Contains(err.Error(), "标签不存在") {
+		t.Fatalf("unexpected missing-tag error: %v", err)
+	}
+
+	badMatch := base()
+	badMatch.TagFilterMatch = "either"
+	if _, _, err := server.groupFromInput(ctx, badMatch, nil); err == nil {
+		t.Fatal("an invalid match mode was accepted")
+	} else if !strings.Contains(err.Error(), "标签匹配方式") {
+		t.Fatalf("unexpected match-mode error: %v", err)
+	}
+}
+
+func TestCloneGroupPoolDetachesTagFilter(t *testing.T) {
+	original := &store.GroupPool{ID: 7, Regions: []string{"hk"}, TagWhitelist: []int64{1, 2},
+		TagBlacklist: []int64{3}, TagFilterMatch: store.TagFilterMatchAll}
+	cloned := cloneGroupPool(original)
+	cloned.TagWhitelist[0] = 99
+	cloned.TagBlacklist[0] = 98
+	if original.TagWhitelist[0] != 1 || original.TagBlacklist[0] != 3 {
+		t.Fatalf("clone aliases the tag filter: %+v", original)
+	}
+	if cloned.TagFilterMatch != store.TagFilterMatchAll {
+		t.Fatalf("clone lost the match mode: %+v", cloned)
+	}
 }

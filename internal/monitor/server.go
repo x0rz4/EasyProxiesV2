@@ -70,15 +70,29 @@ type GroupRuntimeManager interface {
 	GroupRuntimeStatus(groupID int64) GroupRuntimeStatus
 }
 
+// GroupMembershipManager is implemented by runtimes that can react to a node's
+// facts changing — its tags or its landing region — by rebuilding only the
+// groups whose member set moved. Callers keep a TriggerReload fallback, which is
+// correct but rebuilds every listener in the process.
+type GroupMembershipManager interface {
+	ApplyGroupMembershipChanges(ctx context.Context, changedNodeIDs []int64) error
+}
+
 // ManagedNodeConfig is the flattened API representation used by node management.
 type ManagedNodeConfig struct {
-	Name            string            `json:"name"`
-	URI             string            `json:"uri"`
-	Port            uint16            `json:"port"`
-	Username        string            `json:"username,omitempty"`
-	Password        string            `json:"password,omitempty"`
-	Region          string            `json:"region,omitempty"`
-	Country         string            `json:"country,omitempty"`
+	// ID is the persisted node ID. It is what a tag assignment addresses, so the
+	// management UI needs it alongside the connection settings.
+	ID       int64  `json:"id,omitempty"`
+	Name     string `json:"name"`
+	URI      string `json:"uri"`
+	Port     uint16 `json:"port"`
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
+	Region   string `json:"region,omitempty"`
+	Country  string `json:"country,omitempty"`
+	// Tags is the node's projected tag set (manual ∪ auto names). It is read-only
+	// here: tags are written through the tagging endpoints, not node updates.
+	Tags            []string          `json:"tags,omitempty"`
 	Source          config.NodeSource `json:"source,omitempty"`
 	Disabled        bool              `json:"disabled,omitempty"`
 	SubscriptionIDs []int64           `json:"subscription_ids"`
@@ -261,6 +275,8 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 	mux.HandleFunc("/api/reload", s.withAuth(s.handleReload))
 	mux.HandleFunc("/api/groups", s.withAuth(s.handleGroups))
 	mux.HandleFunc("/api/groups/", s.withAuth(s.handleGroupItem))
+	mux.HandleFunc("/api/tags", s.withAuth(s.handleTags))
+	mux.HandleFunc("/api/tags/", s.withAuth(s.handleTagItem))
 	mux.HandleFunc("/sub/", s.handleGroupSubscription)
 
 	// GeoIP database management
@@ -409,6 +425,26 @@ func (s *Server) enqueueRetagAll() {
 		return
 	}
 	s.retag.EnqueueAll()
+}
+
+// refreshGroupMembership tells the runtime that these nodes' facts moved, so any
+// group whose member set depends on them has to be rebuilt.
+//
+// A runtime that cannot do this incrementally falls back to a full reload, which
+// is correct but rebuilds every listener; a runtime with neither capability makes
+// this a no-op, which is what the lightweight test managers want.
+func (s *Server) refreshGroupMembership(changedNodeIDs []int64) error {
+	if s == nil || len(changedNodeIDs) == 0 || s.nodeMgr == nil {
+		return nil
+	}
+	if membershipMgr, ok := s.nodeMgr.(GroupMembershipManager); ok {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		return membershipMgr.ApplyGroupMembershipChanges(ctx, changedNodeIDs)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return s.nodeMgr.TriggerReload(ctx)
 }
 
 // SetConfig binds the persistable config object for settings API.
@@ -2668,16 +2704,21 @@ func (s *Server) geoipEnabled() bool {
 }
 
 type groupPoolInput struct {
-	Name                 string   `json:"name"`
-	BindAddress          string   `json:"bind_address"`
-	BindPort             uint16   `json:"bind_port"`
-	Protocol             string   `json:"protocol"`
-	Username             string   `json:"username"`
-	Password             string   `json:"password"`
-	DispatchMode         string   `json:"dispatch_mode"`
-	Regions              []string `json:"regions"`
-	ExplicitNodeIDs      []int64  `json:"explicit_node_ids"`
-	ExcludedNodeIDs      *[]int64 `json:"excluded_node_ids"`
+	Name            string   `json:"name"`
+	BindAddress     string   `json:"bind_address"`
+	BindPort        uint16   `json:"bind_port"`
+	Protocol        string   `json:"protocol"`
+	Username        string   `json:"username"`
+	Password        string   `json:"password"`
+	DispatchMode    string   `json:"dispatch_mode"`
+	Regions         []string `json:"regions"`
+	ExplicitNodeIDs []int64  `json:"explicit_node_ids"`
+	ExcludedNodeIDs *[]int64 `json:"excluded_node_ids"`
+	// TagWhitelist and TagBlacklist are pointers so that omitting them from a
+	// partial update leaves the stored filter alone, matching ExcludedNodeIDs.
+	TagWhitelist         *[]int64 `json:"tag_whitelist"`
+	TagBlacklist         *[]int64 `json:"tag_blacklist"`
+	TagFilterMatch       string   `json:"tag_filter_match"`
 	FailureWindowSeconds int      `json:"failure_window_seconds"`
 	FailureThreshold     int      `json:"failure_threshold"`
 	HealthCheckSeconds   int      `json:"health_check_seconds"`
@@ -3266,6 +3307,10 @@ func (s *Server) groupFromInput(ctx context.Context, input groupPoolInput, exist
 	} else if existing != nil {
 		enabled = existing.Enabled
 	}
+	tagWhitelist, tagBlacklist, tagFilterMatch, err := s.groupTagFilterFromInput(ctx, input, existing)
+	if err != nil {
+		return nil, nil, err
+	}
 	subscriptionEnabled := true
 	if input.SubscriptionEnabled != nil {
 		subscriptionEnabled = *input.SubscriptionEnabled
@@ -3288,6 +3333,7 @@ func (s *Server) groupFromInput(ctx context.Context, input groupPoolInput, exist
 	group := &store.GroupPool{Name: input.Name, BindAddress: input.BindAddress, BindPort: input.BindPort,
 		Protocol: protocol, Username: input.Username, Password: input.Password, DispatchMode: input.DispatchMode,
 		Regions: regions, ExplicitNodeIDs: keptNodeIDs, ExcludedNodeIDs: excludedNodeIDs, FailureWindowSeconds: input.FailureWindowSeconds,
+		TagWhitelist: tagWhitelist, TagBlacklist: tagBlacklist, TagFilterMatch: tagFilterMatch,
 		FailureThreshold: input.FailureThreshold, HealthCheckSeconds: input.HealthCheckSeconds, Enabled: enabled,
 		SubscriptionEnabled: subscriptionEnabled, SubscriptionToken: subscriptionToken,
 		SubscriptionMode: input.SubscriptionMode, ExternalHost: strings.TrimSpace(input.ExternalHost)}
@@ -3295,6 +3341,88 @@ func (s *Server) groupFromInput(ctx context.Context, input groupPoolInput, exist
 		group.ID, group.CurrentActiveNodeID, group.CreatedAt, group.NodeStates = existing.ID, existing.CurrentActiveNodeID, existing.CreatedAt, existing.NodeStates
 	}
 	return group, removedNodeIDs, nil
+}
+
+// groupTagFilterFromInput normalizes the group's tag filter. Tag IDs that no
+// longer exist are rejected rather than dropped: silently discarding a
+// whitelist entry would widen the group, which is the opposite of what the
+// operator asked for.
+func (s *Server) groupTagFilterFromInput(ctx context.Context, input groupPoolInput,
+	existing *store.GroupPool) ([]int64, []int64, string, error) {
+	whitelistInput, blacklistInput := []int64(nil), []int64(nil)
+	switch {
+	case input.TagWhitelist != nil:
+		whitelistInput = *input.TagWhitelist
+	case existing != nil:
+		whitelistInput = existing.TagWhitelist
+	}
+	switch {
+	case input.TagBlacklist != nil:
+		blacklistInput = *input.TagBlacklist
+	case existing != nil:
+		blacklistInput = existing.TagBlacklist
+	}
+	match := strings.ToLower(strings.TrimSpace(input.TagFilterMatch))
+	if match == "" && existing != nil {
+		match = existing.TagFilterMatch
+	}
+	switch match {
+	case "":
+		match = store.TagFilterMatchAny
+	case store.TagFilterMatchAny, store.TagFilterMatchAll:
+	default:
+		return nil, nil, "", errors.New("标签匹配方式只能是 any 或 all")
+	}
+
+	whitelist := normalizeTagIDs(whitelistInput)
+	blacklist := normalizeTagIDs(blacklistInput)
+	inWhitelist := make(map[int64]struct{}, len(whitelist))
+	for _, tagID := range whitelist {
+		inWhitelist[tagID] = struct{}{}
+	}
+	for _, tagID := range blacklist {
+		if _, conflict := inWhitelist[tagID]; conflict {
+			return nil, nil, "", errors.New("标签白名单与黑名单不能包含同一标签")
+		}
+	}
+	if len(whitelist) == 0 && len(blacklist) == 0 {
+		return whitelist, blacklist, match, nil
+	}
+	if s.store == nil {
+		return nil, nil, "", errors.New("标签筛选不可用: 数据存储未初始化")
+	}
+	tags, err := s.store.ListTags(ctx)
+	if err != nil {
+		return nil, nil, "", fmt.Errorf("读取标签列表: %w", err)
+	}
+	known := make(map[int64]struct{}, len(tags))
+	for _, tag := range tags {
+		known[tag.ID] = struct{}{}
+	}
+	for _, tagID := range append(append([]int64(nil), whitelist...), blacklist...) {
+		if _, ok := known[tagID]; !ok {
+			return nil, nil, "", fmt.Errorf("标签不存在: %d", tagID)
+		}
+	}
+	return whitelist, blacklist, match, nil
+}
+
+// normalizeTagIDs drops non-positive IDs and duplicates while keeping the order
+// the operator sent, which is the order the UI shows them back in.
+func normalizeTagIDs(tagIDs []int64) []int64 {
+	normalized := make([]int64, 0, len(tagIDs))
+	seen := make(map[int64]struct{}, len(tagIDs))
+	for _, tagID := range tagIDs {
+		if tagID <= 0 {
+			continue
+		}
+		if _, duplicate := seen[tagID]; duplicate {
+			continue
+		}
+		seen[tagID] = struct{}{}
+		normalized = append(normalized, tagID)
+	}
+	return normalized
 }
 
 func (s *Server) allocateGroupPort(ctx context.Context) (uint16, error) {
@@ -3405,6 +3533,8 @@ func cloneGroupPool(groupPool *store.GroupPool) *store.GroupPool {
 	cloned.Regions = append([]string(nil), groupPool.Regions...)
 	cloned.ExplicitNodeIDs = append([]int64(nil), groupPool.ExplicitNodeIDs...)
 	cloned.ExcludedNodeIDs = append([]int64(nil), groupPool.ExcludedNodeIDs...)
+	cloned.TagWhitelist = append([]int64(nil), groupPool.TagWhitelist...)
+	cloned.TagBlacklist = append([]int64(nil), groupPool.TagBlacklist...)
 	cloned.NodeStates = append([]store.GroupNodeState(nil), groupPool.NodeStates...)
 	return &cloned
 }

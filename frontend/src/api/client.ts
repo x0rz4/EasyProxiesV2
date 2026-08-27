@@ -32,6 +32,14 @@ import type {
   NodeCheckTask,
   NodeCheckEvent,
   NodeCheckResultItem,
+  NodeTagAssignment,
+  Tag,
+  TagCondition,
+  TagMutexGroup,
+  TagPayload,
+  TagPreviewResponse,
+  TagSchema,
+  TagsResponse,
 } from '../types'
 
 // ---- Token management ----
@@ -250,6 +258,92 @@ export async function createGroupPool(payload: GroupPoolPayload): Promise<GroupP
 
 export async function updateGroupPool(id: number, payload: GroupPoolPayload): Promise<GroupPoolMutationResponse> {
   return request(`/api/groups/${id}`, { method: 'PUT', body: JSON.stringify(payload) })
+}
+
+// ---- Node tags API ----
+
+export async function fetchTags(): Promise<TagsResponse> {
+  return request<TagsResponse>('/api/tags')
+}
+
+export async function createTag(payload: TagPayload): Promise<{ tag: Tag }> {
+  return request<{ tag: Tag }>('/api/tags', { method: 'POST', body: JSON.stringify(payload) })
+}
+
+export async function updateTag(id: number, payload: TagPayload): Promise<{ tag: Tag }> {
+  return request<{ tag: Tag }>(`/api/tags/${id}`, { method: 'PUT', body: JSON.stringify(payload) })
+}
+
+export async function deleteTag(id: number, force = false): Promise<{ ok: boolean }> {
+  return request<{ ok: boolean }>(`/api/tags/${id}${force ? '?force=1' : ''}`, { method: 'DELETE' })
+}
+
+export async function setTagAuto(id: number, autoEnabled: boolean): Promise<{ tag: Tag }> {
+  return request<{ tag: Tag }>(`/api/tags/${id}/auto`, {
+    method: 'PATCH', body: JSON.stringify({ auto_enabled: autoEnabled }),
+  })
+}
+
+export async function fetchTagSchema(): Promise<TagSchema> {
+  return request<TagSchema>('/api/tags/schema')
+}
+
+export async function previewTagRule(body: {
+  rule: TagCondition
+  tag_id?: number
+  mutex_group_id?: number
+  priority?: number
+  node_ids?: number[]
+  limit?: number
+}, signal?: AbortSignal): Promise<TagPreviewResponse> {
+  return request<TagPreviewResponse>('/api/tags/preview', {
+    method: 'POST', body: JSON.stringify(body), signal,
+  })
+}
+
+export async function recomputeTags(nodeIds?: number[]): Promise<{ changed_node_ids: number[] }> {
+  return request<{ changed_node_ids: number[] }>('/api/tags/recompute', {
+    method: 'POST', body: JSON.stringify(nodeIds ? { node_ids: nodeIds } : {}),
+  })
+}
+
+export async function seedTagTemplates(): Promise<{ created: string[]; skipped: string[]; conflicts: string[] }> {
+  return request('/api/tags/templates', { method: 'POST' })
+}
+
+export async function fetchTagAssignments(nodeIds: number[] = []): Promise<{ assignments: NodeTagAssignment[] }> {
+  const query = nodeIds.length ? `?node_ids=${nodeIds.join(',')}` : ''
+  return request<{ assignments: NodeTagAssignment[] }>(`/api/tags/assignments${query}`)
+}
+
+export async function setNodeManualTags(nodeId: number, tagIds: number[]): Promise<{ assignment: NodeTagAssignment }> {
+  return request<{ assignment: NodeTagAssignment }>(`/api/tags/nodes/${nodeId}`, {
+    method: 'PUT', body: JSON.stringify({ tag_ids: tagIds }),
+  })
+}
+
+export async function batchUpdateNodeTags(body: {
+  node_ids: number[]
+  add_tag_ids: number[]
+  remove_tag_ids: number[]
+}): Promise<{ ok: boolean; node_ids: number[] }> {
+  return request('/api/tags/nodes/batch', { method: 'POST', body: JSON.stringify(body) })
+}
+
+export async function fetchTagMutexGroups(): Promise<{ mutex_groups: TagMutexGroup[] }> {
+  return request('/api/tags/mutex-groups')
+}
+
+export async function createTagMutexGroup(payload: { name: string; description?: string }): Promise<{ mutex_group: TagMutexGroup }> {
+  return request('/api/tags/mutex-groups', { method: 'POST', body: JSON.stringify(payload) })
+}
+
+export async function updateTagMutexGroup(id: number, payload: { name?: string; description?: string }): Promise<{ mutex_group: TagMutexGroup }> {
+  return request(`/api/tags/mutex-groups/${id}`, { method: 'PUT', body: JSON.stringify(payload) })
+}
+
+export async function deleteTagMutexGroup(id: number): Promise<{ ok: boolean }> {
+  return request(`/api/tags/mutex-groups/${id}`, { method: 'DELETE' })
 }
 
 export async function deleteGroupPool(id: number) {

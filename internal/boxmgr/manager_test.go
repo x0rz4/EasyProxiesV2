@@ -229,7 +229,7 @@ func TestForcedTopologyUpdateDoesNotKeepRemovedNodeRuntime(t *testing.T) {
 	before := storeGroupFromConfig(cfg.Groups[0])
 	after := cloneStoreGroupForTest(before)
 	after.Regions = []string{"us"}
-	if err := manager.applyGroupRuntime(context.Background(), before, after, true); err == nil {
+	if err := manager.applyGroupRuntime(context.Background(), before, after, applyModeForceNoRollback); err == nil {
 		t.Fatal("forced topology update with no members unexpectedly succeeded")
 	}
 	slot := manager.groupSlot(11)

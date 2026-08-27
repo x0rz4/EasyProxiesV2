@@ -1,8 +1,10 @@
 # 分组筛查规则页面实现方案
 
-> 状态：设计提案  
+> 状态：设计提案 —— **部分已被 `plane/node-tagging-system.md` 取代并落地**  
 > 产品目标：规则筛查 → 自动入组 → 分组独立端口 → 由 Xboard 配置展示名与倍率  
 > 前置依赖：现有分组池、节点探测、解锁检测；运行时应用建议衔接 `plane/incremental-hot-reload.md`
+
+> **取代关系**：§1 的三档商品目标已由节点打标系统达成，路径不同 —— 规则挂在**标签**上，分组通过「标签白名单 / 黑名单」间接筛查，没有独立的 `screening_rules` 引擎。已被取代的章节：§7.5（`member_source` → 三个 tag 列）、§8.1（标签来源 → `node_tags.source` + `nodes.tags` 投影）、§10.1（`ResolveEffectiveGroupMembers` → `groupmember.Filter.Allow`）。§6 的规则 JSON 模型与 §9 的引擎语义以 `internal/nodefacts` 的形式落地，本文档其余部分作为「若将来真要做独立筛查规则实体」的设计参考保留。
 
 ## 1. 目标
 
@@ -33,10 +35,10 @@
 ### 2.2 必须补齐
 
 - 没有筛查规则、规则版本、运行记录和派生成员表。
-- 当前成员计算是 `regions ∪ explicit_node_ids - excluded_node_ids`，无法区分规则成员与人工成员。
-- 当前 unlock 自动标签会整体覆盖 `node.Tags`，人工标签和探测标签没有来源隔离。
+- ~~当前成员计算是 `regions ∪ explicit_node_ids - excluded_node_ids`，无法区分规则成员与人工成员。~~ **已解决**：成员判定收敛到 `internal/groupmember.Filter.Allow`，并接受标签白/黑名单；规则成员与人工成员的区分落在 `node_tags.source` 上。
+- ~~当前 unlock 自动标签会整体覆盖 `node.Tags`，人工标签和探测标签没有来源隔离。~~ **已解决**（打标系统 Phase 3）：`persistUnlockResult` 不再写标签，只入队重算；`node_tags` 主键含 `source`，`ReplaceAutoNodeTags` 只删 `source='auto'`。见 `plane/node-tagging-system.md` §3.2、§6。
 - 丢包率、抖动、p50/p95 延迟暂未形成持久化质量事实。
-- group 配置变化当前触发完整 box reload；规则重算不能逐节点触发 reload。
+- ~~group 配置变化当前触发完整 box reload；规则重算不能逐节点触发 reload。~~ **已解决**：`boxmgr.ApplyGroupMembershipChanges` 只重建成员集变化的分组 box，base box 永不 reload。
 - multi-port/group 路由仍是静态构建，批量成员变化要和增量热重载方案协同。
 
 ## 3. 产品边界与首期范围
@@ -69,6 +71,7 @@
 节点监控
 订阅管理
 节点管理
+节点标签    ← 已实现，打标规则与互斥组（plane/node-tagging-system.md）
 筛查规则    ← 新增，策略中心
 分组池      ← 执行状态与入口
 解锁检测
@@ -244,7 +247,9 @@ Go 的 regexp 使用 RE2，可避免灾难性回溯，但仍需限制表达式�
 
 ## 7. 数据库设计
 
-追加 migration 9，建议包含以下表和字段。
+追加 migration，建议包含以下表和字段。
+
+> **版本纠正**：本文档写作时的最大 migration 版本是 8，写成「migration 9」。此后仓库演进到 **12**，节点打标系统占用 **13**（`add node tagging system`）。若将来真要建独立的 `screening_rules` 实体，从 **14** 起。
 
 ### 7.1 screening_rules
 
@@ -329,6 +334,20 @@ CREATE TABLE screening_settings (
 
 ### 7.5 group_pools.member_source
 
+> **已被取代。** migration 13 没有加 `member_source`，而是加了三列：
+>
+> ```sql
+> ALTER TABLE group_pools ADD COLUMN tag_whitelist_json TEXT NOT NULL DEFAULT '[]';
+> ALTER TABLE group_pools ADD COLUMN tag_blacklist_json TEXT NOT NULL DEFAULT '[]';
+> ALTER TABLE group_pools ADD COLUMN tag_filter_match   TEXT NOT NULL DEFAULT 'any';
+> ```
+>
+> 没有 `manual` / `rules` / `hybrid` 三态：成员始终是 `region ∪ explicit − excluded`，标签白/黑名单只是在 region 分支上再加一道过滤，空白名单等于不过滤。这样默认值天然向后兼容，也不需要在三种模式之间做语义解释。白/黑名单存标签 **ID**（改名安全），`tag_filter_match ∈ {any, all}`。判定顺序见 `plane/node-tagging-system.md` §7。
+>
+> 「人工覆盖导致多组」这层担忧同样换了形式：`explicit_node_ids` **绕过**白/黑名单（强制加入就该是强制加入），互斥只发生在标签层（`tag_mutex_groups`），且互斥组内人工标签压过所有自动标签。
+
+以下为原设计，保留作参考：
+
 增加：
 
 ```sql
@@ -376,6 +395,15 @@ type NodeFacts struct {
 FactLoader 必须批量读取 nodes、node_stats、node_unlock_results 和必要的 group states，禁止按节点 N+1 查询。
 
 ### 8.1 标签来源修正
+
+> **已定论并落地（方案一的变体）。** 最终做法：
+>
+> - `node_tags(node_id, tag_id, source, ...)`，主键含 `source ∈ {manual, auto}`。这是**结构性**保证 —— `ReplaceAutoNodeTags` 只发 `DELETE ... WHERE node_id=? AND source='auto'`，一次解锁检测在物理上不可能删掉人工标签。
+> - `nodes.tags` 保留，但降级为 `manual ∪ auto` **名称**的去重排序**投影列**，由标签层在同一事务内改写。所以 `store.Node.Tags`、`ManagedNode.Tags`、`mergeNodeMetadata` 以及所有现有读点零改动，运行期分组筛选也不用 join。
+> - `persistUnlockResult` 里那段 `node.Tags = newTags` + `UpdateNode` 已删除，改为 `enqueueRetag(nodeID)`。原逻辑还顺带修掉三个 bug：依赖从不被填充的 `unlock.IPInfo.Pure`/`RiskLevel`（两个分支是死代码）、标签字符串与 `DisplayName` 耦合、真实 IP 质量事实其实在 `node_ip_quality_results`。
+> - 投影刷新**不走 `UpdateNode`**，避免标签抖动刷新 `nodes.updated_at` 污染身份对账与订阅 diff。
+>
+> 细节见 `plane/node-tagging-system.md` §3.2、§3.3、§6。以下为当时的两个候选：
 
 当前 unlock 检测会用自动标签整体覆盖 `node.Tags`。引入规则前应二选一：
 
@@ -475,6 +503,23 @@ P1 不让 `add_tag` 参与同一轮事实输入，避免规则 A 写标签后改
 ## 10. 分组池集成
 
 ### 10.1 Effective membership
+
+> **已被取代。** 「统一成员判定」这条原则保留并落地了，但形态是**谓词**而不是「按 groupID 返回成员列表」：
+>
+> ```go
+> // internal/groupmember
+> func NewFilter(groupCfg config.GroupPoolConfig, opts ...Option) Filter
+> func (f Filter) Allow(node Node) bool
+> func Nodes(cfg *config.Config, groupCfg config.GroupPoolConfig, opts ...Option) []config.NodeConfig
+> ```
+>
+> 为什么是谓词：builder 按 `memberTags` 顺序迭代（顺序决定 `members[0]`，即分组默认出口），boxmgr 按 `cfg.Nodes` 迭代。谓词让判定只有一份实现，同时不改变各调用方的成员顺序 —— 改顺序会静默改掉分组默认出口。它也不需要 `ctx`/`store`，可以在纯内存的配置快照上跑，`ApplyGroupMembershipChanges` 的「旧成员 vs 新成员」比较就是这么做的。
+>
+> 判定顺序（定案）：分组停用 → `excluded` 强制排除 → `explicit` 强制加入且**绕过白/黑名单** → 否则 region + 白名单(any|all) + 黑名单。空 region 归一为 `geoip.RegionOther`。替换掉的三处重复实现：`builder.go`、`boxmgr.groupMemberNodes`、以及 `monitor/group_subscription.go`（后者消费 `GroupRuntimeSnapshots()`，自动继承）。见 `plane/node-tagging-system.md` §7。
+>
+> EVICTED 语义不变：它是组内运行状态，不影响成员身份。
+
+以下为原设计：
 
 新增 store/service 层方法统一计算有效成员，builder、API 和 runtime 禁止各自重复实现集合逻辑：
 
@@ -663,6 +708,19 @@ Mutation 成功后精确失效规则、groups 和相关 nodes 查询。排序使
 
 ## 15. 实施阶段
 
+> **实际执行的是打标系统的 8 个阶段**，P0–P5 的对应关系如下。**三档商品目标在 Phase 7 结束即达成，不需要 `screening_rules` 引擎。**
+>
+> | 本文档 | 打标系统实际阶段 | 说明 |
+> | --- | --- | --- |
+> | P0 模型与纯引擎 | Phase 1 store 基座（migration 13 + `sqlite_tags.go` + 批量事实读） / Phase 2 引擎（`internal/nodefacts` + `internal/nodetag`，离线） | 引擎包名是 `nodefacts`/`nodetag` 而不是 `screening`；`Fact[T]` 三态与未知语义原样落地 |
+> | P1 规则 API 与派生成员 | Phase 6 HTTP API（`/api/tags*`） / Phase 4 统一成员判定（`internal/groupmember`） | 没有 `assignments` 表与 `ruleset_version`/`applied_version`：规则挂在标签上，`node_tags` 就是派生成员，`rule_version` 承担版本追踪 |
+> | P2 页面 | Phase 7 前端（`TagsPanel` + `components/tags/*`） | 导航项叫「节点标签」；三档商品在分组池页面用标签白/黑名单配置 |
+> | P3 质量维度 | Phase 2（unlock / ipq / ASN / risk / freshness 字段） / Phase 3 触发（探测完成后按 node ID 增量重算） | 来源隔离在 Phase 1 就靠 `node_tags.source` 结构性解决，不是 P3 的补救项 |
+> | P4 稳定性与热更新 | Phase 3 队列（去抖 2s / 兜底 10min） / Phase 5 成员增量（`applyMode` 三值 + `ApplyGroupMembershipChanges`） | 成员变化不再触发完整 box reload，且不依赖 `incremental-hot-reload.md` 的第一阶段 |
+> | P5 高级质量规则 | **未做** | 丢包 / 抖动 / p50 / p95 仍未持久化；`add_tag`/`exclude` 动作在标签模型里不存在（标签本身就是「加标签」这个动作） |
+>
+> Phase 8 是文档：新增 `plane/node-tagging-system.md` 并修订本文档。
+
 ### P0：模型与纯规则引擎
 
 - migration 9、store 接口与 SQLite 实现。
@@ -719,7 +777,7 @@ Mutation 成功后精确失效规则、groups 和相关 nodes 查询。排序使
 
 ### 16.2 Store 与 API 测试
 
-- migration 8 → 9 保留原 group 行为，member_source 默认为 manual。
+- ~~migration 8 → 9 保留原 group 行为，member_source 默认为 manual。~~ 实际是 **12 → 13**：三个 tag 列的默认值（`'[]'`/`'[]'`/`'any'`）保证原 group 行为不变，并额外用 `json_each(nodes.tags)` 回填已有标签为 `node_tags(source='manual')`。见 `internal/store/tags_test.go`。
 - CRUD、reorder、409 version conflict、preview 无副作用。
 - apply 事务失败后旧 assignments 完整保留。
 - 删除 rule/group/node 时外键行为符合设计。
@@ -763,6 +821,7 @@ Mutation 成功后精确失效规则、groups 和相关 nodes 查询。排序使
 3. 保存启用规则是否自动 apply；建议默认不自动，明确使用“保存并应用”。
 4. inline 节点无数据库 ID 时如何进入 assignments；当前实际 reload 会把 SQLite ID 合并回配置，规则引擎应只对已持久化节点工作。
 5. 人工标签的管理入口和 derived tags 拆分方案。
+   **已定论**：拆分靠 `node_tags.source`（`manual` / `auto` 可并存于同一 (node, tag)），`nodes.tags` 降级为两者名称并集的投影列。人工标签的管理入口是 `PUT /api/tags/nodes/{node_id}`（覆盖该节点人工标签集）与 `POST /api/tags/nodes/batch`（批量增删），前端在「节点管理」页每行的 `NodeTagPicker`。自动标签只由规则产生，运营不能手改；互斥组内人工标签压过所有自动标签。见 `plane/node-tagging-system.md` §3.3、§5.1、§8。
 6. 第一版 runtime 是暂时完整 reload，还是等 group 增量 snapshot 一起上线；为避免新增功能放大中断，建议至少做到一次规则运行只 reload 一次，并尽快接增量路径。
 
 以上决策确认后，可以按 P0 → P1 → P2 并行拆分后端模型、API 与前端静态页面，但 assignments 接入 group runtime 必须等 effective membership resolver 完成后再合并。

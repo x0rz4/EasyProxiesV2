@@ -12,6 +12,7 @@ import { PageContent, PageHeader, PageLayout } from './ui/PageLayout'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { cn } from '../utils/cn'
+import NodeTagPicker from './tags/NodeTagPicker'
 import {
   ArrowDown, ArrowUp, ArrowUpDown, Ban, Server, SlidersHorizontal, ChevronDown,
   Download, Upload, RefreshCw, Plus, Search, Activity, FolderX, ShieldCheck,
@@ -228,7 +229,7 @@ export default function ManagePanel() {
           success_count: 0,
           failure_count: 0,
           tag: undefined,
-          tags: undefined,
+          tags: cfg.tags,
         }
       }
 
@@ -243,7 +244,7 @@ export default function ManagePanel() {
           success_count: 0,
           failure_count: 0,
           tag: undefined,
-          tags: undefined,
+          tags: cfg.tags,
         }
       }
 
@@ -268,7 +269,7 @@ export default function ManagePanel() {
         success_count: typeof snap.success_count === 'number' ? snap.success_count : 0,
         failure_count: snap.failure_count,
         tag: snap.tag,
-        tags: snap.tags,
+        tags: cfg.tags,
       }
     })
   }, [configNodes, monitorData])
@@ -889,13 +890,7 @@ export default function ManagePanel() {
                         {node.region && <span className="text-lg leading-none filter drop-shadow-sm">{regionFlag(node.region)}</span>}
                         <span className="truncate max-w-[200px]" title={node.name}>{node.name}</span>
                       </div>
-                      {node.tags && node.tags.length > 0 && (
-                        <div className="flex flex-wrap gap-1 mt-1">
-                          {node.tags.slice(0, 3).map(tag => (
-                            <span key={tag} className="badge badge-[10px] badge-ghost opacity-60 px-1 py-0 text-[10px]">{tag}</span>
-                          ))}
-                        </div>
-                      )}
+                      <NodeTagPicker nodeId={node.id} currentTagNames={node.tags} />
                     </td>
                     <td><StatusBadge status={node.runtimeStatus} /></td>
                     <td className={`font-mono text-sm font-medium ${latencyColor(node.latency_ms)}`}>

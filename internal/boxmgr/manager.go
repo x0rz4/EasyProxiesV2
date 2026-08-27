@@ -19,6 +19,7 @@ import (
 	"easy_proxies/internal/builder"
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/group"
+	"easy_proxies/internal/groupmember"
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/nodecodec"
 	"easy_proxies/internal/outbound/pool"
@@ -420,7 +421,7 @@ func (m *Manager) syncGroupRuntimesAfterBaseReload(ctx context.Context, oldCfg, 
 		if groupRuntimeTopologyEqual(oldCfg, newCfg, id) {
 			continue
 		}
-		if err := m.applyGroupRuntime(ctx, oldGroups[id], newGroups[id], true); err != nil {
+		if err := m.applyGroupRuntime(ctx, oldGroups[id], newGroups[id], applyModeForceNoRollback); err != nil {
 			result = errors.Join(result, fmt.Errorf("group %d: %w", id, err))
 		}
 	}
@@ -453,34 +454,31 @@ func groupConfigByID(cfg *config.Config, groupID int64) (config.GroupPoolConfig,
 	return config.GroupPoolConfig{}, false
 }
 
+// groupMemberNodes reports the group's members as the running box will see them.
+// The judgement itself belongs to internal/groupmember so that this comparison
+// and the builder can never disagree about who is in the group.
 func groupMemberNodes(cfg *config.Config, groupCfg config.GroupPoolConfig) []config.NodeConfig {
 	if cfg == nil || !groupCfg.Enabled {
 		return nil
 	}
-	regions := make(map[string]struct{}, len(groupCfg.Regions))
-	for _, region := range groupCfg.Regions {
-		regions[strings.ToLower(strings.TrimSpace(region))] = struct{}{}
+	return groupmember.Nodes(cfg, groupCfg, groupmember.WithTagNames(cfg.TagNames))
+}
+
+// groupMemberRuntimeShape reports the group's members reduced to what its running
+// box is built from. Tags are stripped because they never reach the box — the
+// builder deliberately keeps them out of the member metadata — so a node merely
+// gaining a tag it was already qualified by must not count as a change.
+func groupMemberRuntimeShape(cfg *config.Config, groupCfg config.GroupPoolConfig) []config.NodeConfig {
+	members := groupMemberNodes(cfg, groupCfg)
+	if members == nil {
+		return nil
 	}
-	explicit := make(map[int64]struct{}, len(groupCfg.ExplicitNodeIDs))
-	for _, nodeID := range groupCfg.ExplicitNodeIDs {
-		explicit[nodeID] = struct{}{}
+	shape := make([]config.NodeConfig, len(members))
+	for index, member := range members {
+		member.Tags = nil
+		shape[index] = member
 	}
-	excluded := make(map[int64]struct{}, len(groupCfg.ExcludedNodeIDs))
-	for _, nodeID := range groupCfg.ExcludedNodeIDs {
-		excluded[nodeID] = struct{}{}
-	}
-	result := make([]config.NodeConfig, 0)
-	for _, node := range cfg.Nodes {
-		if _, skip := excluded[node.ID]; skip {
-			continue
-		}
-		_, manuallyIncluded := explicit[node.ID]
-		_, regionIncluded := regions[strings.ToLower(strings.TrimSpace(node.Region))]
-		if manuallyIncluded || regionIncluded {
-			result = append(result, node)
-		}
-	}
-	return result
+	return shape
 }
 
 func storeGroupFromConfig(groupCfg config.GroupPoolConfig) *store.GroupPool {
@@ -488,6 +486,8 @@ func storeGroupFromConfig(groupCfg config.GroupPoolConfig) *store.GroupPool {
 		BindPort: groupCfg.BindPort, Protocol: groupCfg.Protocol, Username: groupCfg.Username, Password: groupCfg.Password,
 		DispatchMode: groupCfg.DispatchMode, Regions: append([]string(nil), groupCfg.Regions...),
 		ExplicitNodeIDs: append([]int64(nil), groupCfg.ExplicitNodeIDs...), ExcludedNodeIDs: append([]int64(nil), groupCfg.ExcludedNodeIDs...),
+		TagWhitelist: append([]int64(nil), groupCfg.TagWhitelist...), TagBlacklist: append([]int64(nil), groupCfg.TagBlacklist...),
+		TagFilterMatch:       groupCfg.TagFilterMatch,
 		FailureWindowSeconds: int(groupCfg.FailureWindow / time.Second), FailureThreshold: groupCfg.FailureThreshold,
 		HealthCheckSeconds: int(groupCfg.HealthCheckInterval / time.Second), CurrentActiveNodeID: groupCfg.CurrentActiveNodeID,
 		Enabled: groupCfg.Enabled, SubscriptionEnabled: groupCfg.SubscriptionEnabled, SubscriptionToken: groupCfg.SubscriptionToken,
@@ -687,11 +687,34 @@ func (m *Manager) startInitialGroup(ctx context.Context, groupID int64) error {
 	return nil
 }
 
+// applyMode says how applyGroupRuntime should treat a rebuild request. The
+// distinction that matters is not "rebuild or not" but what happens when the
+// rebuild fails, which is why this is three values rather than a bool.
+type applyMode uint8
+
+const (
+	// applyModeDelta skips the rebuild entirely when the group definition is
+	// unchanged. It is the default for an operator editing one group.
+	applyModeDelta applyMode = iota
+	// applyModeForceNoRollback rebuilds unconditionally and leaves the group
+	// stopped on failure. It is for the path that follows a base reload: the base
+	// box has already moved on, so the old group box could not be recreated
+	// against it even if we tried.
+	applyModeForceNoRollback
+	// applyModeForceWithRollback rebuilds unconditionally but restores the
+	// previous box on failure. It is for rebuilds driven by node facts — tags,
+	// regions — where the group definition itself is untouched and still valid,
+	// so falling back to the running listener is strictly better than dropping it.
+	applyModeForceWithRollback
+)
+
+func (mode applyMode) forced() bool { return mode != applyModeDelta }
+
 func (m *Manager) ApplyGroupRuntime(ctx context.Context, before, after *store.GroupPool) error {
-	return m.applyGroupRuntime(ctx, before, after, false)
+	return m.applyGroupRuntime(ctx, before, after, applyModeDelta)
 }
 
-func (m *Manager) applyGroupRuntime(ctx context.Context, before, after *store.GroupPool, force bool) error {
+func (m *Manager) applyGroupRuntime(ctx context.Context, before, after *store.GroupPool, mode applyMode) error {
 	groupID := int64(0)
 	if after != nil {
 		groupID = after.ID
@@ -707,7 +730,7 @@ func (m *Manager) applyGroupRuntime(ctx context.Context, before, after *store.Gr
 	}
 	defer releaseGroupSlot(slot)
 
-	if !force && groupRuntimeEqual(before, after) {
+	if !mode.forced() && groupRuntimeEqual(before, after) {
 		m.replaceCachedGroup(after)
 		return nil
 	}
@@ -748,7 +771,7 @@ func (m *Manager) applyGroupRuntime(ctx context.Context, before, after *store.Gr
 	}
 	newBox, err := m.createGroupBox(baseCtx, candidateCfg, groupID)
 	if err != nil {
-		if force {
+		if mode == applyModeForceNoRollback {
 			if oldBox != nil {
 				_ = oldBox.Close()
 			}
@@ -759,6 +782,7 @@ func (m *Manager) applyGroupRuntime(ctx context.Context, before, after *store.Gr
 			m.replaceCachedGroup(after)
 			return err
 		}
+		// The old box was never closed, so it is still serving: leave it alone.
 		if oldBox != nil {
 			m.setGroupRuntimeStatus(groupID, "ready", "")
 		} else {
@@ -771,7 +795,7 @@ func (m *Manager) applyGroupRuntime(ctx context.Context, before, after *store.Gr
 	}
 	if err = newBox.Start(); err != nil {
 		_ = newBox.Close()
-		if force {
+		if mode == applyModeForceNoRollback {
 			slot.mu.Lock()
 			slot.box = nil
 			slot.state = monitor.GroupRuntimeStatus{Status: "error", Error: err.Error()}
@@ -882,6 +906,126 @@ func (m *Manager) replaceCachedGroup(groupPool *store.GroupPool) {
 	m.cfg.Groups = groups
 }
 
+// loadTagNames snapshots the tag ID → name mapping group membership is resolved
+// through. An ID missing from the result is treated as a tag no node can carry,
+// so a deleted tag narrows the groups referencing it instead of widening them.
+func (m *Manager) loadTagNames(ctx context.Context) (map[int64]string, error) {
+	if m.store == nil {
+		return nil, nil
+	}
+	tags, err := m.store.ListTags(ctx)
+	if err != nil {
+		return nil, err
+	}
+	tagNames := make(map[int64]string, len(tags))
+	for _, tag := range tags {
+		tagNames[tag.ID] = tag.Name
+	}
+	return tagNames, nil
+}
+
+// ApplyGroupMembershipChanges reacts to node facts changing — tags being
+// recomputed, a landing region being classified — by rebuilding only the group
+// listeners whose member set actually moved.
+//
+// The base box is never reloaded. A full reload rebuilds every listener in the
+// process, which drops live connections on groups that did not change, and node
+// facts change far more often than group definitions do. The cached config is
+// refreshed even when no group is affected, so the next reload still sees the
+// current tags.
+func (m *Manager) ApplyGroupMembershipChanges(ctx context.Context, changedNodeIDs []int64) error {
+	if len(changedNodeIDs) == 0 {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if m.store == nil {
+		return nil
+	}
+	changed := make(map[int64]struct{}, len(changedNodeIDs))
+	ids := make([]int64, 0, len(changedNodeIDs))
+	for _, nodeID := range changedNodeIDs {
+		if nodeID <= 0 {
+			continue
+		}
+		if _, seen := changed[nodeID]; seen {
+			continue
+		}
+		changed[nodeID] = struct{}{}
+		ids = append(ids, nodeID)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	// Read the store before taking the lock: the fresh facts are what the new
+	// membership is judged against, and the query must not block reloads.
+	nodes, err := m.store.ListNodes(ctx, store.NodeFilter{NodeIDs: ids})
+	if err != nil {
+		return fmt.Errorf("list changed nodes: %w", err)
+	}
+	tagNames, err := m.loadTagNames(ctx)
+	if err != nil {
+		return fmt.Errorf("list tags: %w", err)
+	}
+	storedByID := make(map[int64]store.Node, len(nodes))
+	for _, node := range nodes {
+		storedByID[node.ID] = node
+	}
+
+	m.mu.Lock()
+	if m.cfg == nil {
+		m.mu.Unlock()
+		return nil
+	}
+	before := m.cfg.Clone()
+	for idx := range m.cfg.Nodes {
+		nodeID := m.cfg.Nodes[idx].ID
+		if _, affected := changed[nodeID]; !affected {
+			continue
+		}
+		// A node the store no longer reports is left as it is: it is on its way out
+		// through a config reload, and clearing its facts here would shuffle groups
+		// on the way.
+		stored, found := storedByID[nodeID]
+		if !found {
+			continue
+		}
+		m.cfg.Nodes[idx].Tags = append([]string(nil), stored.Tags...)
+		// The landing classification is a membership fact too, and this is the path
+		// a region change arrives through as well.
+		m.cfg.Nodes[idx].Region = stored.Region
+		m.cfg.Nodes[idx].Country = stored.Country
+	}
+	m.cfg.TagNames = tagNames
+	after := m.cfg.Clone()
+	m.mu.Unlock()
+
+	var result error
+	for index := range after.Groups {
+		groupCfg := after.Groups[index]
+		if !groupCfg.Enabled || groupCfg.ID == 0 {
+			continue
+		}
+		previous, found := groupConfigByID(before, groupCfg.ID)
+		if found && reflect.DeepEqual(groupMemberRuntimeShape(before, previous), groupMemberRuntimeShape(after, groupCfg)) {
+			continue
+		}
+		groupPool := storeGroupFromConfig(groupCfg)
+		// The group definition itself did not change, so the running listener is
+		// still a valid fallback: rebuild forcibly but keep the rollback.
+		if err := m.applyGroupRuntime(ctx, groupPool, groupPool, applyModeForceWithRollback); err != nil {
+			result = errors.Join(result, fmt.Errorf("group %d: %w", groupCfg.ID, err))
+			continue
+		}
+		m.logger.Infof("group %q rebuilt after node membership change", groupCfg.Name)
+	}
+	return result
+}
+
+// groupRuntimeEqual reports whether two revisions of a group definition describe
+// the same listener. Every field that can change who is in the group has to be
+// here: editing only the tag whitelist would otherwise be a silent no-op.
 func groupRuntimeEqual(before, after *store.GroupPool) bool {
 	if before == nil || after == nil {
 		return before == after
@@ -890,6 +1034,8 @@ func groupRuntimeEqual(before, after *store.GroupPool) bool {
 		before.Protocol == after.Protocol && before.Username == after.Username && before.Password == after.Password &&
 		before.DispatchMode == after.DispatchMode && reflect.DeepEqual(before.Regions, after.Regions) &&
 		reflect.DeepEqual(before.ExplicitNodeIDs, after.ExplicitNodeIDs) && reflect.DeepEqual(before.ExcludedNodeIDs, after.ExcludedNodeIDs) &&
+		reflect.DeepEqual(before.TagWhitelist, after.TagWhitelist) && reflect.DeepEqual(before.TagBlacklist, after.TagBlacklist) &&
+		before.TagFilterMatch == after.TagFilterMatch &&
 		before.FailureWindowSeconds == after.FailureWindowSeconds && before.FailureThreshold == after.FailureThreshold &&
 		before.HealthCheckSeconds == after.HealthCheckSeconds && before.Enabled == after.Enabled
 }
@@ -1164,6 +1310,7 @@ func (m *Manager) ListConfigNodes(ctx context.Context, subscriptionID *int64) ([
 			port = runtimePort
 		}
 		result = append(result, monitor.ManagedNodeConfig{
+			ID:              n.ID,
 			Name:            n.Name,
 			URI:             n.URI,
 			Port:            port,
@@ -1171,6 +1318,7 @@ func (m *Manager) ListConfigNodes(ctx context.Context, subscriptionID *int64) ([
 			Password:        n.Password,
 			Region:          n.Region,
 			Country:         n.Country,
+			Tags:            n.Tags,
 			Source:          config.NodeSource(n.Source),
 			Disabled:        !n.Enabled,
 			SubscriptionIDs: n.SubscriptionIDs,
@@ -1184,8 +1332,9 @@ func managedNodeConfig(node config.NodeConfig, subscriptionIDs []int64) monitor.
 	if subscriptionIDs == nil {
 		subscriptionIDs = []int64{}
 	}
-	return monitor.ManagedNodeConfig{Name: node.Name, URI: node.URI, Port: node.Port,
-		Username: node.Username, Password: node.Password, Region: node.Region, Country: node.Country, Source: node.Source,
+	return monitor.ManagedNodeConfig{ID: node.ID, Name: node.Name, URI: node.URI, Port: node.Port,
+		Username: node.Username, Password: node.Password, Region: node.Region, Country: node.Country,
+		Tags: node.Tags, Source: node.Source,
 		Disabled: node.Disabled, SubscriptionIDs: subscriptionIDs}
 }
 
@@ -1458,6 +1607,7 @@ func (m *Manager) TriggerReload(ctx context.Context) error {
 					// Inline connection settings take priority, while SQLite owns the
 					// stable identity and discovered region metadata used by groups.
 					newCfg.Nodes[idx].ID = n.ID
+					newCfg.Nodes[idx].Tags = append([]string(nil), n.Tags...)
 					if newCfg.Nodes[idx].Region == "" {
 						newCfg.Nodes[idx].Region = n.Region
 					}
@@ -1476,6 +1626,7 @@ func (m *Manager) TriggerReload(ctx context.Context) error {
 					Source:       config.NodeSource(n.Source),
 					Region:       n.Region,
 					Country:      n.Country,
+					Tags:         append([]string(nil), n.Tags...),
 					IdentityHash: n.IdentityHash, CanonicalJSON: n.CanonicalJSON,
 				})
 			}
@@ -1486,6 +1637,13 @@ func (m *Manager) TriggerReload(ctx context.Context) error {
 			m.logger.Warnf("failed to list group pools during reload: %v", err)
 		} else {
 			newCfg.Groups = GroupConfigsFromStore(groups)
+		}
+		// Tag names join a group's tag IDs to the tag names a node carries, so the
+		// snapshot has to be refreshed together with the nodes it applies to.
+		if tagNames, err := m.loadTagNames(ctx); err != nil {
+			m.logger.Warnf("failed to list tags during reload: %v", err)
+		} else {
+			newCfg.TagNames = tagNames
 		}
 	}
 
@@ -1523,6 +1681,9 @@ func GroupConfigsFromStore(groups []store.GroupPool) []config.GroupPoolConfig {
 			DispatchMode: group.DispatchMode, Regions: append([]string(nil), group.Regions...),
 			ExplicitNodeIDs:  append([]int64(nil), group.ExplicitNodeIDs...),
 			ExcludedNodeIDs:  append([]int64(nil), group.ExcludedNodeIDs...),
+			TagWhitelist:     append([]int64(nil), group.TagWhitelist...),
+			TagBlacklist:     append([]int64(nil), group.TagBlacklist...),
+			TagFilterMatch:   group.TagFilterMatch,
 			FailureWindow:    time.Duration(group.FailureWindowSeconds) * time.Second,
 			FailureThreshold: group.FailureThreshold, HealthCheckInterval: time.Duration(group.HealthCheckSeconds) * time.Second,
 			CurrentActiveNodeID: group.CurrentActiveNodeID, Enabled: group.Enabled,

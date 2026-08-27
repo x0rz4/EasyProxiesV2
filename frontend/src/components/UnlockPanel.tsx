@@ -448,6 +448,9 @@ export default function UnlockPanel() {
       />
 
       <PageContent fill>
+        <p className="mb-4 text-sm leading-6 text-base-content/55">
+          原生 IP / 解锁标签现由“节点标签”页面中的规则产生；本页只负责检测并保存事实。
+        </p>
         {/* ---- Batch progress banner ---- */}
         {batchRunning && (
           <div className={cn(surfaceClass, 'mb-5 border-primary/30 bg-primary/5 p-4 sm:p-5')}>
@@ -1161,15 +1164,6 @@ function UnlockRow({
             <div className="truncate font-semibold text-base-content" title={node.name}>
               <span className="mr-1.5 font-mono text-[10px] text-base-content/35">{index + 1}</span>{node.name}
             </div>
-            {node.tags && node.tags.length > 0 && (
-              <div className="mt-0.5 flex flex-wrap gap-1">
-                {node.tags.slice(0, 2).map((tag) => (
-                  <span key={tag} className="badge badge-ghost badge-xs text-[10px] text-base-content/50">
-                    {tag}
-                  </span>
-                ))}
-              </div>
-            )}
           </div>
         </div>
       </td>

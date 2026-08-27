@@ -398,7 +398,9 @@ func (m *nodeCheckManager) runQuality(task *nodeCheckTask) {
 	outcomes := make(map[int64][]string)
 	var outcomesMu sync.Mutex
 	var locationMu sync.Mutex
-	locationChanged := false
+	// relocatedNodeIDs, not just a boolean: a region change moves group
+	// membership, and the incremental path needs to know which nodes moved.
+	relocatedNodeIDs := make([]int64, 0)
 	markLocation := func(node Snapshot, region, country string) {
 		region = strings.ToLower(strings.TrimSpace(region))
 		country = strings.TrimSpace(country)
@@ -411,7 +413,7 @@ func (m *nodeCheckManager) runQuality(task *nodeCheckTask) {
 		m.server.mgr.UpdateNodeLocation(node.NodeID, region, country)
 		if node.Region != region || node.Country != country {
 			locationMu.Lock()
-			locationChanged = true
+			relocatedNodeIDs = append(relocatedNodeIDs, node.NodeID)
 			locationMu.Unlock()
 		}
 	}
@@ -544,15 +546,10 @@ func (m *nodeCheckManager) runQuality(task *nodeCheckTask) {
 		task.publish(nodeCheckEvent{Type: "task", Phase: "quality", NodeID: node.NodeID, Tag: node.Tag, Name: node.Name, Status: stageStatus})
 	}
 	locationMu.Lock()
-	shouldReload := locationChanged
+	relocated := append([]int64(nil), relocatedNodeIDs...)
 	locationMu.Unlock()
-	if shouldReload && m.server.nodeMgr != nil {
-		reloadCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		err := m.server.nodeMgr.TriggerReload(reloadCtx)
-		cancel()
-		if err != nil {
-			task.publish(nodeCheckEvent{Type: "task", Phase: "quality", Status: "warning", Error: "落地地区已保存，但分组刷新失败: " + err.Error()})
-		}
+	if err := m.server.refreshGroupMembership(relocated); err != nil {
+		task.publish(nodeCheckEvent{Type: "task", Phase: "quality", Status: "warning", Error: "落地地区已保存，但分组刷新失败: " + err.Error()})
 	}
 	m.persist(task)
 }
