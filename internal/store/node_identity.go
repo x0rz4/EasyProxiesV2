@@ -159,7 +159,24 @@ func mergeNodeReferences(tx *sql.Tx, winnerID, loserID int64) error {
 	if err := mergeGroupStates(tx, winnerID, loserID); err != nil {
 		return err
 	}
+	if err := mergeNodeTags(tx, winnerID, loserID); err != nil {
+		return err
+	}
 	_, err := tx.Exec(`DELETE FROM nodes WHERE id=?`, loserID)
+	return err
+}
+
+// mergeNodeTags moves the loser's tag assignments to the winner, preserving the
+// manual/auto split. Without this the loser's rows would vanish with the
+// ON DELETE CASCADE below, silently dropping tags on every store.Open(). The
+// caller rewrites the winner's nodes.tags projection from the merged name union.
+func mergeNodeTags(tx *sql.Tx, winnerID, loserID int64) error {
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO node_tags(node_id,tag_id,source,rule_version,matched_at,updated_at)
+		SELECT ?,tag_id,source,rule_version,matched_at,updated_at FROM node_tags WHERE node_id=?`,
+		winnerID, loserID); err != nil {
+		return err
+	}
+	_, err := tx.Exec(`DELETE FROM node_tags WHERE node_id=?`, loserID)
 	return err
 }
 

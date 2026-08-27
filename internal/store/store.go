@@ -172,6 +172,55 @@ type Store interface {
 	UpsertGroupNodeState(ctx context.Context, state *GroupNodeState) error
 	ClearGroupNodeState(ctx context.Context, groupID, nodeID int64) error
 
+	// --- Node tags ---
+
+	ListTags(ctx context.Context) ([]Tag, error)
+	GetTag(ctx context.Context, id int64) (*Tag, error)
+	GetTagByName(ctx context.Context, name string) (*Tag, error)
+	CreateTag(ctx context.Context, tag *Tag) error
+	UpdateTag(ctx context.Context, tag *Tag) error
+	// DeleteTag removes a tag, its assignments, and its ID from every group
+	// pool tag whitelist/blacklist.
+	DeleteTag(ctx context.Context, id int64) error
+
+	ListTagMutexGroups(ctx context.Context) ([]TagMutexGroup, error)
+	CreateTagMutexGroup(ctx context.Context, group *TagMutexGroup) error
+	UpdateTagMutexGroup(ctx context.Context, group *TagMutexGroup) error
+	// DeleteTagMutexGroup only detaches its member tags; it never deletes tags.
+	DeleteTagMutexGroup(ctx context.Context, id int64) error
+
+	// ListNodeTags returns assignments matching the filter. A zero filter
+	// returns every assignment.
+	ListNodeTags(ctx context.Context, filter NodeTagFilter) ([]NodeTag, error)
+
+	// CountNodesByTag returns the number of distinct nodes per tag ID.
+	CountNodesByTag(ctx context.Context) (map[int64]int, error)
+
+	// SetManualNodeTags replaces one node's manual assignments. Auto
+	// assignments are untouched.
+	SetManualNodeTags(ctx context.Context, nodeID int64, tagIDs []int64) error
+
+	// BatchUpdateManualNodeTags adds and removes manual assignments across
+	// many nodes in one transaction.
+	BatchUpdateManualNodeTags(ctx context.Context, nodeIDs, addTagIDs, removeTagIDs []int64) error
+
+	// ReplaceAutoNodeTags replaces the auto assignments of the listed nodes and
+	// rewrites their nodes.tags projection from manual ∪ auto. Manual
+	// assignments are never touched, and nodes absent from assignments are left
+	// alone.
+	ReplaceAutoNodeTags(ctx context.Context, assignments []NodeAutoTagAssignment) error
+
+	// --- Batch fact reads ---
+	// Every method takes a node ID slice; nil means "all nodes". These exist so
+	// the tagging engine loads a whole fact set in a fixed number of queries
+	// instead of one query per node.
+
+	ListNodeStats(ctx context.Context, nodeIDs []int64) (map[int64]*NodeStats, error)
+	ListNodeDetectionResultsByIDs(ctx context.Context, nodeIDs []int64) (map[int64]*NodeDetectionResult, error)
+	ListNodeIPQualityResultsByIDs(ctx context.Context, nodeIDs []int64) (map[int64][]NodeIPQualityResult, error)
+	ListUnlockResultsByIDs(ctx context.Context, nodeIDs []int64) (map[int64]*UnlockResult, error)
+	ListNodeSubscriptionIDs(ctx context.Context, nodeIDs []int64) (map[int64][]int64, error)
+
 	// --- Lifecycle ---
 
 	// Close releases all resources held by the store.
@@ -186,16 +235,19 @@ type Store interface {
 
 // Node represents a proxy node stored in the database.
 type Node struct {
-	ID            int64     `json:"id"`
-	URI           string    `json:"uri"`
-	Name          string    `json:"name"`
-	Source        string    `json:"source"` // inline, nodes_file, subscription, manual
-	Port          uint16    `json:"port"`
-	Username      string    `json:"username,omitempty"`
-	Password      string    `json:"password,omitempty"`
-	Region        string    `json:"region,omitempty"`
-	Country       string    `json:"country,omitempty"`
-	Enabled       bool      `json:"enabled"`
+	ID       int64  `json:"id"`
+	URI      string `json:"uri"`
+	Name     string `json:"name"`
+	Source   string `json:"source"` // inline, nodes_file, subscription, manual
+	Port     uint16 `json:"port"`
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
+	Region   string `json:"region,omitempty"`
+	Country  string `json:"country,omitempty"`
+	Enabled  bool   `json:"enabled"`
+	// Tags is a denormalized projection of node_tags (manual ∪ auto tag names,
+	// deduplicated and sorted). It is rewritten by the tagging service; writes
+	// from anywhere else are overwritten by the next recompute.
 	Tags          []string  `json:"tags,omitempty"`
 	IdentityHash  string    `json:"-"`
 	CanonicalJSON string    `json:"-"`
@@ -209,28 +261,104 @@ type ManagedNode struct {
 	SubscriptionIDs []int64 `json:"subscription_ids"`
 }
 
+// Node tag assignment sources. The pair is part of the node_tags primary key so
+// a rule recompute can delete auto rows without touching manual ones.
+const (
+	NodeTagSourceManual = "manual"
+	NodeTagSourceAuto   = "auto"
+)
+
+// Group pool tag whitelist match modes.
+const (
+	TagFilterMatchAny = "any"
+	TagFilterMatchAll = "all"
+)
+
+// TagMutexGroup constrains its member tags to at most one per node.
+type TagMutexGroup struct {
+	ID          int64     `json:"id"`
+	Name        string    `json:"name"`
+	Description string    `json:"description,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// Tag is a node label that may carry an auto-assignment rule.
+type Tag struct {
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Color       string `json:"color,omitempty"`
+	Description string `json:"description,omitempty"`
+	// MutexGroupID is 0 when the tag belongs to no mutex group.
+	MutexGroupID int64 `json:"mutex_group_id,omitempty"`
+	// Priority breaks mutex-group ties, highest first.
+	Priority    int  `json:"priority"`
+	AutoEnabled bool `json:"auto_enabled"`
+	// RuleJSON holds the serialized condition AST, empty when there is no rule.
+	RuleJSON string `json:"rule_json,omitempty"`
+	// RuleVersion increments whenever RuleJSON changes.
+	RuleVersion int `json:"rule_version"`
+	// BuiltinKey identifies a seeded template independently of the display
+	// name, which operators may rename.
+	BuiltinKey string    `json:"builtin_key,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+// NodeTag is one (node, tag, source) assignment.
+type NodeTag struct {
+	NodeID      int64     `json:"node_id"`
+	TagID       int64     `json:"tag_id"`
+	Source      string    `json:"source"`
+	RuleVersion int       `json:"rule_version"`
+	MatchedAt   time.Time `json:"matched_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// NodeTagFilter narrows ListNodeTags. Empty fields mean "no restriction".
+type NodeTagFilter struct {
+	NodeIDs []int64
+	TagIDs  []int64
+	Source  string
+}
+
+// NodeAutoTagAssignment is the desired auto-tag state of one node.
+type NodeAutoTagAssignment struct {
+	NodeID int64
+	TagIDs []int64
+	// RuleVersions is indexed like TagIDs; a shorter slice records 0.
+	RuleVersions []int
+}
+
 // NodeFilter specifies criteria for listing nodes.
 type NodeFilter struct {
-	Source  string // Filter by source (empty = all)
-	Region  string // Filter by region (empty = all)
-	Enabled *bool  // Filter by enabled status (nil = all)
-	Limit   int    // Max results (0 = no limit)
-	Offset  int    // Pagination offset
+	NodeIDs []int64 // Filter by node IDs (nil = all)
+	Source  string  // Filter by source (empty = all)
+	Region  string  // Filter by region (empty = all)
+	Enabled *bool   // Filter by enabled status (nil = all)
+	Limit   int     // Max results (0 = no limit)
+	Offset  int     // Pagination offset
 }
 
 // GroupPool is a persisted independently-addressable proxy pool definition.
 type GroupPool struct {
-	ID                   int64            `json:"id"`
-	Name                 string           `json:"name"`
-	BindAddress          string           `json:"bind_address"`
-	BindPort             uint16           `json:"bind_port"`
-	Protocol             string           `json:"protocol"`
-	Username             string           `json:"username,omitempty"`
-	Password             string           `json:"password,omitempty"`
-	DispatchMode         string           `json:"dispatch_mode"`
-	Regions              []string         `json:"regions"`
-	ExplicitNodeIDs      []int64          `json:"explicit_node_ids"`
-	ExcludedNodeIDs      []int64          `json:"excluded_node_ids"`
+	ID              int64    `json:"id"`
+	Name            string   `json:"name"`
+	BindAddress     string   `json:"bind_address"`
+	BindPort        uint16   `json:"bind_port"`
+	Protocol        string   `json:"protocol"`
+	Username        string   `json:"username,omitempty"`
+	Password        string   `json:"password,omitempty"`
+	DispatchMode    string   `json:"dispatch_mode"`
+	Regions         []string `json:"regions"`
+	ExplicitNodeIDs []int64  `json:"explicit_node_ids"`
+	ExcludedNodeIDs []int64  `json:"excluded_node_ids"`
+	// TagWhitelist and TagBlacklist hold tag IDs so renaming a tag cannot break
+	// a group. An empty whitelist means "no tag requirement".
+	TagWhitelist []int64 `json:"tag_whitelist"`
+	TagBlacklist []int64 `json:"tag_blacklist"`
+	// TagFilterMatch is "any" or "all" and applies to TagWhitelist.
+	TagFilterMatch       string           `json:"tag_filter_match"`
 	FailureWindowSeconds int              `json:"failure_window_seconds"`
 	FailureThreshold     int              `json:"failure_threshold"`
 	HealthCheckSeconds   int              `json:"health_check_seconds"`

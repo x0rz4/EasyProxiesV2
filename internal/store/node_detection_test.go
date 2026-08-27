@@ -112,6 +112,58 @@ func TestNodeConnectionIdentityChangeClearsDetectionCache(t *testing.T) {
 	}
 }
 
+// TestIdentityChangeDropsAutoTagsOnly pins the coupling between cached facts and
+// auto tags: an auto tag must not outlive the evidence it was derived from, while
+// operator-entered tags survive.
+func TestIdentityChangeDropsAutoTagsOnly(t *testing.T) {
+	ctx := context.Background()
+	opened, err := Open(filepath.Join(t.TempDir(), "identity-autotags.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	db := opened.(*sqliteStore)
+
+	node := &Node{URI: "http://user:old@127.0.0.1:8080", Name: "tagged", Source: NodeSourceManual, Enabled: true}
+	if err := db.CreateNode(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+	manual := &Tag{Name: "hand-picked"}
+	auto := &Tag{Name: "derived", AutoEnabled: true}
+	if err := db.CreateTag(ctx, manual); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateTag(ctx, auto); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetManualNodeTags(ctx, node.ID, []int64{manual.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReplaceAutoNodeTags(ctx, []NodeAutoTagAssignment{{NodeID: node.ID, TagIDs: []int64{auto.ID}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	node.URI = "http://user:new@127.0.0.1:8080"
+	if err := db.UpdateNode(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+
+	assignments, err := db.ListNodeTags(ctx, NodeTagFilter{NodeIDs: []int64{node.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(assignments) != 1 || assignments[0].TagID != manual.ID || assignments[0].Source != NodeTagSourceManual {
+		t.Fatalf("assignments = %+v, want only the manual one", assignments)
+	}
+	reloaded, err := db.GetNode(ctx, node.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reloaded.Tags) != 1 || reloaded.Tags[0] != "hand-picked" {
+		t.Fatalf("projection = %v, want [hand-picked]", reloaded.Tags)
+	}
+}
+
 func TestUpdateNodeLocationOnlyChangesLandingMetadata(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(filepath.Join(t.TempDir(), "location.db"))

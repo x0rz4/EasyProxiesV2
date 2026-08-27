@@ -102,3 +102,98 @@ func TestIdentityReconcileMergesHistoricalReferences(t *testing.T) {
 		t.Fatalf("diagnostics were not merged: detection=%+v quality=%+v", detections[winner.ID], quality[winner.ID])
 	}
 }
+
+// TestIdentityReconcileMigratesNodeTags guards the assignments against the
+// ON DELETE CASCADE in mergeNodeReferences. Reconciliation runs on every
+// store.Open(), so a missing migration here would drop tags on every startup.
+func TestIdentityReconcileMigratesNodeTags(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "identity-tags.db")
+	opened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := opened.(*sqliteStore)
+
+	winnerNode := &Node{URI: "http://user:pass@EXAMPLE.com:80#winner", Name: "winner", Enabled: true, Tags: []string{"kept-manual"}}
+	if err := db.CreateNode(ctx, winnerNode); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec(`DROP INDEX uq_nodes_identity_hash`); err != nil {
+		t.Fatal(err)
+	}
+	result, err := db.db.Exec(`INSERT INTO nodes(uri,name,source,enabled,tags,identity_hash,canonical_json) VALUES(?,?,?,?,?,?,?)`,
+		"http://user:pass@example.com#loser", "loser", NodeSourceManual, 1,
+		`["loser-manual","loser-auto"]`, "legacy-loser", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	loserID, _ := result.LastInsertId()
+
+	loserManual := &Tag{Name: "loser-manual"}
+	loserAuto := &Tag{Name: "loser-auto"}
+	if err := db.CreateTag(ctx, loserManual); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateTag(ctx, loserAuto); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetManualNodeTags(ctx, loserID, []int64{loserManual.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReplaceAutoNodeTags(ctx, []NodeAutoTagAssignment{{
+		NodeID: loserID, TagIDs: []int64{loserAuto.ID}, RuleVersions: []int{3},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+
+	assignments, err := reopened.ListNodeTags(ctx, NodeTagFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources := map[string]string{}
+	for _, assignment := range assignments {
+		if assignment.NodeID != winnerNode.ID {
+			t.Fatalf("assignment %+v still points at the merged-away node", assignment)
+		}
+		sources[assignment.Source] += "x"
+		if assignment.TagID == loserAuto.ID && assignment.RuleVersion != 3 {
+			t.Fatalf("auto assignment lost its rule version: %+v", assignment)
+		}
+	}
+	if len(assignments) != 3 {
+		t.Fatalf("assignments = %+v, want 3 (two manual, one auto)", assignments)
+	}
+	if len(sources[NodeTagSourceManual]) != 2 || len(sources[NodeTagSourceAuto]) != 1 {
+		t.Fatalf("sources = %v, want both preserved", sources)
+	}
+
+	merged, err := reopened.GetNode(ctx, winnerNode.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"kept-manual", "loser-auto", "loser-manual"}
+	if len(merged.Tags) != len(want) {
+		t.Fatalf("projection = %v, want %v", merged.Tags, want)
+	}
+	for _, name := range want {
+		found := false
+		for _, got := range merged.Tags {
+			if got == name {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("projection = %v, missing %q", merged.Tags, name)
+		}
+	}
+}

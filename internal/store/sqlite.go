@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -76,26 +77,11 @@ type querier interface {
 // ===================== Node operations =====================
 
 func (s *sqliteStore) ListNodes(ctx context.Context, filter NodeFilter) ([]Node, error) {
+	if len(filter.NodeIDs) > sqliteMaxVariables {
+		return s.listNodesChunked(ctx, filter)
+	}
 	query := "SELECT id, uri, name, source, port, username, password, region, country, enabled, tags, identity_hash, canonical_json, created_at, updated_at FROM nodes"
-	var conditions []string
-	var args []any
-
-	if filter.Source != "" {
-		conditions = append(conditions, "source = ?")
-		args = append(args, filter.Source)
-	}
-	if filter.Region != "" {
-		conditions = append(conditions, "region = ?")
-		args = append(args, filter.Region)
-	}
-	if filter.Enabled != nil {
-		conditions = append(conditions, "enabled = ?")
-		if *filter.Enabled {
-			args = append(args, 1)
-		} else {
-			args = append(args, 0)
-		}
-	}
+	conditions, args := nodeFilterConditions(filter)
 
 	if len(conditions) > 0 {
 		query += " WHERE " + strings.Join(conditions, " AND ")
@@ -115,6 +101,62 @@ func (s *sqliteStore) ListNodes(ctx context.Context, filter NodeFilter) ([]Node,
 	defer rows.Close()
 
 	return scanNodes(rows)
+}
+
+// listNodesChunked keeps a large NodeIDs filter under the SQLite bound-variable
+// limit by querying in chunks and paginating the merged result in Go.
+func (s *sqliteStore) listNodesChunked(ctx context.Context, filter NodeFilter) ([]Node, error) {
+	limit, offset := filter.Limit, filter.Offset
+	chunkFilter := filter
+	chunkFilter.Limit, chunkFilter.Offset = 0, 0
+	var merged []Node
+	for _, chunk := range chunkIDs(filter.NodeIDs, sqliteMaxVariables) {
+		chunkFilter.NodeIDs = chunk
+		nodes, err := s.ListNodes(ctx, chunkFilter)
+		if err != nil {
+			return nil, err
+		}
+		merged = append(merged, nodes...)
+	}
+	sort.Slice(merged, func(i, j int) bool { return merged[i].ID < merged[j].ID })
+	if offset > 0 {
+		if offset >= len(merged) {
+			return nil, nil
+		}
+		merged = merged[offset:]
+	}
+	if limit > 0 && limit < len(merged) {
+		merged = merged[:limit]
+	}
+	return merged, nil
+}
+
+// nodeFilterConditions builds the shared WHERE fragments for node listing and
+// counting so both stay in sync.
+func nodeFilterConditions(filter NodeFilter) ([]string, []any) {
+	var conditions []string
+	var args []any
+	if len(filter.NodeIDs) > 0 {
+		conditions = append(conditions, "id IN "+inClause(len(filter.NodeIDs)))
+		args = append(args, idArgs(filter.NodeIDs)...)
+	}
+	if filter.Source != "" {
+		conditions = append(conditions, "source = ?")
+		args = append(args, filter.Source)
+	}
+	if filter.Region != "" {
+		conditions = append(conditions, "region = ?")
+		args = append(args, filter.Region)
+	}
+	if filter.Enabled != nil {
+		conditions = append(conditions, "enabled = ?")
+		if *filter.Enabled {
+			args = append(args, 1)
+		} else {
+			args = append(args, 0)
+		}
+	}
+	return conditions, args
 }
 
 func (s *sqliteStore) ListManagedNodes(ctx context.Context, subscriptionID *int64) ([]ManagedNode, error) {
@@ -246,7 +288,42 @@ func (s *sqliteStore) CreateNode(ctx context.Context, node *Node) error {
 		return fmt.Errorf("create initial node stats: %w", err)
 	}
 
-	return nil
+	// Materialize the tags written above as real manual assignments. nodes.tags
+	// is only a projection of node_tags, so tags that exist nowhere else would
+	// be erased by the first recompute.
+	return s.materializeManualNodeTags(ctx, node.ID, node.Tags)
+}
+
+// materializeManualNodeTags turns tag names into manual assignments, creating
+// missing tags on the way, and rewrites the node's projection.
+func (s *sqliteStore) materializeManualNodeTags(ctx context.Context, nodeID int64, names []string) error {
+	wanted := dedupeSorted(names)
+	if len(wanted) == 0 {
+		return nil
+	}
+	return s.runInTx(ctx, func(tx *sqliteStore) error {
+		tagIDs := make([]int64, 0, len(wanted))
+		for _, name := range wanted {
+			name = strings.TrimSpace(name)
+			if name == "" {
+				continue
+			}
+			if _, err := tx.conn().ExecContext(ctx,
+				"INSERT OR IGNORE INTO tags (name) VALUES (?)", name); err != nil {
+				return fmt.Errorf("create tag %q: %w", name, err)
+			}
+			var tagID int64
+			if err := tx.conn().QueryRowContext(ctx,
+				"SELECT id FROM tags WHERE name = ?", name).Scan(&tagID); err != nil {
+				return fmt.Errorf("lookup tag %q: %w", name, err)
+			}
+			tagIDs = append(tagIDs, tagID)
+		}
+		if err := tx.insertNodeTags(ctx, nodeID, tagIDs, nil, NodeTagSourceManual); err != nil {
+			return err
+		}
+		return tx.refreshNodeTagProjection(ctx, []int64{nodeID})
+	})
 }
 
 func (s *sqliteStore) UpdateNode(ctx context.Context, node *Node) error {
@@ -266,20 +343,16 @@ func (s *sqliteStore) UpdateNode(ctx context.Context, node *Node) error {
 		enabled = 1
 	}
 
-	var tagsJSON = "[]"
-	if len(node.Tags) > 0 {
-		if b, err := json.Marshal(node.Tags); err == nil {
-			tagsJSON = string(b)
-		}
-	}
-
+	// nodes.tags is deliberately absent: it is a projection of node_tags owned by
+	// the tagging layer, so an UpdateNode caller carrying a stale (or empty) Tags
+	// slice cannot drop assignments. Use SetManualNodeTags to change tags.
 	result, err := s.conn().ExecContext(ctx,
 		`UPDATE nodes SET uri=?, name=?, source=?, port=?, username=?, password=?,
-		 region=?, country=?, enabled=?, tags=?, identity_hash=?, canonical_json=?, updated_at=?
+		 region=?, country=?, enabled=?, identity_hash=?, canonical_json=?, updated_at=?
 		 WHERE id=?`,
 		node.URI, node.Name, node.Source, node.Port,
 		node.Username, node.Password, node.Region, node.Country,
-		enabled, tagsJSON, node.IdentityHash, node.CanonicalJSON, now, node.ID,
+		enabled, node.IdentityHash, node.CanonicalJSON, now, node.ID,
 	)
 	if err != nil {
 		return fmt.Errorf("update node %d: %w", node.ID, err)
@@ -306,13 +379,21 @@ func (s *sqliteStore) UpdateNodeLocation(ctx context.Context, nodeID int64, regi
 	return requireAffected(result, fmt.Sprintf("node %d not found", nodeID))
 }
 
+// clearNodeDetectionCache drops the cached facts of a node whose identity
+// changed. Auto tags are derived from exactly those facts, so they go too — an
+// auto tag must never outlive its evidence. Manual assignments stay, and the
+// caller is expected to enqueue the node for a recompute.
 func (s *sqliteStore) clearNodeDetectionCache(ctx context.Context, nodeID int64) error {
 	for _, table := range []string{"node_detection_results", "node_ip_quality_results", "node_unlock_results"} {
 		if _, err := s.conn().ExecContext(ctx, "DELETE FROM "+table+" WHERE node_id=?", nodeID); err != nil {
 			return fmt.Errorf("clear node %d cached detection from %s: %w", nodeID, table, err)
 		}
 	}
-	return nil
+	if _, err := s.conn().ExecContext(ctx,
+		"DELETE FROM node_tags WHERE node_id=? AND source=?", nodeID, NodeTagSourceAuto); err != nil {
+		return fmt.Errorf("clear node %d auto tags: %w", nodeID, err)
+	}
+	return s.refreshNodeTagProjection(ctx, []int64{nodeID})
 }
 
 func (s *sqliteStore) DeleteNode(ctx context.Context, id int64) error {
@@ -400,26 +481,21 @@ func (s *sqliteStore) BulkUpsertNodes(ctx context.Context, nodes []Node) error {
 }
 
 func (s *sqliteStore) CountNodes(ctx context.Context, filter NodeFilter) (int64, error) {
-	query := "SELECT COUNT(*) FROM nodes"
-	var conditions []string
-	var args []any
-
-	if filter.Source != "" {
-		conditions = append(conditions, "source = ?")
-		args = append(args, filter.Source)
-	}
-	if filter.Region != "" {
-		conditions = append(conditions, "region = ?")
-		args = append(args, filter.Region)
-	}
-	if filter.Enabled != nil {
-		conditions = append(conditions, "enabled = ?")
-		if *filter.Enabled {
-			args = append(args, 1)
-		} else {
-			args = append(args, 0)
+	if len(filter.NodeIDs) > sqliteMaxVariables {
+		var total int64
+		chunkFilter := filter
+		for _, chunk := range chunkIDs(filter.NodeIDs, sqliteMaxVariables) {
+			chunkFilter.NodeIDs = chunk
+			count, err := s.CountNodes(ctx, chunkFilter)
+			if err != nil {
+				return 0, err
+			}
+			total += count
 		}
+		return total, nil
 	}
+	query := "SELECT COUNT(*) FROM nodes"
+	conditions, args := nodeFilterConditions(filter)
 
 	if len(conditions) > 0 {
 		query += " WHERE " + strings.Join(conditions, " AND ")
@@ -1081,11 +1157,22 @@ func (s *sqliteStore) BatchUpdateStats(ctx context.Context, updates []StatsUpdat
 }
 
 func (s *sqliteStore) GetAllNodeStats(ctx context.Context) (map[int64]*NodeStats, error) {
+	return s.ListNodeStats(ctx, nil)
+}
+
+// ListNodeStats returns stats for the given nodes, or every node when nodeIDs
+// is nil.
+func (s *sqliteStore) ListNodeStats(ctx context.Context, nodeIDs []int64) (map[int64]*NodeStats, error) {
+	return loadByNodeIDs(ctx, nodeIDs, s.listNodeStatsChunk)
+}
+
+func (s *sqliteStore) listNodeStatsChunk(ctx context.Context, nodeIDs []int64) (map[int64]*NodeStats, error) {
+	where, args := nodeIDCondition("node_id", nodeIDs)
 	rows, err := s.conn().QueryContext(ctx,
 		`SELECT node_id, failure_count, success_count, blacklisted, blacklisted_until,
 		 last_error, last_failure_at, last_success_at, last_latency_ms,
 		 available, initial_check_done, total_upload_bytes, total_download_bytes, updated_at
-		 FROM node_stats`)
+		 FROM node_stats`+where, args...)
 	if err != nil {
 		return nil, fmt.Errorf("get all node stats: %w", err)
 	}
@@ -1341,7 +1428,18 @@ func (s *sqliteStore) GetUnlockResult(ctx context.Context, nodeID int64) (*Unloc
 }
 
 func (s *sqliteStore) ListUnlockResults(ctx context.Context) (map[int64]*UnlockResult, error) {
-	rows, err := s.conn().QueryContext(ctx, "SELECT "+unlockColumns+" FROM node_unlock_results")
+	return s.ListUnlockResultsByIDs(ctx, nil)
+}
+
+// ListUnlockResultsByIDs returns unlock results for the given nodes, or every
+// node when nodeIDs is nil.
+func (s *sqliteStore) ListUnlockResultsByIDs(ctx context.Context, nodeIDs []int64) (map[int64]*UnlockResult, error) {
+	return loadByNodeIDs(ctx, nodeIDs, s.listUnlockResultsChunk)
+}
+
+func (s *sqliteStore) listUnlockResultsChunk(ctx context.Context, nodeIDs []int64) (map[int64]*UnlockResult, error) {
+	where, args := nodeIDCondition("node_id", nodeIDs)
+	rows, err := s.conn().QueryContext(ctx, "SELECT "+unlockColumns+" FROM node_unlock_results"+where, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list unlock results: %w", err)
 	}
@@ -1485,9 +1583,21 @@ func (s *sqliteStore) UpsertNodeDetectionResult(ctx context.Context, result *Nod
 }
 
 func (s *sqliteStore) ListNodeDetectionResults(ctx context.Context) (map[int64]*NodeDetectionResult, error) {
+	return s.ListNodeDetectionResultsByIDs(ctx, nil)
+}
+
+// ListNodeDetectionResultsByIDs returns detection results for the given nodes,
+// or every node when nodeIDs is nil.
+func (s *sqliteStore) ListNodeDetectionResultsByIDs(ctx context.Context, nodeIDs []int64) (map[int64]*NodeDetectionResult, error) {
+	return loadByNodeIDs(ctx, nodeIDs, s.listNodeDetectionResultsChunk)
+}
+
+func (s *sqliteStore) listNodeDetectionResultsChunk(ctx context.Context, nodeIDs []int64) (map[int64]*NodeDetectionResult, error) {
+	where, args := nodeIDCondition("node_id", nodeIDs)
 	rows, err := s.conn().QueryContext(ctx, `SELECT node_id,task_id,latency_status,latency_ms,latency_error,latency_checked_at,
 		speed_status,average_bytes_per_second,peak_bytes_per_second,bytes_downloaded,speed_duration_ms,speed_error,speed_checked_at,
-		exit_ip,exit_ip_family,exit_country,exit_country_code,exit_ip_status,exit_ip_error,exit_ip_checked_at,updated_at FROM node_detection_results`)
+		exit_ip,exit_ip_family,exit_country,exit_country_code,exit_ip_status,exit_ip_error,exit_ip_checked_at,updated_at
+		FROM node_detection_results`+where, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1542,9 +1652,20 @@ func (s *sqliteStore) UpsertNodeIPQualityResult(ctx context.Context, result *Nod
 }
 
 func (s *sqliteStore) ListNodeIPQualityResults(ctx context.Context) (map[int64][]NodeIPQualityResult, error) {
+	return s.ListNodeIPQualityResultsByIDs(ctx, nil)
+}
+
+// ListNodeIPQualityResultsByIDs returns IP quality results for the given nodes,
+// or every node when nodeIDs is nil.
+func (s *sqliteStore) ListNodeIPQualityResultsByIDs(ctx context.Context, nodeIDs []int64) (map[int64][]NodeIPQualityResult, error) {
+	return loadByNodeIDs(ctx, nodeIDs, s.listNodeIPQualityResultsChunk)
+}
+
+func (s *sqliteStore) listNodeIPQualityResultsChunk(ctx context.Context, nodeIDs []int64) (map[int64][]NodeIPQualityResult, error) {
+	where, args := nodeIDCondition("node_id", nodeIDs)
 	rows, err := s.conn().QueryContext(ctx, `SELECT node_id,provider,task_id,status,ip,family,country,country_code,asn,org,isp,
 		is_broadcast,is_residential,fraud_score,proxy,hosting,mobile,reason,checked_at,updated_at
-		FROM node_ip_quality_results ORDER BY node_id,provider`)
+		FROM node_ip_quality_results`+where+` ORDER BY node_id,provider`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1638,7 +1759,8 @@ func (s *sqliteStore) PruneNodeDetectionTasks(ctx context.Context, keep int) err
 // ===================== Group pool operations =====================
 
 const groupPoolColumns = `id, name, bind_address, bind_port, protocol, username, password,
-dispatch_mode, regions_json, explicit_node_ids_json, excluded_node_ids_json, failure_window_seconds,
+dispatch_mode, regions_json, explicit_node_ids_json, excluded_node_ids_json,
+tag_whitelist_json, tag_blacklist_json, tag_filter_match, failure_window_seconds,
 failure_threshold, health_check_seconds, current_active_node_id, enabled,
 subscription_enabled, subscription_token, subscription_mode, external_host, created_at, updated_at`
 
@@ -1687,14 +1809,17 @@ func (s *sqliteStore) CreateGroupPool(ctx context.Context, g *GroupPool) error {
 	regions, _ := json.Marshal(g.Regions)
 	nodeIDs, _ := json.Marshal(g.ExplicitNodeIDs)
 	excludedNodeIDs, _ := json.Marshal(g.ExcludedNodeIDs)
+	tagWhitelist, tagBlacklist, tagFilterMatch := marshalGroupTagFilter(g)
 	result, err := s.conn().ExecContext(ctx, `INSERT INTO group_pools
 (name, bind_address, bind_port, protocol, username, password, dispatch_mode, regions_json,
- explicit_node_ids_json, excluded_node_ids_json, failure_window_seconds, failure_threshold, health_check_seconds,
+ explicit_node_ids_json, excluded_node_ids_json, tag_whitelist_json, tag_blacklist_json, tag_filter_match,
+ failure_window_seconds, failure_threshold, health_check_seconds,
  current_active_node_id, enabled, subscription_enabled, subscription_token, subscription_mode,
  external_host, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		g.Name, g.BindAddress, g.BindPort, g.Protocol, g.Username, g.Password, g.DispatchMode,
-		string(regions), string(nodeIDs), string(excludedNodeIDs), g.FailureWindowSeconds, g.FailureThreshold,
+		string(regions), string(nodeIDs), string(excludedNodeIDs), tagWhitelist, tagBlacklist, tagFilterMatch,
+		g.FailureWindowSeconds, g.FailureThreshold,
 		g.HealthCheckSeconds, g.CurrentActiveNodeID, boolToInt(g.Enabled), boolToInt(g.SubscriptionEnabled),
 		g.SubscriptionToken, g.SubscriptionMode, g.ExternalHost, formatTime(time.Now()), formatTime(time.Now()))
 	if err != nil {
@@ -1708,19 +1833,52 @@ func (s *sqliteStore) UpdateGroupPool(ctx context.Context, g *GroupPool) error {
 	regions, _ := json.Marshal(g.Regions)
 	nodeIDs, _ := json.Marshal(g.ExplicitNodeIDs)
 	excludedNodeIDs, _ := json.Marshal(g.ExcludedNodeIDs)
+	tagWhitelist, tagBlacklist, tagFilterMatch := marshalGroupTagFilter(g)
 	result, err := s.conn().ExecContext(ctx, `UPDATE group_pools SET
 name=?, bind_address=?, bind_port=?, protocol=?, username=?, password=?, dispatch_mode=?,
-regions_json=?, explicit_node_ids_json=?, excluded_node_ids_json=?, failure_window_seconds=?, failure_threshold=?,
+regions_json=?, explicit_node_ids_json=?, excluded_node_ids_json=?,
+tag_whitelist_json=?, tag_blacklist_json=?, tag_filter_match=?, failure_window_seconds=?, failure_threshold=?,
 health_check_seconds=?, current_active_node_id=?, enabled=?, subscription_enabled=?, subscription_token=?,
 subscription_mode=?, external_host=?, updated_at=? WHERE id=?`,
 		g.Name, g.BindAddress, g.BindPort, g.Protocol, g.Username, g.Password, g.DispatchMode,
-		string(regions), string(nodeIDs), string(excludedNodeIDs), g.FailureWindowSeconds, g.FailureThreshold,
+		string(regions), string(nodeIDs), string(excludedNodeIDs), tagWhitelist, tagBlacklist, tagFilterMatch,
+		g.FailureWindowSeconds, g.FailureThreshold,
 		g.HealthCheckSeconds, g.CurrentActiveNodeID, boolToInt(g.Enabled), boolToInt(g.SubscriptionEnabled),
 		g.SubscriptionToken, g.SubscriptionMode, g.ExternalHost, formatTime(time.Now()), g.ID)
 	if err != nil {
 		return fmt.Errorf("update group pool: %w", err)
 	}
 	return requireAffected(result, "group pool not found")
+}
+
+// marshalGroupTagFilter serializes the tag filter columns, normalizing the
+// match mode so a zero-valued GroupPool stores the schema default.
+func marshalGroupTagFilter(g *GroupPool) (whitelist, blacklist, match string) {
+	whitelistJSON, _ := json.Marshal(normalizeIDList(g.TagWhitelist))
+	blacklistJSON, _ := json.Marshal(normalizeIDList(g.TagBlacklist))
+	match = g.TagFilterMatch
+	if match != TagFilterMatchAll {
+		match = TagFilterMatchAny
+	}
+	return string(whitelistJSON), string(blacklistJSON), match
+}
+
+// normalizeIDList drops non-positive IDs and duplicates while preserving order,
+// and never returns nil so the JSON column stays a valid array.
+func normalizeIDList(ids []int64) []int64 {
+	normalized := make([]int64, 0, len(ids))
+	seen := make(map[int64]struct{}, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		normalized = append(normalized, id)
+	}
+	return normalized
 }
 
 func (s *sqliteStore) UpdateGroupCurrentActiveNode(ctx context.Context, groupID, nodeID int64) error {
@@ -1787,10 +1945,11 @@ last_error, evicted_at, updated_at FROM group_node_states WHERE group_id = ?`, g
 
 func scanGroupPool(row scanner) (GroupPool, error) {
 	var g GroupPool
-	var regions, nodeIDs, excludedNodeIDs, createdAt, updatedAt string
+	var regions, nodeIDs, excludedNodeIDs, tagWhitelist, tagBlacklist, createdAt, updatedAt string
 	var enabled, subscriptionEnabled int
 	err := row.Scan(&g.ID, &g.Name, &g.BindAddress, &g.BindPort, &g.Protocol, &g.Username, &g.Password,
-		&g.DispatchMode, &regions, &nodeIDs, &excludedNodeIDs, &g.FailureWindowSeconds, &g.FailureThreshold,
+		&g.DispatchMode, &regions, &nodeIDs, &excludedNodeIDs, &tagWhitelist, &tagBlacklist, &g.TagFilterMatch,
+		&g.FailureWindowSeconds, &g.FailureThreshold,
 		&g.HealthCheckSeconds, &g.CurrentActiveNodeID, &enabled, &subscriptionEnabled,
 		&g.SubscriptionToken, &g.SubscriptionMode, &g.ExternalHost, &createdAt, &updatedAt)
 	if err != nil {
@@ -1799,6 +1958,11 @@ func scanGroupPool(row scanner) (GroupPool, error) {
 	_ = json.Unmarshal([]byte(regions), &g.Regions)
 	_ = json.Unmarshal([]byte(nodeIDs), &g.ExplicitNodeIDs)
 	_ = json.Unmarshal([]byte(excludedNodeIDs), &g.ExcludedNodeIDs)
+	_ = json.Unmarshal([]byte(tagWhitelist), &g.TagWhitelist)
+	_ = json.Unmarshal([]byte(tagBlacklist), &g.TagBlacklist)
+	if g.TagFilterMatch != TagFilterMatchAll {
+		g.TagFilterMatch = TagFilterMatchAny
+	}
 	g.Enabled = enabled != 0
 	g.SubscriptionEnabled = subscriptionEnabled != 0
 	g.CreatedAt, g.UpdatedAt = parseTime(createdAt), parseTime(updatedAt)

@@ -326,6 +326,84 @@ ALTER TABLE node_detection_results ADD COLUMN exit_country TEXT NOT NULL DEFAULT
 ALTER TABLE node_detection_results ADD COLUMN exit_country_code TEXT NOT NULL DEFAULT '';
 `,
 		},
+		{
+			Version:     13,
+			Description: "add node tagging system",
+			Up: `
+CREATE TABLE tag_mutex_groups (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(name)
+);
+
+CREATE TABLE tags (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    name           TEXT NOT NULL,
+    color          TEXT NOT NULL DEFAULT '',
+    description    TEXT NOT NULL DEFAULT '',
+    mutex_group_id INTEGER REFERENCES tag_mutex_groups(id) ON DELETE SET NULL,
+    priority       INTEGER NOT NULL DEFAULT 0,
+    auto_enabled   INTEGER NOT NULL DEFAULT 0,
+    rule_json      TEXT NOT NULL DEFAULT '',
+    rule_version   INTEGER NOT NULL DEFAULT 1,
+    builtin_key    TEXT NOT NULL DEFAULT '',
+    created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(name)
+);
+CREATE INDEX idx_tags_auto ON tags(auto_enabled);
+CREATE INDEX idx_tags_mutex ON tags(mutex_group_id, priority DESC, id);
+
+-- source separates operator-managed tags from rule-derived ones. Auto recompute
+-- only ever deletes source='auto' rows, so manual tags cannot be clobbered.
+CREATE TABLE node_tags (
+    node_id      INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    tag_id       INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+    source       TEXT NOT NULL DEFAULT 'manual',
+    rule_version INTEGER NOT NULL DEFAULT 0,
+    matched_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (node_id, tag_id, source)
+);
+CREATE INDEX idx_node_tags_tag ON node_tags(tag_id, source);
+
+ALTER TABLE group_pools ADD COLUMN tag_whitelist_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE group_pools ADD COLUMN tag_blacklist_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE group_pools ADD COLUMN tag_filter_match   TEXT NOT NULL DEFAULT 'any';
+
+-- Backfill: every existing nodes.tags entry becomes a manual tag assignment so
+-- the upgrade never loses operator-entered labels. From here on nodes.tags is
+-- only a projection of node_tags (manual ∪ auto names, deduplicated and sorted);
+-- writes from outside the tagging layer are overwritten by the next recompute.
+WITH node_tag_names AS (
+    SELECT nodes.id AS node_id, trim(entry.value) AS tag_name
+    FROM nodes,
+         json_each(CASE
+             WHEN json_valid(nodes.tags) AND json_type(nodes.tags) = 'array' THEN nodes.tags
+             ELSE '[]'
+         END) AS entry
+    WHERE trim(entry.value) <> ''
+)
+INSERT OR IGNORE INTO tags (name) SELECT DISTINCT tag_name FROM node_tag_names;
+
+WITH node_tag_names AS (
+    SELECT nodes.id AS node_id, trim(entry.value) AS tag_name
+    FROM nodes,
+         json_each(CASE
+             WHEN json_valid(nodes.tags) AND json_type(nodes.tags) = 'array' THEN nodes.tags
+             ELSE '[]'
+         END) AS entry
+    WHERE trim(entry.value) <> ''
+)
+INSERT OR IGNORE INTO node_tags (node_id, tag_id, source)
+SELECT ntn.node_id, tags.id, 'manual'
+FROM node_tag_names AS ntn
+JOIN tags ON tags.name = ntn.tag_name;
+`,
+		},
 	}
 }
 
