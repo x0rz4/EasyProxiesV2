@@ -1,10 +1,127 @@
 package geoip
 
 import (
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/oschwald/geoip2-golang/v2"
 )
+
+func withDownloadTestConfig(t *testing.T, urls []string, validator func(string) error) {
+	t.Helper()
+	oldURLs, oldClient, oldValidator := downloadURLs, downloadHTTPClient, databaseValidator
+	downloadURLs = urls
+	downloadHTTPClient = &http.Client{}
+	databaseValidator = validator
+	downloadSourceMu.Lock()
+	oldSource := lastSuccessfulDownload
+	lastSuccessfulDownload = ""
+	downloadSourceMu.Unlock()
+	t.Cleanup(func() {
+		downloadURLs, downloadHTTPClient, databaseValidator = oldURLs, oldClient, oldValidator
+		downloadSourceMu.Lock()
+		lastSuccessfulDownload = oldSource
+		downloadSourceMu.Unlock()
+	})
+}
+
+func markerValidator(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(string(data), "valid-mmdb") {
+		return errors.New("invalid fixture")
+	}
+	return nil
+}
+
+func TestDownloadDatabaseFallsBackToSecondDirectSource(t *testing.T) {
+	var requests []string
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests = append(requests, "primary")
+		http.Error(w, "unavailable", http.StatusBadGateway)
+	}))
+	defer primary.Close()
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests = append(requests, "fallback")
+		_, _ = w.Write([]byte(strings.Repeat("valid-mmdb", 200)))
+	}))
+	defer fallback.Close()
+	withDownloadTestConfig(t, []string{primary.URL, fallback.URL}, markerValidator)
+
+	dbPath := filepath.Join(t.TempDir(), "GeoLite2-Country.mmdb")
+	if err := DownloadDatabase(dbPath); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(requests, ",") != "primary,fallback" {
+		t.Fatalf("source order = %v", requests)
+	}
+	status := DatabaseStatus(dbPath)
+	if !status.Exists || status.SourceURL != fallback.URL {
+		t.Fatalf("database status = %+v", status)
+	}
+}
+
+func TestEnsureDatabaseReplacesInvalidFile(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(strings.Repeat("valid-mmdb", 200)))
+	}))
+	defer server.Close()
+	withDownloadTestConfig(t, []string{server.URL}, markerValidator)
+
+	dbPath := filepath.Join(t.TempDir(), "GeoLite2-Country.mmdb")
+	if err := os.WriteFile(dbPath, []byte("broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureDatabase(dbPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := markerValidator(dbPath); err != nil {
+		t.Fatalf("invalid database was not replaced: %v", err)
+	}
+}
+
+func TestDownloadDatabaseReportsEverySourceAndPreservesExistingFile(t *testing.T) {
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { http.Error(w, "one", http.StatusBadGateway) }))
+	defer first.Close()
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { http.Error(w, "two", http.StatusForbidden) }))
+	defer second.Close()
+	withDownloadTestConfig(t, []string{first.URL, second.URL}, markerValidator)
+
+	dbPath := filepath.Join(t.TempDir(), "GeoLite2-Country.mmdb")
+	if err := os.WriteFile(dbPath, []byte("keep-me"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := DownloadDatabase(dbPath)
+	if err == nil || !strings.Contains(err.Error(), first.URL) || !strings.Contains(err.Error(), second.URL) {
+		t.Fatalf("download error = %v", err)
+	}
+	data, readErr := os.ReadFile(dbPath)
+	if readErr != nil || string(data) != "keep-me" {
+		t.Fatalf("existing file changed: data=%q err=%v", data, readErr)
+	}
+	matches, globErr := filepath.Glob(filepath.Join(filepath.Dir(dbPath), ".geoip-*.mmdb"))
+	if globErr != nil || len(matches) != 0 {
+		t.Fatalf("temporary downloads were not cleaned up: matches=%v err=%v", matches, globErr)
+	}
+}
+
+func TestValidateMMDBRejectsMarkerOnlyFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fake.mmdb")
+	data := []byte(strings.Repeat("not-a-database", 1000) + "MaxMind.com")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateMMDB(path); err == nil {
+		t.Fatal("marker-only file passed MMDB validation")
+	}
+}
 
 func TestParseLookupAddress(t *testing.T) {
 	for _, input := range []string{"203.0.113.10", "2001:db8::10"} {

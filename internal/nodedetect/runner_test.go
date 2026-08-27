@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -78,10 +79,10 @@ func TestMeasureSpeedStopsAtByteLimit(t *testing.T) {
 }
 
 func TestMeasureSpeedRejectsHTTPError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { http.Error(w, "bad", http.StatusBadGateway) }))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { http.Error(w, "bad", http.StatusForbidden) }))
 	defer server.Close()
-	if _, err := MeasureSpeed(context.Background(), directDial, SpeedOptions{URL: server.URL, Duration: time.Second, RequestTimeout: time.Second, MaxBytes: 100_000, PeakSampleInterval: 50 * time.Millisecond}, nil); err == nil {
-		t.Fatal("expected HTTP status error")
+	if _, err := MeasureSpeed(context.Background(), directDial, SpeedOptions{URL: server.URL, Duration: time.Second, RequestTimeout: time.Second, MaxBytes: 100_000, PeakSampleInterval: 50 * time.Millisecond}, nil); err == nil || !strings.Contains(err.Error(), "HTTP 403") {
+		t.Fatalf("expected HTTP 403 error, got %v", err)
 	}
 }
 

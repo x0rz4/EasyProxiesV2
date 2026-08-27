@@ -69,6 +69,7 @@ func (r nodeCheckSettingsResponse) toConfig() (config.NodeCheckConfig, error) {
 		return config.NodeCheckConfig{}, err
 	}
 	value := config.NodeCheckConfig{LatencyURL: strings.TrimSpace(r.LatencyURL), SpeedURL: strings.TrimSpace(r.SpeedURL), LandingIPURL: strings.TrimSpace(r.LandingIPURL), LatencyTimeout: latencyTimeout, SpeedDuration: speedDuration, SpeedRequestTimeout: speedRequestTimeout, QualityTimeout: qualityTimeout, MaxDownloadBytes: r.MaxDownloadBytes, PeakSampleInterval: peakInterval, LatencyConcurrency: r.LatencyConcurrency, SpeedConcurrency: r.SpeedConcurrency, QualityConcurrency: r.QualityConcurrency, IncludeHandshake: r.IncludeHandshake, IPPureEnabled: r.IPPureEnabled, IPPureURL: strings.TrimSpace(r.IPPureURL), IPAPIEnabled: r.IPAPIEnabled, IPAPIBaseURL: strings.TrimSpace(r.IPAPIBaseURL)}
+	config.NormalizeNodeCheckSpeedSettings(&value)
 	if err := config.ValidateNodeCheckConfig(value); err != nil {
 		return config.NodeCheckConfig{}, err
 	}

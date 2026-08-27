@@ -30,7 +30,9 @@ func (m *Manager) applyCachedNodeLocations(ctx context.Context, cfg *config.Conf
 	}
 
 	lookup := m.openLandingGeoIP(cfg)
-	if lookup != nil {
+	if lookup == nil {
+		m.logger.Warnf("GeoIP database unavailable; preserving cached node locations and pausing classification")
+	} else {
 		defer lookup.Close()
 	}
 	for index := range cfg.Nodes {
@@ -55,6 +57,12 @@ func (m *Manager) applyCachedNodeLocations(ctx context.Context, cfg *config.Conf
 					}
 				}
 			}
+		}
+		if lookup == nil && region == "" {
+			// Do not erase persisted metadata while the authoritative classifier
+			// is unavailable. A later successful database download triggers a
+			// controlled reload that reconciles this node.
+			continue
 		}
 		// Rows without a successful tunneled lookup are intentionally unknown.
 		// This clears legacy URI-host-derived classifications.
@@ -107,9 +115,11 @@ func (m *Manager) detectMissingNodeLocations(ctx context.Context, cfg *config.Co
 	}
 
 	lookup := m.openLandingGeoIP(cfg)
-	if lookup != nil {
-		defer lookup.Close()
+	if lookup == nil {
+		m.logger.Warnf("GeoIP database unavailable; skipping landing IP initialization")
+		return false
 	}
+	defer lookup.Close()
 	concurrency := cfg.Management.NodeCheck.QualityConcurrency
 	if concurrency <= 0 {
 		concurrency = 5
@@ -224,7 +234,7 @@ func (m *Manager) openLandingGeoIP(cfg *config.Config) *geoip.Lookup {
 	if path == "" {
 		return nil
 	}
-	lookup, err := geoip.New(path)
+	lookup, err := geoip.OpenExisting(path)
 	if err != nil {
 		m.logger.Warnf("open GeoIP database for landing IP classification: %v", err)
 		return nil

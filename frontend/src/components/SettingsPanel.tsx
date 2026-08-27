@@ -121,8 +121,11 @@ export default function SettingsPanel() {
     setGeoipLoading(true)
     try {
       const res = await downloadGeoipDatabase()
-      toast.success(res.message || 'IP 库下载完成')
-      refetchGeoip()
+      if (res.reload_error) toast.warning(`IP 库下载完成，但区域回填失败：${res.reload_error}`)
+      else toast.success(res.reloaded ? 'IP 库下载完成，节点区域已回填' : (res.message || 'IP 库下载完成'))
+      void refetchGeoip()
+      void queryClient.invalidateQueries({ queryKey: ['configNodes'] })
+      void queryClient.invalidateQueries({ queryKey: ['nodes'] })
     } catch (err) {
       toast.error(err instanceof Error ? err.message : '下载 IP 库失败')
     } finally {
@@ -134,14 +137,17 @@ export default function SettingsPanel() {
     setGeoipLoading(true)
     try {
       const res = await updateGeoipDatabase()
-      toast.success(res.message || 'IP 库更新完成')
+      if (res.reload_error) toast.warning(`IP 库更新完成，但区域回填失败：${res.reload_error}`)
+      else toast.success(res.reloaded ? 'IP 库更新完成，节点区域已回填' : (res.message || 'IP 库更新完成'))
       if (res.reload_hint) {
         setNeedReload(true)
         if (!pending.includes('runtime_config')) {
           setPending([...pending, 'runtime_config'])
         }
       }
-      refetchGeoip()
+      void refetchGeoip()
+      void queryClient.invalidateQueries({ queryKey: ['configNodes'] })
+      void queryClient.invalidateQueries({ queryKey: ['nodes'] })
     } catch (err) {
       toast.error(err instanceof Error ? err.message : '更新 IP 库失败')
     } finally {
@@ -633,6 +639,54 @@ export default function SettingsPanel() {
             />
           </label>
 
+          {/* IP 库是节点落地地区识别的基础，与区域路由开关无关。 */}
+          <div className="bg-base-200/30 p-4 rounded-xl border border-base-200 space-y-3">
+            <div className="flex items-center justify-between gap-3">
+              <span className="font-semibold text-base-content/80 text-sm">IP 库状态</span>
+              {geoipStatus?.database?.exists ? (
+                <span className="badge badge-success badge-sm gap-1">已下载</span>
+              ) : (
+                <span className="badge badge-ghost badge-sm gap-1">未下载</span>
+              )}
+            </div>
+
+            {geoipStatus?.database && (
+              <div className="text-xs text-base-content/60 space-y-1 font-mono">
+                {geoipStatus.database.exists ? (
+                  <>
+                    <div>大小：{formatBytes(geoipStatus.database.size_bytes)}</div>
+                    {geoipStatus.database.modified_at && (
+                      <div>更新时间：{formatTimestamp(geoipStatus.database.modified_at)}</div>
+                    )}
+                  </>
+                ) : (
+                  <div>数据库尚未下载，节点区域识别已暂停</div>
+                )}
+                <div className="truncate" title={geoipStatus.database.source_url || geoipStatus.database.download_url}>
+                  当前来源：{geoipStatus.database.source_url || geoipStatus.database.download_url}
+                </div>
+                {geoipStatus.database.fallback_url && (
+                  <div className="truncate" title={geoipStatus.database.fallback_url}>备用来源：{geoipStatus.database.fallback_url}</div>
+                )}
+              </div>
+            )}
+
+            <div className="flex flex-wrap gap-2 pt-1">
+              <button type="button" className="btn btn-sm btn-outline" disabled={geoipLoading} onClick={handleGeoipDownload}>
+                {geoipLoading ? <span className="loading loading-spinner loading-xs"></span> : null}
+                下载 IP 库
+              </button>
+              <button type="button" className="btn btn-sm btn-primary" disabled={geoipLoading} onClick={handleGeoipUpdate}>
+                {geoipLoading ? <span className="loading loading-spinner loading-xs"></span> : null}
+                更新 IP 库
+              </button>
+              <button type="button" className="btn btn-sm btn-ghost" disabled={geoipLoading} onClick={() => void refetchGeoip()}>
+                刷新状态
+              </button>
+            </div>
+            <p className="text-xs text-base-content/40 m-0">下载或更新成功后会自动回填节点区域，无需手动重载。</p>
+          </div>
+
           {settings.geoip_enabled && (
             <div className="space-y-4 pt-2 animate-in fade-in slide-in-from-top-2">
               <fieldset className="fieldset">
@@ -644,73 +698,6 @@ export default function SettingsPanel() {
                   onChange={(e) => updateField('geoip_database_path', e.target.value)}
                 />
               </fieldset>
-
-              {/* IP 库状态与下载/更新 */}
-              <div className="bg-base-200/30 p-4 rounded-xl border border-base-200 space-y-3">
-                <div className="flex items-center justify-between gap-3">
-                  <span className="font-semibold text-base-content/80 text-sm">IP 库状态</span>
-                  {geoipStatus?.database?.exists ? (
-                    <span className="badge badge-success badge-sm gap-1">已下载</span>
-                  ) : (
-                    <span className="badge badge-ghost badge-sm gap-1">未下载</span>
-                  )}
-                </div>
-
-                {geoipStatus?.database && (
-                  <div className="text-xs text-base-content/60 space-y-1 font-mono">
-                    {geoipStatus.database.exists ? (
-                      <>
-                        <div>大小：{formatBytes(geoipStatus.database.size_bytes)}</div>
-                        {geoipStatus.database.modified_at && (
-                          <div>更新时间：{formatTimestamp(geoipStatus.database.modified_at)}</div>
-                        )}
-                      </>
-                    ) : (
-                      <div>数据库尚未下载，点击「下载 IP 库」获取</div>
-                    )}
-                    {geoipStatus.database.download_url && (
-                      <div className="truncate" title={geoipStatus.database.download_url}>
-                        来源：{geoipStatus.database.download_url}
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                {/* Error/Success toasts were used instead of these inline alerts, but keeping this simple layout logic to not break it if it's used elsewhere, or just omit if covered by toast */}
-
-                <div className="flex flex-wrap gap-2 pt-1">
-                  <button
-                    type="button"
-                    className="btn btn-sm btn-outline"
-                    disabled={geoipLoading}
-                    onClick={handleGeoipDownload}
-                  >
-                    {geoipLoading ? <span className="loading loading-spinner loading-xs"></span> : null}
-                    下载 IP 库
-                  </button>
-                  <button
-                    type="button"
-                    className="btn btn-sm btn-primary"
-                    disabled={geoipLoading}
-                    onClick={handleGeoipUpdate}
-                  >
-                    {geoipLoading ? <span className="loading loading-spinner loading-xs"></span> : null}
-                    更新 IP 库
-                  </button>
-                  <button
-                    type="button"
-                    className="btn btn-sm btn-ghost"
-                    disabled={geoipLoading}
-                    onClick={() => void refetchGeoip()}
-                  >
-                    刷新状态
-                  </button>
-                </div>
-                <p className="text-xs text-base-content/40 m-0">
-                  「下载」仅在缺失时拉取；「更新」强制重新下载并覆盖。更新后需重载配置以使新库生效。
-                </p>
-              </div>
-
               <label className="flex items-center justify-between cursor-pointer gap-4 bg-base-200/30 p-4 rounded-xl border border-base-200 hover:border-base-300 transition-colors">
                 <span className="font-semibold text-base-content/90">自动更新数据库</span>
                 <input

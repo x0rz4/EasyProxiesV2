@@ -38,6 +38,39 @@ func TestManagementProbeSettingsDefaultsAndExplicitZeroRetries(t *testing.T) {
 	}
 }
 
+func TestGeoIPAndSpeedDefaultsUseLocalDatabaseAndTenMegabyteTarget(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("log_level: info\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadForReload(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.GeoIP.DatabasePath != filepath.Join(dir, "GeoLite2-Country.mmdb") {
+		t.Fatalf("GeoIP path = %q", cfg.GeoIP.DatabasePath)
+	}
+	check := cfg.Management.NodeCheck
+	if check.SpeedURL != DefaultNodeCheckSpeedURL || check.MaxDownloadBytes != DefaultNodeCheckMaxDownloadBytes {
+		t.Fatalf("node-check defaults = %+v", check)
+	}
+}
+
+func TestLegacyCloudflareSpeedDefaultsAreMigratedWithoutChangingCustomTargets(t *testing.T) {
+	legacy := NodeCheckConfig{SpeedURL: LegacyNodeCheckSpeedURL, MaxDownloadBytes: 100_000_000}
+	NormalizeNodeCheckSpeedSettings(&legacy)
+	if legacy.SpeedURL != DefaultNodeCheckSpeedURL || legacy.MaxDownloadBytes != DefaultNodeCheckMaxDownloadBytes {
+		t.Fatalf("legacy settings not migrated: %+v", legacy)
+	}
+
+	custom := NodeCheckConfig{SpeedURL: "https://speed.example/download?bytes=100000000", MaxDownloadBytes: 100_000_000}
+	NormalizeNodeCheckSpeedSettings(&custom)
+	if custom.SpeedURL != "https://speed.example/download?bytes=100000000" || custom.MaxDownloadBytes != 100_000_000 {
+		t.Fatalf("custom settings changed: %+v", custom)
+	}
+}
+
 func TestManagementProbeSettingsCloneAndSaveRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte("management:\n  probe_target: example.com:80\n"), 0o600); err != nil {

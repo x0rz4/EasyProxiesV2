@@ -159,6 +159,28 @@ type NodeCheckConfig struct {
 	IPAPIBaseURL        string        `yaml:"ip_api_base_url"`
 }
 
+const (
+	DefaultNodeCheckSpeedURL         = "https://speed.cloudflare.com/__down?bytes=10000000"
+	LegacyNodeCheckSpeedURL          = "https://speed.cloudflare.com/__down?bytes=100000000"
+	DefaultNodeCheckMaxDownloadBytes = int64(10_000_000)
+)
+
+// NormalizeNodeCheckSpeedSettings migrates only the retired built-in
+// Cloudflare settings. Arbitrary user-provided speed-test URLs and limits are
+// left untouched.
+func NormalizeNodeCheckSpeedSettings(check *NodeCheckConfig) {
+	if check == nil {
+		return
+	}
+	legacyURL := strings.EqualFold(strings.TrimSpace(check.SpeedURL), LegacyNodeCheckSpeedURL)
+	if strings.TrimSpace(check.SpeedURL) == "" || legacyURL {
+		check.SpeedURL = DefaultNodeCheckSpeedURL
+	}
+	if check.MaxDownloadBytes <= 0 || (legacyURL && check.MaxDownloadBytes == 100_000_000) {
+		check.MaxDownloadBytes = DefaultNodeCheckMaxDownloadBytes
+	}
+}
+
 // SubscriptionRefreshConfig controls subscription auto-refresh and reload settings.
 type SubscriptionRefreshConfig struct {
 	Enabled            bool          `yaml:"enabled"`              // 是否启用定时刷新
@@ -309,6 +331,13 @@ func (c *Config) normalize() error {
 // This is the single source of truth for defaults, used by both
 // normalizeInternal and NormalizeWithPortMap to avoid code duplication.
 func (c *Config) applyDefaults() error {
+	if strings.TrimSpace(c.GeoIP.DatabasePath) == "" {
+		baseDir := "."
+		if c.filePath != "" {
+			baseDir = filepath.Dir(c.filePath)
+		}
+		c.GeoIP.DatabasePath = filepath.Join(baseDir, "GeoLite2-Country.mmdb")
+	}
 	if c.Listener.Address == "" {
 		c.Listener.Address = "0.0.0.0"
 	}
@@ -410,11 +439,9 @@ func (c *Config) applyDefaults() error {
 		c.Management.RoutineProbeRetries = &defaultRetries
 	}
 	check := &c.Management.NodeCheck
+	NormalizeNodeCheckSpeedSettings(check)
 	if check.LatencyURL == "" {
 		check.LatencyURL = "https://cp.cloudflare.com/generate_204"
-	}
-	if check.SpeedURL == "" {
-		check.SpeedURL = "https://speed.cloudflare.com/__down?bytes=100000000"
 	}
 	if check.LandingIPURL == "" {
 		check.LandingIPURL = "https://api.ipify.org"
@@ -430,9 +457,6 @@ func (c *Config) applyDefaults() error {
 	}
 	if check.QualityTimeout <= 0 {
 		check.QualityTimeout = 5 * time.Second
-	}
-	if check.MaxDownloadBytes <= 0 {
-		check.MaxDownloadBytes = 100_000_000
 	}
 	if check.PeakSampleInterval <= 0 {
 		check.PeakSampleInterval = 100 * time.Millisecond

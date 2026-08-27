@@ -15,7 +15,7 @@ import (
 	"easy_proxies/internal/store"
 )
 
-func TestApplyCachedNodeLocationsUsesLandingResultAndClearsLegacyHostRegion(t *testing.T) {
+func TestApplyCachedNodeLocationsUsesClassifiedCacheAndPreservesLocationWithoutDatabase(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(filepath.Join(t.TempDir(), "landing.db"))
 	if err != nil {
@@ -42,8 +42,8 @@ func TestApplyCachedNodeLocationsUsesLandingResultAndClearsLegacyHostRegion(t *t
 	if cfg.Nodes[0].Region != "au" || cfg.Nodes[0].Country != "Australia" {
 		t.Fatalf("cached landing location not applied: %+v", cfg.Nodes[0])
 	}
-	if cfg.Nodes[1].Region != "" || cfg.Nodes[1].Country != "" {
-		t.Fatalf("legacy host-derived region was retained: %+v", cfg.Nodes[1])
+	if cfg.Nodes[1].Region != "jp" || cfg.Nodes[1].Country != "Japan" {
+		t.Fatalf("location was cleared while GeoIP was unavailable: %+v", cfg.Nodes[1])
 	}
 	nodes, err := db.ListNodes(ctx, store.NodeFilter{})
 	if err != nil {
@@ -53,8 +53,44 @@ func TestApplyCachedNodeLocationsUsesLandingResultAndClearsLegacyHostRegion(t *t
 	for _, node := range nodes {
 		byID[node.ID] = node
 	}
-	if byID[cached.ID].Region != "au" || byID[legacy.ID].Region != "" {
+	if byID[cached.ID].Region != "au" || byID[legacy.ID].Region != "jp" {
 		t.Fatalf("authoritative landing metadata not persisted: %+v", byID)
+	}
+}
+
+func TestListConfigNodesReturnsPersistedLocationForDisabledNodes(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "managed-locations.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	enabled := &store.Node{URI: "http://127.0.0.1:8080", Name: "enabled", Source: store.NodeSourceManual, Enabled: true, Region: "us", Country: "United States"}
+	disabled := &store.Node{URI: "http://127.0.0.2:8080", Name: "disabled", Source: store.NodeSourceManual, Enabled: false, Region: "jp", Country: "Japan"}
+	for _, node := range []*store.Node{enabled, disabled} {
+		if err := db.CreateNode(ctx, node); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	manager := New(&config.Config{Nodes: []config.NodeConfig{{ID: enabled.ID, URI: enabled.URI}}}, monitor.Config{}, WithStore(db))
+	nodes, err := manager.ListConfigNodes(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 2 {
+		t.Fatalf("managed nodes = %d, want 2", len(nodes))
+	}
+	byName := make(map[string]monitor.ManagedNodeConfig, len(nodes))
+	for _, node := range nodes {
+		byName[node.Name] = node
+	}
+	if got := byName["enabled"]; got.Region != "us" || got.Country != "United States" || got.Disabled {
+		t.Fatalf("enabled location missing from API model: %+v", got)
+	}
+	if got := byName["disabled"]; got.Region != "jp" || got.Country != "Japan" || !got.Disabled {
+		t.Fatalf("disabled location missing from API model: %+v", got)
 	}
 }
 
@@ -69,7 +105,7 @@ func TestSuccessfulLandingIPIsCacheHit(t *testing.T) {
 	}
 }
 
-func TestDetectMissingNodeLocationQueriesOnceThenUsesCache(t *testing.T) {
+func TestDetectMissingNodeLocationPausesWithoutGeoIPDatabase(t *testing.T) {
 	ctx := context.Background()
 	var requests atomic.Int32
 	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -100,14 +136,14 @@ func TestDetectMissingNodeLocationQueriesOnceThenUsesCache(t *testing.T) {
 
 	manager.detectMissingNodeLocations(ctx, cfg)
 	manager.detectMissingNodeLocations(ctx, cfg)
-	if got := requests.Load(); got != 1 {
-		t.Fatalf("landing endpoint requests=%d, want exactly one after successful cache", got)
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("landing endpoint requests=%d, want none while GeoIP is unavailable", got)
 	}
 	results, err := db.ListNodeDetectionResults(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !hasSuccessfulLandingIP(results[node.ID]) || results[node.ID].ExitIP != "203.0.113.7" {
-		t.Fatalf("landing IP was not cached: %+v", results[node.ID])
+	if results[node.ID] != nil {
+		t.Fatalf("landing result was written while classification was paused: %+v", results[node.ID])
 	}
 }

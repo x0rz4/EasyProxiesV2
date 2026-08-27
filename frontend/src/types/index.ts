@@ -275,6 +275,8 @@ export interface ConfigNodeConfig {
   port: number
   username: string
   password: string
+  region?: string
+  country?: string
   source?: string
   disabled?: boolean
   subscription_ids: number[]
@@ -382,6 +384,8 @@ export interface GeoipDatabaseInfo {
   size_bytes: number
   modified_at: string
   download_url: string
+  fallback_url: string
+  source_url: string
 }
 
 export interface GeoipStatus {
@@ -389,6 +393,8 @@ export interface GeoipStatus {
   database: GeoipDatabaseInfo
   message?: string
   reload_hint?: boolean
+  reloaded?: boolean
+  reload_error?: string
 }
 
 export interface SubscriptionStatus {

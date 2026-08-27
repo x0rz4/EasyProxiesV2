@@ -14,6 +14,7 @@ import (
 
 	"easy_proxies/internal/boxmgr"
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/geoip"
 	"easy_proxies/internal/group"
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/nodecodec"
@@ -23,7 +24,17 @@ import (
 
 // Run builds the runtime components from config and blocks until shutdown.
 func Run(ctx context.Context, cfg *config.Config) error {
-	// ── 1. Open SQLite store ──
+	// ── 1. Prepare the GeoIP database before any landing-location work ──
+	// A download failure must not take down the proxy runtime. BoxManager opens
+	// only an existing validated database and will pause location classification
+	// while this prerequisite is unavailable.
+	if dbPath := strings.TrimSpace(cfg.GeoIP.DatabasePath); dbPath != "" {
+		if err := geoip.EnsureDatabase(dbPath); err != nil {
+			log.Printf("⚠️ GeoIP initialization failed; node location classification is paused: %v", err)
+		}
+	}
+
+	// ── 2. Open SQLite store ──
 	dbPath := cfg.DatabasePath
 	if dbPath == "" {
 		dbPath = filepath.Join(filepath.Dir(cfg.FilePath()), "data", "data.db")
@@ -42,7 +53,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	}
 	defer dataStore.Close()
 
-	// ── 2. Load nodes from Store into config (if any exist) ──
+	// ── 3. Load nodes from Store into config (if any exist) ──
 	if err := loadNodesFromStore(ctx, cfg, dataStore); err != nil {
 		log.Printf("⚠️ Failed to load nodes from store: %v", err)
 	}
@@ -50,7 +61,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("load group pools: %w", err)
 	}
 
-	// ── 3. Build monitor config ──
+	// ── 4. Build monitor config ──
 	proxyUsername := cfg.Listener.Username
 	proxyPassword := cfg.Listener.Password
 	if !cfg.Listener.Enabled && cfg.MultiPort.Enabled {
@@ -78,7 +89,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		RoutineProbeRetries:  cfg.RoutineProbeRetryCount(),
 	}
 
-	// ── 4. Create and start BoxManager ──
+	// ── 5. Create and start BoxManager ──
 	boxMgr := boxmgr.New(cfg, monitorCfg, boxmgr.WithStore(dataStore))
 	groupPersister := newGroupStatePersister(dataStore)
 	group.SetGroupStateObserver(groupPersister.Observe)
@@ -97,7 +108,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		server.SetStore(dataStore)
 	}
 
-	// ── 5. Create and start SubscriptionManager ──
+	// ── 6. Create and start SubscriptionManager ──
 	// Always created so it can dynamically respond to config changes
 	// (e.g., user enables subscriptions via WebUI). The manager's internal
 	// refresh loop checks config state to decide when to actually refresh.
@@ -112,12 +123,12 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		server.SetSubscriptionRefresher(subMgr)
 	}
 
-	// ── 6. Start periodic stats flush ──
+	// ── 7. Start periodic stats flush ──
 	statsCtx, statsCancel := context.WithCancel(ctx)
 	defer statsCancel()
 	go periodicStatsFlush(statsCtx, boxMgr, dataStore)
 
-	// ── 7. Wait for shutdown signal ──
+	// ── 8. Wait for shutdown signal ──
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
@@ -129,7 +140,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		fmt.Printf("Received %s, initiating graceful shutdown...\n", sig)
 	}
 
-	// ── 8. Graceful shutdown ──
+	// ── 9. Graceful shutdown ──
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
 

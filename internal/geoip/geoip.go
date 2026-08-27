@@ -2,6 +2,7 @@ package geoip
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -28,9 +29,21 @@ const (
 	RegionOther = "other"
 )
 
-// Default GeoIP database download URL
+// Default GeoIP database download URLs. Keep these as direct upstream
+// addresses and do not route them through a third-party proxy mirror.
 const (
-	DefaultGeoIPURL = "https://ghproxy.net/https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb"
+	DefaultGeoIPURL        = "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb"
+	FallbackGeoIPURL       = "https://git.io/GeoLite2-Country.mmdb"
+	geoIPDownloadUserAgent = "EasyProxies/GeoIP"
+)
+
+var (
+	downloadMu             sync.Mutex
+	downloadURLs           = []string{DefaultGeoIPURL, FallbackGeoIPURL}
+	downloadHTTPClient     = &http.Client{Timeout: 60 * time.Second}
+	databaseValidator      = validateMMDB
+	downloadSourceMu       sync.RWMutex
+	lastSuccessfulDownload string
 )
 
 // RegionInfo contains region details
@@ -50,28 +63,33 @@ type Lookup struct {
 	updateOnce     sync.Once
 }
 
-// EnsureDatabase checks if the GeoIP database exists, and downloads it if not
+// EnsureDatabase checks whether the GeoIP database exists and is valid. A
+// missing or invalid database is replaced from the configured direct sources.
 func EnsureDatabase(dbPath string) error {
 	if dbPath == "" {
 		return nil
 	}
+	downloadMu.Lock()
+	defer downloadMu.Unlock()
 
-	// Check if file already exists and is valid
 	info, err := os.Stat(dbPath)
 	if err == nil {
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("geoip database path is not a file: %s", dbPath)
 		}
-		if info.Size() > 0 {
-			return nil // File exists and has content
+		if validateErr := databaseValidator(dbPath); validateErr == nil {
+			return nil
+		} else {
+			log.Printf("⚠️  GeoIP database at %s is invalid, downloading a replacement: %v", dbPath, validateErr)
 		}
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("stat geoip database: %w", err)
+	} else {
+		log.Printf("📥 GeoIP database not found at %s, downloading...", dbPath)
 	}
 
-	log.Printf("📥 GeoIP database not found at %s, downloading...", dbPath)
 	if err := fetchDatabase(dbPath); err != nil {
-		return err
+		return fmt.Errorf("download GeoIP database: %w", err)
 	}
 	log.Printf("✅ GeoIP database downloaded successfully to %s", dbPath)
 	return nil
@@ -84,6 +102,8 @@ func DownloadDatabase(dbPath string) error {
 	if dbPath == "" {
 		return fmt.Errorf("geoip database path is empty")
 	}
+	downloadMu.Lock()
+	defer downloadMu.Unlock()
 	log.Printf("📥 GeoIP database download requested for %s", dbPath)
 	if err := fetchDatabase(dbPath); err != nil {
 		return err
@@ -92,12 +112,10 @@ func DownloadDatabase(dbPath string) error {
 	return nil
 }
 
-// fetchDatabase downloads the GeoIP database from DefaultGeoIPURL into a
-// temporary file in the same directory as dbPath, validates it, and atomically
-// renames it to dbPath, overwriting any existing file. The temp file lives in
-// the same directory so the rename is atomic on the same filesystem.
+// fetchDatabase tries each direct source in order. Every attempt downloads to
+// the destination directory, validates the temporary file, then replaces the
+// installed database without exposing a partial download.
 func fetchDatabase(dbPath string) error {
-	// Create parent directory if needed
 	dir := filepath.Dir(dbPath)
 	if dir != "." {
 		if err := os.MkdirAll(dir, 0755); err != nil {
@@ -105,24 +123,39 @@ func fetchDatabase(dbPath string) error {
 		}
 	}
 
-	// Download with timeout
-	client := &http.Client{Timeout: 60 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, DefaultGeoIPURL, nil)
-	if err != nil {
-		return fmt.Errorf("create download request: %w", err)
+	var failures error
+	for _, source := range downloadURLs {
+		log.Printf("🌐 Trying GeoIP source: %s", source)
+		if err := fetchDatabaseFromURL(dbPath, dir, source); err != nil {
+			failures = errors.Join(failures, fmt.Errorf("%s: %w", source, err))
+			continue
+		}
+		downloadSourceMu.Lock()
+		lastSuccessfulDownload = source
+		downloadSourceMu.Unlock()
+		return nil
 	}
+	if failures == nil {
+		return errors.New("no GeoIP download sources configured")
+	}
+	return failures
+}
 
-	resp, err := client.Do(req)
+func fetchDatabaseFromURL(dbPath, dir, source string) error {
+	req, err := http.NewRequest(http.MethodGet, source, nil)
 	if err != nil {
-		return fmt.Errorf("download failed: %w", err)
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("User-Agent", geoIPDownloadUserAgent)
+	resp, err := downloadHTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download failed: unexpected status %s", resp.Status)
+		return fmt.Errorf("unexpected status %s", resp.Status)
 	}
 
-	// Download to temporary file
 	tempFile, err := os.CreateTemp(dir, ".geoip-*.mmdb")
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
@@ -131,27 +164,21 @@ func fetchDatabase(dbPath string) error {
 	cleanup := true
 	defer func() {
 		if tempFile != nil {
-			tempFile.Close()
+			_ = tempFile.Close()
 		}
 		if cleanup {
-			os.Remove(tempPath)
+			_ = os.Remove(tempPath)
 		}
 	}()
 
-	// Copy with progress tracking
 	progress := &progressWriter{total: resp.ContentLength}
-	reader := io.TeeReader(resp.Body, progress)
-	written, err := io.Copy(tempFile, reader)
+	written, err := io.Copy(tempFile, io.TeeReader(resp.Body, progress))
 	if err != nil {
-		return fmt.Errorf("download failed: %w", err)
+		return fmt.Errorf("read response: %w", err)
 	}
-
-	// Verify download completeness
-	if resp.ContentLength > 0 && written < resp.ContentLength {
+	if resp.ContentLength > 0 && written != resp.ContentLength {
 		return fmt.Errorf("incomplete download (%d/%d bytes)", written, resp.ContentLength)
 	}
-
-	// Sync and close temp file
 	if err := tempFile.Sync(); err != nil {
 		return fmt.Errorf("sync temp file: %w", err)
 	}
@@ -159,17 +186,45 @@ func fetchDatabase(dbPath string) error {
 		return fmt.Errorf("close temp file: %w", err)
 	}
 	tempFile = nil
-
-	// Validate MMDB format
-	if err := validateMMDB(tempPath); err != nil {
+	if err := databaseValidator(tempPath); err != nil {
 		return fmt.Errorf("validation failed: %w", err)
 	}
-
-	// Atomic rename
-	if err := os.Rename(tempPath, dbPath); err != nil {
-		return fmt.Errorf("rename failed: %w", err)
+	if err := replaceDatabaseFile(tempPath, dbPath); err != nil {
+		return err
 	}
 	cleanup = false
+	return nil
+}
+
+func replaceDatabaseFile(tempPath, dbPath string) error {
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		if err := os.Rename(tempPath, dbPath); err != nil {
+			return fmt.Errorf("install database: %w", err)
+		}
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("stat existing database: %w", err)
+	}
+
+	backupFile, err := os.CreateTemp(filepath.Dir(dbPath), ".geoip-backup-*.mmdb")
+	if err != nil {
+		return fmt.Errorf("create backup path: %w", err)
+	}
+	backupPath := backupFile.Name()
+	if err := backupFile.Close(); err != nil {
+		return fmt.Errorf("close backup path: %w", err)
+	}
+	if err := os.Remove(backupPath); err != nil {
+		return fmt.Errorf("prepare backup path: %w", err)
+	}
+	if err := os.Rename(dbPath, backupPath); err != nil {
+		return fmt.Errorf("backup existing database: %w", err)
+	}
+	if err := os.Rename(tempPath, dbPath); err != nil {
+		_ = os.Rename(backupPath, dbPath)
+		return fmt.Errorf("install database: %w", err)
+	}
+	_ = os.Remove(backupPath)
 	return nil
 }
 
@@ -180,6 +235,8 @@ type DatabaseStatusInfo struct {
 	SizeBytes    int64  `json:"size_bytes"`
 	ModifiedAt   string `json:"modified_at"` // RFC3339 (UTC), empty if the file does not exist
 	DownloadURL  string `json:"download_url"`
+	FallbackURL  string `json:"fallback_url"`
+	SourceURL    string `json:"source_url"`
 }
 
 // DatabaseStatus reports the on-disk state of the GeoIP database at dbPath.
@@ -187,7 +244,11 @@ func DatabaseStatus(dbPath string) DatabaseStatusInfo {
 	info := DatabaseStatusInfo{
 		DatabasePath: dbPath,
 		DownloadURL:  DefaultGeoIPURL,
+		FallbackURL:  FallbackGeoIPURL,
 	}
+	downloadSourceMu.RLock()
+	info.SourceURL = lastSuccessfulDownload
+	downloadSourceMu.RUnlock()
 	if dbPath == "" {
 		return info
 	}
@@ -262,6 +323,17 @@ func validateMMDB(path string) error {
 		return fmt.Errorf("missing MaxMind metadata")
 	}
 
+	// The metadata marker alone is not enough to prove that the search tree and
+	// metadata are readable. Opening the database catches truncated or otherwise
+	// malformed MMDB files before they replace the installed copy.
+	db, err := geoip2.Open(path)
+	if err != nil {
+		return fmt.Errorf("open database: %w", err)
+	}
+	if err := db.Close(); err != nil {
+		return fmt.Errorf("close database: %w", err)
+	}
+
 	return nil
 }
 
@@ -301,6 +373,23 @@ func New(dbPath string) (*Lookup, error) {
 	return NewWithAutoUpdate(dbPath, 0)
 }
 
+// OpenExisting opens an installed GeoIP database without attempting any
+// network access. Location-detection paths use this after startup preparation
+// so a node check can never trigger a surprise download.
+func OpenExisting(dbPath string) (*Lookup, error) {
+	if dbPath == "" {
+		return &Lookup{}, nil
+	}
+	if err := databaseValidator(dbPath); err != nil {
+		return nil, fmt.Errorf("validate database: %w", err)
+	}
+	db, err := geoip2.Open(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	return &Lookup{db: db, path: dbPath, stopChan: make(chan struct{})}, nil
+}
+
 // NewWithAutoUpdate creates a new GeoIP lookup instance with auto-update support
 func NewWithAutoUpdate(dbPath string, updateInterval time.Duration) (*Lookup, error) {
 	if dbPath == "" {
@@ -312,17 +401,11 @@ func NewWithAutoUpdate(dbPath string, updateInterval time.Duration) (*Lookup, er
 		return nil, fmt.Errorf("ensure database: %w", err)
 	}
 
-	db, err := geoip2.Open(dbPath)
+	lookup, err := OpenExisting(dbPath)
 	if err != nil {
 		return nil, err
 	}
-
-	lookup := &Lookup{
-		db:             db,
-		path:           dbPath,
-		updateInterval: updateInterval,
-		stopChan:       make(chan struct{}),
-	}
+	lookup.updateInterval = updateInterval
 
 	// Start auto-update goroutine if interval is set
 	if updateInterval > 0 {
@@ -394,76 +477,7 @@ func (l *Lookup) Update() error {
 
 // downloadDatabase downloads the GeoIP database to the specified path
 func downloadDatabase(filepath string) error {
-	// Create parent directory if needed
-	dir := filepath[:strings.LastIndex(filepath, "/")]
-	if dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return fmt.Errorf("create directory: %w", err)
-		}
-	}
-
-	// Download with timeout
-	client := &http.Client{Timeout: 60 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, DefaultGeoIPURL, nil)
-	if err != nil {
-		return fmt.Errorf("create download request: %w", err)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status %s", resp.Status)
-	}
-
-	// Create temp file
-	tempFile, err := os.CreateTemp(dir, ".geoip-download-*.mmdb")
-	if err != nil {
-		return fmt.Errorf("create temp file: %w", err)
-	}
-	tempPath := tempFile.Name()
-	cleanup := true
-	defer func() {
-		if tempFile != nil {
-			tempFile.Close()
-		}
-		if cleanup {
-			os.Remove(tempPath)
-		}
-	}()
-
-	// Copy with progress tracking
-	progress := &progressWriter{total: resp.ContentLength}
-	reader := io.TeeReader(resp.Body, progress)
-	written, err := io.Copy(tempFile, reader)
-	if err != nil {
-		return err
-	}
-
-	// Verify download completeness
-	if resp.ContentLength > 0 && written < resp.ContentLength {
-		return fmt.Errorf("incomplete download (%d/%d bytes)", written, resp.ContentLength)
-	}
-
-	// Sync and close
-	if err := tempFile.Sync(); err != nil {
-		return err
-	}
-	if err := tempFile.Close(); err != nil {
-		return err
-	}
-	tempFile = nil
-
-	// Rename to target path
-	if err := os.Rename(tempPath, filepath); err != nil {
-		return err
-	}
-	cleanup = false
-
-	return nil
+	return fetchDatabase(filepath)
 }
 
 // Close closes the GeoIP database and stops auto-update

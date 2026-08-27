@@ -15,7 +15,10 @@ import (
 	"time"
 )
 
-const minValidDownloadBytes int64 = 10 * 1024
+const (
+	minValidDownloadBytes   int64 = 10 * 1024
+	defaultMaxDownloadBytes int64 = 10_000_000
+)
 
 type DialFunc func(context.Context, string, string) (net.Conn, error)
 
@@ -102,7 +105,7 @@ func MeasureSpeed(ctx context.Context, dial DialFunc, options SpeedOptions, prog
 		options.RequestTimeout = 8 * time.Second
 	}
 	if options.MaxBytes <= 0 {
-		options.MaxBytes = 100_000_000
+		options.MaxBytes = defaultMaxDownloadBytes
 	}
 	if options.PeakSampleInterval <= 0 {
 		options.PeakSampleInterval = 100 * time.Millisecond

@@ -66,13 +66,13 @@ management:
   # 手动综合检测；仅从 WebUI 触发，不影响节点健康、黑名单或分组调度
   node_check:
     latency_url: https://cp.cloudflare.com/generate_204
-    speed_url: https://speed.cloudflare.com/__down?bytes=100000000
+    speed_url: https://speed.cloudflare.com/__down?bytes=10000000
     landing_ip_url: https://api.ipify.org            # 通过节点隧道请求；成功后按节点身份缓存，重启不重复检测，不使用节点 host
     latency_timeout: 5s
     speed_duration: 5s                              # 达到持续时间或最大字节任一条件即停止
     speed_request_timeout: 8s
     quality_timeout: 5s
-    max_download_bytes: 100000000
+    max_download_bytes: 10000000
     peak_sample_interval: 100ms
     latency_concurrency: 20                         # 1-128
     speed_concurrency: 2                            # 1-8，避免批量任务占满带宽

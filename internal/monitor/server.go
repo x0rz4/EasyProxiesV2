@@ -76,6 +76,8 @@ type ManagedNodeConfig struct {
 	Port            uint16            `json:"port"`
 	Username        string            `json:"username,omitempty"`
 	Password        string            `json:"password,omitempty"`
+	Region          string            `json:"region,omitempty"`
+	Country         string            `json:"country,omitempty"`
 	Source          config.NodeSource `json:"source,omitempty"`
 	Disabled        bool              `json:"disabled,omitempty"`
 	SubscriptionIDs []int64           `json:"subscription_ids"`
@@ -279,7 +281,11 @@ func (s *Server) SetNodeManager(nm NodeManager) {
 // then fall back to the trace endpoint's coarse loc field.
 func (s *Server) SetGeoipLookup(l *geoip.Lookup) {
 	if s != nil {
+		s.geoLookupMu.Lock()
+		defer s.geoLookupMu.Unlock()
 		s.geoLookup = l
+		s.geoLookupPath = ""
+		s.geoLookupMtime = time.Time{}
 	}
 }
 
@@ -291,9 +297,6 @@ func (s *Server) SetGeoipLookup(l *geoip.Lookup) {
 // configured database path, re-opening if the on-disk file changed (e.g.
 // after the user downloaded/updated the IP library via the WebUI).
 func (s *Server) geoipLookupForCheck() *geoip.Lookup {
-	if s != nil && s.geoLookup != nil && s.geoLookup.IsEnabled() {
-		return s.geoLookup
-	}
 	if s == nil {
 		return nil
 	}
@@ -319,7 +322,7 @@ func (s *Server) geoipLookupForCheck() *geoip.Lookup {
 		s.geoLookup.Close()
 		s.geoLookup = nil
 	}
-	l, err := geoip.New(dbPath)
+	l, err := geoip.OpenExisting(dbPath)
 	if err != nil || l == nil {
 		return nil
 	}
@@ -327,6 +330,22 @@ func (s *Server) geoipLookupForCheck() *geoip.Lookup {
 	s.geoLookupPath = dbPath
 	s.geoLookupMtime = mtime
 	return s.geoLookup
+}
+
+// closeGeoipLookup releases the memory-mapped database before replacing it.
+// This is required on Windows, where an open MMDB cannot be renamed over.
+func (s *Server) closeGeoipLookup() {
+	if s == nil {
+		return
+	}
+	s.geoLookupMu.Lock()
+	defer s.geoLookupMu.Unlock()
+	if s.geoLookup != nil {
+		_ = s.geoLookup.Close()
+	}
+	s.geoLookup = nil
+	s.geoLookupPath = ""
+	s.geoLookupMtime = time.Time{}
 }
 
 // SetStore sets the data store for session persistence and other operations.
@@ -2568,10 +2587,12 @@ func (s *Server) respondNodeError(w http.ResponseWriter, err error) {
 
 // geoipResponse is the JSON structure returned by the GeoIP management endpoints.
 type geoipResponse struct {
-	Enabled    bool                     `json:"enabled"`
-	Database   geoip.DatabaseStatusInfo `json:"database"`
-	Message    string                   `json:"message,omitempty"`
-	ReloadHint bool                     `json:"reload_hint,omitempty"` // true when the runtime GeoIP lookup should be reloaded to pick up the new db
+	Enabled     bool                     `json:"enabled"`
+	Database    geoip.DatabaseStatusInfo `json:"database"`
+	Message     string                   `json:"message,omitempty"`
+	ReloadHint  bool                     `json:"reload_hint,omitempty"` // true when the runtime GeoIP lookup should be reloaded to pick up the new db
+	Reloaded    bool                     `json:"reloaded"`
+	ReloadError string                   `json:"reload_error,omitempty"`
 }
 
 // geoipDatabasePath reads the configured GeoIP database path under cfgSrc.
@@ -3391,15 +3412,16 @@ func (s *Server) handleGeoipDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.closeGeoipLookup()
 	if err := geoip.EnsureDatabase(dbPath); err != nil {
 		s.logger.Printf("GeoIP database download failed: %v", err)
 		writeAPIError(w, http.StatusInternalServerError, fmt.Sprintf("下载 IP 库失败: %v", err))
 		return
 	}
+	reloaded, reloadError := s.reloadAfterGeoipMutation(r.Context())
 	writeJSON(w, geoipResponse{
-		Enabled:  s.geoipEnabled(),
-		Database: geoip.DatabaseStatus(dbPath),
-		Message:  "IP 库下载完成",
+		Enabled: s.geoipEnabled(), Database: geoip.DatabaseStatus(dbPath),
+		Message: "IP 库下载完成", Reloaded: reloaded, ReloadError: reloadError,
 	})
 }
 
@@ -3416,17 +3438,30 @@ func (s *Server) handleGeoipUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.closeGeoipLookup()
 	if err := geoip.DownloadDatabase(dbPath); err != nil {
 		s.logger.Printf("GeoIP database update failed: %v", err)
 		writeAPIError(w, http.StatusInternalServerError, fmt.Sprintf("更新 IP 库失败: %v", err))
 		return
 	}
+	reloaded, reloadError := s.reloadAfterGeoipMutation(r.Context())
 	writeJSON(w, geoipResponse{
-		Enabled:    s.geoipEnabled(),
-		Database:   geoip.DatabaseStatus(dbPath),
-		Message:    "IP 库更新完成，请重载配置以生效",
-		ReloadHint: true,
+		Enabled: s.geoipEnabled(), Database: geoip.DatabaseStatus(dbPath),
+		Message: "IP 库更新完成", Reloaded: reloaded, ReloadError: reloadError,
 	})
+}
+
+func (s *Server) reloadAfterGeoipMutation(ctx context.Context) (bool, string) {
+	if s.nodeMgr == nil {
+		return false, "节点管理器未初始化，无法自动回填区域"
+	}
+	reloadCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
+	defer cancel()
+	if err := s.nodeMgr.TriggerReload(reloadCtx); err != nil {
+		s.logger.Printf("GeoIP database installed but node location backfill failed: %v", err)
+		return false, err.Error()
+	}
+	return true, ""
 }
 
 // Session management functions

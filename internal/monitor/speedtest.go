@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"easy_proxies/internal/config"
 	"easy_proxies/internal/nodedetect"
 )
 
@@ -16,7 +17,12 @@ type SpeedtestRunner struct {
 func (r *SpeedtestRunner) Run(ctx context.Context, dialer DialerFunc, callback func(mbps float64, done bool)) (nodedetect.SpeedResult, error) {
 	options := r.Options
 	if options.URL == "" {
-		options = nodedetect.SpeedOptions{URL: "https://speed.cloudflare.com/__down?bytes=100000000", Duration: 5 * time.Second, RequestTimeout: 8 * time.Second, MaxBytes: 100_000_000, PeakSampleInterval: 100 * time.Millisecond}
+		options = nodedetect.SpeedOptions{URL: config.DefaultNodeCheckSpeedURL, Duration: 5 * time.Second, RequestTimeout: 8 * time.Second, MaxBytes: config.DefaultNodeCheckMaxDownloadBytes, PeakSampleInterval: 100 * time.Millisecond}
+	} else if options.URL == config.LegacyNodeCheckSpeedURL {
+		options.URL = config.DefaultNodeCheckSpeedURL
+		if options.MaxBytes == 100_000_000 {
+			options.MaxBytes = config.DefaultNodeCheckMaxDownloadBytes
+		}
 	}
 	result, err := nodedetect.MeasureSpeed(ctx, nodedetect.DialFunc(dialer), options, func(progress nodedetect.SpeedProgress) {
 		callback(float64(progress.AverageBytesPerSecond)*8/1_000_000, false)

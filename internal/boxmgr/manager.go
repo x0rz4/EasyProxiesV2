@@ -1169,6 +1169,8 @@ func (m *Manager) ListConfigNodes(ctx context.Context, subscriptionID *int64) ([
 			Port:            port,
 			Username:        n.Username,
 			Password:        n.Password,
+			Region:          n.Region,
+			Country:         n.Country,
 			Source:          config.NodeSource(n.Source),
 			Disabled:        !n.Enabled,
 			SubscriptionIDs: n.SubscriptionIDs,
@@ -1183,7 +1185,7 @@ func managedNodeConfig(node config.NodeConfig, subscriptionIDs []int64) monitor.
 		subscriptionIDs = []int64{}
 	}
 	return monitor.ManagedNodeConfig{Name: node.Name, URI: node.URI, Port: node.Port,
-		Username: node.Username, Password: node.Password, Source: node.Source,
+		Username: node.Username, Password: node.Password, Region: node.Region, Country: node.Country, Source: node.Source,
 		Disabled: node.Disabled, SubscriptionIDs: subscriptionIDs}
 }
 
