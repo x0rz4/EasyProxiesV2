@@ -101,11 +101,11 @@ func TestApplyGroupMembershipChangesRebuildsOnlyAffectedGroups(t *testing.T) {
 	if manager.groupSlot(22).box != allBefore {
 		t.Fatal("group whose member set did not change was rebuilt")
 	}
-	if manager.groupSlot(21).box == vipBefore {
-		t.Fatal("group whose member set changed was not rebuilt")
+	if manager.groupSlot(21).box != vipBefore {
+		t.Fatal("group whose member set changed replaced its listener box")
 	}
 	if status := manager.GroupRuntimeStatus(21).Status; status != "ready" {
-		t.Fatalf("rebuilt group status = %q, want ready", status)
+		t.Fatalf("updated group status = %q, want ready", status)
 	}
 	assertTCPListening(t, ports[1])
 	assertTCPListening(t, ports[2])
@@ -179,8 +179,8 @@ func TestApplyGroupMembershipChangesFollowsLandingRegion(t *testing.T) {
 	if err := manager.ApplyGroupMembershipChanges(ctx, []int64{mover.ID}); err != nil {
 		t.Fatal(err)
 	}
-	if manager.groupSlot(51).box == boxBefore {
-		t.Fatal("group did not rebuild after a member left its region")
+	if manager.groupSlot(51).box != boxBefore {
+		t.Fatal("group replaced its listener after a member left its region")
 	}
 	manager.mu.RLock()
 	cached := manager.cfg.Clone()
@@ -305,20 +305,19 @@ func TestForcedRebuildWithRollbackKeepsServingListener(t *testing.T) {
 	if manager.groupSlot(41).box != boxBefore {
 		t.Fatal("failed rebuild replaced the listener it could not rebuild")
 	}
-	if status := manager.GroupRuntimeStatus(41).Status; status != "ready" {
-		t.Fatalf("rolled-back group status = %q, want ready", status)
+	if status := manager.GroupRuntimeStatus(41).Status; status != "degraded" {
+		t.Fatalf("retained group status = %q, want degraded", status)
 	}
 	assertTCPListening(t, ports[1])
 
-	// Same failure, no-rollback mode: the group is left stopped and reported as
-	// broken, which TestForcedTopologyUpdateDoesNotKeepRemovedNodeRuntime pins.
+	// The post-base path also keeps the old listener and reports degradation.
 	if err := manager.applyGroupRuntime(context.Background(), before, after, applyModeForceNoRollback); err == nil {
 		t.Fatal("forced rebuild with no members unexpectedly succeeded")
 	}
-	if manager.groupSlot(41).box != nil {
-		t.Fatal("no-rollback mode kept a runtime it reported as failed")
+	if manager.groupSlot(41).box != boxBefore {
+		t.Fatal("post-base failure replaced the retained runtime")
 	}
-	if status := manager.GroupRuntimeStatus(41).Status; status != "error" {
-		t.Fatalf("no-rollback group status = %q, want error", status)
+	if status := manager.GroupRuntimeStatus(41).Status; status != "degraded" {
+		t.Fatalf("post-base group status = %q, want degraded", status)
 	}
 }

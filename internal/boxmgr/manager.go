@@ -106,11 +106,24 @@ type runtimeNode struct {
 }
 
 type groupRuntimeSlot struct {
-	gate  chan struct{}
-	box   *box.Box
-	mu    sync.RWMutex
-	state monitor.GroupRuntimeStatus
+	gate               chan struct{}
+	box                *box.Box
+	mu                 sync.RWMutex
+	state              monitor.GroupRuntimeStatus
+	appliedFingerprint string
+	members            map[string]runtimeNode
+	retiring           map[string]*groupRetirement
 }
+
+type groupRetirement struct {
+	cancel  chan struct{}
+	node    runtimeNode
+	member  pool.RetiredMember
+	version uint64
+	once    sync.Once
+}
+
+func (r *groupRetirement) stop() { r.once.Do(func() { close(r.cancel) }) }
 
 // New creates a BoxManager with the given config.
 func New(cfg *config.Config, monitorCfg monitor.Config, opts ...Option) *Manager {
@@ -287,6 +300,9 @@ func (m *Manager) reload(newCfg *config.Config) error {
 		if m.detectMissingNodeLocations(locationCtx, newCfg) {
 			return m.reload(newCfg)
 		}
+		if err := m.retryDegradedGroupRuntimes(ctx, newCfg); err != nil {
+			return err
+		}
 		m.logger.Infof("reload skipped: runtime configuration unchanged")
 		return nil
 	}
@@ -295,10 +311,11 @@ func (m *Manager) reload(newCfg *config.Config) error {
 		if err := m.reloadNodesIncrementally(ctx, oldBox, oldCfg, newCfg); err != nil {
 			return err
 		}
+		groupErr := m.syncGroupRuntimesAfterBaseReload(ctx, oldCfg, newCfg)
 		if m.detectMissingNodeLocations(locationCtx, newCfg) {
 			return m.reload(newCfg)
 		}
-		return nil
+		return groupErr
 	}
 	drainTimeout := m.drainTimeout
 	reloadGeneration := m.runtimeGeneration + 1
@@ -428,6 +445,23 @@ func (m *Manager) reload(newCfg *config.Config) error {
 	return groupReloadErr
 }
 
+func (m *Manager) retryDegradedGroupRuntimes(ctx context.Context, cfg *config.Config) error {
+	if cfg == nil {
+		return nil
+	}
+	var result error
+	for _, groupCfg := range cfg.Groups {
+		if !groupCfg.Enabled || groupCfg.ID == 0 || m.GroupRuntimeStatus(groupCfg.ID).Status != "degraded" {
+			continue
+		}
+		groupPool := storeGroupFromConfig(groupCfg)
+		if err := m.applyGroupRuntime(ctx, groupPool, groupPool, applyModeForceNoRollback); err != nil {
+			result = errors.Join(result, fmt.Errorf("retry degraded group %d: %w", groupCfg.ID, err))
+		}
+	}
+	return result
+}
+
 func (m *Manager) syncGroupRuntimesAfterBaseReload(ctx context.Context, oldCfg, newCfg *config.Config) error {
 	oldGroups := make(map[int64]*store.GroupPool)
 	if oldCfg != nil {
@@ -515,6 +549,53 @@ func groupMemberRuntimeShape(cfg *config.Config, groupCfg config.GroupPoolConfig
 	return shape
 }
 
+func groupAppliedFingerprint(cfg *config.Config, groupCfg config.GroupPoolConfig) string {
+	shape := struct {
+		Enabled        bool
+		BindAddress    string
+		BindPort       uint16
+		Protocol       string
+		Username       string
+		Password       string
+		DispatchMode   string
+		FailureWindow  time.Duration
+		FailureLimit   int
+		HealthInterval time.Duration
+		Preferred      int64
+		SkipCertVerify bool
+		Members        []config.NodeConfig
+	}{groupCfg.Enabled, groupCfg.BindAddress, groupCfg.BindPort, groupCfg.Protocol, groupCfg.Username, groupCfg.Password,
+		groupCfg.DispatchMode, groupCfg.FailureWindow, groupCfg.FailureThreshold, groupCfg.HealthCheckInterval,
+		groupCfg.CurrentActiveNodeID, cfg != nil && cfg.SkipCertVerify, groupMemberRuntimeShape(cfg, groupCfg)}
+	encoded, _ := yaml.Marshal(shape)
+	return string(encoded)
+}
+
+func groupListenerEqual(before, after *store.GroupPool) bool {
+	if before == nil || after == nil {
+		return false
+	}
+	return before.ID == after.ID && before.Enabled && after.Enabled && before.BindAddress == after.BindAddress &&
+		before.BindPort == after.BindPort && before.Protocol == after.Protocol && before.Username == after.Username && before.Password == after.Password
+}
+
+func groupRuntimeNodesForConfig(cfg *config.Config, groupCfg config.GroupPoolConfig, generation uint64, instance *box.Box) map[string]runtimeNode {
+	result := make(map[string]runtimeNode)
+	for _, node := range groupMemberNodes(cfg, groupCfg) {
+		tag, err := runtimetag.Format(node.NodeKey(), generation)
+		if err != nil {
+			continue
+		}
+		if instance != nil {
+			if _, found := instance.Outbound().Outbound(tag); !found {
+				continue
+			}
+		}
+		result[runtimeNodeKey(node)] = runtimeNode{tag: tag, node: node}
+	}
+	return result
+}
+
 func storeGroupFromConfig(groupCfg config.GroupPoolConfig) *store.GroupPool {
 	groupPool := &store.GroupPool{ID: groupCfg.ID, Name: groupCfg.Name, BindAddress: groupCfg.BindAddress,
 		BindPort: groupCfg.BindPort, Protocol: groupCfg.Protocol, Username: groupCfg.Username, Password: groupCfg.Password,
@@ -548,13 +629,6 @@ func incrementalReloadEligible(oldCfg, newCfg *config.Config) bool {
 	if oldCfg == nil || newCfg == nil || len(oldCfg.Nodes) == 0 || len(newCfg.Nodes) == 0 || oldCfg.MultiPort.Enabled || newCfg.MultiPort.Enabled ||
 		oldCfg.GeoIP.Enabled || newCfg.GeoIP.Enabled {
 		return false
-	}
-	for _, cfg := range []*config.Config{oldCfg, newCfg} {
-		for _, groupCfg := range cfg.Groups {
-			if groupCfg.Enabled {
-				return false
-			}
-		}
 	}
 	oldShape, newShape := oldCfg.Clone(), newCfg.Clone()
 	oldShape.Nodes, newShape.Nodes = nil, nil
@@ -697,13 +771,25 @@ func (m *Manager) reloadNodesIncrementally(ctx context.Context, instance *box.Bo
 func (m *Manager) cleanupCreatedMembers(instance *box.Box, tags []string) {
 	for index := len(tags) - 1; index >= 0; index-- {
 		created, _ := instance.Outbound().Outbound(tags[index])
-		if err := instance.Outbound().Remove(tags[index]); err != nil {
+		if err := removeOutboundSafely(instance, tags[index]); err != nil {
 			if created != nil {
 				_ = common.Close(created)
 			}
 			m.logger.Warnf("rollback dynamic outbound %s: %v", tags[index], err)
 		}
 	}
+}
+
+func removeOutboundSafely(instance *box.Box, tag string) (err error) {
+	if instance == nil {
+		return errors.New("runtime box is nil")
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("sing-box Remove(%s) panicked after manager mutation: %v", tag, recovered)
+		}
+	}()
+	return instance.Outbound().Remove(tag)
 }
 
 func (m *Manager) drainRetiredMember(instance *box.Box, member pool.RetiredMember, snapshotVersion uint64, timeout time.Duration) {
@@ -716,7 +802,7 @@ func (m *Manager) drainRetiredMember(instance *box.Box, member pool.RetiredMembe
 		m.logger.Warnf("retired outbound %s from snapshot v%d still draining (snapshot_refs=%d operations=%d active=%d); retaining it", member.Tag(), snapshotVersion, refs, operations, active)
 		time.Sleep(5 * time.Second)
 	}
-	if err := instance.Outbound().Remove(member.Tag()); err != nil {
+	if err := removeOutboundSafely(instance, member.Tag()); err != nil {
 		// Remove may already have deleted the manager lookup. Never retry it;
 		// close through the saved ref retained by RetiredMember.
 		closeErr := member.Close()
@@ -836,7 +922,8 @@ func (m *Manager) groupSlot(groupID int64) *groupRuntimeSlot {
 	if slot := m.groupSlots[groupID]; slot != nil {
 		return slot
 	}
-	slot := &groupRuntimeSlot{gate: make(chan struct{}, 1), state: monitor.GroupRuntimeStatus{Status: "stopped"}}
+	slot := &groupRuntimeSlot{gate: make(chan struct{}, 1), state: monitor.GroupRuntimeStatus{Status: "stopped"},
+		members: make(map[string]runtimeNode), retiring: make(map[string]*groupRetirement)}
 	slot.gate <- struct{}{}
 	m.groupSlots[groupID] = slot
 	return slot
@@ -900,6 +987,10 @@ func (m *Manager) startInitialGroup(ctx context.Context, groupID int64) error {
 	slot.mu.Lock()
 	slot.box = instance
 	slot.state = monitor.GroupRuntimeStatus{Status: "ready"}
+	if groupCfg, ok := groupConfigByID(cfg, groupID); ok {
+		slot.members = groupRuntimeNodesForConfig(cfg, groupCfg, m.runtimeGeneration, instance)
+		slot.appliedFingerprint = groupAppliedFingerprint(cfg, groupCfg)
+	}
 	slot.mu.Unlock()
 	return nil
 }
@@ -947,11 +1038,6 @@ func (m *Manager) applyGroupRuntime(ctx context.Context, before, after *store.Gr
 	}
 	defer releaseGroupSlot(slot)
 
-	if !mode.forced() && groupRuntimeEqual(before, after) {
-		m.replaceCachedGroup(after)
-		return nil
-	}
-
 	slot.mu.Lock()
 	oldBox := slot.box
 	slot.state = monitor.GroupRuntimeStatus{Status: "reconfiguring"}
@@ -959,6 +1045,7 @@ func (m *Manager) applyGroupRuntime(ctx context.Context, before, after *store.Gr
 
 	if after == nil || !after.Enabled {
 		if oldBox != nil {
+			cancelGroupRetirements(slot)
 			if err := oldBox.Close(); err != nil {
 				m.mu.RLock()
 				baseCtx := m.baseCtx
@@ -980,6 +1067,32 @@ func (m *Manager) applyGroupRuntime(ctx context.Context, before, after *store.Gr
 	}
 
 	candidateCfg := m.configWithGroup(after)
+	candidateGroup, found := groupConfigByID(candidateCfg, groupID)
+	if !found {
+		m.setGroupRuntimeStatus(groupID, "error", "group configuration is missing")
+		return errors.New("group configuration is missing")
+	}
+	fingerprint := groupAppliedFingerprint(candidateCfg, candidateGroup)
+	slot.mu.RLock()
+	alreadyApplied := slot.appliedFingerprint == fingerprint
+	slot.mu.RUnlock()
+	if !mode.forced() && alreadyApplied {
+		m.setGroupRuntimeStatus(groupID, "ready", "")
+		m.replaceCachedGroup(after)
+		return nil
+	}
+	if oldBox != nil && groupListenerEqual(before, after) {
+		if err := m.applyGroupRuntimeIncremental(candidateCfg, candidateGroup, slot, oldBox, fingerprint); err != nil {
+			if mode.forced() {
+				m.setGroupRuntimeStatus(groupID, "degraded", err.Error())
+			} else {
+				m.setGroupRuntimeStatus(groupID, "ready", "")
+			}
+			return err
+		}
+		m.replaceCachedGroup(after)
+		return nil
+	}
 	m.mu.RLock()
 	baseCtx := m.baseCtx
 	m.mu.RUnlock()
@@ -1008,6 +1121,7 @@ func (m *Manager) applyGroupRuntime(ctx context.Context, before, after *store.Gr
 		return err
 	}
 	if oldBox != nil {
+		cancelGroupRetirements(slot)
 		_ = oldBox.Close()
 	}
 	if err = newBox.Start(); err != nil {
@@ -1030,9 +1144,215 @@ func (m *Manager) applyGroupRuntime(ctx context.Context, before, after *store.Gr
 	slot.mu.Lock()
 	slot.box = newBox
 	slot.state = monitor.GroupRuntimeStatus{Status: "ready"}
+	slot.members = groupRuntimeNodesForConfig(candidateCfg, candidateGroup, m.runtimeGeneration, newBox)
+	slot.appliedFingerprint = fingerprint
 	slot.mu.Unlock()
 	m.replaceCachedGroup(after)
 	return nil
+}
+
+func cancelGroupRetirements(slot *groupRuntimeSlot) {
+	if slot == nil {
+		return
+	}
+	slot.mu.Lock()
+	for tag, ticket := range slot.retiring {
+		ticket.stop()
+		delete(slot.retiring, tag)
+	}
+	slot.mu.Unlock()
+}
+
+func (m *Manager) applyGroupRuntimeIncremental(cfg *config.Config, groupCfg config.GroupPoolConfig, slot *groupRuntimeSlot, instance *box.Box, fingerprint string) (resultErr error) {
+	poolTag := fmt.Sprintf("group-pool-%d", groupCfg.ID)
+	poolOutbound, found := instance.Outbound().Outbound(poolTag)
+	if !found {
+		return fmt.Errorf("group runtime pool %s not found", poolTag)
+	}
+	runtimePool, ok := poolOutbound.(pool.RuntimePool)
+	if !ok {
+		return fmt.Errorf("group runtime pool %s has no transaction interface", poolTag)
+	}
+	desiredNodes := groupMemberNodes(cfg, groupCfg)
+	if len(desiredNodes) == 0 {
+		return errors.New("group update has no matching nodes; retaining current members")
+	}
+	m.mu.RLock()
+	generation := m.runtimeGeneration
+	m.mu.RUnlock()
+	slot.mu.Lock()
+	previous := make(map[string]runtimeNode, len(slot.members))
+	for key, item := range slot.members {
+		previous[key] = item
+	}
+	retiring := make(map[string]*groupRetirement, len(slot.retiring))
+	for tag, ticket := range slot.retiring {
+		retiring[tag] = ticket
+	}
+	slot.mu.Unlock()
+
+	next := make(map[string]runtimeNode, len(desiredNodes))
+	specs := make([]pool.RuntimeMemberSpec, 0, len(desiredNodes))
+	createdTags := make([]string, 0)
+	usedTags := make(map[string]struct{}, len(desiredNodes))
+	cancelledTickets := make([]*groupRetirement, 0)
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		for _, old := range cancelledTickets {
+			replacement := &groupRetirement{cancel: make(chan struct{}), node: old.node, member: old.member, version: old.version}
+			slot.mu.Lock()
+			if slot.retiring[old.member.Tag()] == nil {
+				slot.retiring[old.member.Tag()] = replacement
+				go m.drainRetiredGroupMember(instance, groupCfg.ID, slot, replacement, old.member, old.version)
+			}
+			slot.mu.Unlock()
+		}
+	}()
+	for _, node := range desiredNodes {
+		key := runtimeNodeKey(node)
+		current, retained := previous[key]
+		if retained && current.node.URI == node.URI {
+			current.node = node
+			next[key] = current
+			specs = append(specs, pool.RuntimeMemberSpec{Tag: current.tag, Meta: runtimeMemberMeta(cfg, node)})
+			usedTags[current.tag] = struct{}{}
+			continue
+		}
+		tag, err := runtimetag.Format(node.NodeKey(), generation)
+		if err != nil {
+			m.cleanupCreatedMembers(instance, createdTags)
+			return fmt.Errorf("group node %q tag: %w", node.Name, err)
+		}
+		if _, collision := usedTags[tag]; collision {
+			m.cleanupCreatedMembers(instance, createdTags)
+			return fmt.Errorf("group runtime tag collision: %s", tag)
+		}
+		if ticket := retiring[tag]; ticket != nil && ticket.node.node.URI == node.URI {
+			slot.mu.Lock()
+			if slot.retiring[tag] == ticket {
+				ticket.stop()
+				if _, stillRegistered := instance.Outbound().Outbound(tag); stillRegistered {
+					cancelledTickets = append(cancelledTickets, ticket)
+					delete(slot.retiring, tag)
+					slot.mu.Unlock()
+					next[key] = runtimeNode{tag: tag, node: node}
+					specs = append(specs, pool.RuntimeMemberSpec{Tag: tag, Meta: runtimeMemberMeta(cfg, node)})
+					usedTags[tag] = struct{}{}
+					continue
+				}
+			}
+			slot.mu.Unlock()
+		}
+		built, err := builder.BuildNodeOutbound(tag, node, cfg.SkipCertVerify)
+		if err != nil {
+			m.cleanupCreatedMembers(instance, createdTags)
+			return fmt.Errorf("build group node %q: %w", node.Name, err)
+		}
+		if err := runtimePool.CreateMember(tag, built.Type, built.Options); err != nil {
+			m.cleanupCreatedMembers(instance, createdTags)
+			return fmt.Errorf("create group node %q: %w", node.Name, err)
+		}
+		createdTags = append(createdTags, tag)
+		next[key] = runtimeNode{tag: tag, node: node}
+		specs = append(specs, pool.RuntimeMemberSpec{Tag: tag, Meta: runtimeMemberMeta(cfg, node)})
+		usedTags[tag] = struct{}{}
+	}
+	initial := make(map[string]group.GroupInitialState, len(specs))
+	stateByNodeID := make(map[int64]config.GroupNodeStateConfig, len(groupCfg.NodeStates))
+	for _, state := range groupCfg.NodeStates {
+		stateByNodeID[state.NodeID] = state
+	}
+	for _, spec := range specs {
+		state := stateByNodeID[spec.Meta.NodeID]
+		initial[spec.Tag] = group.GroupInitialState{NodeID: spec.Meta.NodeID,
+			FailureHistory: append([]int64(nil), state.FailureHistory...), Evicted: state.Evicted,
+			LastError: state.LastError, EvictedAt: state.EvictedAt}
+	}
+	prepared, err := runtimePool.PrepareUpdate(pool.RuntimeUpdate{Members: specs, Mode: groupCfg.DispatchMode,
+		FailureWindow: groupCfg.FailureWindow, FailureThreshold: groupCfg.FailureThreshold,
+		HealthCheckInterval: groupCfg.HealthCheckInterval, PreferredNodeID: groupCfg.CurrentActiveNodeID,
+		InitialGroupState: initial})
+	if err != nil {
+		m.cleanupCreatedMembers(instance, createdTags)
+		return fmt.Errorf("prepare group runtime: %w", err)
+	}
+	version, retiredMembers, err := prepared.Commit()
+	if err != nil {
+		prepared.Rollback()
+		m.cleanupCreatedMembers(instance, createdTags)
+		return fmt.Errorf("commit group runtime: %w", err)
+	}
+	committed = true
+	slot.mu.Lock()
+	slot.members = next
+	slot.appliedFingerprint = fingerprint
+	slot.state = monitor.GroupRuntimeStatus{Status: "ready"}
+	for _, retired := range retiredMembers {
+		ticket := &groupRetirement{cancel: make(chan struct{}), member: retired, version: version}
+		for _, item := range previous {
+			if item.tag == retired.Tag() {
+				ticket.node = item
+				break
+			}
+		}
+		if old := slot.retiring[retired.Tag()]; old != nil {
+			old.stop()
+		}
+		slot.retiring[retired.Tag()] = ticket
+		go m.drainRetiredGroupMember(instance, groupCfg.ID, slot, ticket, retired, version)
+	}
+	slot.mu.Unlock()
+	m.logger.Infof("group %q published pool snapshot v%d with %d members", groupCfg.Name, version, len(specs))
+	return nil
+}
+
+func (m *Manager) drainRetiredGroupMember(instance *box.Box, groupID int64, slot *groupRuntimeSlot, ticket *groupRetirement, member pool.RetiredMember, version uint64) {
+	timeout := m.drainTimeout
+	deadline := time.Now().Add(timeout)
+	for !member.Drained() && (timeout <= 0 || time.Now().Before(deadline)) {
+		select {
+		case <-ticket.cancel:
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	for !member.Drained() {
+		refs, operations, active := member.Counts()
+		m.logger.Warnf("group %d outbound %s from snapshot v%d still draining (snapshot_refs=%d operations=%d active=%d); retaining it",
+			groupID, member.Tag(), version, refs, operations, active)
+		select {
+		case <-ticket.cancel:
+			return
+		case <-time.After(5 * time.Second):
+		}
+	}
+	slot.mu.Lock()
+	if slot.retiring[member.Tag()] != ticket {
+		slot.mu.Unlock()
+		return
+	}
+	select {
+	case <-ticket.cancel:
+		delete(slot.retiring, member.Tag())
+		slot.mu.Unlock()
+		return
+	default:
+	}
+	// Keep the retirement claim while Remove mutates sing-box's manager. A
+	// concurrent re-add either cancels before this point or waits until removal
+	// has completed and then creates a fresh outbound; it can never lose its new
+	// object to a stale drain goroutine.
+	err := removeOutboundSafely(instance, member.Tag())
+	delete(slot.retiring, member.Tag())
+	slot.mu.Unlock()
+	if err != nil {
+		closeErr := member.Close()
+		m.logger.Errorf("remove retired group outbound %s failed after manager mutation: %v (saved close: %v)", member.Tag(), err, closeErr)
+	}
+	member.ReleaseState()
 }
 
 func (m *Manager) restoreGroupBox(ctx context.Context, slot *groupRuntimeSlot, previous *store.GroupPool) error {
@@ -1076,7 +1396,7 @@ func (m *Manager) ActivateGroupMember(ctx context.Context, groupID, nodeID int64
 	}
 	defer releaseGroupSlot(slot)
 	status := m.GroupRuntimeStatus(groupID)
-	if status.Status != "ready" {
+	if status.Status != "ready" && status.Status != "degraded" {
 		return errors.New("分组运行时尚未就绪")
 	}
 	if err := group.ActivateMember(groupID, nodeID); err != nil {
@@ -1142,8 +1462,8 @@ func (m *Manager) loadTagNames(ctx context.Context) (map[int64]string, error) {
 }
 
 // ApplyGroupMembershipChanges reacts to node facts changing — tags being
-// recomputed, a landing region being classified — by rebuilding only the group
-// listeners whose member set actually moved.
+// recomputed, a landing region being classified — by updating only the group
+// pool snapshots whose member set actually moved.
 //
 // The base box is never reloaded. A full reload rebuilds every listener in the
 // process, which drops live connections on groups that did not change, and node
@@ -1230,12 +1550,12 @@ func (m *Manager) ApplyGroupMembershipChanges(ctx context.Context, changedNodeID
 		}
 		groupPool := storeGroupFromConfig(groupCfg)
 		// The group definition itself did not change, so the running listener is
-		// still a valid fallback: rebuild forcibly but keep the rollback.
+		// still a valid fallback: update forcibly while retaining it on failure.
 		if err := m.applyGroupRuntime(ctx, groupPool, groupPool, applyModeForceWithRollback); err != nil {
 			result = errors.Join(result, fmt.Errorf("group %d: %w", groupCfg.ID, err))
 			continue
 		}
-		m.logger.Infof("group %q rebuilt after node membership change", groupCfg.Name)
+		m.logger.Infof("group %q updated in place after node membership change", groupCfg.Name)
 	}
 	return result
 }

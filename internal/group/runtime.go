@@ -146,6 +146,105 @@ func notifyGroupState(event GroupStateEvent) {
 	}
 }
 
+// RuntimeUpdate describes a complete group state topology. It is consumed by
+// the pool control plane after outbound validation has succeeded.
+type RuntimeUpdate struct {
+	FailureWindow    time.Duration
+	FailureThreshold int
+	PreferredNodeID  int64
+	Members          map[string]GroupInitialState
+}
+
+// ReconcileSilent migrates mutable member state by stable NodeID without
+// notifying observers. The caller publishes its matching pool snapshot before
+// passing the returned events to NotifyEvents.
+func ReconcileSilent(groupID int64, update RuntimeUpdate) []GroupStateEvent {
+	value, ok := groupRuntimeStore.Load(groupID)
+	if !ok {
+		return nil
+	}
+	runtime := value.(*groupRuntime)
+	window := update.FailureWindow
+	if window <= 0 {
+		window = 5 * time.Minute
+	}
+	threshold := update.FailureThreshold
+	if threshold <= 0 {
+		threshold = 3
+	}
+	runtime.mu.Lock()
+	oldByNodeID := make(map[int64]*groupMemberRuntime, len(runtime.members))
+	for _, member := range runtime.members {
+		oldByNodeID[member.nodeID] = member
+	}
+	currentNodeID := int64(0)
+	if current := runtime.members[runtime.currentTag]; current != nil {
+		currentNodeID = current.nodeID
+	}
+	next := make(map[string]*groupMemberRuntime, len(update.Members))
+	events := make([]GroupStateEvent, 0)
+	now := time.Now()
+	for tag, initial := range update.Members {
+		member := &groupMemberRuntime{nodeID: initial.NodeID, tag: tag}
+		if old := oldByNodeID[initial.NodeID]; old != nil {
+			member.failureHistory = append([]int64(nil), old.failureHistory...)
+			member.evicted, member.lastError, member.evictedAt = old.evicted, old.lastError, old.evictedAt
+		} else {
+			member.failureHistory = append([]int64(nil), initial.FailureHistory...)
+			member.evicted, member.lastError, member.evictedAt = initial.Evicted, initial.LastError, initial.EvictedAt
+		}
+		if _, globallyEvicted := globalEvictedNodes.Load(member.nodeID); globallyEvicted {
+			member.evicted = true
+		}
+		pruned := pruneFailures(member, window, now)
+		newlyEvicted := !member.evicted && len(member.failureHistory) >= threshold
+		if newlyEvicted {
+			member.evicted = true
+			member.evictedAt = now
+			globalEvictedNodes.Store(member.nodeID, true)
+		}
+		if pruned || newlyEvicted {
+			events = append(events, GroupStateEvent{GroupID: groupID, NodeID: member.nodeID,
+				FailureHistory: append([]int64(nil), member.failureHistory...), Evicted: member.evicted,
+				LastError: member.lastError, EvictedAt: member.evictedAt, StateChanged: true})
+		}
+		next[tag] = member
+	}
+	runtime.window, runtime.threshold, runtime.members = window, threshold, next
+	preferredNodeID := currentNodeID
+	if preferredNodeID == 0 {
+		preferredNodeID = update.PreferredNodeID
+	}
+	runtime.currentTag = ""
+	for tag, member := range next {
+		if member.nodeID == preferredNodeID && !member.evicted && len(member.failureHistory) == 0 {
+			runtime.currentTag = tag
+			break
+		}
+	}
+	nextCurrentNodeID := int64(0)
+	if current := next[runtime.currentTag]; current != nil {
+		nextCurrentNodeID = current.nodeID
+	}
+	if nextCurrentNodeID != currentNodeID {
+		events = append(events, GroupStateEvent{GroupID: groupID, NodeID: nextCurrentNodeID,
+			CurrentNodeID: nextCurrentNodeID, CurrentChanged: true})
+	}
+	runtime.mu.Unlock()
+	return events
+}
+
+// NotifyEvents completes a silent reconciliation after the matching pool
+// snapshot has become visible.
+func NotifyEvents(events []GroupStateEvent) {
+	for _, event := range events {
+		notifyGroupState(event)
+		if event.Evicted {
+			propagateEviction(event.NodeID, event.LastError, event.EvictedAt)
+		}
+	}
+}
+
 func Register(groupID int64, failureWindow time.Duration, failureThreshold int, currentTag string, members map[string]GroupInitialState) func() {
 	if groupID == 0 {
 		return func() {}

@@ -3051,9 +3051,13 @@ func (s *Server) writeGroupList(w http.ResponseWriter, r *http.Request) {
 		nodeByID[node.ID] = node
 	}
 	monitorByTag := make(map[string]Snapshot)
+	monitorByNodeID := make(map[int64]Snapshot)
 	if s.mgr != nil {
 		for _, snapshot := range s.mgr.Snapshot() {
 			monitorByTag[snapshot.Tag] = snapshot
+			if snapshot.NodeID != 0 {
+				monitorByNodeID[snapshot.NodeID] = snapshot
+			}
 		}
 	}
 	runtimes := group.GroupRuntimeSnapshots()
@@ -3080,7 +3084,10 @@ func (s *Server) writeGroupList(w http.ResponseWriter, r *http.Request) {
 			response.CurrentActiveTag = runtimeState.CurrentTag
 			for _, member := range runtimeState.Members {
 				node := nodeByID[member.NodeID]
-				mon := monitorByTag[member.Tag]
+				mon := monitorByNodeID[member.NodeID]
+				if mon.NodeID == 0 {
+					mon = monitorByTag[member.Tag]
+				}
 				status := member.Status
 				if status == "ALIVE" && mon.InitialCheckDone && !mon.Available {
 					status = "SUSPECT"

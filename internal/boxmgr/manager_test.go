@@ -221,6 +221,42 @@ func TestApplyGroupRuntimeDoesNotReplaceBaseOrSiblingRuntime(t *testing.T) {
 	}
 }
 
+func TestApplyGroupPolicyUpdateKeepsGroupBoxAndListener(t *testing.T) {
+	group.Reset()
+	defer group.Reset()
+	ports := reserveTCPPorts(t, 2)
+	cfg := &config.Config{
+		Listener: config.ListenerConfig{Enabled: true, Address: "127.0.0.1", Port: ports[0], Protocol: "http"},
+		Pool:     config.PoolConfig{Mode: "fixed", FailureThreshold: 3, BlacklistDuration: time.Minute},
+		Nodes:    []config.NodeConfig{{ID: 1, Name: "node", URI: "http://127.0.0.1:65530", Region: "hk"}},
+		Groups: []config.GroupPoolConfig{{ID: 3, Name: "policy", BindAddress: "127.0.0.1", BindPort: ports[1], Protocol: "mixed",
+			DispatchMode: "fixed", Regions: []string{"hk"}, FailureWindow: 5 * time.Minute, FailureThreshold: 3,
+			HealthCheckInterval: time.Minute, Enabled: true}}, LogLevel: "error",
+	}
+	if err := cfg.NormalizeWithPortMap(nil); err != nil {
+		t.Fatal(err)
+	}
+	manager := New(cfg, monitor.Config{})
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	boxBefore := manager.groupSlot(3).box
+	before := storeGroupFromConfig(cfg.Groups[0])
+	after := cloneStoreGroupForTest(before)
+	after.DispatchMode = "random"
+	after.FailureWindowSeconds = 60
+	after.FailureThreshold = 2
+	after.HealthCheckSeconds = 15
+	if err := manager.ApplyGroupRuntime(context.Background(), before, after); err != nil {
+		t.Fatal(err)
+	}
+	if manager.groupSlot(3).box != boxBefore {
+		t.Fatal("non-listener policy update replaced the group box")
+	}
+	assertTCPListening(t, ports[1])
+}
+
 func TestActivateGroupMemberWaitsForSameGroupRebuild(t *testing.T) {
 	group.Reset()
 	defer group.Reset()
@@ -321,8 +357,8 @@ func TestForcedTopologyUpdateDoesNotKeepRemovedNodeRuntime(t *testing.T) {
 		t.Fatal("forced topology update with no members unexpectedly succeeded")
 	}
 	slot := manager.groupSlot(11)
-	if slot.box != nil || manager.GroupRuntimeStatus(11).Status != "error" {
-		t.Fatalf("removed-node runtime remained active: box=%p status=%+v", slot.box, manager.GroupRuntimeStatus(11))
+	if slot.box == nil || manager.GroupRuntimeStatus(11).Status != "degraded" {
+		t.Fatalf("empty update did not retain degraded runtime: box=%p status=%+v", slot.box, manager.GroupRuntimeStatus(11))
 	}
 }
 

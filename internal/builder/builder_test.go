@@ -219,7 +219,7 @@ func TestBuildNodeOutboundSupportsSOCKS5(t *testing.T) {
 	}
 }
 
-func TestBuildCreatesIndependentGroupListenerSelectorAndPool(t *testing.T) {
+func TestBuildCreatesIndependentGroupListenerAndPoolWithoutSelector(t *testing.T) {
 	cfg := &config.Config{Listener: config.ListenerConfig{Enabled: true, Address: "127.0.0.1", Port: 2323, Protocol: "http"},
 		Pool: config.PoolConfig{Mode: "random", FailureThreshold: 3, BlacklistDuration: time.Hour},
 		Nodes: []config.NodeConfig{{ID: 1, Name: "hk", URI: "http://hk.example:80", Region: "hk"},
@@ -244,10 +244,10 @@ func TestBuildCreatesIndependentGroupListenerSelectorAndPool(t *testing.T) {
 			foundSelector = outbound.Type == C.TypeSelector
 		case "group-pool-7":
 			options, ok := outbound.Options.(*poolout.Options)
-			foundPool = ok && options.SelectorTag == "group-selector-7" && len(options.Members) == 1
+			foundPool = ok && options.SelectorTag == "" && len(options.Members) == 1
 		}
 	}
-	if !foundInbound || !foundSelector || !foundPool {
+	if !foundInbound || foundSelector || !foundPool {
 		t.Fatalf("missing group components: inbound=%v selector=%v pool=%v", foundInbound, foundSelector, foundPool)
 	}
 }

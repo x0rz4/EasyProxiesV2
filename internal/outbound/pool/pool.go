@@ -79,16 +79,44 @@ func Register(registry *outbound.Registry) {
 // member references are immutable; their pointed-to shared runtime state may
 // continue to change independently.
 type MemberRef struct {
-	outbound adapter.Outbound
-	tag      string
-	entry    *monitor.EntryHandle
-	shared   *sharedMemberState
-	meta     MemberMeta
+	outbound  adapter.Outbound
+	tag       string
+	entry     *monitor.EntryHandle
+	shared    *sharedMemberState
+	runtime   *memberRuntime
+	meta      MemberMeta
+	latencyMs atomic.Int64
+}
 
+// memberRuntime owns lifecycle counters for one concrete outbound. Multiple
+// immutable MemberRef values may describe the same outbound after metadata or
+// group-policy updates; keeping the counters here makes remove/re-add races
+// visible to every ref and every retired ticket.
+type memberRuntime struct {
+	outbound     adapter.Outbound
+	shared       *sharedMemberState
 	snapshotRefs atomic.Int64
 	operations   atomic.Int64
 	retired      atomic.Bool
-	latencyMs    atomic.Int64
+	releaseOnce  sync.Once
+}
+
+func newMemberRuntime(detour adapter.Outbound, shared *sharedMemberState) *memberRuntime {
+	if shared != nil {
+		shared.owners.Add(1)
+	}
+	return &memberRuntime{outbound: detour, shared: shared}
+}
+
+func (r *memberRuntime) releaseOwner(tag string) {
+	if r == nil || r.shared == nil {
+		return
+	}
+	r.releaseOnce.Do(func() {
+		if r.shared.owners.Add(-1) == 0 {
+			sharedStateStore.CompareAndDelete(tag, r.shared)
+		}
+	})
 }
 
 // Keep the existing internal name while the rest of the pool implementation
@@ -101,6 +129,7 @@ type memberState = MemberRef
 type PoolSnapshot struct {
 	Members []*MemberRef
 	Version uint64
+	mode    string
 
 	tcpMembers  []*MemberRef
 	udpMembers  []*MemberRef
@@ -122,17 +151,22 @@ type RuntimeMemberSpec struct {
 // RetiredMember owns the saved reference needed after publication. sing-box's
 // Remove may return an error after deleting its lookup entry, so cleanup must
 // not try to resolve the outbound again.
-type RetiredMember struct{ ref *MemberRef }
+type RetiredMember struct {
+	ref  *MemberRef
+	pool *poolOutbound
+}
 
 func (m RetiredMember) Tag() string { return m.ref.tag }
 
 func (m RetiredMember) Drained() bool {
-	return m.ref.snapshotRefs.Load() == 0 && m.ref.operations.Load() == 0 &&
+	runtimeState := ensureMemberRuntime(m.ref)
+	return runtimeState.snapshotRefs.Load() == 0 && runtimeState.operations.Load() == 0 &&
 		(m.ref.shared == nil || m.ref.shared.activeCount() == 0)
 }
 
 func (m RetiredMember) Counts() (snapshotRefs, operations int64, active int32) {
-	return m.ref.snapshotRefs.Load(), m.ref.operations.Load(), func() int32 {
+	runtimeState := ensureMemberRuntime(m.ref)
+	return runtimeState.snapshotRefs.Load(), runtimeState.operations.Load(), func() int32 {
 		if m.ref.shared == nil {
 			return 0
 		}
@@ -146,8 +180,14 @@ func (m RetiredMember) Close() error { return common.Close(m.ref.outbound) }
 // operation and connection has drained. Stable-node history lives in monitor's
 // migrated entry and is not lost with this version-specific state.
 func (m RetiredMember) ReleaseState() {
-	if m.ref.shared != nil {
-		sharedStateStore.CompareAndDelete(m.ref.tag, m.ref.shared)
+	runtimeState := ensureMemberRuntime(m.ref)
+	runtimeState.releaseOwner(m.ref.tag)
+	if m.pool != nil {
+		m.pool.mu.Lock()
+		if m.pool.runtimeByTag[m.ref.tag] == runtimeState {
+			delete(m.pool.runtimeByTag, m.ref.tag)
+		}
+		m.pool.mu.Unlock()
 	}
 }
 
@@ -155,6 +195,27 @@ func (m RetiredMember) ReleaseState() {
 type RuntimePool interface {
 	CreateMember(string, string, any) error
 	ReconcileMembers([]RuntimeMemberSpec) (uint64, []RetiredMember, error)
+	PrepareUpdate(RuntimeUpdate) (PreparedUpdate, error)
+}
+
+// RuntimeUpdate is a complete immutable group pool configuration. Zero policy
+// values are normalized to the same defaults used at cold start.
+type RuntimeUpdate struct {
+	Members             []RuntimeMemberSpec
+	Mode                string
+	FailureWindow       time.Duration
+	FailureThreshold    int
+	HealthCheckInterval time.Duration
+	PreferredNodeID     int64
+	InitialGroupState   map[string]group.GroupInitialState
+}
+
+// PreparedUpdate contains only validated, detached input. Commit is the sole
+// mutation point; Rollback is idempotent and deliberately leaves the live pool
+// untouched.
+type PreparedUpdate interface {
+	Commit() (uint64, []RetiredMember, error)
+	Rollback()
 }
 
 type poolOutbound struct {
@@ -169,9 +230,12 @@ type poolOutbound struct {
 	mu                    sync.Mutex
 	topology              []*MemberRef
 	topologyByTag         map[string]*MemberRef
+	runtimeByTag          map[string]*memberRuntime
 	currentMember         atomic.Pointer[MemberRef]
 	rrCounter             atomic.Uint32
 	randomState           atomic.Uint64
+	failureThreshold      atomic.Int64
+	failureWindowNanos    atomic.Int64
 	monitor               *monitor.Manager
 	selector              selectorOutbound
 	selectorMu            sync.Mutex
@@ -218,8 +282,11 @@ func newPool(ctx context.Context, router adapter.Router, logger log.ContextLogge
 		mode:          normalized.Mode,
 		monitor:       monitorMgr,
 		topologyByTag: make(map[string]*MemberRef, len(normalized.Members)),
+		runtimeByTag:  make(map[string]*memberRuntime, len(normalized.Members)),
 	}
 	p.randomState.Store(uint64(time.Now().UnixNano()) | 1)
+	p.failureThreshold.Store(int64(normalized.FailureThreshold))
+	p.failureWindowNanos.Store(int64(normalized.FailureWindow))
 	if normalized.Mode == modeLowestLatency && normalized.PreferredMember == "" {
 		p.waitForInitialLatency.Store(true)
 	}
@@ -351,7 +418,11 @@ func (p *poolOutbound) Start(stage adapter.StartStage) error {
 		p.unsubscribeHealth = p.monitor.SubscribeHealthResults(p.handleHealthResult)
 	}
 	if p.monitor != nil && p.options.GroupID != 0 {
-		p.unregisterSchedule = p.monitor.RegisterGroupHealthSchedule(p.options.GroupID, p.options.Members, p.options.HealthCheckInterval)
+		nodeIDs := make([]int64, 0, len(p.options.Members))
+		for _, tag := range p.options.Members {
+			nodeIDs = append(nodeIDs, p.options.Metadata[tag].NodeID)
+		}
+		p.unregisterSchedule = p.monitor.RegisterGroupHealthScheduleByNodeID(p.options.GroupID, nodeIDs, p.options.HealthCheckInterval)
 		p.reconcileCurrent()
 		p.unsubscribeActivation = group.RegisterActivationHandler(p.options.GroupID, p.activateNodeID)
 		p.unsubscribeGroupState = group.SubscribeStateChanges(p.handleGroupState)
@@ -397,7 +468,7 @@ func (p *poolOutbound) releaseSnapshotReader(snapshot *PoolSnapshot) {
 func (p *poolOutbound) releaseSnapshotMembers(snapshot *PoolSnapshot) {
 	snapshot.releaseOnce.Do(func() {
 		for _, member := range snapshot.allMembers {
-			member.snapshotRefs.Add(-1)
+			member.runtime.snapshotRefs.Add(-1)
 		}
 	})
 }
@@ -412,13 +483,15 @@ func (p *poolOutbound) publishSnapshotLocked(members []*memberState) *PoolSnapsh
 	}
 	snapshot := &PoolSnapshot{
 		Version:     version,
+		mode:        p.mode,
 		allMembers:  append([]*MemberRef(nil), members...),
 		memberIndex: make(map[*MemberRef]int, len(members)),
 		tcpIndex:    make(map[*MemberRef]int, len(members)),
 		udpIndex:    make(map[*MemberRef]int, len(members)),
 	}
 	for _, member := range snapshot.allMembers {
-		member.snapshotRefs.Add(1)
+		ensureMemberRuntime(member)
+		member.runtime.snapshotRefs.Add(1)
 		if !p.memberAvailableForSnapshot(member, time.Now()) {
 			continue
 		}
@@ -471,6 +544,9 @@ func (p *poolOutbound) memberAvailableForSnapshot(member *MemberRef, now time.Ti
 	if p.monitor != nil {
 		_, probeConfigured = p.monitor.TargetForProbe()
 		monitorSnapshot := p.monitor.SnapshotForTag(member.tag)
+		if p.options.MonitorObserverOnly && p.memberMeta(member).NodeID != 0 {
+			monitorSnapshot = p.monitor.SnapshotForNodeID(p.memberMeta(member).NodeID)
+		}
 		if monitorSnapshot != nil {
 			member.latencyMs.Store(monitorSnapshot.LastLatencyMs)
 		}
@@ -514,6 +590,12 @@ func (p *poolOutbound) Close() error {
 		if p.unregisterRuntime != nil {
 			p.unregisterRuntime()
 		}
+		p.mu.Lock()
+		for tag, runtimeState := range p.runtimeByTag {
+			runtimeState.releaseOwner(tag)
+		}
+		p.runtimeByTag = nil
+		p.mu.Unlock()
 	})
 	return nil
 }
@@ -560,10 +642,12 @@ func (p *poolOutbound) initializeMembersLocked() error {
 		// Acquire shared state (creates if not exists, reuses if already created)
 		state := acquireSharedState(tag)
 
+		runtimeState := newMemberRuntime(detour, state)
 		member := &memberState{
 			outbound: detour,
 			tag:      tag,
 			shared:   state,
+			runtime:  runtimeState,
 			entry:    state.entryHandle(),
 			meta:     p.options.Metadata[tag],
 		}
@@ -574,7 +658,7 @@ func (p *poolOutbound) initializeMembersLocked() error {
 			meta := p.options.Metadata[tag]
 			var entry *monitor.EntryHandle
 			if p.options.MonitorObserverOnly {
-				entry = p.monitor.HandleForTag(tag)
+				entry = p.monitor.HandleForNodeID(meta.NodeID)
 			} else {
 				entry = p.monitor.MigrateRuntimeTag(meta.NodeID, monitor.NodeInfo{
 					NodeID: meta.NodeID, Tag: tag, Name: meta.Name, URI: meta.URI, Mode: meta.Mode,
@@ -598,6 +682,7 @@ func (p *poolOutbound) initializeMembersLocked() error {
 			}
 		}
 		members = append(members, member)
+		p.runtimeByTag[tag] = runtimeState
 	}
 	if p.options.SelectorTag != "" {
 		detour, loaded := p.manager.Outbound(p.options.SelectorTag)
@@ -629,6 +714,10 @@ func (p *poolOutbound) initializeMembersLocked() error {
 func (p *poolOutbound) ReconcileMembers(specs []RuntimeMemberSpec) (uint64, []RetiredMember, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.reconcileMembersLocked(specs)
+}
+
+func (p *poolOutbound) reconcileMembersLocked(specs []RuntimeMemberSpec) (uint64, []RetiredMember, error) {
 	if p.closed.Load() {
 		return 0, nil, net.ErrClosed
 	}
@@ -656,13 +745,19 @@ func (p *poolOutbound) ReconcileMembers(specs []RuntimeMemberSpec) (uint64, []Re
 		member := p.topologyByTag[spec.Tag]
 		if member == nil || member.outbound != detour {
 			state := acquireSharedState(spec.Tag)
-			member = &MemberRef{outbound: detour, tag: spec.Tag, shared: state, entry: state.entryHandle(), meta: spec.Meta}
+			runtimeState := p.runtimeByTag[spec.Tag]
+			if runtimeState == nil || runtimeState.outbound != detour {
+				runtimeState = newMemberRuntime(detour, state)
+				p.runtimeByTag[spec.Tag] = runtimeState
+			}
+			runtimeState.retired.Store(false)
+			member = &MemberRef{outbound: detour, tag: spec.Tag, shared: state, runtime: runtimeState, entry: state.entryHandle(), meta: spec.Meta}
 			member.latencyMs.Store(-1)
 			p.attachMonitorMember(member)
 		} else if member.meta != spec.Meta {
 			// Metadata belongs to the immutable published ref. A metadata-only
 			// update gets a new ref while retaining the same outbound and counters.
-			replacement := &MemberRef{outbound: member.outbound, tag: member.tag, entry: member.entry, shared: member.shared, meta: spec.Meta}
+			replacement := &MemberRef{outbound: member.outbound, tag: member.tag, entry: member.entry, shared: member.shared, runtime: member.runtime, meta: spec.Meta}
 			replacement.latencyMs.Store(member.latencyMs.Load())
 			member = replacement
 			p.attachMonitorMember(member)
@@ -672,7 +767,7 @@ func (p *poolOutbound) ReconcileMembers(specs []RuntimeMemberSpec) (uint64, []Re
 	retired := make([]RetiredMember, 0)
 	for _, member := range p.topology {
 		if _, retained := seen[member.tag]; !retained {
-			retired = append(retired, RetiredMember{ref: member})
+			retired = append(retired, RetiredMember{ref: member, pool: p})
 		}
 	}
 	p.topology = next
@@ -716,10 +811,112 @@ func (p *poolOutbound) ReconcileMembers(specs []RuntimeMemberSpec) (uint64, []Re
 	for _, item := range retired {
 		// Close the acquireOperation race before the new topology becomes
 		// visible. Existing operations remain counted and are allowed to drain.
-		item.ref.retired.Store(true)
+		item.ref.runtime.retired.Store(true)
 	}
 	snapshot := p.publishSnapshotLocked(next)
 	return snapshot.Version, retired, nil
+}
+
+type preparedPoolUpdate struct {
+	pool       *poolOutbound
+	update     RuntimeUpdate
+	rolledBack atomic.Bool
+	committed  atomic.Bool
+}
+
+// PrepareUpdate validates and deep-copies a complete desired runtime without
+// changing the current topology, group state, policy, or health schedule.
+func (p *poolOutbound) PrepareUpdate(update RuntimeUpdate) (PreparedUpdate, error) {
+	if len(update.Members) == 0 {
+		return nil, errors.New("pool update requires at least one member")
+	}
+	copyUpdate := RuntimeUpdate{
+		Members:             make([]RuntimeMemberSpec, len(update.Members)),
+		Mode:                normalizeOptions(Options{Mode: update.Mode}).Mode,
+		FailureWindow:       update.FailureWindow,
+		FailureThreshold:    update.FailureThreshold,
+		HealthCheckInterval: update.HealthCheckInterval,
+		PreferredNodeID:     update.PreferredNodeID,
+		InitialGroupState:   make(map[string]group.GroupInitialState, len(update.InitialGroupState)),
+	}
+	copy(copyUpdate.Members, update.Members)
+	seen := make(map[string]struct{}, len(copyUpdate.Members))
+	for index := range copyUpdate.Members {
+		spec := &copyUpdate.Members[index]
+		if spec.Tag == "" {
+			return nil, errors.New("pool member tag is empty")
+		}
+		if _, exists := seen[spec.Tag]; exists {
+			return nil, E.New("duplicate pool member: ", spec.Tag)
+		}
+		seen[spec.Tag] = struct{}{}
+		detour, loaded := p.manager.Outbound(spec.Tag)
+		if !loaded {
+			return nil, E.New("pool member not found: ", spec.Tag)
+		}
+		networks := detour.Network()
+		if !common.Contains(networks, N.NetworkTCP) && !common.Contains(networks, N.NetworkUDP) {
+			return nil, E.New("pool member has no supported network: ", spec.Tag)
+		}
+	}
+	for tag, state := range update.InitialGroupState {
+		state.FailureHistory = append([]int64(nil), state.FailureHistory...)
+		copyUpdate.InitialGroupState[tag] = state
+	}
+	return &preparedPoolUpdate{pool: p, update: copyUpdate}, nil
+}
+
+func (u *preparedPoolUpdate) Rollback() { u.rolledBack.Store(true) }
+
+func (u *preparedPoolUpdate) Commit() (uint64, []RetiredMember, error) {
+	if u == nil || u.pool == nil || u.rolledBack.Load() {
+		return 0, nil, errors.New("pool update was rolled back")
+	}
+	if !u.committed.CompareAndSwap(false, true) {
+		return 0, nil, errors.New("pool update already committed")
+	}
+	p := u.pool
+	p.mu.Lock()
+	if p.closed.Load() {
+		p.mu.Unlock()
+		return 0, nil, net.ErrClosed
+	}
+	oldMode := p.mode
+	p.mode = u.update.Mode
+	p.options.Mode = u.update.Mode
+	p.options.FailureWindow = u.update.FailureWindow
+	p.options.FailureThreshold = u.update.FailureThreshold
+	p.options.HealthCheckInterval = u.update.HealthCheckInterval
+	p.failureThreshold.Store(int64(u.update.FailureThreshold))
+	p.failureWindowNanos.Store(int64(u.update.FailureWindow))
+	events := group.ReconcileSilent(p.options.GroupID, group.RuntimeUpdate{
+		FailureWindow: u.update.FailureWindow, FailureThreshold: u.update.FailureThreshold,
+		PreferredNodeID: u.update.PreferredNodeID, Members: u.update.InitialGroupState,
+	})
+	version, retired, err := p.reconcileMembersLocked(u.update.Members)
+	if err != nil {
+		p.mode, p.options.Mode = oldMode, oldMode
+		p.mu.Unlock()
+		return 0, nil, err
+	}
+	memberTags := make([]string, 0, len(u.update.Members))
+	memberNodeIDs := make([]int64, 0, len(u.update.Members))
+	for _, spec := range u.update.Members {
+		memberTags = append(memberTags, spec.Tag)
+		memberNodeIDs = append(memberNodeIDs, spec.Meta.NodeID)
+	}
+	p.options.Members = memberTags
+	oldSchedule := p.unregisterSchedule
+	if p.monitor != nil && p.options.GroupID != 0 {
+		p.unregisterSchedule = p.monitor.RegisterGroupHealthScheduleByNodeID(p.options.GroupID, memberNodeIDs, u.update.HealthCheckInterval)
+	}
+	p.mu.Unlock()
+	if oldSchedule != nil {
+		oldSchedule()
+	}
+	group.NotifyEvents(events)
+	p.reconcileCurrent()
+	return version, retired, nil
 }
 
 func (p *poolOutbound) attachMonitorMember(member *MemberRef) {
@@ -729,7 +926,7 @@ func (p *poolOutbound) attachMonitorMember(member *MemberRef) {
 	meta := member.meta
 	var entry *monitor.EntryHandle
 	if p.options.MonitorObserverOnly {
-		entry = p.monitor.HandleForTag(member.tag)
+		entry = p.monitor.HandleForNodeID(meta.NodeID)
 	} else {
 		entry = p.monitor.MigrateRuntimeTag(meta.NodeID, monitor.NodeInfo{NodeID: meta.NodeID, Tag: member.tag, Name: meta.Name, URI: meta.URI,
 			Mode: meta.Mode, ListenAddress: meta.ListenAddress, Port: meta.Port, Region: meta.Region, Country: meta.Country})
@@ -916,7 +1113,11 @@ func (p *poolOutbound) availableMembers(snapshot *PoolSnapshot, now time.Time, n
 }
 
 func (p *poolOutbound) selectMember(snapshot *PoolSnapshot, candidates []*memberState) *memberState {
-	if p.mode == modeLowestLatency && !sameCandidateSlice(candidates, snapshot.tcpMembers) && !sameCandidateSlice(candidates, snapshot.udpMembers) {
+	mode := snapshot.mode
+	if mode == "" {
+		mode = p.mode
+	}
+	if mode == modeLowestLatency && !sameCandidateSlice(candidates, snapshot.tcpMembers) && !sameCandidateSlice(candidates, snapshot.udpMembers) {
 		if current := p.currentMember.Load(); current != nil {
 			for _, member := range candidates {
 				if member == current {
@@ -940,7 +1141,11 @@ func sameCandidateSlice(left, right []*MemberRef) bool {
 }
 
 func (p *poolOutbound) selectionIndex(snapshot *PoolSnapshot, candidates []*MemberRef) int {
-	switch p.mode {
+	mode := snapshot.mode
+	if mode == "" {
+		mode = p.mode
+	}
+	switch mode {
 	case modeRandom:
 		return int(p.nextRandom() % uint64(len(candidates)))
 	case modeBalance:
@@ -970,7 +1175,7 @@ func (p *poolOutbound) selectionIndex(snapshot *PoolSnapshot, candidates []*Memb
 				return index
 			}
 		}
-		if p.mode == modeLowestLatency {
+		if mode == modeLowestLatency {
 			return 0
 		}
 		return p.nextFixedIndex(snapshot, candidates, current)
@@ -1087,19 +1292,30 @@ func (p *poolOutbound) handleGroupState(event group.GroupStateEvent) {
 }
 
 func (p *poolOutbound) handleHealthResult(event monitor.HealthResultEvent) {
-	if !p.hasMember(event.Tag) {
+	tag := event.Tag
+	if p.options.GroupID != 0 && event.NodeID != 0 {
+		p.mu.Lock()
+		for _, member := range p.topology {
+			if p.memberMeta(member).NodeID == event.NodeID {
+				tag = member.tag
+				break
+			}
+		}
+		p.mu.Unlock()
+	}
+	if !p.hasMember(tag) {
 		return
 	}
 	if p.options.GroupID != 0 {
 		if event.Success {
-			group.RecordHealthSuccess(p.options.GroupID, event.Tag)
+			group.RecordHealthSuccess(p.options.GroupID, tag)
 		} else {
-			group.RecordGroupHealthFailure(p.options.GroupID, event.Tag, errors.New(event.Error), event.CheckedAt)
-			p.scheduleExpiryRebuild(p.options.FailureWindow)
+			group.RecordGroupHealthFailure(p.options.GroupID, tag, errors.New(event.Error), event.CheckedAt)
+			p.scheduleExpiryRebuild(p.currentFailureWindow())
 		}
 	}
 	p.mu.Lock()
-	if member := p.topologyByTag[event.Tag]; member != nil {
+	if member := p.topologyByTag[tag]; member != nil {
 		if event.Success {
 			latency := event.Latency.Milliseconds()
 			if latency == 0 && event.Latency > 0 {
@@ -1206,6 +1422,9 @@ func (p *poolOutbound) allInitialChecksDone(snapshot *PoolSnapshot) bool {
 	}
 	for _, member := range snapshot.allMembers {
 		monitorSnapshot := p.monitor.SnapshotForTag(member.tag)
+		if p.options.MonitorObserverOnly && p.memberMeta(member).NodeID != 0 {
+			monitorSnapshot = p.monitor.SnapshotForNodeID(p.memberMeta(member).NodeID)
+		}
 		if monitorSnapshot == nil || !monitorSnapshot.InitialCheckDone {
 			return false
 		}
@@ -1227,21 +1446,41 @@ func (p *poolOutbound) recordFailure(member *memberState, cause error, destinati
 			p.logger.Warn("group ", p.options.GroupID, " marked ", member.tag, " suspect: ", cause)
 		}
 		p.rebuildCandidatesNow()
-		p.scheduleExpiryRebuild(p.options.FailureWindow)
+		p.scheduleExpiryRebuild(p.currentFailureWindow())
 		return
 	}
 	if member.shared == nil {
 		p.logger.Warn("proxy ", member.tag, " failure (no shared state): ", cause)
 		return
 	}
-	failures, blacklisted, until := member.shared.recordFailure(cause, p.options.FailureThreshold, p.options.BlacklistDuration, destination)
+	threshold := p.currentFailureThreshold()
+	failures, blacklisted, until := member.shared.recordFailure(cause, threshold, p.options.BlacklistDuration, destination)
 	if blacklisted {
 		p.logger.Warn("proxy ", member.tag, " blacklisted for ", p.options.BlacklistDuration, ": ", cause)
 		p.rebuildCandidatesNow()
 		p.scheduleExpiryRebuild(time.Until(until))
 	} else {
-		p.logger.Warn("proxy ", member.tag, " failure ", failures, "/", p.options.FailureThreshold, ": ", cause)
+		p.logger.Warn("proxy ", member.tag, " failure ", failures, "/", threshold, ": ", cause)
 	}
+}
+
+func (p *poolOutbound) currentFailureThreshold() int {
+	threshold := int(p.failureThreshold.Load())
+	if threshold <= 0 {
+		threshold = p.options.FailureThreshold
+	}
+	if threshold <= 0 {
+		threshold = 3
+	}
+	return threshold
+}
+
+func (p *poolOutbound) currentFailureWindow() time.Duration {
+	window := time.Duration(p.failureWindowNanos.Load())
+	if window <= 0 {
+		window = p.options.FailureWindow
+	}
+	return window
 }
 
 func (p *poolOutbound) recordSuccess(member *memberState, destination string) {
@@ -1505,18 +1744,26 @@ func (p *poolOutbound) makeDialerByTagFunc(tag string) monitor.DialerFunc {
 }
 
 func (m *MemberRef) acquireOperation() bool {
-	if m.retired.Load() {
+	runtimeState := ensureMemberRuntime(m)
+	if runtimeState.retired.Load() {
 		return false
 	}
-	m.operations.Add(1)
-	if m.retired.Load() {
-		m.operations.Add(-1)
+	runtimeState.operations.Add(1)
+	if runtimeState.retired.Load() {
+		runtimeState.operations.Add(-1)
 		return false
 	}
 	return true
 }
 
-func (m *MemberRef) releaseOperation() { m.operations.Add(-1) }
+func (m *MemberRef) releaseOperation() { ensureMemberRuntime(m).operations.Add(-1) }
+
+func ensureMemberRuntime(member *MemberRef) *memberRuntime {
+	if member.runtime == nil {
+		member.runtime = newMemberRuntime(member.outbound, member.shared)
+	}
+	return member.runtime
+}
 
 type operationConn struct {
 	net.Conn

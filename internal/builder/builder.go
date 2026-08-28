@@ -285,20 +285,13 @@ func BuildVersion(cfg *config.Config, runtimeTagVersion uint64) (option.Options,
 		if preferredTag == "" && group.DispatchMode != "lowest_latency" {
 			preferredTag = members[0]
 		}
-		selectorDefault := preferredTag
-		if selectorDefault == "" {
-			selectorDefault = members[0]
-		}
-		selectorTag := fmt.Sprintf("group-selector-%d", group.ID)
 		groupOutboundTag := fmt.Sprintf("group-pool-%d", group.ID)
 		groupInboundTag := fmt.Sprintf("group-in-%d", group.ID)
-		outbounds = append(outbounds, option.Outbound{Type: C.TypeSelector, Tag: selectorTag,
-			Options: &option.SelectorOutboundOptions{Outbounds: members, Default: selectorDefault, InterruptExistConnections: false}})
 		groupOptions := poolout.Options{Mode: group.DispatchMode, Members: members,
 			FailureThreshold: group.FailureThreshold, FailureWindow: group.FailureWindow,
 			HealthCheckInterval: group.HealthCheckInterval,
 			BlacklistDuration:   100 * 365 * 24 * time.Hour, Metadata: groupMeta,
-			GroupID: group.ID, PreferredMember: preferredTag, InitialGroupState: stateByTag, SelectorTag: selectorTag}
+			GroupID: group.ID, PreferredMember: preferredTag, InitialGroupState: stateByTag}
 		outbounds = append(outbounds, option.Outbound{Type: poolout.Type, Tag: groupOutboundTag, Options: &groupOptions})
 
 		addr, err := parseAddr(group.BindAddress)
@@ -411,7 +404,7 @@ func BuildBaseVersion(cfg *config.Config, runtimeTagVersion uint64) (option.Opti
 }
 
 // BuildGroup builds a self-contained sing-box instance for one enabled group.
-// It retains only the target group's inbound, selector, pool, and the member
+// It retains only the target group's inbound, pool, and member
 // outbounds on which that pool depends.
 func BuildGroup(cfg *config.Config, groupID int64) (option.Options, error) {
 	return BuildGroupVersion(cfg, groupID, runtimetag.InitialVersion)
@@ -438,9 +431,8 @@ func BuildGroupVersion(cfg *config.Config, groupID int64, runtimeTagVersion uint
 		return option.Options{}, err
 	}
 	poolTag := fmt.Sprintf("group-pool-%d", groupID)
-	selectorTag := fmt.Sprintf("group-selector-%d", groupID)
 	inboundTag := fmt.Sprintf("group-in-%d", groupID)
-	keep := map[string]struct{}{poolTag: {}, selectorTag: {}}
+	keep := map[string]struct{}{poolTag: {}}
 	foundPool := false
 	for _, outbound := range opts.Outbounds {
 		if outbound.Tag != poolTag {
@@ -460,13 +452,13 @@ func BuildGroupVersion(cfg *config.Config, groupID int64, runtimeTagVersion uint
 	if !foundPool {
 		return option.Options{}, fmt.Errorf("group %d has no routable members", groupID)
 	}
-	filteredOutbounds := opts.Outbounds[:0]
+	filteredOutbounds := make([]option.Outbound, 0, len(keep))
 	for _, outbound := range opts.Outbounds {
 		if _, ok := keep[outbound.Tag]; ok {
 			filteredOutbounds = append(filteredOutbounds, outbound)
 		}
 	}
-	filteredInbounds := opts.Inbounds[:0]
+	filteredInbounds := make([]option.Inbound, 0, 1)
 	for _, inbound := range opts.Inbounds {
 		if inbound.Tag == inboundTag {
 			filteredInbounds = append(filteredInbounds, inbound)

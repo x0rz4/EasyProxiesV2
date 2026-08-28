@@ -106,7 +106,7 @@ export interface GroupPool {
   health_check_seconds: number
   current_active_node_id?: number
   enabled: boolean
-  runtime_status: 'starting' | 'ready' | 'reconfiguring' | 'stopped' | 'error'
+  runtime_status: 'starting' | 'ready' | 'degraded' | 'reconfiguring' | 'stopped' | 'error'
   runtime_error?: string
   subscription_enabled: boolean
   subscription_token?: string

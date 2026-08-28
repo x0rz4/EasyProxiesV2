@@ -182,6 +182,7 @@ type DebugLogEvent struct {
 // committed so health transitions cannot be dropped.
 type HealthResultEvent struct {
 	Tag       string
+	NodeID    int64
 	Success   bool
 	Latency   time.Duration
 	Error     string
@@ -308,6 +309,7 @@ type Manager struct {
 
 type groupHealthSchedule struct {
 	tags     map[string]struct{}
+	nodeIDs  map[int64]struct{}
 	interval time.Duration
 	token    uint64
 }
@@ -447,6 +449,32 @@ func (m *Manager) RegisterGroupHealthSchedule(groupID int64, tags []string, inte
 	}
 }
 
+// RegisterGroupHealthScheduleByNodeID keeps schedules stable while concrete
+// runtime tags migrate between outbound generations.
+func (m *Manager) RegisterGroupHealthScheduleByNodeID(groupID int64, nodeIDs []int64, interval time.Duration) func() {
+	if groupID == 0 || interval <= 0 {
+		return func() {}
+	}
+	set := make(map[int64]struct{}, len(nodeIDs))
+	for _, nodeID := range nodeIDs {
+		if nodeID != 0 {
+			set[nodeID] = struct{}{}
+		}
+	}
+	m.groupScheduleMu.Lock()
+	m.groupScheduleNext++
+	token := m.groupScheduleNext
+	m.groupSchedules[groupID] = groupHealthSchedule{nodeIDs: set, interval: interval, token: token}
+	m.groupScheduleMu.Unlock()
+	return func() {
+		m.groupScheduleMu.Lock()
+		if current, ok := m.groupSchedules[groupID]; ok && current.token == token {
+			delete(m.groupSchedules, groupID)
+		}
+		m.groupScheduleMu.Unlock()
+	}
+}
+
 func (m *Manager) UnregisterGroupHealthSchedule(groupID int64) {
 	if groupID == 0 {
 		return
@@ -466,9 +494,19 @@ func (m *Manager) probeDue(tag string, lastCheck, now time.Time) bool {
 	if interval <= 0 {
 		interval = 2 * time.Hour
 	}
+	var nodeID int64
+	m.mu.RLock()
+	if item := m.nodes[tag]; item != nil {
+		item.mu.RLock()
+		nodeID = item.info.NodeID
+		item.mu.RUnlock()
+	}
+	m.mu.RUnlock()
 	m.groupScheduleMu.RLock()
 	for _, schedule := range m.groupSchedules {
-		if _, contains := schedule.tags[tag]; contains && schedule.interval > 0 && schedule.interval < interval {
+		_, tagMatch := schedule.tags[tag]
+		_, nodeMatch := schedule.nodeIDs[nodeID]
+		if (tagMatch || nodeMatch) && schedule.interval > 0 && schedule.interval < interval {
 			interval = schedule.interval
 		}
 	}
@@ -900,6 +938,24 @@ func (m *Manager) HandleForTag(tag string) *EntryHandle {
 	return &EntryHandle{ref: entry}
 }
 
+// HandleForNodeID resolves the current monitor owner for a stable node.
+func (m *Manager) HandleForNodeID(nodeID int64) *EntryHandle {
+	if nodeID == 0 {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, item := range m.nodes {
+		item.mu.RLock()
+		matches := item.info.NodeID == nodeID
+		item.mu.RUnlock()
+		if matches {
+			return &EntryHandle{ref: item}
+		}
+	}
+	return nil
+}
+
 // DestinationForProbe exposes the configured destination for health checks.
 func (m *Manager) DestinationForProbe() (M.Socksaddr, bool) {
 	m.mu.RLock()
@@ -1040,6 +1096,17 @@ func (m *Manager) SnapshotForTag(tag string) *Snapshot {
 	}
 	snap := e.snapshot()
 	return &snap
+}
+
+// SnapshotForNodeID returns health for the current runtime generation of a
+// stable node, independent of a group box's concrete tag.
+func (m *Manager) SnapshotForNodeID(nodeID int64) *Snapshot {
+	handle := m.HandleForNodeID(nodeID)
+	if handle == nil {
+		return nil
+	}
+	snapshot := handle.ref.snapshot()
+	return &snapshot
 }
 
 // SnapshotFiltered returns a sorted copy of current node states.
@@ -1217,9 +1284,9 @@ func (m *Manager) applyHealthResult(e *entry, latency time.Duration, probeErr er
 		e.mu.Unlock()
 	}
 	e.mu.RLock()
-	tag := e.info.Tag
+	tag, nodeID := e.info.Tag, e.info.NodeID
 	e.mu.RUnlock()
-	event := HealthResultEvent{Tag: tag, Success: probeErr == nil, Latency: latency, CheckedAt: checkedAt}
+	event := HealthResultEvent{Tag: tag, NodeID: nodeID, Success: probeErr == nil, Latency: latency, CheckedAt: checkedAt}
 	if probeErr != nil {
 		event.Error = probeErr.Error()
 	}

@@ -382,7 +382,7 @@ func TestRetiredMemberWaitsForLoadedSnapshotReader(t *testing.T) {
 		t.Fatal(err)
 	}
 	storeTestSnapshot(p, &memberState{tag: "new", outbound: &fakeOutbound{}, shared: acquireSharedState("new")})
-	member.retired.Store(true)
+	member.runtime.retired.Store(true)
 	retired := RetiredMember{ref: member}
 	if retired.Drained() {
 		t.Fatal("retired member drained while an old snapshot reader was paused")
@@ -498,6 +498,9 @@ func TestLockFreeSelectionModesAndNetworkCandidates(t *testing.T) {
 	if first, second := p.selectionIndex(snapshot, snapshot.tcpMembers), p.selectionIndex(snapshot, snapshot.tcpMembers); first != 0 || second != 1 {
 		t.Fatalf("sequential indexes = %d,%d", first, second)
 	}
+	// Legacy unit setup mutates p.mode directly; production snapshots carry an
+	// immutable mode and are republished by Commit.
+	snapshot.mode = ""
 
 	p.mode = modeBalance
 	a.shared.incActive()

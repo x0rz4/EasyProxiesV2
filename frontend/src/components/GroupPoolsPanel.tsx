@@ -54,6 +54,7 @@ const dispatchModeHint: Record<GroupPoolPayload['dispatch_mode'], string> = {
 const runtimeStatusStyle: Record<GroupPool['runtime_status'], { label: string; badge: string }> = {
   starting: { label: '启动中', badge: 'badge-info' },
   ready: { label: '运行中', badge: 'badge-success' },
+  degraded: { label: '降级运行', badge: 'badge-warning' },
   reconfiguring: { label: '更新中', badge: 'badge-info' },
   stopped: { label: '已停用', badge: 'badge-ghost' },
   error: { label: '运行错误', badge: 'badge-error' },
@@ -315,7 +316,7 @@ export default function GroupPoolsPanel() {
       ? { description: '失败节点已从当前编辑草稿移除' } : undefined)
   }
 
-  const activeGroups = groups.filter((group) => group.runtime_status === 'ready').length
+  const activeGroups = groups.filter((group) => group.runtime_status === 'ready' || group.runtime_status === 'degraded').length
   const totalMembers = groups.reduce((sum, group) => sum + group.member_count, 0)
   const evictedMembers = groups.reduce((sum, group) => sum + group.evicted_count, 0)
 
@@ -467,7 +468,7 @@ export default function GroupPoolsPanel() {
                     regional={Boolean(member.region && regionsText.split(/[,，\s]+/).some((region) => region.toLowerCase() === member.region?.toLowerCase()))}
                     latency={latencyOverrides[member.node_id] ?? member.latency_ms} probing={probingNodeIDs.has(member.node_id)} onProbe={() => void probeOption({ id: member.node_id, name: member.name || member.tag, tag: member.tag })}
                     onExclude={() => excludeDraftMember(member.node_id, member.name || member.tag)}
-                    onActivate={() => { void run(`activate-${editing.id}-${member.node_id}`, () => activateGroupMember(editing.id, member.node_id), '当前出口已立即切换').then(() => { setEditing((current) => current ? { ...current, members: current.members.map(m => ({ ...m, is_active: m.node_id === member.node_id })) } : null) }) }} isActivateBusy={busy === `activate-${editing.id}-${member.node_id}` || editing.runtime_status !== 'ready'} />)}
+                    onActivate={() => { void run(`activate-${editing.id}-${member.node_id}`, () => activateGroupMember(editing.id, member.node_id), '当前出口已立即切换').then(() => { setEditing((current) => current ? { ...current, members: current.members.map(m => ({ ...m, is_active: m.node_id === member.node_id })) } : null) }) }} isActivateBusy={busy === `activate-${editing.id}-${member.node_id}` || (editing.runtime_status !== 'ready' && editing.runtime_status !== 'degraded')} />)}
                   {editing.members.filter(member => !form.excluded_node_ids.includes(member.node_id)).length === 0 && <div className="md:col-span-2"><EmptyMemberList message="当前没有运行成员" /></div>}
                 </div>
               </div>}
@@ -611,7 +612,7 @@ function GroupCard({ group, nodeOptions, tags, busy, expanded, onToggleExpanded,
 	const excludedNodes = (group.excluded_node_ids || []).map((id) => nodeByID.get(id) || { id, name: `节点 #${id}`, region: '', status: 'pending' as const })
 	const runtimeStyle = runtimeStatusStyle[group.runtime_status] || runtimeStatusStyle.stopped
 	const runtimeUpdating = group.runtime_status === 'starting' || group.runtime_status === 'reconfiguring'
-	const runtimeReady = group.runtime_status === 'ready'
+	const runtimeReady = group.runtime_status === 'ready' || group.runtime_status === 'degraded'
 	const copySubscription = async (format: 'clash' | 'base64', mode: 'members' | 'entry') => {
 		if (!group.subscription_token) { toast.error('当前分组没有可用的订阅 Token'); return }
 		const query = new URLSearchParams({ token: group.subscription_token, format, mode })

@@ -126,3 +126,24 @@ func TestStateSubscribersReceiveChangesAndCanUnsubscribe(t *testing.T) {
 	case <-time.After(20 * time.Millisecond):
 	}
 }
+
+func TestReconcileSilentMigratesStateByNodeIDAndAppliesPolicy(t *testing.T) {
+	Reset()
+	defer Reset()
+	now := time.Now()
+	Register(202, 10*time.Minute, 3, "node@v1", map[string]GroupInitialState{"node@v1": {NodeID: 7}})
+	RecordFailure(202, "node@v1", errors.New("one"), now)
+	RecordFailure(202, "node@v1", errors.New("two"), now.Add(time.Second))
+	events := ReconcileSilent(202, RuntimeUpdate{FailureWindow: 5 * time.Minute, FailureThreshold: 2,
+		PreferredNodeID: 7, Members: map[string]GroupInitialState{"node@v2": {NodeID: 7}, "new@v2": {NodeID: 8}}})
+	if MemberAvailable(202, "node@v1") {
+		t.Fatal("retired runtime tag remained a member")
+	}
+	snapshot := GroupRuntimeSnapshots()[202]
+	if len(snapshot.Members) != 2 || snapshot.Members[0].NodeID != 7 || snapshot.Members[0].Status != "EVICTED" {
+		t.Fatalf("state was not migrated and re-evaluated: %+v", snapshot)
+	}
+	if len(events) == 0 || !events[0].StateChanged {
+		t.Fatalf("policy transition did not produce a deferred event: %+v", events)
+	}
+}

@@ -20,6 +20,7 @@ type sharedMemberState struct {
 	active           atomic.Int32
 	totalUpload      atomic.Int64
 	totalDownload    atomic.Int64
+	owners           atomic.Int64
 }
 
 var sharedStateStore sync.Map // map[tag]*sharedMemberState
