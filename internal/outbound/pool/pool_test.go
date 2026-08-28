@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -64,6 +66,19 @@ func TestNormalizeOptionsAlignsInitialStateWithMembers(t *testing.T) {
 	originalHistory[0] = 99
 	if options.InitialGroupState["node-a"].FailureHistory[0] != 1 {
 		t.Fatal("failure history was not defensively copied")
+	}
+}
+
+func TestPoolDependenciesDoNotProtectRuntimeMembers(t *testing.T) {
+	dependencies := poolDependencies(Options{
+		Members:     []string{"0123456789abcdef@v1", "fedcba9876543210@v2"},
+		SelectorTag: "group-selector-7",
+	})
+	if !slices.Equal(dependencies, []string{"group-selector-7"}) {
+		t.Fatalf("pool dependencies=%v, want only static selector dependency", dependencies)
+	}
+	if dependencies := poolDependencies(Options{Members: []string{"0123456789abcdef@v1"}}); len(dependencies) != 0 {
+		t.Fatalf("base pool dependencies=%v, want runtime members unprotected", dependencies)
 	}
 }
 
@@ -260,8 +275,9 @@ func TestBasePoolExcludesActiveProbeFailures(t *testing.T) {
 	mgr.Register(monitor.NodeInfo{Tag: "failed"}).MarkInitialCheckDone(false)
 	healthy := &memberState{tag: "healthy", shared: acquireSharedState("healthy")}
 	failed := &memberState{tag: "failed", shared: acquireSharedState("failed")}
-	p := &poolOutbound{monitor: mgr, members: []*memberState{healthy, failed}}
-	got := p.availableMembersLocked(time.Now(), "", nil)
+	p := &poolOutbound{monitor: mgr}
+	snapshot := storeTestSnapshot(p, healthy, failed)
+	got := p.availableMembers(snapshot, time.Now(), "", nil)
 	if len(got) != 1 || got[0] != healthy {
 		t.Fatalf("available members=%v, want only healthy", memberTags(got))
 	}
@@ -313,6 +329,85 @@ func memberTags(members []*memberState) []string {
 	return tags
 }
 
+func storeTestSnapshot(p *poolOutbound, members ...*memberState) *PoolSnapshot {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.topology = append([]*memberState(nil), members...)
+	p.topologyByTag = make(map[string]*MemberRef, len(members))
+	for _, member := range members {
+		p.topologyByTag[member.tag] = member
+		if member.meta == (MemberMeta{}) {
+			member.meta = p.options.Metadata[member.tag]
+		}
+		if p.monitor != nil {
+			if snapshot := p.monitor.SnapshotForTag(member.tag); snapshot != nil {
+				member.latencyMs.Store(snapshot.LastLatencyMs)
+			}
+		}
+	}
+	if current := p.topologyByTag[group.CurrentTag(p.options.GroupID)]; current != nil {
+		p.currentMember.Store(current)
+	}
+	return p.publishSnapshotLocked(members)
+}
+
+func TestPoolSnapshotReplacementIsVersionedAndImmutable(t *testing.T) {
+	p := &poolOutbound{}
+	a := &memberState{tag: "a"}
+	b := &memberState{tag: "b"}
+	c := &memberState{tag: "c"}
+
+	input := []*memberState{a, b}
+	first := storeTestSnapshot(p, input...)
+	input[0] = c
+	second := storeTestSnapshot(p, b, c)
+
+	if first.Version != 1 || second.Version != 2 {
+		t.Fatalf("snapshot versions = %d, %d; want 1, 2", first.Version, second.Version)
+	}
+	if got := memberTags(first.Members); !slices.Equal(got, []string{"a", "b"}) {
+		t.Fatalf("first snapshot mutated after publication: %v", got)
+	}
+	if got := memberTags(p.current.Load().Members); !slices.Equal(got, []string{"b", "c"}) {
+		t.Fatalf("current snapshot members = %v, want [b c]", got)
+	}
+}
+
+func TestRetiredMemberWaitsForLoadedSnapshotReader(t *testing.T) {
+	member := &memberState{tag: "old", outbound: &fakeOutbound{}, shared: acquireSharedState("old")}
+	p := &poolOutbound{}
+	storeTestSnapshot(p, member)
+	_, release, err := p.acquireSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	storeTestSnapshot(p, &memberState{tag: "new", outbound: &fakeOutbound{}, shared: acquireSharedState("new")})
+	member.retired.Store(true)
+	retired := RetiredMember{ref: member}
+	if retired.Drained() {
+		t.Fatal("retired member drained while an old snapshot reader was paused")
+	}
+	release()
+	if !retired.Drained() {
+		refs, operations, active := retired.Counts()
+		t.Fatalf("retired member did not drain after reader release: refs=%d operations=%d active=%d", refs, operations, active)
+	}
+}
+
+func BenchmarkSelectMember1000(b *testing.B) {
+	members := make([]*memberState, 1024)
+	for index := range members {
+		members[index] = &memberState{tag: strconv.Itoa(index), outbound: &fakeOutbound{}, shared: acquireSharedState(strconv.Itoa(index))}
+	}
+	p := &poolOutbound{mode: modeSequential}
+	snapshot := storeTestSnapshot(p, members...)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_ = p.selectionIndex(snapshot, snapshot.tcpMembers)
+	}
+}
+
 type halfCloseConn struct {
 	net.Conn
 	closeWriteCalls atomic.Int32
@@ -321,7 +416,8 @@ type halfCloseConn struct {
 
 type fakeOutbound struct {
 	adapter.Outbound
-	dial func(context.Context, string, M.Socksaddr) (net.Conn, error)
+	dial     func(context.Context, string, M.Socksaddr) (net.Conn, error)
+	networks []string
 }
 
 type fakeSelector struct {
@@ -337,7 +433,12 @@ func (s *fakeSelector) SelectOutbound(tag string) bool {
 }
 func (s *fakeSelector) Now() string { return s.selected }
 
-func (o *fakeOutbound) Network() []string { return []string{N.NetworkTCP} }
+func (o *fakeOutbound) Network() []string {
+	if len(o.networks) == 0 {
+		return []string{N.NetworkTCP}
+	}
+	return o.networks
+}
 
 func (o *fakeOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	return o.dial(ctx, network, destination)
@@ -366,9 +467,9 @@ func TestDialContextFallsBackToAnotherMember(t *testing.T) {
 	p := &poolOutbound{
 		logger:  boxlog.NewNOPFactory().Logger(),
 		mode:    modeSequential,
-		members: []*memberState{first, second},
 		options: Options{FailureThreshold: 3, BlacklistDuration: time.Minute},
 	}
+	storeTestSnapshot(p, first, second)
 	conn, err := p.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("example.com:443"))
 	if err != nil {
 		t.Fatal(err)
@@ -380,6 +481,137 @@ func TestDialContextFallsBackToAnotherMember(t *testing.T) {
 		t.Fatalf("second member active count = %d, want 1", second.shared.activeCount())
 	}
 	_ = conn.Close()
+}
+
+func TestLockFreeSelectionModesAndNetworkCandidates(t *testing.T) {
+	a := &memberState{tag: "a", outbound: &fakeOutbound{networks: []string{N.NetworkTCP}}, shared: acquireSharedState("select-a")}
+	bMember := &memberState{tag: "b", outbound: &fakeOutbound{networks: []string{N.NetworkTCP, N.NetworkUDP}}, shared: acquireSharedState("select-b")}
+	c := &memberState{tag: "c", outbound: &fakeOutbound{networks: []string{N.NetworkUDP}}, shared: acquireSharedState("select-c")}
+	p := &poolOutbound{mode: modeSequential}
+	snapshot := storeTestSnapshot(p, a, bMember, c)
+	if got := memberTags(snapshot.tcpMembers); !slices.Equal(got, []string{"a", "b"}) {
+		t.Fatalf("TCP candidates = %v", got)
+	}
+	if got := memberTags(snapshot.udpMembers); !slices.Equal(got, []string{"b", "c"}) {
+		t.Fatalf("UDP candidates = %v", got)
+	}
+	if first, second := p.selectionIndex(snapshot, snapshot.tcpMembers), p.selectionIndex(snapshot, snapshot.tcpMembers); first != 0 || second != 1 {
+		t.Fatalf("sequential indexes = %d,%d", first, second)
+	}
+
+	p.mode = modeBalance
+	a.shared.incActive()
+	if selected := p.selectionIndex(snapshot, snapshot.tcpMembers); selected != 1 {
+		t.Fatalf("balance selected index %d, want idle member 1", selected)
+	}
+	a.shared.decActive()
+
+	p.mode = modeRandom
+	var invalid atomic.Int32
+	var done sync.WaitGroup
+	for range 32 {
+		done.Add(1)
+		go func() {
+			defer done.Done()
+			for range 1000 {
+				index := p.selectionIndex(snapshot, snapshot.tcpMembers)
+				if index < 0 || index >= len(snapshot.tcpMembers) {
+					invalid.Add(1)
+				}
+			}
+		}()
+	}
+	done.Wait()
+	if invalid.Load() != 0 {
+		t.Fatalf("random selection returned %d invalid indexes", invalid.Load())
+	}
+}
+
+func TestBlacklistExpiryRepublishesCandidate(t *testing.T) {
+	state := acquireSharedState("expiry")
+	member := &memberState{tag: "expiry", outbound: &fakeOutbound{}, shared: state}
+	p := &poolOutbound{logger: boxlog.NewNOPFactory().Logger(), mode: modeSequential,
+		options: Options{FailureThreshold: 1, BlacklistDuration: 20 * time.Millisecond}}
+	storeTestSnapshot(p, member)
+	p.recordFailure(member, errors.New("down"), "test")
+	if got := len(p.current.Load().Members); got != 0 {
+		t.Fatalf("blacklisted snapshot has %d candidates", got)
+	}
+	deadline := time.Now().Add(time.Second)
+	for len(p.current.Load().Members) == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := len(p.current.Load().Members); got != 1 {
+		t.Fatalf("expired blacklist snapshot has %d candidates", got)
+	}
+	_ = p.Close()
+}
+
+func TestDialContextKeepsLoadedSnapshotAcrossRetry(t *testing.T) {
+	ResetSharedStateStore()
+	t.Cleanup(ResetSharedStateStore)
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	first := &memberState{
+		tag:    "first",
+		shared: acquireSharedState("first"),
+		outbound: &fakeOutbound{dial: func(context.Context, string, M.Socksaddr) (net.Conn, error) {
+			close(firstStarted)
+			<-releaseFirst
+			return nil, errors.New("first unavailable")
+		}},
+	}
+	client, server := net.Pipe()
+	defer server.Close()
+	var secondCalls atomic.Int32
+	second := &memberState{
+		tag:    "second",
+		shared: acquireSharedState("second"),
+		outbound: &fakeOutbound{dial: func(context.Context, string, M.Socksaddr) (net.Conn, error) {
+			secondCalls.Add(1)
+			return client, nil
+		}},
+	}
+	var replacementCalls atomic.Int32
+	replacement := &memberState{
+		tag:    "replacement",
+		shared: acquireSharedState("replacement"),
+		outbound: &fakeOutbound{dial: func(context.Context, string, M.Socksaddr) (net.Conn, error) {
+			replacementCalls.Add(1)
+			return nil, errors.New("replacement must not be used by in-flight dial")
+		}},
+	}
+	p := &poolOutbound{
+		logger:  boxlog.NewNOPFactory().Logger(),
+		mode:    modeSequential,
+		options: Options{FailureThreshold: 3, BlacklistDuration: time.Minute},
+	}
+	firstSnapshot := storeTestSnapshot(p, first, second)
+
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	result := make(chan dialResult, 1)
+	go func() {
+		conn, err := p.DialContext(t.Context(), N.NetworkTCP, M.ParseSocksaddr("example.com:443"))
+		result <- dialResult{conn: conn, err: err}
+	}()
+	<-firstStarted
+	secondSnapshot := storeTestSnapshot(p, replacement)
+	close(releaseFirst)
+
+	dialed := <-result
+	if dialed.err != nil {
+		t.Fatal(dialed.err)
+	}
+	defer dialed.conn.Close()
+	if secondCalls.Load() != 1 || replacementCalls.Load() != 0 {
+		t.Fatalf("retry calls: old second=%d replacement=%d", secondCalls.Load(), replacementCalls.Load())
+	}
+	if firstSnapshot.Version != 1 || secondSnapshot.Version != 2 || p.current.Load() != secondSnapshot {
+		t.Fatalf("unexpected snapshots: first=%d second=%d current=%p", firstSnapshot.Version, secondSnapshot.Version, p.current.Load())
+	}
 }
 
 func (c *halfCloseConn) CloseWrite() error {
@@ -480,21 +712,24 @@ func TestFixedSelectionKeepsHealthyCurrentThenUsesMemberOrder(t *testing.T) {
 	c := &memberState{tag: "c", shared: acquireSharedState("c")}
 	d := &memberState{tag: "d", shared: acquireSharedState("d")}
 	selector := &fakeSelector{selected: "b"}
-	p := &poolOutbound{mode: modeFixed, selector: selector, options: Options{GroupID: 20},
-		members: []*memberState{a, b, c, d}}
-	if selected := p.selectMember([]*memberState{a, b, c, d}); selected != b {
+	p := &poolOutbound{mode: modeFixed, selector: selector, options: Options{GroupID: 20}}
+	snapshot := storeTestSnapshot(p, a, b, c, d)
+	if selected := p.selectMember(snapshot, []*memberState{a, b, c, d}); selected != b {
 		t.Fatalf("healthy current changed to %s", selected.tag)
 	}
 	group.SetCurrentTag(20, "")
-	if selected := p.selectMember([]*memberState{a, d}); selected != d {
+	p.currentMember.Store(b)
+	if selected := p.selectMember(snapshot, []*memberState{a, d}); selected != d {
 		t.Fatalf("replacement = %s, want next available d", selected.tag)
 	}
 	selector.selected = "d"
-	if selected := p.selectMember([]*memberState{a}); selected != a {
+	p.currentMember.Store(d)
+	if selected := p.selectMember(snapshot, []*memberState{a}); selected != a {
 		t.Fatalf("wrapped replacement = %s, want a", selected.tag)
 	}
 	selector.selected = ""
-	if selected := p.selectMember([]*memberState{a, d}); selected != a {
+	p.currentMember.Store(nil)
+	if selected := p.selectMember(snapshot, []*memberState{a, d}); selected != a {
 		t.Fatalf("initial replacement = %s, want first available a", selected.tag)
 	}
 }
@@ -516,11 +751,13 @@ func TestLowestLatencySelectionKeepsHealthyCurrentThenUsesLatency(t *testing.T) 
 	b := &memberState{tag: "b", shared: acquireSharedState("b")}
 	p := &poolOutbound{mode: modeLowestLatency, monitor: mgr, options: Options{GroupID: 25,
 		Metadata: map[string]MemberMeta{"a": {NodeID: 1}, "b": {NodeID: 2}}}}
-	if selected := p.selectMember([]*memberState{a, b}); selected != a {
+	snapshot := storeTestSnapshot(p, a, b)
+	if selected := p.selectMember(snapshot, []*memberState{a, b}); selected != a {
 		t.Fatalf("healthy current changed to %s", selected.tag)
 	}
 	group.SetCurrentTag(25, "")
-	if selected := p.selectMember([]*memberState{a, b}); selected != b {
+	p.currentMember.Store(nil)
+	if selected := p.selectMember(snapshot, []*memberState{a, b}); selected != b {
 		t.Fatalf("replacement = %s, want lowest-latency b", selected.tag)
 	}
 }
@@ -540,7 +777,8 @@ func TestLowestLatencySelectionUsesKnownLatencyThenStableNodeOrder(t *testing.T)
 	p := &poolOutbound{mode: modeLowestLatency, monitor: mgr, options: Options{Metadata: map[string]MemberMeta{
 		"unknown": {NodeID: 1}, "higher-id": {NodeID: 3}, "lower-id": {NodeID: 2},
 	}}}
-	if selected := p.selectMember([]*memberState{unknown, higherID, lowerID}); selected != lowerID {
+	snapshot := storeTestSnapshot(p, unknown, higherID, lowerID)
+	if selected := p.selectMember(snapshot, []*memberState{unknown, higherID, lowerID}); selected != lowerID {
 		t.Fatalf("selected %s, want known latency with lowest stable node ID", selected.tag)
 	}
 }
@@ -564,14 +802,15 @@ func TestLowestLatencyInitialSelectionWaitsForAllInitialChecks(t *testing.T) {
 		options: Options{GroupID: 28, Members: []string{"a", "b"}, Metadata: map[string]MemberMeta{
 			"a": {NodeID: 1}, "b": {NodeID: 2},
 		}},
-		members: []*memberState{{tag: "a", shared: acquireSharedState("a")}, {tag: "b", shared: acquireSharedState("b")}},
 	}
+	storeTestSnapshot(p, &memberState{tag: "a", shared: acquireSharedState("a")}, &memberState{tag: "b", shared: acquireSharedState("b")})
 	p.waitForInitialLatency.Store(true)
 	p.reconcileCurrent()
 	if selector.calls.Load() != 0 || group.CurrentTag(28) != "" {
 		t.Fatalf("selected before all initial checks: calls=%d current=%q", selector.calls.Load(), group.CurrentTag(28))
 	}
 	bEntry.RecordSuccessWithLatency(10 * time.Millisecond)
+	p.rebuildCandidatesNow()
 	p.reconcileCurrent()
 	if selector.calls.Load() != 1 || selector.selected != "b" || group.CurrentTag(28) != "b" {
 		t.Fatalf("initial lowest selection: calls=%d selector=%q current=%q", selector.calls.Load(), selector.selected, group.CurrentTag(28))
@@ -599,8 +838,8 @@ func TestHealthFailureHotSwitchesSelector(t *testing.T) {
 	p := &poolOutbound{
 		logger: boxlog.NewNOPFactory().Logger(), mode: modeFixed, monitor: mgr, selector: selector,
 		options: Options{GroupID: 21, Metadata: map[string]MemberMeta{"a": {NodeID: 1}, "b": {NodeID: 2}, "c": {NodeID: 3}}},
-		members: []*memberState{{tag: "a", shared: acquireSharedState("a")}, {tag: "b", shared: acquireSharedState("b")}, {tag: "c", shared: acquireSharedState("c")}},
 	}
+	storeTestSnapshot(p, &memberState{tag: "a", shared: acquireSharedState("a")}, &memberState{tag: "b", shared: acquireSharedState("b")}, &memberState{tag: "c", shared: acquireSharedState("c")})
 	p.handleHealthResult(monitor.HealthResultEvent{Tag: "b", Error: "down", CheckedAt: time.Now()})
 	if selector.selected != "c" || group.CurrentTag(21) != "c" {
 		t.Fatalf("selector=%q current=%q, want ordered replacement c", selector.selected, group.CurrentTag(21))
@@ -624,8 +863,8 @@ func TestFixedHealthSuccessDoesNotSwitchHealthyCurrent(t *testing.T) {
 	p := &poolOutbound{
 		logger: boxlog.NewNOPFactory().Logger(), mode: modeFixed, monitor: mgr, selector: selector,
 		options: Options{GroupID: 27},
-		members: []*memberState{{tag: "a", shared: acquireSharedState("a")}, {tag: "b", shared: acquireSharedState("b")}},
 	}
+	storeTestSnapshot(p, &memberState{tag: "a", shared: acquireSharedState("a")}, &memberState{tag: "b", shared: acquireSharedState("b")})
 	p.handleHealthResult(monitor.HealthResultEvent{Tag: "b", Success: true, Latency: 10 * time.Millisecond, CheckedAt: time.Now()})
 	if selector.calls.Load() != 0 || selector.selected != "a" || group.CurrentTag(27) != "a" {
 		t.Fatalf("healthy fixed current switched: calls=%d selector=%q current=%q", selector.calls.Load(), selector.selected, group.CurrentTag(27))
@@ -650,8 +889,8 @@ func TestLowestLatencyHealthFailureHotSwitchesToLowestCandidate(t *testing.T) {
 	p := &poolOutbound{
 		logger: boxlog.NewNOPFactory().Logger(), mode: modeLowestLatency, monitor: mgr, selector: selector,
 		options: Options{GroupID: 26, Metadata: map[string]MemberMeta{"a": {NodeID: 1}, "b": {NodeID: 2}, "c": {NodeID: 3}}},
-		members: []*memberState{{tag: "a", shared: acquireSharedState("a")}, {tag: "b", shared: acquireSharedState("b")}, {tag: "c", shared: acquireSharedState("c")}},
 	}
+	storeTestSnapshot(p, &memberState{tag: "a", shared: acquireSharedState("a")}, &memberState{tag: "b", shared: acquireSharedState("b")}, &memberState{tag: "c", shared: acquireSharedState("c")})
 	p.handleHealthResult(monitor.HealthResultEvent{Tag: "b", Error: "down", CheckedAt: time.Now()})
 	if selector.selected != "a" || group.CurrentTag(26) != "a" {
 		t.Fatalf("selector=%q current=%q, want lowest-latency replacement a", selector.selected, group.CurrentTag(26))
@@ -675,8 +914,8 @@ func TestRandomHealthSuccessDoesNotRotateHealthyCurrent(t *testing.T) {
 	p := &poolOutbound{
 		logger: boxlog.NewNOPFactory().Logger(), mode: modeRandom, monitor: mgr, selector: selector,
 		options: Options{GroupID: 23},
-		members: []*memberState{{tag: "a", shared: acquireSharedState("a")}, {tag: "b", shared: acquireSharedState("b")}},
 	}
+	storeTestSnapshot(p, &memberState{tag: "a", shared: acquireSharedState("a")}, &memberState{tag: "b", shared: acquireSharedState("b")})
 	p.handleHealthResult(monitor.HealthResultEvent{Tag: "b", Success: true, CheckedAt: time.Now()})
 	if selector.selected != "a" || group.CurrentTag(23) != "a" {
 		t.Fatalf("healthy random current rotated: selector=%q current=%q", selector.selected, group.CurrentTag(23))
@@ -701,8 +940,8 @@ func TestManualActivationUsesSelectorAndRejectsUnhealthyMember(t *testing.T) {
 	p := &poolOutbound{
 		logger: boxlog.NewNOPFactory().Logger(), mode: modeLowestLatency, monitor: mgr, selector: selector,
 		options: Options{GroupID: 24, Metadata: map[string]MemberMeta{"a": {NodeID: 1}, "b": {NodeID: 2}}},
-		members: []*memberState{{tag: "a", shared: acquireSharedState("a")}, {tag: "b", shared: acquireSharedState("b")}},
 	}
+	storeTestSnapshot(p, &memberState{tag: "a", shared: acquireSharedState("a")}, &memberState{tag: "b", shared: acquireSharedState("b")})
 	unregister := group.RegisterActivationHandler(24, p.activateNodeID)
 	defer unregister()
 	if err := group.ActivateMember(24, 2); err != nil {
@@ -716,6 +955,7 @@ func TestManualActivationUsesSelectorAndRejectsUnhealthyMember(t *testing.T) {
 		t.Fatalf("manual healthy current did not persist: calls=%d selector=%q current=%q", selector.calls.Load(), selector.selected, group.CurrentTag(24))
 	}
 	bEntry.MarkInitialCheckDone(false)
+	p.handleHealthResult(monitor.HealthResultEvent{Tag: "b", Error: "down", CheckedAt: time.Now()})
 	if err := group.ActivateMember(24, 2); err == nil {
 		t.Fatal("unhealthy member was manually activated")
 	}

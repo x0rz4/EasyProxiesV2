@@ -19,6 +19,7 @@ import (
 	json "easy_proxies/internal/jsonx"
 	"easy_proxies/internal/nodecodec"
 	poolout "easy_proxies/internal/outbound/pool"
+	"easy_proxies/internal/runtimetag"
 
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
@@ -26,8 +27,19 @@ import (
 	"github.com/sagernet/sing/common/json/badoption"
 )
 
-// Build converts high level config into sing-box Options tree.
+// Build converts high level config into a sing-box Options tree. The initial
+// runtime is versioned too, so cold-start members never use a separate legacy
+// tag namespace from members created by a later reconciliation.
 func Build(cfg *config.Config) (option.Options, error) {
+	return BuildVersion(cfg, runtimetag.InitialVersion)
+}
+
+// BuildVersion converts high level config into a sing-box Options tree using
+// one runtime tag version for every node outbound in the tree.
+func BuildVersion(cfg *config.Config, runtimeTagVersion uint64) (option.Options, error) {
+	if runtimeTagVersion == 0 {
+		return option.Options{}, errors.New("runtime tag version must be greater than zero")
+	}
 	baseOutbounds := make([]option.Outbound, 0, len(cfg.Nodes))
 	memberTags := make([]string, 0, len(cfg.Nodes))
 	metadata := make(map[string]poolout.MemberMeta)
@@ -38,7 +50,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 	// output, and tags are an internal classification.
 	nodeTagNamesByID := make(map[int64][]string)
 	var failedNodes []string
-	usedTags := make(map[string]int) // Track tag usage for uniqueness
+	usedTags := make(map[string]struct{}, len(cfg.Nodes))
 
 	// Track nodes by region for GeoIP routing.
 	// Region codes are open-ended (any lowercased ISO country code can appear),
@@ -46,18 +58,14 @@ func Build(cfg *config.Config) (option.Options, error) {
 	regionMembers := make(map[string][]string)
 
 	for _, node := range cfg.Nodes {
-		baseTag := sanitizeTag(node.Name)
-		if baseTag == "" {
-			baseTag = fmt.Sprintf("node-%d", len(memberTags)+1)
+		tag, err := runtimetag.Format(node.NodeKey(), runtimeTagVersion)
+		if err != nil {
+			log.Printf("❌ Failed to build node '%s': %v (skipping)", node.Name, err)
+			failedNodes = append(failedNodes, node.Name)
+			continue
 		}
-
-		// Ensure tag uniqueness by appending a counter if needed
-		tag := baseTag
-		if count, exists := usedTags[baseTag]; exists {
-			usedTags[baseTag] = count + 1
-			tag = fmt.Sprintf("%s-%d", baseTag, count+1)
-		} else {
-			usedTags[baseTag] = 1
+		if _, exists := usedTags[tag]; exists {
+			return option.Options{}, fmt.Errorf("runtime tag collision %q for node %q", tag, node.Name)
 		}
 
 		outbound, err := buildNodeOutbound(tag, node.URI, cfg.SkipCertVerify)
@@ -66,6 +74,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 			failedNodes = append(failedNodes, node.Name)
 			continue
 		}
+		usedTags[tag] = struct{}{}
 		memberTags = append(memberTags, tag)
 		baseOutbounds = append(baseOutbounds, outbound)
 		meta := poolout.MemberMeta{
@@ -390,15 +399,27 @@ func Build(cfg *config.Config) (option.Options, error) {
 // Groups are hosted by independent boxes so mutating one group never requires
 // rebinding the global listener or another group's listener.
 func BuildBase(cfg *config.Config) (option.Options, error) {
+	return BuildBaseVersion(cfg, runtimetag.InitialVersion)
+}
+
+// BuildBaseVersion builds the application-wide runtime with an explicit node
+// outbound tag version.
+func BuildBaseVersion(cfg *config.Config, runtimeTagVersion uint64) (option.Options, error) {
 	baseCfg := cfg.Clone()
 	baseCfg.Groups = nil
-	return Build(baseCfg)
+	return BuildVersion(baseCfg, runtimeTagVersion)
 }
 
 // BuildGroup builds a self-contained sing-box instance for one enabled group.
 // It retains only the target group's inbound, selector, pool, and the member
 // outbounds on which that pool depends.
 func BuildGroup(cfg *config.Config, groupID int64) (option.Options, error) {
+	return BuildGroupVersion(cfg, groupID, runtimetag.InitialVersion)
+}
+
+// BuildGroupVersion builds one group runtime with an explicit node outbound
+// tag version.
+func BuildGroupVersion(cfg *config.Config, groupID int64, runtimeTagVersion uint64) (option.Options, error) {
 	groupCfg := cfg.Clone()
 	groupCfg.Listener.Enabled = false
 	groupCfg.MultiPort.Enabled = false
@@ -412,7 +433,7 @@ func BuildGroup(cfg *config.Config, groupID int64) (option.Options, error) {
 	if len(groupCfg.Groups) != 1 || !groupCfg.Groups[0].Enabled {
 		return option.Options{}, fmt.Errorf("group %d is not enabled", groupID)
 	}
-	opts, err := Build(groupCfg)
+	opts, err := BuildVersion(groupCfg, runtimeTagVersion)
 	if err != nil {
 		return option.Options{}, err
 	}
@@ -463,6 +484,16 @@ func BuildGroup(cfg *config.Config, groupID int64) (option.Options, error) {
 	opts.Experimental = nil
 	opts.Services = nil
 	return opts, nil
+}
+
+// BuildNodeOutbound builds one dynamic node outbound under an already
+// validated concrete runtime tag. Dynamic nodes must remain dependency-free;
+// callers verify the created adapter before publishing it into a pool.
+func BuildNodeOutbound(tag string, node config.NodeConfig, skipCertVerify bool) (option.Outbound, error) {
+	if strings.TrimSpace(tag) == "" {
+		return option.Outbound{}, errors.New("runtime tag is empty")
+	}
+	return buildNodeOutbound(tag, node.URI, skipCertVerify)
 }
 
 func buildPoolInbound(cfg *config.Config) (option.Inbound, error) {
@@ -1208,20 +1239,6 @@ func orderedRegions(regionMembers map[string][]string) []string {
 	if _, ok := regionMembers[geoip.RegionOther]; ok {
 		result = append(result, geoip.RegionOther)
 	}
-	return result
-}
-
-func sanitizeTag(name string) string {
-	lower := strings.ToLower(name)
-	lower = strings.TrimSpace(lower)
-	if lower == "" {
-		return ""
-	}
-	segments := strings.FieldsFunc(lower, func(r rune) bool {
-		return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9')
-	})
-	result := strings.Join(segments, "-")
-	result = strings.Trim(result, "-")
 	return result
 }
 

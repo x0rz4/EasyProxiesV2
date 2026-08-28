@@ -23,11 +23,13 @@ import (
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/nodecodec"
 	"easy_proxies/internal/outbound/pool"
+	"easy_proxies/internal/runtimetag"
 	"easy_proxies/internal/store"
 
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/include"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common"
 )
 
 // Ensure Manager implements monitor.NodeManager.
@@ -67,7 +69,8 @@ type ConfigUpdateListener interface {
 
 // Manager owns the lifecycle of the active sing-box instance.
 type Manager struct {
-	mu sync.RWMutex
+	mu       sync.RWMutex
+	reloadMu sync.Mutex
 
 	currentBox    *box.Box
 	monitorMgr    *monitor.Manager
@@ -92,6 +95,14 @@ type Manager struct {
 	groupSlotsMu sync.Mutex
 	groupSlots   map[int64]*groupRuntimeSlot
 	landingMu    sync.Mutex
+
+	runtimeGeneration uint64
+	runtimeNodes      map[string]runtimeNode
+}
+
+type runtimeNode struct {
+	tag  string
+	node config.NodeConfig
 }
 
 type groupRuntimeSlot struct {
@@ -104,9 +115,11 @@ type groupRuntimeSlot struct {
 // New creates a BoxManager with the given config.
 func New(cfg *config.Config, monitorCfg monitor.Config, opts ...Option) *Manager {
 	m := &Manager{
-		cfg:        cfg,
-		monitorCfg: monitorCfg,
-		groupSlots: make(map[int64]*groupRuntimeSlot),
+		cfg:               cfg,
+		monitorCfg:        monitorCfg,
+		groupSlots:        make(map[int64]*groupRuntimeSlot),
+		runtimeGeneration: runtimetag.InitialVersion,
+		runtimeNodes:      make(map[string]runtimeNode),
 	}
 	m.applyConfigSettings(cfg)
 	for _, opt := range opts {
@@ -192,6 +205,8 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.mu.Lock()
 	m.currentBox = instance
 	m.lastAppliedBasePort = cfg.MultiPort.BasePort
+	m.runtimeGeneration = runtimetag.InitialVersion
+	m.runtimeNodes = runtimeNodesForConfig(cfg, m.runtimeGeneration, instance)
 	m.mu.Unlock()
 
 	for index := range cfg.Groups {
@@ -238,6 +253,12 @@ func (m *Manager) Start(ctx context.Context) error {
 // For multi-port mode, we must stop the old instance first to release ports.
 // Supports transitioning from idle state (0 nodes → has nodes).
 func (m *Manager) Reload(newCfg *config.Config) error {
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+	return m.reload(newCfg)
+}
+
+func (m *Manager) reload(newCfg *config.Config) error {
 	if newCfg == nil {
 		return errors.New("new config is nil")
 	}
@@ -264,12 +285,23 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 		// newly discovered country then flows through the regular controlled
 		// reload so affected group membership is recalculated.
 		if m.detectMissingNodeLocations(locationCtx, newCfg) {
-			return m.Reload(newCfg)
+			return m.reload(newCfg)
 		}
 		m.logger.Infof("reload skipped: runtime configuration unchanged")
 		return nil
 	}
+	if oldBox != nil && incrementalReloadEligible(oldCfg, newCfg) {
+		m.mu.Unlock()
+		if err := m.reloadNodesIncrementally(ctx, oldBox, oldCfg, newCfg); err != nil {
+			return err
+		}
+		if m.detectMissingNodeLocations(locationCtx, newCfg) {
+			return m.reload(newCfg)
+		}
+		return nil
+	}
 	drainTimeout := m.drainTimeout
+	reloadGeneration := m.runtimeGeneration + 1
 	m.currentBox = nil // Mark as reloading
 	m.mu.Unlock()
 
@@ -302,7 +334,7 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 	maxRetries := 10
 	for retry := 0; retry < maxRetries; retry++ {
 		var err error
-		instance, err = m.createBaseBox(ctx, newCfg)
+		instance, err = m.createBaseBoxVersion(ctx, newCfg, reloadGeneration)
 		if err != nil {
 			m.rollbackToOldConfig(ctx, oldCfg)
 			return fmt.Errorf("create new box: %w", err)
@@ -334,7 +366,7 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 			m.monitorMgr.BeginReload()
 		}
 		var err error
-		instance, err = m.createBaseBox(ctx, newCfg)
+		instance, err = m.createBaseBoxVersion(ctx, newCfg, reloadGeneration)
 		if err != nil {
 			m.rollbackToOldConfig(ctx, oldCfg)
 			return fmt.Errorf("rebuild base with landing locations: %w", err)
@@ -357,6 +389,8 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 	m.mu.Lock()
 	m.currentBox = instance
 	m.cfg = newCfg
+	m.runtimeGeneration = reloadGeneration
+	m.runtimeNodes = runtimeNodesForConfig(newCfg, reloadGeneration, instance)
 	m.idle = false // Clear idle state on successful reload
 	m.lastAppliedBasePort = newCfg.MultiPort.BasePort
 	// Update monitor server's config reference so settings API reads the latest config
@@ -510,6 +544,187 @@ func runtimeConfigEqual(a, b *config.Config) bool {
 	return aErr == nil && bErr == nil && bytes.Equal(aYAML, bYAML) && reflect.DeepEqual(a.Groups, b.Groups)
 }
 
+func incrementalReloadEligible(oldCfg, newCfg *config.Config) bool {
+	if oldCfg == nil || newCfg == nil || len(oldCfg.Nodes) == 0 || len(newCfg.Nodes) == 0 || oldCfg.MultiPort.Enabled || newCfg.MultiPort.Enabled ||
+		oldCfg.GeoIP.Enabled || newCfg.GeoIP.Enabled {
+		return false
+	}
+	for _, cfg := range []*config.Config{oldCfg, newCfg} {
+		for _, groupCfg := range cfg.Groups {
+			if groupCfg.Enabled {
+				return false
+			}
+		}
+	}
+	oldShape, newShape := oldCfg.Clone(), newCfg.Clone()
+	oldShape.Nodes, newShape.Nodes = nil, nil
+	return runtimeConfigEqual(oldShape, newShape)
+}
+
+func runtimeNodeKey(node config.NodeConfig) string {
+	if node.ID != 0 {
+		return fmt.Sprintf("id:%d", node.ID)
+	}
+	return "key:" + node.NodeKey()
+}
+
+func runtimeNodesForConfig(cfg *config.Config, generation uint64, instance *box.Box) map[string]runtimeNode {
+	result := make(map[string]runtimeNode, len(cfg.Nodes))
+	for _, node := range cfg.Nodes {
+		tag, err := runtimetag.Format(node.NodeKey(), generation)
+		if err == nil {
+			if instance != nil {
+				if _, found := instance.Outbound().Outbound(tag); !found {
+					continue
+				}
+			}
+			result[runtimeNodeKey(node)] = runtimeNode{tag: tag, node: node}
+		}
+	}
+	return result
+}
+
+func runtimeMemberMeta(cfg *config.Config, node config.NodeConfig) pool.MemberMeta {
+	meta := pool.MemberMeta{NodeID: node.ID, Name: node.Name, URI: node.URI, Mode: cfg.EntryMode(), Region: strings.ToLower(node.Region), Country: node.Country}
+	if cfg.MultiPort.Enabled {
+		meta.ListenAddress, meta.Port = cfg.MultiPort.Address, node.Port
+	} else if cfg.Listener.Enabled {
+		meta.ListenAddress, meta.Port = cfg.Listener.Address, cfg.Listener.Port
+	}
+	if meta.Region == "" {
+		meta.Region, meta.Country = "other", "Unknown"
+	}
+	return meta
+}
+
+func (m *Manager) reloadNodesIncrementally(ctx context.Context, instance *box.Box, oldCfg, newCfg *config.Config) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	m.mu.RLock()
+	previous := make(map[string]runtimeNode, len(m.runtimeNodes))
+	for key, value := range m.runtimeNodes {
+		previous[key] = value
+	}
+	nextGeneration := m.runtimeGeneration + 1
+	drainTimeout := m.drainTimeout
+	m.mu.RUnlock()
+
+	poolOutbound, found := instance.Outbound().Outbound(pool.Tag)
+	if !found {
+		return errors.New("incremental reload: shared pool not found")
+	}
+	runtimePool, ok := poolOutbound.(pool.RuntimePool)
+	if !ok {
+		return errors.New("incremental reload: shared pool has no runtime control interface")
+	}
+
+	nextRuntime := make(map[string]runtimeNode, len(newCfg.Nodes))
+	specs := make([]pool.RuntimeMemberSpec, 0, len(newCfg.Nodes))
+	newTags := make([]string, 0)
+	createdTags := make([]string, 0)
+	usedTags := make(map[string]struct{}, len(newCfg.Nodes))
+	for _, node := range newCfg.Nodes {
+		key := runtimeNodeKey(node)
+		current, retained := previous[key]
+		if retained && current.node.URI == node.URI && oldCfg.SkipCertVerify == newCfg.SkipCertVerify {
+			current.node = node
+			nextRuntime[key] = current
+			specs = append(specs, pool.RuntimeMemberSpec{Tag: current.tag, Meta: runtimeMemberMeta(newCfg, node)})
+			usedTags[current.tag] = struct{}{}
+			continue
+		}
+		tag, err := runtimetag.Format(node.NodeKey(), nextGeneration)
+		if err != nil {
+			m.cleanupCreatedMembers(instance, createdTags)
+			return fmt.Errorf("incremental reload node %q tag: %w", node.Name, err)
+		}
+		if _, collision := usedTags[tag]; collision {
+			m.cleanupCreatedMembers(instance, createdTags)
+			return fmt.Errorf("incremental reload runtime tag collision: %s", tag)
+		}
+		built, err := builder.BuildNodeOutbound(tag, node, newCfg.SkipCertVerify)
+		if err != nil {
+			m.cleanupCreatedMembers(instance, createdTags)
+			return fmt.Errorf("build dynamic node %q: %w", node.Name, err)
+		}
+		if err := runtimePool.CreateMember(tag, built.Type, built.Options); err != nil {
+			m.cleanupCreatedMembers(instance, createdTags)
+			return fmt.Errorf("create dynamic node %q: %w", node.Name, err)
+		}
+		createdTags = append(createdTags, tag)
+		newTags = append(newTags, tag)
+		usedTags[tag] = struct{}{}
+		nextRuntime[key] = runtimeNode{tag: tag, node: node}
+		specs = append(specs, pool.RuntimeMemberSpec{Tag: tag, Meta: runtimeMemberMeta(newCfg, node)})
+	}
+
+	version, retired, err := runtimePool.ReconcileMembers(specs)
+	if err != nil {
+		m.cleanupCreatedMembers(instance, createdTags)
+		return fmt.Errorf("publish incremental pool topology: %w", err)
+	}
+	m.applyConfigSettings(newCfg)
+	m.mu.Lock()
+	if m.currentBox != instance {
+		m.mu.Unlock()
+		return errors.New("incremental reload lost active box ownership after publication")
+	}
+	m.cfg = newCfg
+	m.runtimeGeneration = nextGeneration
+	m.runtimeNodes = nextRuntime
+	if m.monitorServer != nil {
+		m.monitorServer.SetConfig(newCfg)
+	}
+	listeners := append([]ConfigUpdateListener(nil), m.configListeners...)
+	m.mu.Unlock()
+	for _, listener := range listeners {
+		listener.OnConfigUpdate(newCfg)
+	}
+	if m.monitorMgr != nil {
+		m.monitorMgr.RequestProbeTagsOnce(newTags)
+	}
+	for _, retiredMember := range retired {
+		if m.monitorMgr != nil {
+			m.monitorMgr.UnregisterRuntimeTag(retiredMember.Tag())
+		}
+		go m.drainRetiredMember(instance, retiredMember, version, drainTimeout)
+	}
+	m.logger.Infof("incremental reload published pool snapshot v%d with %d nodes (%d new versions)", version, len(specs), len(newTags))
+	return nil
+}
+
+func (m *Manager) cleanupCreatedMembers(instance *box.Box, tags []string) {
+	for index := len(tags) - 1; index >= 0; index-- {
+		created, _ := instance.Outbound().Outbound(tags[index])
+		if err := instance.Outbound().Remove(tags[index]); err != nil {
+			if created != nil {
+				_ = common.Close(created)
+			}
+			m.logger.Warnf("rollback dynamic outbound %s: %v", tags[index], err)
+		}
+	}
+}
+
+func (m *Manager) drainRetiredMember(instance *box.Box, member pool.RetiredMember, snapshotVersion uint64, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for !member.Drained() && (timeout <= 0 || time.Now().Before(deadline)) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	for !member.Drained() {
+		refs, operations, active := member.Counts()
+		m.logger.Warnf("retired outbound %s from snapshot v%d still draining (snapshot_refs=%d operations=%d active=%d); retaining it", member.Tag(), snapshotVersion, refs, operations, active)
+		time.Sleep(5 * time.Second)
+	}
+	if err := instance.Outbound().Remove(member.Tag()); err != nil {
+		// Remove may already have deleted the manager lookup. Never retry it;
+		// close through the saved ref retained by RetiredMember.
+		closeErr := member.Close()
+		m.logger.Errorf("remove retired outbound %s failed after manager mutation: %v (saved close: %v)", member.Tag(), err, closeErr)
+	}
+	member.ReleaseState()
+}
+
 func effectiveHealthCheckInterval(cfg *config.Config) time.Duration {
 	if cfg == nil {
 		return 2 * time.Hour
@@ -573,6 +788,8 @@ func (m *Manager) rollbackToOldConfig(ctx context.Context, oldCfg *config.Config
 
 // Close terminates the active instance and auxiliary components.
 func (m *Manager) Close() error {
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
 	groupErr := m.closeAllGroupRuntimes("stopped", "")
 
 	m.mu.Lock()
@@ -1042,6 +1259,16 @@ func groupRuntimeEqual(before, after *store.GroupPool) bool {
 
 // createBaseBox builds the application-wide instance without group listeners.
 func (m *Manager) createBaseBox(ctx context.Context, cfg *config.Config) (*box.Box, error) {
+	m.mu.RLock()
+	generation := m.runtimeGeneration
+	m.mu.RUnlock()
+	if generation == 0 {
+		generation = runtimetag.InitialVersion
+	}
+	return m.createBaseBoxVersion(ctx, cfg, generation)
+}
+
+func (m *Manager) createBaseBoxVersion(ctx context.Context, cfg *config.Config, generation uint64) (*box.Box, error) {
 	if cfg == nil {
 		return nil, errors.New("config is nil")
 	}
@@ -1049,7 +1276,7 @@ func (m *Manager) createBaseBox(ctx context.Context, cfg *config.Config) (*box.B
 		return nil, errors.New("monitor manager not initialized")
 	}
 
-	opts, err := builder.BuildBase(cfg)
+	opts, err := builder.BuildBaseVersion(cfg, generation)
 	if err != nil {
 		return nil, fmt.Errorf("build sing-box options: %w", err)
 	}
@@ -1060,7 +1287,13 @@ func (m *Manager) createGroupBox(ctx context.Context, cfg *config.Config, groupI
 	if cfg == nil {
 		return nil, errors.New("config is nil")
 	}
-	opts, err := builder.BuildGroup(cfg, groupID)
+	m.mu.RLock()
+	generation := m.runtimeGeneration
+	m.mu.RUnlock()
+	if generation == 0 {
+		generation = runtimetag.InitialVersion
+	}
+	opts, err := builder.BuildGroupVersion(cfg, groupID, generation)
 	if err != nil {
 		return nil, err
 	}

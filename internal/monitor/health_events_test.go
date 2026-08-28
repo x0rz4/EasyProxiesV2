@@ -83,6 +83,34 @@ func TestBeginReloadPreservesIndependentGroupSchedules(t *testing.T) {
 	}
 }
 
+func TestMigrateRuntimeTagPreservesHistoryWithoutDuplicate(t *testing.T) {
+	mgr, err := NewManager(Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	entry := mgr.Register(NodeInfo{NodeID: 7, Tag: "node@v1", Name: "old"})
+	entry.RecordSuccessWithLatency(23 * time.Millisecond)
+	entry.AddTraffic(100, 200)
+	migrated := mgr.MigrateRuntimeTag(7, NodeInfo{NodeID: 7, Tag: "node@v2", Name: "new"})
+	if migrated == nil {
+		t.Fatal("migration returned no handle")
+	}
+	if mgr.SnapshotForTag("node@v1") != nil {
+		t.Fatal("old runtime tag remains visible")
+	}
+	snapshots := mgr.Snapshot()
+	if len(snapshots) != 1 || snapshots[0].Tag != "node@v2" || snapshots[0].Name != "new" {
+		t.Fatalf("migrated snapshots = %+v", snapshots)
+	}
+	if snapshots[0].SuccessCount != 1 || snapshots[0].TotalUpload != 100 || snapshots[0].TotalDownload != 200 || snapshots[0].LastLatencyMs != 23 {
+		t.Fatalf("migration lost history: %+v", snapshots[0])
+	}
+	if snapshots[0].InitialCheckDone || snapshots[0].Available {
+		t.Fatalf("new concrete runtime inherited availability: %+v", snapshots[0])
+	}
+}
+
 func TestOldGroupScheduleCleanupDoesNotDeleteNewGeneration(t *testing.T) {
 	mgr, err := NewManager(Config{})
 	if err != nil {

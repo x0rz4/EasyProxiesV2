@@ -634,7 +634,7 @@ func (m *Manager) probeBatchEntry(ctx context.Context, entry *entry, timeout tim
 			break
 		}
 	}
-	if ctx.Err() == nil {
+	if ctx.Err() == nil && entryRuntimeTag(entry) == result.Tag {
 		m.applyHealthResult(entry, result.Latency, result.Err, time.Now())
 	}
 	return result
@@ -747,7 +747,10 @@ func (m *Manager) SweepStaleNodes() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for tag, e := range m.nodes {
-		if e.reloadGen != m.reloadGen {
+		e.mu.RLock()
+		generation := e.reloadGen
+		e.mu.RUnlock()
+		if generation != m.reloadGen {
 			delete(m.nodes, tag)
 		}
 	}
@@ -777,11 +780,111 @@ func (m *Manager) Register(info NodeInfo) *EntryHandle {
 		}
 		m.nodes[info.Tag] = e
 	} else {
+		e.mu.Lock()
 		e.info = info
 		e.reloadGen = m.reloadGen
 		e.onTimeline = m.publishDebugLog
+		e.mu.Unlock()
 	}
 	return &EntryHandle{ref: e}
+}
+
+// MigrateRuntimeTag atomically moves the monitor identity of a stable node to
+// a new concrete runtime tag. The entry object is retained, so latency,
+// counters, traffic and timeline history survive an outbound replacement.
+// If no entry with nodeID exists this behaves like Register.
+func (m *Manager) MigrateRuntimeTag(nodeID int64, info NodeInfo) *EntryHandle {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if existing := m.nodes[info.Tag]; existing != nil {
+		existing.mu.Lock()
+		existing.info = info
+		existing.reloadGen = m.reloadGen
+		existing.onTimeline = m.publishDebugLog
+		existing.mu.Unlock()
+		return &EntryHandle{ref: existing}
+	}
+	var oldTag string
+	var existing *entry
+	if nodeID != 0 {
+		for tag, candidate := range m.nodes {
+			candidate.mu.RLock()
+			matches := candidate.info.NodeID == nodeID
+			candidate.mu.RUnlock()
+			if matches {
+				oldTag, existing = tag, candidate
+				break
+			}
+		}
+	}
+	if existing == nil {
+		existing = &entry{timeline: make([]TimelineEvent, 0, maxTimelineSize), onTimeline: m.publishDebugLog}
+	} else {
+		delete(m.nodes, oldTag)
+	}
+	existing.mu.Lock()
+	existing.info = info
+	existing.reloadGen = m.reloadGen
+	existing.onTimeline = m.publishDebugLog
+	if oldTag != "" && oldTag != info.Tag {
+		// Health belongs to the concrete outbound generation. Keep historical
+		// counters/timeline/latency for the stable node, but require the new
+		// runtime to prove availability before it becomes a pool candidate.
+		existing.initialCheckDone = false
+		existing.available = false
+		existing.lastHealthCheck = time.Time{}
+	}
+	existing.mu.Unlock()
+	m.nodes[info.Tag] = existing
+	return &EntryHandle{ref: existing}
+}
+
+// UnregisterRuntimeTag removes a retired runtime identity if it is still the
+// map owner. A migrated entry is keyed by its new tag and is left untouched.
+func (m *Manager) UnregisterRuntimeTag(tag string) {
+	m.mu.Lock()
+	if existing := m.nodes[tag]; existing != nil {
+		existing.mu.RLock()
+		currentTag := existing.info.Tag
+		existing.mu.RUnlock()
+		if currentTag == tag {
+			delete(m.nodes, tag)
+		}
+	}
+	m.mu.Unlock()
+}
+
+// RequestProbeTagsOnce schedules startup-policy probes only for the supplied
+// concrete tags. It intentionally does not occupy the global batch gate.
+func (m *Manager) RequestProbeTagsOnce(tags []string) {
+	if len(tags) == 0 {
+		return
+	}
+	if _, ready := m.TargetForProbe(); !ready {
+		for _, tag := range tags {
+			_ = m.MarkAvailableWithoutProbe(tag)
+		}
+		return
+	}
+	policy := m.ProbePolicy()
+	for _, tag := range tags {
+		m.mu.RLock()
+		nodeEntry := m.nodes[tag]
+		m.mu.RUnlock()
+		if nodeEntry == nil {
+			continue
+		}
+		m.probeTagMu.Lock()
+		if _, busy := m.probeTagsInFlight[tag]; busy {
+			m.probeTagMu.Unlock()
+			continue
+		}
+		m.probeTagsInFlight[tag] = struct{}{}
+		m.probeTagMu.Unlock()
+		go func(item *entry) {
+			_ = m.probeBatchEntry(m.ctx, item, policy.StartupTimeout, 0, policy.DialTimeout, policy.ResponseTimeout)
+		}(nodeEntry)
+	}
 }
 
 // HandleForTag returns an existing monitor entry without changing its reload
@@ -1056,11 +1159,23 @@ func (m *Manager) Probe(ctx context.Context, tag string) (time.Duration, error) 
 			break
 		}
 	}
-	m.applyHealthResult(e, latency, err, time.Now())
+	if entryRuntimeTag(e) == tag {
+		m.applyHealthResult(e, latency, err, time.Now())
+	}
 	if err != nil {
 		return 0, err
 	}
 	return latency, nil
+}
+
+func entryRuntimeTag(e *entry) string {
+	if e == nil {
+		return ""
+	}
+	e.mu.RLock()
+	tag := e.info.Tag
+	e.mu.RUnlock()
+	return tag
 }
 
 func (m *Manager) beginTagProbe(tag string) bool {

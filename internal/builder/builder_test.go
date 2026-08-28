@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"strings"
 	"testing"
 	"time"
@@ -108,6 +109,63 @@ func TestBuildBaseWithManyNodesAndEntriesDisabledHasOnlySharedMonitoringPool(t *
 	}
 	if poolCount != 1 {
 		t.Fatalf("disabled topology pool outbounds=%d, want one shared monitoring pool", poolCount)
+	}
+}
+
+func TestBuildUsesVersionedNodeKeyTagsFromColdStart(t *testing.T) {
+	cfg := &config.Config{
+		Pool: config.PoolConfig{Mode: "sequential"},
+		Nodes: []config.NodeConfig{
+			{Name: "renamable display name", URI: "http://first.example:80", IdentityHash: "v1:0123456789abcdef111111111111111111111111111111111111111111111111"},
+			{Name: "same display name", URI: "http://second.example:80", IdentityHash: "raw-v1:fedcba9876543210222222222222222222222222222222222222222222222222"},
+		},
+	}
+	opts, err := Build(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wantTags := map[string]struct{}{
+		"0123456789abcdef@v1": {},
+		"fedcba9876543210@v1": {},
+	}
+	gotNodeTags := make(map[string]struct{})
+	var poolOptions *poolout.Options
+	for _, outbound := range opts.Outbounds {
+		if outbound.Type == poolout.Type {
+			poolOptions = outbound.Options.(*poolout.Options)
+			continue
+		}
+		gotNodeTags[outbound.Tag] = struct{}{}
+	}
+	if !maps.Equal(gotNodeTags, wantTags) {
+		t.Fatalf("cold-start node tags=%v, want %v", gotNodeTags, wantTags)
+	}
+	if poolOptions == nil || len(poolOptions.Members) != len(wantTags) {
+		t.Fatalf("pool options=%+v, want both versioned members", poolOptions)
+	}
+	for _, tag := range poolOptions.Members {
+		if _, ok := wantTags[tag]; !ok {
+			t.Fatalf("pool member tag=%q, want versioned NodeKey tag", tag)
+		}
+		if _, ok := poolOptions.Metadata[tag]; !ok {
+			t.Fatalf("metadata missing for versioned tag %q", tag)
+		}
+	}
+}
+
+func TestBuildVersionUsesRequestedRuntimeGeneration(t *testing.T) {
+	cfg := &config.Config{Pool: config.PoolConfig{Mode: "sequential"}, Nodes: []config.NodeConfig{{
+		Name: "node", URI: "http://node.example:80", IdentityHash: "v1:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+	}}}
+	opts, err := BuildVersion(cfg, 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, outbound := range opts.Outbounds {
+		if outbound.Type != poolout.Type && outbound.Tag != "0011223344556677@v9" {
+			t.Fatalf("node tag=%q, want explicit runtime generation", outbound.Tag)
+		}
 	}
 }
 

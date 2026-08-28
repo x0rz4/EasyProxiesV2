@@ -103,3 +103,26 @@ func TestOldRuntimeCleanupDoesNotDeleteNewGeneration(t *testing.T) {
 		t.Fatalf("new runtime generation was removed: %+v, present=%v", snapshot, ok)
 	}
 }
+
+func TestStateSubscribersReceiveChangesAndCanUnsubscribe(t *testing.T) {
+	Reset()
+	defer Reset()
+	events := make(chan GroupStateEvent, 2)
+	unsubscribe := SubscribeStateChanges(func(event GroupStateEvent) { events <- event })
+	Register(101, time.Minute, 3, "node", map[string]GroupInitialState{"node": {NodeID: 1}})
+	select {
+	case event := <-events:
+		if !event.CurrentChanged || event.CurrentNodeID != 1 {
+			t.Fatalf("initial subscriber event = %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("state subscriber was not called")
+	}
+	unsubscribe()
+	SetCurrentTag(101, "")
+	select {
+	case event := <-events:
+		t.Fatalf("unsubscribed callback received %+v", event)
+	case <-time.After(20 * time.Millisecond):
+	}
+}

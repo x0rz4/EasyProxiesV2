@@ -28,6 +28,7 @@ type GroupStateEvent struct {
 	CurrentNodeID  int64
 	CurrentChanged bool
 	StateChanged   bool
+	Recovered      bool
 }
 
 // GroupMemberSnapshot is the runtime view consumed by the management API.
@@ -73,7 +74,30 @@ var (
 	groupObserverMu    sync.RWMutex
 	groupObserver      func(GroupStateEvent)
 	activationHandlers sync.Map // map[int64]func(int64) error
+	stateSubscriberMu  sync.RWMutex
+	stateSubscriberID  uint64
+	stateSubscribers   = make(map[uint64]func(GroupStateEvent))
 )
+
+// SubscribeStateChanges registers a lightweight runtime observer. Unlike the
+// single persistence observer, subscribers are intended for in-process caches
+// such as pool candidate snapshots. Callbacks run after group locks are
+// released and must return promptly.
+func SubscribeStateChanges(subscriber func(GroupStateEvent)) func() {
+	if subscriber == nil {
+		return func() {}
+	}
+	stateSubscriberMu.Lock()
+	stateSubscriberID++
+	id := stateSubscriberID
+	stateSubscribers[id] = subscriber
+	stateSubscriberMu.Unlock()
+	return func() {
+		stateSubscriberMu.Lock()
+		delete(stateSubscribers, id)
+		stateSubscriberMu.Unlock()
+	}
+}
 
 // RegisterActivationHandler wires the runtime group to its sing-box selector.
 // The returned cleanup only removes the handler if it is still the active one.
@@ -110,6 +134,15 @@ func notifyGroupState(event GroupStateEvent) {
 	groupObserverMu.RUnlock()
 	if observer != nil {
 		observer(event)
+	}
+	stateSubscriberMu.RLock()
+	subscribers := make([]func(GroupStateEvent), 0, len(stateSubscribers))
+	for _, subscriber := range stateSubscribers {
+		subscribers = append(subscribers, subscriber)
+	}
+	stateSubscriberMu.RUnlock()
+	for _, subscriber := range subscribers {
+		subscriber(event)
 	}
 }
 
@@ -281,7 +314,7 @@ func RecordHealthSuccess(groupID int64, tag string) bool {
 	}
 	member.failureHistory = nil
 	member.lastError = ""
-	event := GroupStateEvent{GroupID: groupID, NodeID: member.nodeID, StateChanged: true}
+	event := GroupStateEvent{GroupID: groupID, NodeID: member.nodeID, StateChanged: true, Recovered: true}
 	runtime.mu.Unlock()
 	notifyGroupState(event)
 	return true
@@ -325,7 +358,7 @@ func RestoreGroupMember(groupID, nodeID int64) error {
 			member.evictedAt = time.Time{}
 			member.failureHistory = nil
 			member.lastError = ""
-			event := GroupStateEvent{GroupID: runtime.id, NodeID: nodeID, StateChanged: true}
+			event := GroupStateEvent{GroupID: runtime.id, NodeID: nodeID, StateChanged: true, Recovered: true}
 			runtime.mu.Unlock()
 			notifyGroupState(event)
 			return true
@@ -383,6 +416,9 @@ func Reset() {
 	})
 	globalEvictedNodes.Range(func(key, _ any) bool { globalEvictedNodes.Delete(key); return true })
 	activationHandlers.Range(func(key, _ any) bool { activationHandlers.Delete(key); return true })
+	stateSubscriberMu.Lock()
+	stateSubscribers = make(map[uint64]func(GroupStateEvent))
+	stateSubscriberMu.Unlock()
 }
 
 func pruneFailures(member *groupMemberRuntime, window time.Duration, now time.Time) bool {

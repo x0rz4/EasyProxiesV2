@@ -10,6 +10,7 @@ import (
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/group"
 	"easy_proxies/internal/monitor"
+	"easy_proxies/internal/runtimetag"
 	"easy_proxies/internal/store"
 )
 
@@ -66,6 +67,93 @@ func TestReloadTogglesPoolEntryWithoutAffectingBaseRuntime(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertTCPNotListening(t, port)
+}
+
+func TestStartRegistersVersionedRuntimeTagOnFirstBox(t *testing.T) {
+	cfg := &config.Config{
+		Pool:                config.PoolConfig{Mode: "sequential", FailureThreshold: 3, BlacklistDuration: time.Minute},
+		Nodes:               []config.NodeConfig{{ID: 1, Name: "display name", URI: "http://127.0.0.1:65530", Region: "hk"}},
+		SubscriptionRefresh: config.SubscriptionRefreshConfig{HealthCheckTimeout: time.Millisecond},
+		LogLevel:            "error",
+	}
+	if err := cfg.NormalizeWithPortMap(nil); err != nil {
+		t.Fatal(err)
+	}
+	wantTag, err := runtimetag.Format(cfg.Nodes[0].NodeKey(), runtimetag.InitialVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := New(cfg, monitor.Config{})
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	snapshots := manager.monitorMgr.Snapshot()
+	if len(snapshots) != 1 || snapshots[0].Tag != wantTag {
+		t.Fatalf("cold-start monitor snapshots=%+v, want tag %q", snapshots, wantTag)
+	}
+}
+
+func TestNodeOnlyReloadCreatesPublishesAndDrainsInPlace(t *testing.T) {
+	cfg := &config.Config{
+		Pool:                config.PoolConfig{Mode: "sequential", FailureThreshold: 3, BlacklistDuration: time.Minute},
+		Nodes:               []config.NodeConfig{{ID: 41, Name: "before", URI: "http://127.0.0.1:65530", Region: "hk"}},
+		SubscriptionRefresh: config.SubscriptionRefreshConfig{HealthCheckTimeout: time.Millisecond, DrainTimeout: 100 * time.Millisecond},
+		LogLevel:            "error",
+	}
+	if err := cfg.NormalizeWithPortMap(nil); err != nil {
+		t.Fatal(err)
+	}
+	manager := New(cfg, monitor.Config{})
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	manager.mu.RLock()
+	instance := manager.currentBox
+	manager.mu.RUnlock()
+	oldTag, err := runtimetag.Format(cfg.Nodes[0].NodeKey(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	poolOutbound, found := instance.Outbound().Outbound("proxy-pool")
+	if !found || len(poolOutbound.Dependencies()) != 0 {
+		t.Fatalf("pool dependencies = %v, want no dynamic node dependency", poolOutbound.Dependencies())
+	}
+
+	updated := cfg.Clone()
+	updated.Nodes[0].Name = "after"
+	updated.Nodes[0].URI = "http://127.0.0.1:65531"
+	if err := manager.Reload(updated); err != nil {
+		t.Fatal(err)
+	}
+	manager.mu.RLock()
+	if manager.currentBox != instance {
+		manager.mu.RUnlock()
+		t.Fatal("node-only reload replaced the sing-box instance")
+	}
+	generation := manager.runtimeGeneration
+	manager.mu.RUnlock()
+	if generation != 2 {
+		t.Fatalf("runtime generation = %d, want 2", generation)
+	}
+	newTag, err := runtimetag.Format(updated.Nodes[0].NodeKey(), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshots := manager.monitorMgr.Snapshot()
+	if len(snapshots) != 1 || snapshots[0].Tag != newTag || snapshots[0].Name != "after" {
+		t.Fatalf("monitor migration = %+v, want only %s", snapshots, newTag)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, found := instance.Outbound().Outbound(oldTag); !found {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("retired outbound %s was not removed after drain", oldTag)
 }
 
 func TestReassignConflictingPortRequiresMultiPort(t *testing.T) {
