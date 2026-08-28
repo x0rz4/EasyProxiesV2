@@ -154,6 +154,11 @@ type settingsValidationError struct{ err error }
 
 func (e settingsValidationError) Error() string { return e.err.Error() }
 
+const (
+	serverReadHeaderTimeout = 10 * time.Second
+	serverIdleTimeout       = 60 * time.Second
+)
+
 // SubscriptionStatus represents subscription refresh status.
 type SubscriptionStatus struct {
 	Enabled           bool      `json:"enabled"`           // Whether auto-refresh is enabled in config
@@ -225,19 +230,13 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 		logger = log.Default()
 	}
 
-	// Calculate max concurrent probes
-	maxConcurrentProbes := int64(runtime.NumCPU() * 4)
-	if maxConcurrentProbes < 10 {
-		maxConcurrentProbes = 10
-	}
-
 	s := &Server{
 		cfg:        cfg,
 		mgr:        mgr,
 		logger:     logger,
 		sessions:   make(map[string]*Session),
 		sessionTTL: 24 * time.Hour,
-		probeSem:   semaphore.NewWeighted(maxConcurrentProbes),
+		probeSem:   semaphore.NewWeighted(int64(batchOperationConcurrency())),
 		done:       make(chan struct{}),
 	}
 
@@ -286,8 +285,42 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 
 	// Default handler for static assets (React App)
 	mux.HandleFunc("/", s.handleIndex)
-	s.srv = &http.Server{Addr: cfg.Listen, Handler: mux}
+	s.srv = &http.Server{
+		Addr:              cfg.Listen,
+		Handler:           mux,
+		ReadHeaderTimeout: serverReadHeaderTimeout,
+		IdleTimeout:       serverIdleTimeout,
+	}
 	return s
+}
+
+func batchOperationConcurrency() int {
+	limit := runtime.NumCPU() * 4
+	if limit < 10 {
+		return 10
+	}
+	return limit
+}
+
+type unlockBatchResult struct {
+	result *unlock.Result
+	err    string
+}
+
+func collectUnlockBatch(
+	ctx context.Context,
+	limit int,
+	global *semaphore.Weighted,
+	snapshots []Snapshot,
+	run func(context.Context, Snapshot) unlockBatchResult,
+) <-chan unlockBatchResult {
+	return collectLimited(limit, snapshots, func(snapshot Snapshot) unlockBatchResult {
+		if err := global.Acquire(ctx, 1); err != nil {
+			return unlockBatchResult{err: "unlock cancelled: " + err.Error()}
+		}
+		defer global.Release(1)
+		return run(ctx, snapshot)
+	})
 }
 
 // SetSubscriptionRefresher sets the subscription refresher for API endpoints.
@@ -1438,50 +1471,25 @@ func (s *Server) handleUnlockAll(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
 	defer cancel()
 
-	type unlockResult struct {
-		result *unlock.Result
-		err    string
-	}
-	results := make(chan unlockResult, total)
-	var wg sync.WaitGroup
+	// The per-batch errgroup limit prevents this request from launching an
+	// unbounded goroutine set. The shared weighted semaphore remains the
+	// cross-request limit for all concurrent unlock batches.
+	results := collectUnlockBatch(ctx, batchOperationConcurrency(), s.probeSem, snapshots, func(ctx context.Context, snap Snapshot) unlockBatchResult {
+		// Execute unlock check
+		checkCtx, checkCancel := context.WithTimeout(ctx, 60*time.Second)
+		defer checkCancel()
 
-	// Launch checks with the same semaphore used by probes to bound concurrency.
-	for _, snap := range snapshots {
-		wg.Add(1)
-		go func(snap Snapshot) {
-			defer wg.Done()
-
-			// Acquire semaphore permit
-			if err := s.probeSem.Acquire(ctx, 1); err != nil {
-				results <- unlockResult{err: "unlock cancelled: " + err.Error()}
-				return
-			}
-			defer s.probeSem.Release(1)
-
-			// Execute unlock check
-			checkCtx, checkCancel := context.WithTimeout(ctx, 60*time.Second)
-			defer checkCancel()
-
-			dialer, err := s.mgr.DialerFor(snap.Tag)
-			if err != nil {
-				results <- unlockResult{err: err.Error()}
-				return
-			}
-			res, err := unlock.Check(checkCtx, unlock.DialFunc(dialer), snap.Tag, snap.Name, s.geoipLookupForCheck(), 25*time.Second)
-			if err != nil {
-				results <- unlockResult{err: err.Error()}
-				return
-			}
-			s.persistUnlockResult(&snap, res)
-			results <- unlockResult{result: res}
-		}(snap)
-	}
-
-	// Wait for all checks to complete
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
+		dialer, err := s.mgr.DialerFor(snap.Tag)
+		if err != nil {
+			return unlockBatchResult{err: err.Error()}
+		}
+		res, err := unlock.Check(checkCtx, unlock.DialFunc(dialer), snap.Tag, snap.Name, s.geoipLookupForCheck(), 25*time.Second)
+		if err != nil {
+			return unlockBatchResult{err: err.Error()}
+		}
+		s.persistUnlockResult(&snap, res)
+		return unlockBatchResult{result: res}
+	})
 
 	// Collect and stream results
 	successCount := 0
@@ -1678,7 +1686,6 @@ func (s *Server) handleTrafficStream(w http.ResponseWriter, r *http.Request) {
 func writeJSON(w http.ResponseWriter, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
 	_ = enc.Encode(payload)
 }
 

@@ -9,10 +9,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"easy_proxies/internal/config"
+
+	"golang.org/x/sync/semaphore"
 )
 
 func newOperationsTestServer(t *testing.T) (*Server, *Manager, string) {
@@ -77,7 +81,7 @@ func TestProbeSettingsAPIHotAppliesAndPersists(t *testing.T) {
 
 	getResponse := httptest.NewRecorder()
 	server.handleProbeSettings(getResponse, httptest.NewRequest(http.MethodGet, "/api/operations/probe-settings", nil))
-	if getResponse.Code != http.StatusOK || !strings.Contains(getResponse.Body.String(), `"probe_concurrency": 64`) {
+	if getResponse.Code != http.StatusOK || !strings.Contains(getResponse.Body.String(), `"probe_concurrency":64`) {
 		t.Fatalf("GET status=%d body=%s", getResponse.Code, getResponse.Body.String())
 	}
 }
@@ -161,5 +165,63 @@ func TestManualProbeKeepsSSEEventShape(t *testing.T) {
 		if !strings.Contains(body, eventType) {
 			t.Fatalf("SSE body missing %s: %s", eventType, body)
 		}
+	}
+}
+
+func TestUnlockBatchesShareGlobalConcurrencyLimit(t *testing.T) {
+	global := semaphore.NewWeighted(2)
+	snapshots := make([]Snapshot, 6)
+	for index := range snapshots {
+		snapshots[index] = Snapshot{NodeInfo: NodeInfo{Tag: fmt.Sprintf("unlock-%d", index)}}
+	}
+	var active, maximum atomic.Int64
+	run := func(context.Context, Snapshot) unlockBatchResult {
+		current := active.Add(1)
+		defer active.Add(-1)
+		for {
+			previous := maximum.Load()
+			if current <= previous || maximum.CompareAndSwap(previous, current) {
+				break
+			}
+		}
+		time.Sleep(2 * time.Millisecond)
+		return unlockBatchResult{err: "expected test result"}
+	}
+
+	var wait sync.WaitGroup
+	for range 2 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			count := 0
+			for range collectUnlockBatch(t.Context(), len(snapshots), global, snapshots, run) {
+				count++
+			}
+			if count != len(snapshots) {
+				t.Errorf("batch results = %d, want %d", count, len(snapshots))
+			}
+		}()
+	}
+	wait.Wait()
+	if got := maximum.Load(); got != 2 {
+		t.Fatalf("maximum concurrency across batches = %d, want 2", got)
+	}
+}
+
+func TestUnlockAllKeepsSSEEventShapeWhenNodesFail(t *testing.T) {
+	server, mgr, _ := newOperationsTestServer(t)
+	server.probeSem = semaphore.NewWeighted(2)
+	for index := range 3 {
+		mgr.Register(NodeInfo{Tag: fmt.Sprintf("unlock-error-%d", index), Name: fmt.Sprintf("Node %d", index)})
+	}
+
+	response := httptest.NewRecorder()
+	server.handleUnlockAll(response, httptest.NewRequest(http.MethodPost, "/api/nodes/unlock-all", nil))
+	body := response.Body.String()
+	if strings.Count(body, `"type":"start"`) != 1 || strings.Count(body, `"type":"progress"`) != 3 || strings.Count(body, `"type":"complete"`) != 1 {
+		t.Fatalf("unexpected unlock SSE sequence: %s", body)
+	}
+	if !strings.Contains(body, `"total":3,"success":0,"failed":3`) {
+		t.Fatalf("unexpected unlock completion summary: %s", body)
 	}
 }

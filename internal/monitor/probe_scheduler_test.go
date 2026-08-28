@@ -165,6 +165,97 @@ func TestStartupProbeDoesNotRetry(t *testing.T) {
 	}
 }
 
+func TestProbeBatchCompletesFailuresAndSerializesResults(t *testing.T) {
+	mgr, err := NewManager(Config{
+		ProbeTarget: "http://example.com", ProbeConcurrency: 4,
+		RoutineProbeTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	for index := range 12 {
+		handle := mgr.Register(NodeInfo{Tag: fmt.Sprintf("mixed-%d", index)})
+		failed := index%3 == 0
+		handle.SetProbe(func(context.Context) (time.Duration, error) {
+			if failed {
+				return 0, errors.New("offline")
+			}
+			return time.Millisecond, nil
+		})
+	}
+	var callbacks, activeCallbacks, maximumCallbacks atomic.Int64
+	summary, err := mgr.RunProbeBatch(t.Context(), ProbeRoundManual, false, nil, func(ProbeBatchResult) {
+		current := activeCallbacks.Add(1)
+		for {
+			previous := maximumCallbacks.Load()
+			if current <= previous || maximumCallbacks.CompareAndSwap(previous, current) {
+				break
+			}
+		}
+		time.Sleep(time.Millisecond)
+		callbacks.Add(1)
+		activeCallbacks.Add(-1)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Total != 12 || summary.Success != 8 || summary.Failed != 4 {
+		t.Fatalf("summary = %+v", summary)
+	}
+	if callbacks.Load() != 12 || maximumCallbacks.Load() != 1 {
+		t.Fatalf("callbacks=%d maximum concurrent callbacks=%d", callbacks.Load(), maximumCallbacks.Load())
+	}
+}
+
+func TestProbeBatchCancellationReleasesEveryReservedTag(t *testing.T) {
+	mgr, err := NewManager(Config{
+		ProbeTarget: "http://example.com", ProbeConcurrency: 1,
+		RoutineProbeTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	firstStarted := make(chan struct{})
+	var blockFirst atomic.Bool
+	blockFirst.Store(true)
+	for index := range 3 {
+		handle := mgr.Register(NodeInfo{Tag: fmt.Sprintf("cancel-release-%d", index)})
+		handle.SetProbe(func(ctx context.Context) (time.Duration, error) {
+			if blockFirst.CompareAndSwap(true, false) {
+				close(firstStarted)
+				<-ctx.Done()
+				return 0, ctx.Err()
+			}
+			if err := ctx.Err(); err != nil {
+				return 0, err
+			}
+			return time.Millisecond, nil
+		})
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		_, runErr := mgr.RunProbeBatch(ctx, ProbeRoundManual, false, nil, nil)
+		done <- runErr
+	}()
+	<-firstStarted
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled batch error = %v", err)
+	}
+
+	summary, err := mgr.RunProbeBatch(t.Context(), ProbeRoundManual, false, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Total != 3 || summary.Success != 3 || summary.Failed != 0 {
+		t.Fatalf("second batch summary = %+v; reserved tags were not all released", summary)
+	}
+}
+
 func TestProbeBatchMutualExclusionAndCancellation(t *testing.T) {
 	mgr, err := NewManager(Config{ProbeTarget: "http://example.com", ProbeConcurrency: 1, RoutineProbeTimeout: time.Second})
 	if err != nil {

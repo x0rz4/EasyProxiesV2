@@ -4,10 +4,11 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"easy_proxies/internal/geoip"
+
+	"golang.org/x/sync/errgroup"
 )
 
 const checkerConcurrency = 3
@@ -20,35 +21,35 @@ func checkRegistered(ctx context.Context, dialer DialFunc, tag, name string, geo
 	result.IP = probeExitIP(runtime, geoLookup)
 	runtime.LandingCountry = strings.ToUpper(strings.TrimSpace(result.IP.ISOCode))
 
-	checkers := globalCheckerRegistry.list()
-	result.Services = make([]ServiceResult, len(checkers))
+	result.Services = runRegisteredCheckers(ctx, runtime, globalCheckerRegistry.list())
+	result.Duration = time.Since(startedAt).Milliseconds()
+	return result
+}
+
+func runRegisteredCheckers(ctx context.Context, runtime Runtime, checkers []Checker) []ServiceResult {
+	services := make([]ServiceResult, len(checkers))
 	workerLimit := checkerConcurrency
 	if workerLimit > len(checkers) {
 		workerLimit = len(checkers)
 	}
 	if workerLimit == 0 {
-		result.Duration = time.Since(startedAt).Milliseconds()
-		return result
+		return services
 	}
-	semaphore := make(chan struct{}, workerLimit)
-	var waitGroup sync.WaitGroup
+	var group errgroup.Group
+	group.SetLimit(workerLimit)
 	for index, checker := range checkers {
-		waitGroup.Add(1)
-		go func(index int, checker Checker) {
-			defer waitGroup.Done()
-			select {
-			case semaphore <- struct{}{}:
-				defer func() { <-semaphore }()
-			case <-ctx.Done():
-				result.Services[index] = failedResult(checker, ctx.Err())
-				return
+		index, checker := index, checker
+		group.Go(func() error {
+			if err := ctx.Err(); err != nil {
+				services[index] = failedResult(checker, err)
+				return nil
 			}
-			result.Services[index] = runChecker(runtime, checker)
-		}(index, checker)
+			services[index] = runChecker(runtime, checker)
+			return nil
+		})
 	}
-	waitGroup.Wait()
-	result.Duration = time.Since(startedAt).Milliseconds()
-	return result
+	_ = group.Wait()
+	return services
 }
 
 func runChecker(runtime Runtime, checker Checker) (result ServiceResult) {

@@ -610,23 +610,9 @@ func (m *Manager) RunProbeBatch(ctx context.Context, kind ProbeRoundKind, dueOnl
 		m.logger.Info("starting ", kind, " health check for ", len(entries), " nodes")
 	}
 	workerLimit := effectiveProbeConcurrency(policy.Concurrency, len(entries))
-	jobs := make(chan *entry, len(entries))
-	results := make(chan ProbeBatchResult, len(entries))
-	var wg sync.WaitGroup
-	for _, e := range entries {
-		jobs <- e
-	}
-	close(jobs)
-	for range workerLimit {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for entry := range jobs {
-				results <- m.probeBatchEntry(ctx, entry, timeout, retries, policy.DialTimeout, policy.ResponseTimeout)
-			}
-		}()
-	}
-	go func() { wg.Wait(); close(results) }()
+	results := collectLimited(workerLimit, entries, func(entry *entry) ProbeBatchResult {
+		return m.probeBatchEntry(ctx, entry, timeout, retries, policy.DialTimeout, policy.ResponseTimeout)
+	})
 	summary := ProbeBatchSummary{Total: len(entries)}
 	for result := range results {
 		if result.Err != nil {

@@ -98,7 +98,7 @@ JOIN subscriptions ON subscriptions.id = subscription_nodes.subscription_id AND 
 	}
 	query += " ORDER BY subscription_nodes.node_id, subscription_nodes.subscription_id"
 
-	rows, err := s.conn().QueryContext(ctx, query, args...)
+	rows, err := s.readConn().QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list node subscription IDs: %w", err)
 	}
@@ -120,7 +120,7 @@ const tagColumns = `id, name, color, description, COALESCE(mutex_group_id, 0), p
 auto_enabled, rule_json, rule_version, builtin_key, created_at, updated_at`
 
 func (s *sqliteStore) ListTags(ctx context.Context) ([]Tag, error) {
-	rows, err := s.conn().QueryContext(ctx, "SELECT "+tagColumns+" FROM tags ORDER BY priority DESC, id ASC")
+	rows, err := s.readConn().QueryContext(ctx, "SELECT "+tagColumns+" FROM tags ORDER BY priority DESC, id ASC")
 	if err != nil {
 		return nil, fmt.Errorf("list tags: %w", err)
 	}
@@ -145,7 +145,7 @@ func (s *sqliteStore) GetTagByName(ctx context.Context, name string) (*Tag, erro
 }
 
 func (s *sqliteStore) getTagWhere(ctx context.Context, condition string, arg any) (*Tag, error) {
-	tag, err := scanTag(s.conn().QueryRowContext(ctx, "SELECT "+tagColumns+" FROM tags WHERE "+condition, arg))
+	tag, err := scanTag(s.readConn().QueryRowContext(ctx, "SELECT "+tagColumns+" FROM tags WHERE "+condition, arg))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -160,7 +160,7 @@ func (s *sqliteStore) CreateTag(ctx context.Context, tag *Tag) error {
 		tag.RuleVersion = 1
 	}
 	now := formatTime(time.Now())
-	result, err := s.conn().ExecContext(ctx, `INSERT INTO tags
+	result, err := s.writeConn().ExecContext(ctx, `INSERT INTO tags
 (name, color, description, mutex_group_id, priority, auto_enabled, rule_json, rule_version, builtin_key, created_at, updated_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		tag.Name, tag.Color, tag.Description, nullableID(tag.MutexGroupID), tag.Priority,
@@ -173,7 +173,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 }
 
 func (s *sqliteStore) UpdateTag(ctx context.Context, tag *Tag) error {
-	result, err := s.conn().ExecContext(ctx, `UPDATE tags SET
+	result, err := s.writeConn().ExecContext(ctx, `UPDATE tags SET
 name=?, color=?, description=?, mutex_group_id=?, priority=?, auto_enabled=?,
 rule_json=?, rule_version=?, builtin_key=?, updated_at=? WHERE id=?`,
 		tag.Name, tag.Color, tag.Description, nullableID(tag.MutexGroupID), tag.Priority,
@@ -194,7 +194,7 @@ func (s *sqliteStore) DeleteTag(ctx context.Context, id int64) error {
 		if err != nil {
 			return err
 		}
-		result, err := tx.conn().ExecContext(ctx, "DELETE FROM tags WHERE id = ?", id)
+		result, err := tx.writeConn().ExecContext(ctx, "DELETE FROM tags WHERE id = ?", id)
 		if err != nil {
 			return fmt.Errorf("delete tag: %w", err)
 		}
@@ -209,7 +209,7 @@ func (s *sqliteStore) DeleteTag(ctx context.Context, id int64) error {
 }
 
 func (s *sqliteStore) nodeIDsForTag(ctx context.Context, tagID int64) ([]int64, error) {
-	rows, err := s.conn().QueryContext(ctx, "SELECT DISTINCT node_id FROM node_tags WHERE tag_id = ?", tagID)
+	rows, err := s.writeConn().QueryContext(ctx, "SELECT DISTINCT node_id FROM node_tags WHERE tag_id = ?", tagID)
 	if err != nil {
 		return nil, fmt.Errorf("list nodes for tag: %w", err)
 	}
@@ -228,7 +228,7 @@ func (s *sqliteStore) nodeIDsForTag(ctx context.Context, tagID int64) ([]int64, 
 // removeTagFromGroupFilters strips a deleted tag ID from both group pool tag
 // filter columns so no group keeps referencing a tag that no longer exists.
 func (s *sqliteStore) removeTagFromGroupFilters(ctx context.Context, tagID int64) error {
-	rows, err := s.conn().QueryContext(ctx,
+	rows, err := s.writeConn().QueryContext(ctx,
 		"SELECT id, tag_whitelist_json, tag_blacklist_json FROM group_pools")
 	if err != nil {
 		return fmt.Errorf("list group tag filters: %w", err)
@@ -264,7 +264,7 @@ func (s *sqliteStore) removeTagFromGroupFilters(ctx context.Context, tagID int64
 	for _, row := range updates {
 		whitelistJSON, _ := json.Marshal(row.whitelist)
 		blacklistJSON, _ := json.Marshal(row.blacklist)
-		if _, err := s.conn().ExecContext(ctx,
+		if _, err := s.writeConn().ExecContext(ctx,
 			"UPDATE group_pools SET tag_whitelist_json=?, tag_blacklist_json=?, updated_at=? WHERE id=?",
 			string(whitelistJSON), string(blacklistJSON), formatTime(time.Now()), row.id); err != nil {
 			return fmt.Errorf("clear tag from group pool %d: %w", row.id, err)
@@ -310,7 +310,7 @@ func nullableID(id int64) any {
 // ===================== Tag mutex groups =====================
 
 func (s *sqliteStore) ListTagMutexGroups(ctx context.Context) ([]TagMutexGroup, error) {
-	rows, err := s.conn().QueryContext(ctx,
+	rows, err := s.readConn().QueryContext(ctx,
 		"SELECT id, name, description, created_at, updated_at FROM tag_mutex_groups ORDER BY id ASC")
 	if err != nil {
 		return nil, fmt.Errorf("list tag mutex groups: %w", err)
@@ -331,7 +331,7 @@ func (s *sqliteStore) ListTagMutexGroups(ctx context.Context) ([]TagMutexGroup, 
 
 func (s *sqliteStore) CreateTagMutexGroup(ctx context.Context, group *TagMutexGroup) error {
 	now := formatTime(time.Now())
-	result, err := s.conn().ExecContext(ctx,
+	result, err := s.writeConn().ExecContext(ctx,
 		"INSERT INTO tag_mutex_groups (name, description, created_at, updated_at) VALUES (?, ?, ?, ?)",
 		group.Name, group.Description, now, now)
 	if err != nil {
@@ -342,7 +342,7 @@ func (s *sqliteStore) CreateTagMutexGroup(ctx context.Context, group *TagMutexGr
 }
 
 func (s *sqliteStore) UpdateTagMutexGroup(ctx context.Context, group *TagMutexGroup) error {
-	result, err := s.conn().ExecContext(ctx,
+	result, err := s.writeConn().ExecContext(ctx,
 		"UPDATE tag_mutex_groups SET name=?, description=?, updated_at=? WHERE id=?",
 		group.Name, group.Description, formatTime(time.Now()), group.ID)
 	if err != nil {
@@ -354,7 +354,7 @@ func (s *sqliteStore) UpdateTagMutexGroup(ctx context.Context, group *TagMutexGr
 // DeleteTagMutexGroup detaches member tags through ON DELETE SET NULL; the tags
 // themselves survive with no mutual exclusion.
 func (s *sqliteStore) DeleteTagMutexGroup(ctx context.Context, id int64) error {
-	result, err := s.conn().ExecContext(ctx, "DELETE FROM tag_mutex_groups WHERE id = ?", id)
+	result, err := s.writeConn().ExecContext(ctx, "DELETE FROM tag_mutex_groups WHERE id = ?", id)
 	if err != nil {
 		return fmt.Errorf("delete tag mutex group: %w", err)
 	}
@@ -387,7 +387,7 @@ func (s *sqliteStore) ListNodeTags(ctx context.Context, filter NodeTagFilter) ([
 	}
 	query += " ORDER BY node_id ASC, tag_id ASC, source ASC"
 
-	rows, err := s.conn().QueryContext(ctx, query, args...)
+	rows, err := s.readConn().QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list node tags: %w", err)
 	}
@@ -440,7 +440,7 @@ func (s *sqliteStore) listNodeTagsChunked(ctx context.Context, filter NodeTagFil
 }
 
 func (s *sqliteStore) CountNodesByTag(ctx context.Context) (map[int64]int, error) {
-	rows, err := s.conn().QueryContext(ctx,
+	rows, err := s.readConn().QueryContext(ctx,
 		"SELECT tag_id, COUNT(DISTINCT node_id) FROM node_tags GROUP BY tag_id")
 	if err != nil {
 		return nil, fmt.Errorf("count nodes by tag: %w", err)
@@ -462,7 +462,7 @@ func (s *sqliteStore) CountNodesByTag(ctx context.Context) (map[int64]int, error
 // stay untouched, and the nodes.tags projection is rebuilt from both sources.
 func (s *sqliteStore) SetManualNodeTags(ctx context.Context, nodeID int64, tagIDs []int64) error {
 	return s.runInTx(ctx, func(tx *sqliteStore) error {
-		if _, err := tx.conn().ExecContext(ctx,
+		if _, err := tx.writeConn().ExecContext(ctx,
 			"DELETE FROM node_tags WHERE node_id = ? AND source = ?", nodeID, NodeTagSourceManual); err != nil {
 			return fmt.Errorf("clear manual node tags: %w", err)
 		}
@@ -492,7 +492,7 @@ func (s *sqliteStore) BatchUpdateManualNodeTags(ctx context.Context, nodeIDs, ad
 			for _, nodeChunk := range chunkIDs(nodes, sqliteMaxVariables/2) {
 				args := append(idArgs(nodeChunk), idArgs(chunk)...)
 				args = append(args, NodeTagSourceManual)
-				if _, err := tx.conn().ExecContext(ctx,
+				if _, err := tx.writeConn().ExecContext(ctx,
 					"DELETE FROM node_tags WHERE node_id IN "+inClause(len(nodeChunk))+
 						" AND tag_id IN "+inClause(len(chunk))+" AND source = ?", args...); err != nil {
 					return fmt.Errorf("remove manual node tags: %w", err)
@@ -515,7 +515,7 @@ func (s *sqliteStore) ReplaceAutoNodeTags(ctx context.Context, assignments []Nod
 			if assignment.NodeID <= 0 {
 				continue
 			}
-			if _, err := tx.conn().ExecContext(ctx,
+			if _, err := tx.writeConn().ExecContext(ctx,
 				"DELETE FROM node_tags WHERE node_id = ? AND source = ?",
 				assignment.NodeID, NodeTagSourceAuto); err != nil {
 				return fmt.Errorf("clear auto node tags: %w", err)
@@ -545,7 +545,7 @@ func (s *sqliteStore) insertNodeTags(ctx context.Context, nodeID int64, tagIDs [
 		if index < len(ruleVersions) {
 			ruleVersion = ruleVersions[index]
 		}
-		if _, err := s.conn().ExecContext(ctx, `INSERT INTO node_tags
+		if _, err := s.writeConn().ExecContext(ctx, `INSERT INTO node_tags
 (node_id, tag_id, source, rule_version, matched_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)
 ON CONFLICT(node_id, tag_id, source) DO UPDATE SET rule_version=excluded.rule_version,
 updated_at=excluded.updated_at`, nodeID, tagID, source, ruleVersion, now, now); err != nil {
@@ -565,7 +565,7 @@ func (s *sqliteStore) refreshNodeTagProjection(ctx context.Context, nodeIDs []in
 	}
 	names := make(map[int64][]string, len(unique))
 	for _, chunk := range chunkIDs(unique, sqliteMaxVariables) {
-		rows, err := s.conn().QueryContext(ctx, `SELECT node_tags.node_id, tags.name
+		rows, err := s.writeConn().QueryContext(ctx, `SELECT node_tags.node_id, tags.name
 FROM node_tags JOIN tags ON tags.id = node_tags.tag_id
 WHERE node_tags.node_id IN `+inClause(len(chunk)), idArgs(chunk)...)
 		if err != nil {
@@ -592,7 +592,7 @@ WHERE node_tags.node_id IN `+inClause(len(chunk)), idArgs(chunk)...)
 		if err != nil {
 			return fmt.Errorf("encode node tag projection: %w", err)
 		}
-		if _, err := s.conn().ExecContext(ctx,
+		if _, err := s.writeConn().ExecContext(ctx,
 			"UPDATE nodes SET tags = ? WHERE id = ?", string(encoded), nodeID); err != nil {
 			return fmt.Errorf("write node tag projection: %w", err)
 		}

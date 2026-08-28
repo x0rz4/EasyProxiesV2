@@ -20,26 +20,26 @@ func TestIdentityReconcileMergesHistoricalReferences(t *testing.T) {
 	if err := db.CreateNode(ctx, first); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.db.Exec(`DROP INDEX uq_nodes_identity_hash`); err != nil {
+	if _, err := db.writerDB.Exec(`DROP INDEX uq_nodes_identity_hash`); err != nil {
 		t.Fatal(err)
 	}
-	result, err := db.db.Exec(`INSERT INTO nodes(uri,name,source,enabled,tags,identity_hash,canonical_json) VALUES(?,?,?,?,?,?,?)`,
+	result, err := db.writerDB.Exec(`INSERT INTO nodes(uri,name,source,enabled,tags,identity_hash,canonical_json) VALUES(?,?,?,?,?,?,?)`,
 		"http://user:pass@example.com#second", "manual-name", NodeSourceManual, 0, `["manual-tag"]`, "legacy-second", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	secondID, _ := result.LastInsertId()
-	if _, err := db.db.Exec(`INSERT INTO node_stats(node_id,success_count,total_download_bytes) VALUES(?,?,?)`, secondID, 3, 99); err != nil {
+	if _, err := db.writerDB.Exec(`INSERT INTO node_stats(node_id,success_count,total_download_bytes) VALUES(?,?,?)`, secondID, 3, 99); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.db.Exec(`UPDATE node_stats SET success_count=2,total_upload_bytes=11 WHERE node_id=?`, first.ID); err != nil {
+	if _, err := db.writerDB.Exec(`UPDATE node_stats SET success_count=2,total_upload_bytes=11 WHERE node_id=?`, first.ID); err != nil {
 		t.Fatal(err)
 	}
 	sub := &Subscription{Name: "sub", URL: "https://example.test/sub", Enabled: true, RefreshIntervalSeconds: 60, RefreshTimeoutSeconds: 10}
 	if err := db.CreateSubscription(ctx, sub); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.db.Exec(`INSERT INTO subscription_nodes(subscription_id,node_id,position) VALUES(?,?,?),(?,?,?)`, sub.ID, first.ID, 4, sub.ID, secondID, 1); err != nil {
+	if _, err := db.writerDB.Exec(`INSERT INTO subscription_nodes(subscription_id,node_id,position) VALUES(?,?,?),(?,?,?)`, sub.ID, first.ID, 4, sub.ID, secondID, 1); err != nil {
 		t.Fatal(err)
 	}
 	group := &GroupPool{Name: "group", BindAddress: "127.0.0.1", BindPort: 12000, Protocol: "mixed", DispatchMode: "fixed", ExplicitNodeIDs: []int64{secondID}, ExcludedNodeIDs: []int64{first.ID, secondID}, CurrentActiveNodeID: secondID, Enabled: true}
@@ -119,10 +119,10 @@ func TestIdentityReconcileMigratesNodeTags(t *testing.T) {
 	if err := db.CreateNode(ctx, winnerNode); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.db.Exec(`DROP INDEX uq_nodes_identity_hash`); err != nil {
+	if _, err := db.writerDB.Exec(`DROP INDEX uq_nodes_identity_hash`); err != nil {
 		t.Fatal(err)
 	}
-	result, err := db.db.Exec(`INSERT INTO nodes(uri,name,source,enabled,tags,identity_hash,canonical_json) VALUES(?,?,?,?,?,?,?)`,
+	result, err := db.writerDB.Exec(`INSERT INTO nodes(uri,name,source,enabled,tags,identity_hash,canonical_json) VALUES(?,?,?,?,?,?,?)`,
 		"http://user:pass@example.com#loser", "loser", NodeSourceManual, 1,
 		`["loser-manual","loser-auto"]`, "legacy-loser", "")
 	if err != nil {

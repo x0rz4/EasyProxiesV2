@@ -968,7 +968,7 @@ func (p *poolOutbound) DialContext(ctx context.Context, network string, destinat
 	}
 	var dialErr error
 	for member := cursor.next(); member != nil; member = cursor.next() {
-		p.logger.Info("→ ", dst, " ⇒ ", p.memberName(member), " [", network, "]")
+		p.logger.Debug("→ ", dst, " ⇒ ", p.memberName(member), " [", network, "]")
 		p.incActive(member)
 		conn, err := p.dialSelected(ctx, member, network, destination)
 		if err != nil {
@@ -1008,7 +1008,7 @@ func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 	}
 	var listenErr error
 	for member := cursor.next(); member != nil; member = cursor.next() {
-		p.logger.Info("→ ", dst, " ⇒ ", p.memberName(member), " [udp]")
+		p.logger.Debug("→ ", dst, " ⇒ ", p.memberName(member), " [udp]")
 		p.incActive(member)
 		conn, err := p.listenPacketSelected(ctx, member, destination)
 		if err != nil {

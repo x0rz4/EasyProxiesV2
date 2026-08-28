@@ -19,51 +19,94 @@ import (
 
 // sqliteStore implements Store using SQLite.
 type sqliteStore struct {
-	db *sql.DB
-	tx *sql.Tx // non-nil when operating inside WithTx
+	writerDB *sql.DB
+	readerDB *sql.DB
+	tx       *sql.Tx // non-nil when operating inside WithTx
 }
+
+const (
+	sqliteWriterConnections = 1
+	sqliteReaderConnections = 4
+)
 
 // Open creates a new SQLite-backed Store at the given path.
 // It applies all pending migrations and sets optimal PRAGMAs.
 func Open(dbPath string) (Store, error) {
-	dsn := dbPath + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-64000)&_pragma=foreign_keys(ON)"
+	connectionPragmas := "_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-64000)&_pragma=foreign_keys(ON)"
+	writerDSN := dbPath + "?_pragma=journal_mode(WAL)&" + connectionPragmas
 
-	db, err := sql.Open("sqlite", dsn)
+	writerDB, err := sql.Open("sqlite", writerDSN)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite %q: %w", dbPath, err)
 	}
 
-	// Connection pool settings
-	db.SetMaxOpenConns(1) // SQLite only supports 1 writer
-	db.SetMaxIdleConns(2)
-	db.SetConnMaxLifetime(0) // connections don't expire
+	writerDB.SetMaxOpenConns(sqliteWriterConnections)
+	writerDB.SetMaxIdleConns(sqliteWriterConnections)
+	writerDB.SetConnMaxLifetime(0)
 
-	// Verify connection
-	if err := db.Ping(); err != nil {
-		db.Close()
+	if err := writerDB.Ping(); err != nil {
+		_ = writerDB.Close()
 		return nil, fmt.Errorf("ping sqlite: %w", err)
 	}
 
-	// Run migrations
-	if err := Migrate(db); err != nil {
-		db.Close()
+	if err := Migrate(writerDB); err != nil {
+		_ = writerDB.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
-	if err := reconcileNodeIdentities(db); err != nil {
-		db.Close()
+	if err := reconcileNodeIdentities(writerDB); err != nil {
+		_ = writerDB.Close()
 		return nil, fmt.Errorf("reconcile node identities: %w", err)
 	}
 
+	// journal_mode is database-wide and was established by the writer above.
+	// Reader connections only apply connection-local settings before becoming
+	// query-only, avoiding journal-mode lock negotiation as the pool expands.
+	readerDSN := dbPath + "?" + connectionPragmas + "&_pragma=query_only(ON)"
+	readerDB, err := sql.Open("sqlite", readerDSN)
+	if err != nil {
+		_ = writerDB.Close()
+		return nil, fmt.Errorf("open sqlite reader %q: %w", dbPath, err)
+	}
+	readerDB.SetMaxOpenConns(sqliteReaderConnections)
+	readerDB.SetMaxIdleConns(sqliteReaderConnections)
+	readerDB.SetConnMaxLifetime(0)
+	if err := readerDB.Ping(); err != nil {
+		_ = readerDB.Close()
+		_ = writerDB.Close()
+		return nil, fmt.Errorf("ping sqlite reader: %w", err)
+	}
+	var queryOnly int
+	if err := readerDB.QueryRow("PRAGMA query_only").Scan(&queryOnly); err != nil {
+		_ = readerDB.Close()
+		_ = writerDB.Close()
+		return nil, fmt.Errorf("verify sqlite reader query_only: %w", err)
+	}
+	if queryOnly != 1 {
+		_ = readerDB.Close()
+		_ = writerDB.Close()
+		return nil, errors.New("verify sqlite reader query_only: pragma is disabled")
+	}
+
 	log.Printf("[store] SQLite store opened: %s", dbPath)
-	return &sqliteStore{db: db}, nil
+	return &sqliteStore{writerDB: writerDB, readerDB: readerDB}, nil
 }
 
-// conn returns the underlying *sql.Tx or *sql.DB for executing queries.
-func (s *sqliteStore) conn() querier {
+// readConn routes pure reads to the reader pool. Reads made through a
+// transaction-scoped store stay on that transaction to preserve consistency.
+func (s *sqliteStore) readConn() querier {
 	if s.tx != nil {
 		return s.tx
 	}
-	return s.db
+	return s.readerDB
+}
+
+// writeConn routes mutations and their supporting reads to the single-writer
+// pool. A transaction-scoped store always resolves to its current transaction.
+func (s *sqliteStore) writeConn() querier {
+	if s.tx != nil {
+		return s.tx
+	}
+	return s.writerDB
 }
 
 // querier abstracts *sql.DB and *sql.Tx for query execution.
@@ -94,7 +137,7 @@ func (s *sqliteStore) ListNodes(ctx context.Context, filter NodeFilter) ([]Node,
 		}
 	}
 
-	rows, err := s.conn().QueryContext(ctx, query, args...)
+	rows, err := s.readConn().QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list nodes: %w", err)
 	}
@@ -180,7 +223,7 @@ func (s *sqliteStore) ListManagedNodes(ctx context.Context, subscriptionID *int6
 	}
 	query += ` GROUP BY n.id ORDER BY n.id`
 
-	rows, err := s.conn().QueryContext(ctx, query, args...)
+	rows, err := s.readConn().QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list managed nodes: %w", err)
 	}
@@ -218,25 +261,25 @@ func (s *sqliteStore) ListManagedNodes(ctx context.Context, subscriptionID *int6
 }
 
 func (s *sqliteStore) GetNode(ctx context.Context, id int64) (*Node, error) {
-	row := s.conn().QueryRowContext(ctx,
+	row := s.readConn().QueryRowContext(ctx,
 		"SELECT id, uri, name, source, port, username, password, region, country, enabled, tags, identity_hash, canonical_json, created_at, updated_at FROM nodes WHERE id = ?", id)
 	return scanNode(row)
 }
 
 func (s *sqliteStore) GetNodeByURI(ctx context.Context, uri string) (*Node, error) {
-	row := s.conn().QueryRowContext(ctx,
+	row := s.readConn().QueryRowContext(ctx,
 		"SELECT id, uri, name, source, port, username, password, region, country, enabled, tags, identity_hash, canonical_json, created_at, updated_at FROM nodes WHERE uri = ?", uri)
 	return scanNode(row)
 }
 
 func (s *sqliteStore) GetNodeByIdentity(ctx context.Context, identityHash string) (*Node, error) {
-	row := s.conn().QueryRowContext(ctx,
+	row := s.readConn().QueryRowContext(ctx,
 		"SELECT id, uri, name, source, port, username, password, region, country, enabled, tags, identity_hash, canonical_json, created_at, updated_at FROM nodes WHERE identity_hash = ?", identityHash)
 	return scanNode(row)
 }
 
 func (s *sqliteStore) GetNodeByName(ctx context.Context, name string) (*Node, error) {
-	row := s.conn().QueryRowContext(ctx,
+	row := s.readConn().QueryRowContext(ctx,
 		"SELECT id, uri, name, source, port, username, password, region, country, enabled, tags, identity_hash, canonical_json, created_at, updated_at FROM nodes WHERE name = ?", name)
 	return scanNode(row)
 }
@@ -264,7 +307,7 @@ func (s *sqliteStore) CreateNode(ctx context.Context, node *Node) error {
 		}
 	}
 
-	result, err := s.conn().ExecContext(ctx,
+	result, err := s.writeConn().ExecContext(ctx,
 		`INSERT INTO nodes (uri, name, source, port, username, password, region, country, enabled, tags, identity_hash, canonical_json, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		node.URI, node.Name, node.Source, node.Port,
@@ -282,7 +325,7 @@ func (s *sqliteStore) CreateNode(ctx context.Context, node *Node) error {
 	node.ID = id
 
 	// Create initial stats row
-	_, err = s.conn().ExecContext(ctx,
+	_, err = s.writeConn().ExecContext(ctx,
 		"INSERT OR IGNORE INTO node_stats (node_id) VALUES (?)", id)
 	if err != nil {
 		return fmt.Errorf("create initial node stats: %w", err)
@@ -308,12 +351,12 @@ func (s *sqliteStore) materializeManualNodeTags(ctx context.Context, nodeID int6
 			if name == "" {
 				continue
 			}
-			if _, err := tx.conn().ExecContext(ctx,
+			if _, err := tx.writeConn().ExecContext(ctx,
 				"INSERT OR IGNORE INTO tags (name) VALUES (?)", name); err != nil {
 				return fmt.Errorf("create tag %q: %w", name, err)
 			}
 			var tagID int64
-			if err := tx.conn().QueryRowContext(ctx,
+			if err := tx.writeConn().QueryRowContext(ctx,
 				"SELECT id FROM tags WHERE name = ?", name).Scan(&tagID); err != nil {
 				return fmt.Errorf("lookup tag %q: %w", name, err)
 			}
@@ -328,7 +371,7 @@ func (s *sqliteStore) materializeManualNodeTags(ctx context.Context, nodeID int6
 
 func (s *sqliteStore) UpdateNode(ctx context.Context, node *Node) error {
 	var previousIdentity string
-	if err := s.conn().QueryRowContext(ctx, "SELECT identity_hash FROM nodes WHERE id=?", node.ID).Scan(&previousIdentity); err != nil {
+	if err := s.writeConn().QueryRowContext(ctx, "SELECT identity_hash FROM nodes WHERE id=?", node.ID).Scan(&previousIdentity); err != nil {
 		if err == sql.ErrNoRows {
 			return fmt.Errorf("node %d not found", node.ID)
 		}
@@ -346,7 +389,7 @@ func (s *sqliteStore) UpdateNode(ctx context.Context, node *Node) error {
 	// nodes.tags is deliberately absent: it is a projection of node_tags owned by
 	// the tagging layer, so an UpdateNode caller carrying a stale (or empty) Tags
 	// slice cannot drop assignments. Use SetManualNodeTags to change tags.
-	result, err := s.conn().ExecContext(ctx,
+	result, err := s.writeConn().ExecContext(ctx,
 		`UPDATE nodes SET uri=?, name=?, source=?, port=?, username=?, password=?,
 		 region=?, country=?, enabled=?, identity_hash=?, canonical_json=?, updated_at=?
 		 WHERE id=?`,
@@ -371,7 +414,7 @@ func (s *sqliteStore) UpdateNode(ctx context.Context, node *Node) error {
 }
 
 func (s *sqliteStore) UpdateNodeLocation(ctx context.Context, nodeID int64, region, country string) error {
-	result, err := s.conn().ExecContext(ctx, `UPDATE nodes SET region=?,country=?,updated_at=? WHERE id=?`,
+	result, err := s.writeConn().ExecContext(ctx, `UPDATE nodes SET region=?,country=?,updated_at=? WHERE id=?`,
 		strings.ToLower(strings.TrimSpace(region)), strings.TrimSpace(country), formatTime(time.Now().UTC()), nodeID)
 	if err != nil {
 		return fmt.Errorf("update node %d landing location: %w", nodeID, err)
@@ -385,11 +428,11 @@ func (s *sqliteStore) UpdateNodeLocation(ctx context.Context, nodeID int64, regi
 // caller is expected to enqueue the node for a recompute.
 func (s *sqliteStore) clearNodeDetectionCache(ctx context.Context, nodeID int64) error {
 	for _, table := range []string{"node_detection_results", "node_ip_quality_results", "node_unlock_results"} {
-		if _, err := s.conn().ExecContext(ctx, "DELETE FROM "+table+" WHERE node_id=?", nodeID); err != nil {
+		if _, err := s.writeConn().ExecContext(ctx, "DELETE FROM "+table+" WHERE node_id=?", nodeID); err != nil {
 			return fmt.Errorf("clear node %d cached detection from %s: %w", nodeID, table, err)
 		}
 	}
-	if _, err := s.conn().ExecContext(ctx,
+	if _, err := s.writeConn().ExecContext(ctx,
 		"DELETE FROM node_tags WHERE node_id=? AND source=?", nodeID, NodeTagSourceAuto); err != nil {
 		return fmt.Errorf("clear node %d auto tags: %w", nodeID, err)
 	}
@@ -397,7 +440,7 @@ func (s *sqliteStore) clearNodeDetectionCache(ctx context.Context, nodeID int64)
 }
 
 func (s *sqliteStore) DeleteNode(ctx context.Context, id int64) error {
-	result, err := s.conn().ExecContext(ctx, "DELETE FROM nodes WHERE id = ?", id)
+	result, err := s.writeConn().ExecContext(ctx, "DELETE FROM nodes WHERE id = ?", id)
 	if err != nil {
 		return fmt.Errorf("delete node %d: %w", id, err)
 	}
@@ -409,7 +452,7 @@ func (s *sqliteStore) DeleteNode(ctx context.Context, id int64) error {
 }
 
 func (s *sqliteStore) DeleteNodesBySource(ctx context.Context, source string) (int64, error) {
-	result, err := s.conn().ExecContext(ctx, "DELETE FROM nodes WHERE source = ?", source)
+	result, err := s.writeConn().ExecContext(ctx, "DELETE FROM nodes WHERE source = ?", source)
 	if err != nil {
 		return 0, fmt.Errorf("delete nodes by source %q: %w", source, err)
 	}
@@ -423,7 +466,7 @@ func (s *sqliteStore) BulkUpsertNodes(ctx context.Context, nodes []Node) error {
 
 	execFn := func(txStore *sqliteStore) error {
 		now := time.Now().UTC().Format(time.RFC3339)
-		stmt, err := txStore.conn().PrepareContext(ctx,
+		stmt, err := txStore.writeConn().PrepareContext(ctx,
 			`INSERT INTO nodes (uri, name, source, port, username, password, region, country, enabled, identity_hash, canonical_json, created_at, updated_at)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(identity_hash) WHERE identity_hash<>'' DO UPDATE SET
@@ -460,7 +503,7 @@ func (s *sqliteStore) BulkUpsertNodes(ctx context.Context, nodes []Node) error {
 		}
 
 		// Create stats rows for new nodes
-		_, err = txStore.conn().ExecContext(ctx,
+		_, err = txStore.writeConn().ExecContext(ctx,
 			"INSERT OR IGNORE INTO node_stats (node_id) SELECT id FROM nodes")
 		if err != nil {
 			return fmt.Errorf("create stats for new nodes: %w", err)
@@ -502,7 +545,7 @@ func (s *sqliteStore) CountNodes(ctx context.Context, filter NodeFilter) (int64,
 	}
 
 	var count int64
-	err := s.conn().QueryRowContext(ctx, query, args...).Scan(&count)
+	err := s.readConn().QueryRowContext(ctx, query, args...).Scan(&count)
 	return count, err
 }
 
@@ -513,7 +556,7 @@ const subscriptionColumns = `id, name, url, format, user_agent, enabled, refresh
 	node_count, etag, last_modified, created_at, updated_at`
 
 func (s *sqliteStore) ListSubscriptions(ctx context.Context) ([]Subscription, error) {
-	rows, err := s.conn().QueryContext(ctx, "SELECT "+subscriptionColumns+" FROM subscriptions ORDER BY sort_order, id")
+	rows, err := s.readConn().QueryContext(ctx, "SELECT "+subscriptionColumns+" FROM subscriptions ORDER BY sort_order, id")
 	if err != nil {
 		return nil, fmt.Errorf("list subscriptions: %w", err)
 	}
@@ -530,11 +573,11 @@ func (s *sqliteStore) ListSubscriptions(ctx context.Context) ([]Subscription, er
 }
 
 func (s *sqliteStore) GetSubscription(ctx context.Context, id int64) (*Subscription, error) {
-	return scanSubscriptionRow(s.conn().QueryRowContext(ctx, "SELECT "+subscriptionColumns+" FROM subscriptions WHERE id = ?", id))
+	return scanSubscriptionRow(s.readConn().QueryRowContext(ctx, "SELECT "+subscriptionColumns+" FROM subscriptions WHERE id = ?", id))
 }
 
 func (s *sqliteStore) GetSubscriptionByURL(ctx context.Context, url string) (*Subscription, error) {
-	return scanSubscriptionRow(s.conn().QueryRowContext(ctx, "SELECT "+subscriptionColumns+" FROM subscriptions WHERE url = ?", url))
+	return scanSubscriptionRow(s.readConn().QueryRowContext(ctx, "SELECT "+subscriptionColumns+" FROM subscriptions WHERE url = ?", url))
 }
 
 func (s *sqliteStore) CreateSubscription(ctx context.Context, subscription *Subscription) error {
@@ -542,7 +585,7 @@ func (s *sqliteStore) CreateSubscription(ctx context.Context, subscription *Subs
 		subscription.Format = "auto"
 	}
 	now := time.Now().UTC()
-	result, err := s.conn().ExecContext(ctx, `INSERT INTO subscriptions
+	result, err := s.writeConn().ExecContext(ctx, `INSERT INTO subscriptions
 		(name, url, format, user_agent, enabled, refresh_interval_seconds, refresh_timeout_seconds, sort_order,
 		 last_attempt, last_success, last_error, node_count, etag, last_modified, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -565,7 +608,7 @@ func (s *sqliteStore) UpdateSubscription(ctx context.Context, subscription *Subs
 	if subscription.Format == "" {
 		subscription.Format = "auto"
 	}
-	result, err := s.conn().ExecContext(ctx, `UPDATE subscriptions SET name=?, url=?, format=?, user_agent=?, enabled=?,
+	result, err := s.writeConn().ExecContext(ctx, `UPDATE subscriptions SET name=?, url=?, format=?, user_agent=?, enabled=?,
 		refresh_interval_seconds=?, refresh_timeout_seconds=?, sort_order=?, last_attempt=?,
 		last_success=?, last_error=?, node_count=?, etag=?, last_modified=?, updated_at=? WHERE id=?`,
 		subscription.Name, subscription.URL, subscription.Format, subscription.UserAgent, boolToInt(subscription.Enabled), subscription.RefreshIntervalSeconds,
@@ -581,14 +624,14 @@ func (s *sqliteStore) UpdateSubscription(ctx context.Context, subscription *Subs
 func (s *sqliteStore) DeleteSubscription(ctx context.Context, id int64) error {
 	return s.runInTx(ctx, func(tx *sqliteStore) error {
 		var exists int
-		if err := tx.conn().QueryRowContext(ctx, "SELECT 1 FROM subscriptions WHERE id=?", id).Scan(&exists); err != nil {
+		if err := tx.writeConn().QueryRowContext(ctx, "SELECT 1 FROM subscriptions WHERE id=?", id).Scan(&exists); err != nil {
 			if err == sql.ErrNoRows {
 				return fmt.Errorf("subscription %d not found", id)
 			}
 			return err
 		}
 		now := formatTime(time.Now().UTC())
-		if _, err := tx.conn().ExecContext(ctx, `UPDATE nodes SET source=?, updated_at=?
+		if _, err := tx.writeConn().ExecContext(ctx, `UPDATE nodes SET source=?, updated_at=?
 			WHERE source=?
 			AND id IN (SELECT node_id FROM subscription_nodes WHERE subscription_id=?)
 			AND NOT EXISTS (
@@ -597,7 +640,7 @@ func (s *sqliteStore) DeleteSubscription(ctx context.Context, id int64) error {
 			)`, NodeSourceManual, now, NodeSourceSubscription, id, id); err != nil {
 			return fmt.Errorf("preserve nodes for subscription %d: %w", id, err)
 		}
-		result, err := tx.conn().ExecContext(ctx, "DELETE FROM subscriptions WHERE id=?", id)
+		result, err := tx.writeConn().ExecContext(ctx, "DELETE FROM subscriptions WHERE id=?", id)
 		if err != nil {
 			return fmt.Errorf("delete subscription %d: %w", id, err)
 		}
@@ -606,7 +649,7 @@ func (s *sqliteStore) DeleteSubscription(ctx context.Context, id int64) error {
 }
 
 func (s *sqliteStore) AdoptOrphanSubscriptionNodes(ctx context.Context) (int64, error) {
-	result, err := s.conn().ExecContext(ctx, `UPDATE nodes SET source=?, updated_at=?
+	result, err := s.writeConn().ExecContext(ctx, `UPDATE nodes SET source=?, updated_at=?
 		WHERE source=? AND NOT EXISTS (
 			SELECT 1 FROM subscription_nodes memberships WHERE memberships.node_id=nodes.id
 		)`, NodeSourceManual, formatTime(time.Now().UTC()), NodeSourceSubscription)
@@ -621,7 +664,7 @@ func (s *sqliteStore) AdoptOrphanSubscriptionNodes(ctx context.Context) (int64, 
 }
 
 func (s *sqliteStore) SetSubscriptionEnabled(ctx context.Context, id int64, enabled bool) error {
-	result, err := s.conn().ExecContext(ctx, "UPDATE subscriptions SET enabled=?, updated_at=? WHERE id=?",
+	result, err := s.writeConn().ExecContext(ctx, "UPDATE subscriptions SET enabled=?, updated_at=? WHERE id=?",
 		boolToInt(enabled), formatTime(time.Now().UTC()), id)
 	if err != nil {
 		return fmt.Errorf("set subscription %d enabled: %w", id, err)
@@ -643,7 +686,7 @@ func (s *sqliteStore) UpdateAllSubscriptionRefreshSettings(ctx context.Context, 
 		query += ", refresh_timeout_seconds=?"
 		args = append(args, timeoutSeconds)
 	}
-	_, err := s.conn().ExecContext(ctx, query, args...)
+	_, err := s.writeConn().ExecContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("update subscription refresh settings: %w", err)
 	}
@@ -653,20 +696,20 @@ func (s *sqliteStore) UpdateAllSubscriptionRefreshSettings(ctx context.Context, 
 func (s *sqliteStore) ActivateSubscriptionExclusive(ctx context.Context, id int64) error {
 	return s.runInTx(ctx, func(tx *sqliteStore) error {
 		var exists int
-		if err := tx.conn().QueryRowContext(ctx, "SELECT 1 FROM subscriptions WHERE id=?", id).Scan(&exists); err != nil {
+		if err := tx.writeConn().QueryRowContext(ctx, "SELECT 1 FROM subscriptions WHERE id=?", id).Scan(&exists); err != nil {
 			if err == sql.ErrNoRows {
 				return fmt.Errorf("subscription %d not found", id)
 			}
 			return err
 		}
-		_, err := tx.conn().ExecContext(ctx, `UPDATE subscriptions SET enabled=CASE WHEN id=? THEN 1 ELSE 0 END,
+		_, err := tx.writeConn().ExecContext(ctx, `UPDATE subscriptions SET enabled=CASE WHEN id=? THEN 1 ELSE 0 END,
 			updated_at=? WHERE enabled != CASE WHEN id=? THEN 1 ELSE 0 END`, id, formatTime(time.Now().UTC()), id)
 		return err
 	})
 }
 
 func (s *sqliteStore) ListSubscriptionNodes(ctx context.Context, subscriptionID int64) ([]SubscriptionNode, error) {
-	rows, err := s.conn().QueryContext(ctx, `SELECT sn.subscription_id, sn.position,
+	rows, err := s.readConn().QueryContext(ctx, `SELECT sn.subscription_id, sn.position,
 		n.id, n.uri, n.name, n.source, n.port, n.username, n.password, n.region, n.country,
 		n.enabled, n.tags, n.identity_hash, n.canonical_json, n.created_at, n.updated_at
 		FROM subscription_nodes sn JOIN nodes n ON n.id=sn.node_id
@@ -697,7 +740,7 @@ func (s *sqliteStore) ListSubscriptionNodes(ctx context.Context, subscriptionID 
 }
 
 func (s *sqliteStore) ListEffectiveSubscriptionNodes(ctx context.Context) ([]Node, error) {
-	rows, err := s.conn().QueryContext(ctx, `SELECT DISTINCT n.id, n.uri, n.name, n.source, n.port,
+	rows, err := s.readConn().QueryContext(ctx, `SELECT DISTINCT n.id, n.uri, n.name, n.source, n.port,
 		n.username, n.password, n.region, n.country, n.enabled, n.tags, n.identity_hash, n.canonical_json, n.created_at, n.updated_at
 		FROM nodes n JOIN subscription_nodes sn ON sn.node_id=n.id
 		JOIN subscriptions s ON s.id=sn.subscription_id
@@ -721,11 +764,11 @@ func (s *sqliteStore) CommitSnapshot(ctx context.Context, subscriptionID int64, 
 			return err
 		}
 		var nodeCount int
-		if err := tx.conn().QueryRowContext(ctx,
+		if err := tx.writeConn().QueryRowContext(ctx,
 			"SELECT COUNT(*) FROM subscription_nodes WHERE subscription_id=?", subscriptionID).Scan(&nodeCount); err != nil {
 			return fmt.Errorf("count subscription %d nodes: %w", subscriptionID, err)
 		}
-		result, err := tx.conn().ExecContext(ctx, `UPDATE subscriptions SET last_attempt=?, last_success=?,
+		result, err := tx.writeConn().ExecContext(ctx, `UPDATE subscriptions SET last_attempt=?, last_success=?,
 			last_error=?, node_count=?, etag=?, last_modified=?, updated_at=? WHERE id=?`,
 			formatTime(snapshot.Attempt), formatTime(snapshot.Success), snapshot.Error, nodeCount, snapshot.ETag,
 			snapshot.LastModified, formatTime(time.Now().UTC()), subscriptionID)
@@ -740,7 +783,7 @@ func (s *sqliteStore) replaceSubscriptionNodes(ctx context.Context, subscription
 	if err := s.requireSubscription(ctx, subscriptionID); err != nil {
 		return err
 	}
-	if _, err := s.conn().ExecContext(ctx, "DELETE FROM subscription_nodes WHERE subscription_id=?", subscriptionID); err != nil {
+	if _, err := s.writeConn().ExecContext(ctx, "DELETE FROM subscription_nodes WHERE subscription_id=?", subscriptionID); err != nil {
 		return fmt.Errorf("clear subscription %d nodes: %w", subscriptionID, err)
 	}
 	return s.upsertSubscriptionNodes(ctx, subscriptionID, nodes)
@@ -761,7 +804,7 @@ func (s *sqliteStore) mergeSubscriptionNodes(ctx context.Context, subscriptionID
 	}
 	// Move retained members behind the current snapshot. Members present in the
 	// new snapshot are upserted back to positions starting at zero below.
-	if _, err := s.conn().ExecContext(ctx, `UPDATE subscription_nodes SET position=position+?
+	if _, err := s.writeConn().ExecContext(ctx, `UPDATE subscription_nodes SET position=position+?
 		WHERE subscription_id=?`, len(nodes), subscriptionID); err != nil {
 		return fmt.Errorf("reorder retained subscription %d nodes: %w", subscriptionID, err)
 	}
@@ -801,7 +844,7 @@ func (s *sqliteStore) reconcileSubscriptionLogicalNodes(ctx context.Context, sub
 		incomingByName[logicalName] = node
 	}
 
-	rows, err := s.conn().QueryContext(ctx, `SELECT n.id,n.name,n.identity_hash,n.source,
+	rows, err := s.writeConn().QueryContext(ctx, `SELECT n.id,n.name,n.identity_hash,n.source,
 		(SELECT COUNT(*) FROM subscription_nodes memberships WHERE memberships.node_id=n.id)
 		FROM subscription_nodes current_membership
 		JOIN nodes n ON n.id=current_membership.node_id
@@ -840,7 +883,7 @@ func (s *sqliteStore) reconcileSubscriptionLogicalNodes(ctx context.Context, sub
 		}
 
 		var targetID int64
-		err := s.conn().QueryRowContext(ctx, "SELECT id FROM nodes WHERE identity_hash=?", input.IdentityHash).Scan(&targetID)
+		err := s.writeConn().QueryRowContext(ctx, "SELECT id FROM nodes WHERE identity_hash=?", input.IdentityHash).Scan(&targetID)
 		if err != nil && err != sql.ErrNoRows {
 			return fmt.Errorf("resolve current identity for %q: %w", input.Name, err)
 		}
@@ -863,7 +906,7 @@ func (s *sqliteStore) reconcileSubscriptionLogicalNodes(ctx context.Context, sub
 					return fmt.Errorf("merge stale logical node %d into %d: %w", candidate.id, targetID, err)
 				}
 			}
-			if _, err := s.conn().ExecContext(ctx, `UPDATE nodes SET uri=?,name=?,username=?,password=?,
+			if _, err := s.writeConn().ExecContext(ctx, `UPDATE nodes SET uri=?,name=?,username=?,password=?,
 				region=CASE WHEN ?<>'' THEN ? ELSE region END,
 				country=CASE WHEN ?<>'' THEN ? ELSE country END,
 				identity_hash=?,canonical_json=?,updated_at=? WHERE id=?`,
@@ -913,7 +956,7 @@ func prepareSubscriptionNodeIdentity(node *SubscriptionNodeInput) {
 
 func (s *sqliteStore) requireSubscription(ctx context.Context, subscriptionID int64) error {
 	var exists int
-	if err := s.conn().QueryRowContext(ctx, "SELECT 1 FROM subscriptions WHERE id=?", subscriptionID).Scan(&exists); err != nil {
+	if err := s.writeConn().QueryRowContext(ctx, "SELECT 1 FROM subscriptions WHERE id=?", subscriptionID).Scan(&exists); err != nil {
 		if err == sql.ErrNoRows {
 			return fmt.Errorf("subscription %d not found", subscriptionID)
 		}
@@ -926,7 +969,7 @@ func (s *sqliteStore) upsertSubscriptionNodes(ctx context.Context, subscriptionI
 	now := formatTime(time.Now().UTC())
 	for position, node := range nodes {
 		prepareSubscriptionNodeIdentity(&node)
-		_, err := s.conn().ExecContext(ctx, `INSERT INTO nodes
+		_, err := s.writeConn().ExecContext(ctx, `INSERT INTO nodes
 			(uri, name, source, port, username, password, region, country, enabled, identity_hash, canonical_json, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(identity_hash) WHERE identity_hash<>'' DO UPDATE SET
@@ -941,14 +984,14 @@ func (s *sqliteStore) upsertSubscriptionNodes(ctx context.Context, subscriptionI
 		if err != nil {
 			return fmt.Errorf("upsert subscription node %q: %w", node.URI, err)
 		}
-		if _, err := s.conn().ExecContext(ctx, `INSERT INTO subscription_nodes (subscription_id, node_id, position)
+		if _, err := s.writeConn().ExecContext(ctx, `INSERT INTO subscription_nodes (subscription_id, node_id, position)
 			SELECT ?, id, ? FROM nodes WHERE identity_hash=?
 			ON CONFLICT(subscription_id, node_id) DO UPDATE SET position=excluded.position`,
 			subscriptionID, position, node.IdentityHash); err != nil {
 			return fmt.Errorf("link subscription node %q: %w", node.URI, err)
 		}
 	}
-	if _, err := s.conn().ExecContext(ctx, "INSERT OR IGNORE INTO node_stats (node_id) SELECT id FROM nodes"); err != nil {
+	if _, err := s.writeConn().ExecContext(ctx, "INSERT OR IGNORE INTO node_stats (node_id) SELECT id FROM nodes"); err != nil {
 		return fmt.Errorf("create subscription node stats: %w", err)
 	}
 	return nil
@@ -957,7 +1000,7 @@ func (s *sqliteStore) upsertSubscriptionNodes(ctx context.Context, subscriptionI
 // ===================== Node stats =====================
 
 func (s *sqliteStore) GetNodeStats(ctx context.Context, nodeID int64) (*NodeStats, error) {
-	row := s.conn().QueryRowContext(ctx,
+	row := s.readConn().QueryRowContext(ctx,
 		`SELECT node_id, failure_count, success_count, blacklisted, blacklisted_until,
 		 last_error, last_failure_at, last_success_at, last_latency_ms,
 		 available, initial_check_done, total_upload_bytes, total_download_bytes, updated_at
@@ -1007,7 +1050,7 @@ func (s *sqliteStore) UpsertNodeStats(ctx context.Context, stats *NodeStats) err
 		initialCheckDone = 1
 	}
 
-	_, err := s.conn().ExecContext(ctx,
+	_, err := s.writeConn().ExecContext(ctx,
 		`INSERT INTO node_stats (node_id, failure_count, success_count, blacklisted, blacklisted_until,
 		 last_error, last_failure_at, last_success_at, last_latency_ms, available, initial_check_done,
 		 total_upload_bytes, total_download_bytes, updated_at)
@@ -1031,7 +1074,7 @@ func (s *sqliteStore) UpsertNodeStats(ctx context.Context, stats *NodeStats) err
 
 func (s *sqliteStore) RecordSuccess(ctx context.Context, nodeID int64, latencyMs int64) error {
 	now := time.Now().UTC().Format(time.RFC3339)
-	_, err := s.conn().ExecContext(ctx,
+	_, err := s.writeConn().ExecContext(ctx,
 		`UPDATE node_stats SET
 		 success_count = success_count + 1,
 		 last_success_at = ?,
@@ -1047,7 +1090,7 @@ func (s *sqliteStore) RecordSuccess(ctx context.Context, nodeID int64, latencyMs
 
 func (s *sqliteStore) RecordFailure(ctx context.Context, nodeID int64, errMsg string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
-	_, err := s.conn().ExecContext(ctx,
+	_, err := s.writeConn().ExecContext(ctx,
 		`UPDATE node_stats SET
 		 failure_count = failure_count + 1,
 		 last_error = ?,
@@ -1061,7 +1104,7 @@ func (s *sqliteStore) RecordFailure(ctx context.Context, nodeID int64, errMsg st
 
 func (s *sqliteStore) SetBlacklist(ctx context.Context, nodeID int64, until time.Time) error {
 	now := time.Now().UTC().Format(time.RFC3339)
-	_, err := s.conn().ExecContext(ctx,
+	_, err := s.writeConn().ExecContext(ctx,
 		`UPDATE node_stats SET
 		 blacklisted = 1,
 		 blacklisted_until = ?,
@@ -1075,7 +1118,7 @@ func (s *sqliteStore) SetBlacklist(ctx context.Context, nodeID int64, until time
 
 func (s *sqliteStore) ClearBlacklist(ctx context.Context, nodeID int64) error {
 	now := time.Now().UTC().Format(time.RFC3339)
-	_, err := s.conn().ExecContext(ctx,
+	_, err := s.writeConn().ExecContext(ctx,
 		`UPDATE node_stats SET
 		 blacklisted = 0,
 		 blacklisted_until = '',
@@ -1088,7 +1131,7 @@ func (s *sqliteStore) ClearBlacklist(ctx context.Context, nodeID int64) error {
 
 func (s *sqliteStore) ClearAllBlacklists(ctx context.Context) error {
 	now := time.Now().UTC().Format(time.RFC3339)
-	_, err := s.conn().ExecContext(ctx,
+	_, err := s.writeConn().ExecContext(ctx,
 		`UPDATE node_stats SET blacklisted = 0, blacklisted_until = '', updated_at = ? WHERE blacklisted = 1`,
 		now,
 	)
@@ -1102,7 +1145,7 @@ func (s *sqliteStore) BatchUpdateStats(ctx context.Context, updates []StatsUpdat
 
 	execFn := func(txStore *sqliteStore) error {
 		now := time.Now().UTC().Format(time.RFC3339)
-		stmt, err := txStore.conn().PrepareContext(ctx,
+		stmt, err := txStore.writeConn().PrepareContext(ctx,
 			`INSERT INTO node_stats (node_id, failure_count, success_count, blacklisted, blacklisted_until,
 			 last_error, last_failure_at, last_success_at, last_latency_ms, available, initial_check_done,
 			 total_upload_bytes, total_download_bytes, updated_at)
@@ -1168,7 +1211,7 @@ func (s *sqliteStore) ListNodeStats(ctx context.Context, nodeIDs []int64) (map[i
 
 func (s *sqliteStore) listNodeStatsChunk(ctx context.Context, nodeIDs []int64) (map[int64]*NodeStats, error) {
 	where, args := nodeIDCondition("node_id", nodeIDs)
-	rows, err := s.conn().QueryContext(ctx,
+	rows, err := s.readConn().QueryContext(ctx,
 		`SELECT node_id, failure_count, success_count, blacklisted, blacklisted_until,
 		 last_error, last_failure_at, last_success_at, last_latency_ms,
 		 available, initial_check_done, total_upload_bytes, total_download_bytes, updated_at
@@ -1211,7 +1254,7 @@ func (s *sqliteStore) listNodeStatsChunk(ctx context.Context, nodeIDs []int64) (
 // ===================== Timeline =====================
 
 func (s *sqliteStore) AppendTimeline(ctx context.Context, nodeID int64, event TimelineEvent) error {
-	_, err := s.conn().ExecContext(ctx,
+	_, err := s.writeConn().ExecContext(ctx,
 		`INSERT INTO node_timeline (node_id, success, latency_ms, error, created_at)
 		 VALUES (?, ?, ?, ?, ?)`,
 		nodeID, boolToInt(event.Success), event.LatencyMs, event.Error,
@@ -1225,7 +1268,7 @@ func (s *sqliteStore) GetTimeline(ctx context.Context, nodeID int64, limit int) 
 		limit = 20
 	}
 
-	rows, err := s.conn().QueryContext(ctx,
+	rows, err := s.readConn().QueryContext(ctx,
 		`SELECT id, node_id, success, latency_ms, error, created_at
 		 FROM node_timeline WHERE node_id = ?
 		 ORDER BY id DESC LIMIT ?`,
@@ -1262,7 +1305,7 @@ func (s *sqliteStore) CleanupTimeline(ctx context.Context, keepPerNode int) erro
 		keepPerNode = 20
 	}
 
-	_, err := s.conn().ExecContext(ctx,
+	_, err := s.writeConn().ExecContext(ctx,
 		`DELETE FROM node_timeline WHERE id NOT IN (
 			SELECT id FROM (
 				SELECT id, ROW_NUMBER() OVER (PARTITION BY node_id ORDER BY id DESC) as rn
@@ -1276,7 +1319,7 @@ func (s *sqliteStore) CleanupTimeline(ctx context.Context, keepPerNode int) erro
 // ===================== Sessions =====================
 
 func (s *sqliteStore) CreateSession(ctx context.Context, session *Session) error {
-	_, err := s.conn().ExecContext(ctx,
+	_, err := s.writeConn().ExecContext(ctx,
 		`INSERT INTO sessions (token, created_at, expires_at) VALUES (?, ?, ?)`,
 		session.Token,
 		session.CreatedAt.UTC().Format(time.RFC3339),
@@ -1286,7 +1329,7 @@ func (s *sqliteStore) CreateSession(ctx context.Context, session *Session) error
 }
 
 func (s *sqliteStore) GetSession(ctx context.Context, token string) (*Session, error) {
-	row := s.conn().QueryRowContext(ctx,
+	row := s.readConn().QueryRowContext(ctx,
 		"SELECT token, created_at, expires_at FROM sessions WHERE token = ?", token)
 
 	var sess Session
@@ -1305,20 +1348,20 @@ func (s *sqliteStore) GetSession(ctx context.Context, token string) (*Session, e
 }
 
 func (s *sqliteStore) DeleteSession(ctx context.Context, token string) error {
-	_, err := s.conn().ExecContext(ctx, "DELETE FROM sessions WHERE token = ?", token)
+	_, err := s.writeConn().ExecContext(ctx, "DELETE FROM sessions WHERE token = ?", token)
 	return err
 }
 
 func (s *sqliteStore) CleanupExpiredSessions(ctx context.Context) error {
 	now := time.Now().UTC().Format(time.RFC3339)
-	_, err := s.conn().ExecContext(ctx, "DELETE FROM sessions WHERE expires_at < ?", now)
+	_, err := s.writeConn().ExecContext(ctx, "DELETE FROM sessions WHERE expires_at < ?", now)
 	return err
 }
 
 // ===================== Subscription status =====================
 
 func (s *sqliteStore) GetSubscriptionStatus(ctx context.Context) (*SubscriptionStatus, error) {
-	row := s.conn().QueryRowContext(ctx,
+	row := s.readConn().QueryRowContext(ctx,
 		`SELECT last_refresh, next_refresh, node_count, last_error,
 		 refresh_count, is_refreshing, nodes_hash, updated_at
 		 FROM subscription_status WHERE id = 1`)
@@ -1354,7 +1397,7 @@ func (s *sqliteStore) UpdateSubscriptionStatus(ctx context.Context, status *Subs
 		isRefreshing = 1
 	}
 
-	_, err := s.conn().ExecContext(ctx,
+	_, err := s.writeConn().ExecContext(ctx,
 		`INSERT INTO subscription_status (id, last_refresh, next_refresh, node_count, last_error,
 		 refresh_count, is_refreshing, nodes_hash, updated_at)
 		 VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1397,7 +1440,7 @@ func (s *sqliteStore) UpsertUnlockResult(ctx context.Context, result *UnlockResu
 		checkedAt = formatTime(result.CheckedAt)
 	}
 
-	_, err := s.conn().ExecContext(ctx,
+	_, err := s.writeConn().ExecContext(ctx,
 		`INSERT INTO node_unlock_results (`+unlockColumns+`)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(node_id) DO UPDATE SET
@@ -1422,7 +1465,7 @@ func (s *sqliteStore) UpsertUnlockResult(ctx context.Context, result *UnlockResu
 }
 
 func (s *sqliteStore) GetUnlockResult(ctx context.Context, nodeID int64) (*UnlockResult, error) {
-	row := s.conn().QueryRowContext(ctx,
+	row := s.readConn().QueryRowContext(ctx,
 		"SELECT "+unlockColumns+" FROM node_unlock_results WHERE node_id = ?", nodeID)
 	return scanUnlockResult(row)
 }
@@ -1439,7 +1482,7 @@ func (s *sqliteStore) ListUnlockResultsByIDs(ctx context.Context, nodeIDs []int6
 
 func (s *sqliteStore) listUnlockResultsChunk(ctx context.Context, nodeIDs []int64) (map[int64]*UnlockResult, error) {
 	where, args := nodeIDCondition("node_id", nodeIDs)
-	rows, err := s.conn().QueryContext(ctx, "SELECT "+unlockColumns+" FROM node_unlock_results"+where, args...)
+	rows, err := s.readConn().QueryContext(ctx, "SELECT "+unlockColumns+" FROM node_unlock_results"+where, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list unlock results: %w", err)
 	}
@@ -1545,7 +1588,7 @@ func (s *sqliteStore) UpsertNodeDetectionResult(ctx context.Context, result *Nod
 		return errors.New("upsert node detection result: nil result")
 	}
 	now := time.Now().UTC()
-	_, err := s.conn().ExecContext(ctx, `INSERT INTO node_detection_results (
+	_, err := s.writeConn().ExecContext(ctx, `INSERT INTO node_detection_results (
 		node_id,task_id,latency_status,latency_ms,latency_error,latency_checked_at,
 		speed_status,average_bytes_per_second,peak_bytes_per_second,bytes_downloaded,
 		speed_duration_ms,speed_error,speed_checked_at,exit_ip,exit_ip_family,exit_country,exit_country_code,
@@ -1594,7 +1637,7 @@ func (s *sqliteStore) ListNodeDetectionResultsByIDs(ctx context.Context, nodeIDs
 
 func (s *sqliteStore) listNodeDetectionResultsChunk(ctx context.Context, nodeIDs []int64) (map[int64]*NodeDetectionResult, error) {
 	where, args := nodeIDCondition("node_id", nodeIDs)
-	rows, err := s.conn().QueryContext(ctx, `SELECT node_id,task_id,latency_status,latency_ms,latency_error,latency_checked_at,
+	rows, err := s.readConn().QueryContext(ctx, `SELECT node_id,task_id,latency_status,latency_ms,latency_error,latency_checked_at,
 		speed_status,average_bytes_per_second,peak_bytes_per_second,bytes_downloaded,speed_duration_ms,speed_error,speed_checked_at,
 		exit_ip,exit_ip_family,exit_country,exit_country_code,exit_ip_status,exit_ip_error,exit_ip_checked_at,updated_at
 		FROM node_detection_results`+where, args...)
@@ -1637,7 +1680,7 @@ func (s *sqliteStore) UpsertNodeIPQualityResult(ctx context.Context, result *Nod
 		return errors.New("upsert node IP quality result: nil result")
 	}
 	now := time.Now().UTC()
-	_, err := s.conn().ExecContext(ctx, `INSERT INTO node_ip_quality_results (
+	_, err := s.writeConn().ExecContext(ctx, `INSERT INTO node_ip_quality_results (
 		node_id,provider,task_id,status,ip,family,country,country_code,asn,org,isp,is_broadcast,is_residential,
 		fraud_score,proxy,hosting,mobile,reason,checked_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(node_id,provider) DO UPDATE SET task_id=excluded.task_id,status=excluded.status,ip=excluded.ip,
@@ -1663,7 +1706,7 @@ func (s *sqliteStore) ListNodeIPQualityResultsByIDs(ctx context.Context, nodeIDs
 
 func (s *sqliteStore) listNodeIPQualityResultsChunk(ctx context.Context, nodeIDs []int64) (map[int64][]NodeIPQualityResult, error) {
 	where, args := nodeIDCondition("node_id", nodeIDs)
-	rows, err := s.conn().QueryContext(ctx, `SELECT node_id,provider,task_id,status,ip,family,country,country_code,asn,org,isp,
+	rows, err := s.readConn().QueryContext(ctx, `SELECT node_id,provider,task_id,status,ip,family,country,country_code,asn,org,isp,
 		is_broadcast,is_residential,fraud_score,proxy,hosting,mobile,reason,checked_at,updated_at
 		FROM node_ip_quality_results`+where+` ORDER BY node_id,provider`, args...)
 	if err != nil {
@@ -1707,7 +1750,7 @@ func (s *sqliteStore) UpsertNodeDetectionTask(ctx context.Context, task *NodeDet
 	if task.CreatedAt.IsZero() {
 		task.CreatedAt = now
 	}
-	_, err := s.conn().ExecContext(ctx, `INSERT INTO node_detection_tasks
+	_, err := s.writeConn().ExecContext(ctx, `INSERT INTO node_detection_tasks
 		(id,status,stages_json,settings_json,stats_json,total_nodes,completed_nodes,downloaded_bytes,error,created_at,started_at,finished_at,updated_at)
 		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,stages_json=excluded.stages_json,
 		settings_json=excluded.settings_json,stats_json=excluded.stats_json,total_nodes=excluded.total_nodes,
@@ -1722,7 +1765,7 @@ func (s *sqliteStore) ListNodeDetectionTasks(ctx context.Context, limit int) ([]
 	if limit <= 0 || limit > 100 {
 		limit = 20
 	}
-	rows, err := s.conn().QueryContext(ctx, `SELECT id,status,stages_json,settings_json,stats_json,total_nodes,completed_nodes,
+	rows, err := s.readConn().QueryContext(ctx, `SELECT id,status,stages_json,settings_json,stats_json,total_nodes,completed_nodes,
 		downloaded_bytes,error,created_at,started_at,finished_at,updated_at FROM node_detection_tasks ORDER BY created_at DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -1744,7 +1787,7 @@ func (s *sqliteStore) ListNodeDetectionTasks(ctx context.Context, limit int) ([]
 
 func (s *sqliteStore) InterruptRunningNodeDetectionTasks(ctx context.Context) error {
 	now := formatTime(time.Now().UTC())
-	_, err := s.conn().ExecContext(ctx, `UPDATE node_detection_tasks SET status='interrupted',error='application restarted',finished_at=?,updated_at=? WHERE status IN ('pending','running')`, now, now)
+	_, err := s.writeConn().ExecContext(ctx, `UPDATE node_detection_tasks SET status='interrupted',error='application restarted',finished_at=?,updated_at=? WHERE status IN ('pending','running')`, now, now)
 	return err
 }
 
@@ -1752,7 +1795,7 @@ func (s *sqliteStore) PruneNodeDetectionTasks(ctx context.Context, keep int) err
 	if keep < 1 {
 		keep = 20
 	}
-	_, err := s.conn().ExecContext(ctx, `DELETE FROM node_detection_tasks WHERE id NOT IN (SELECT id FROM node_detection_tasks ORDER BY created_at DESC LIMIT ?)`, keep)
+	_, err := s.writeConn().ExecContext(ctx, `DELETE FROM node_detection_tasks WHERE id NOT IN (SELECT id FROM node_detection_tasks ORDER BY created_at DESC LIMIT ?)`, keep)
 	return err
 }
 
@@ -1765,7 +1808,7 @@ failure_threshold, health_check_seconds, current_active_node_id, enabled,
 subscription_enabled, subscription_token, subscription_mode, external_host, created_at, updated_at`
 
 func (s *sqliteStore) ListGroupPools(ctx context.Context) ([]GroupPool, error) {
-	rows, err := s.conn().QueryContext(ctx, "SELECT "+groupPoolColumns+" FROM group_pools ORDER BY id")
+	rows, err := s.readConn().QueryContext(ctx, "SELECT "+groupPoolColumns+" FROM group_pools ORDER BY id")
 	if err != nil {
 		return nil, fmt.Errorf("list group pools: %w", err)
 	}
@@ -1794,7 +1837,7 @@ func (s *sqliteStore) ListGroupPools(ctx context.Context) ([]GroupPool, error) {
 }
 
 func (s *sqliteStore) GetGroupPool(ctx context.Context, id int64) (*GroupPool, error) {
-	g, err := scanGroupPool(s.conn().QueryRowContext(ctx, "SELECT "+groupPoolColumns+" FROM group_pools WHERE id = ?", id))
+	g, err := scanGroupPool(s.readConn().QueryRowContext(ctx, "SELECT "+groupPoolColumns+" FROM group_pools WHERE id = ?", id))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1810,7 +1853,7 @@ func (s *sqliteStore) CreateGroupPool(ctx context.Context, g *GroupPool) error {
 	nodeIDs, _ := json.Marshal(g.ExplicitNodeIDs)
 	excludedNodeIDs, _ := json.Marshal(g.ExcludedNodeIDs)
 	tagWhitelist, tagBlacklist, tagFilterMatch := marshalGroupTagFilter(g)
-	result, err := s.conn().ExecContext(ctx, `INSERT INTO group_pools
+	result, err := s.writeConn().ExecContext(ctx, `INSERT INTO group_pools
 (name, bind_address, bind_port, protocol, username, password, dispatch_mode, regions_json,
  explicit_node_ids_json, excluded_node_ids_json, tag_whitelist_json, tag_blacklist_json, tag_filter_match,
  failure_window_seconds, failure_threshold, health_check_seconds,
@@ -1834,7 +1877,7 @@ func (s *sqliteStore) UpdateGroupPool(ctx context.Context, g *GroupPool) error {
 	nodeIDs, _ := json.Marshal(g.ExplicitNodeIDs)
 	excludedNodeIDs, _ := json.Marshal(g.ExcludedNodeIDs)
 	tagWhitelist, tagBlacklist, tagFilterMatch := marshalGroupTagFilter(g)
-	result, err := s.conn().ExecContext(ctx, `UPDATE group_pools SET
+	result, err := s.writeConn().ExecContext(ctx, `UPDATE group_pools SET
 name=?, bind_address=?, bind_port=?, protocol=?, username=?, password=?, dispatch_mode=?,
 regions_json=?, explicit_node_ids_json=?, excluded_node_ids_json=?,
 tag_whitelist_json=?, tag_blacklist_json=?, tag_filter_match=?, failure_window_seconds=?, failure_threshold=?,
@@ -1882,7 +1925,7 @@ func normalizeIDList(ids []int64) []int64 {
 }
 
 func (s *sqliteStore) UpdateGroupCurrentActiveNode(ctx context.Context, groupID, nodeID int64) error {
-	result, err := s.conn().ExecContext(ctx,
+	result, err := s.writeConn().ExecContext(ctx,
 		"UPDATE group_pools SET current_active_node_id=?, updated_at=? WHERE id=?",
 		nodeID, formatTime(time.Now()), groupID)
 	if err != nil {
@@ -1892,7 +1935,7 @@ func (s *sqliteStore) UpdateGroupCurrentActiveNode(ctx context.Context, groupID,
 }
 
 func (s *sqliteStore) DeleteGroupPool(ctx context.Context, id int64) error {
-	result, err := s.conn().ExecContext(ctx, "DELETE FROM group_pools WHERE id = ?", id)
+	result, err := s.writeConn().ExecContext(ctx, "DELETE FROM group_pools WHERE id = ?", id)
 	if err != nil {
 		return fmt.Errorf("delete group pool: %w", err)
 	}
@@ -1901,7 +1944,7 @@ func (s *sqliteStore) DeleteGroupPool(ctx context.Context, id int64) error {
 
 func (s *sqliteStore) UpsertGroupNodeState(ctx context.Context, state *GroupNodeState) error {
 	history, _ := json.Marshal(state.FailureHistory)
-	_, err := s.conn().ExecContext(ctx, `INSERT INTO group_node_states
+	_, err := s.writeConn().ExecContext(ctx, `INSERT INTO group_node_states
 (group_id, node_id, failure_history_json, evicted, last_error, evicted_at, updated_at)
 VALUES (?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(group_id, node_id) DO UPDATE SET failure_history_json=excluded.failure_history_json,
@@ -1915,12 +1958,12 @@ updated_at=excluded.updated_at`, state.GroupID, state.NodeID, string(history), b
 }
 
 func (s *sqliteStore) ClearGroupNodeState(ctx context.Context, groupID, nodeID int64) error {
-	_, err := s.conn().ExecContext(ctx, "DELETE FROM group_node_states WHERE group_id = ? AND node_id = ?", groupID, nodeID)
+	_, err := s.writeConn().ExecContext(ctx, "DELETE FROM group_node_states WHERE group_id = ? AND node_id = ?", groupID, nodeID)
 	return err
 }
 
 func (s *sqliteStore) listGroupNodeStates(ctx context.Context, groupID int64) ([]GroupNodeState, error) {
-	rows, err := s.conn().QueryContext(ctx, `SELECT group_id, node_id, failure_history_json, evicted,
+	rows, err := s.readConn().QueryContext(ctx, `SELECT group_id, node_id, failure_history_json, evicted,
 last_error, evicted_at, updated_at FROM group_node_states WHERE group_id = ?`, groupID)
 	if err != nil {
 		return nil, fmt.Errorf("list group node states: %w", err)
@@ -1972,10 +2015,14 @@ func scanGroupPool(row scanner) (GroupPool, error) {
 // ===================== Lifecycle =====================
 
 func (s *sqliteStore) Close() error {
-	if s.db != nil {
-		return s.db.Close()
+	var readerErr, writerErr error
+	if s.readerDB != nil {
+		readerErr = s.readerDB.Close()
 	}
-	return nil
+	if s.writerDB != nil {
+		writerErr = s.writerDB.Close()
+	}
+	return errors.Join(readerErr, writerErr)
 }
 
 func (s *sqliteStore) WithTx(ctx context.Context, fn func(tx Store) error) error {
@@ -1984,12 +2031,12 @@ func (s *sqliteStore) WithTx(ctx context.Context, fn func(tx Store) error) error
 		return fn(s)
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.writerDB.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 
-	txStore := &sqliteStore{db: s.db, tx: tx}
+	txStore := &sqliteStore{writerDB: s.writerDB, readerDB: s.readerDB, tx: tx}
 	if err := fn(txStore); err != nil {
 		_ = tx.Rollback()
 		return err

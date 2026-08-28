@@ -293,53 +293,41 @@ func (m *nodeCheckManager) run(task *nodeCheckTask) {
 }
 
 func (m *nodeCheckManager) runLatency(task *nodeCheckTask) {
-	sem := make(chan struct{}, task.settings.LatencyConcurrency)
-	var wg sync.WaitGroup
-	for _, node := range task.nodes {
+	runLimited(task.settings.LatencyConcurrency, task.nodes, func(node Snapshot) {
 		if task.ctx.Err() != nil {
-			break
+			return
 		}
-		wg.Add(1)
-		go func(node Snapshot) {
-			defer wg.Done()
-			if !acquire(task.ctx, sem) {
-				return
+		dial, err := m.server.mgr.DialerFor(node.Tag)
+		var latency time.Duration
+		if err == nil {
+			latency, err = nodedetect.MeasureLatency(task.ctx, nodedetect.DialFunc(dial), task.settings.LatencyURL, task.settings.LatencyTimeout, task.settings.IncludeHandshake)
+		}
+		now := time.Now().UTC()
+		result := &store.NodeDetectionResult{NodeID: node.NodeID, TaskID: task.snapshot.ID, LatencyStatus: "success", SpeedStatus: "untested", ExitIPStatus: "untested", LatencyCheckedAt: now}
+		status, errText := "success", ""
+		if err != nil {
+			status, errText, result.LatencyStatus, result.LatencyError = "failed", err.Error(), "failed", err.Error()
+		} else {
+			value := latency.Milliseconds()
+			if value < 1 {
+				value = 1
 			}
-			defer func() { <-sem }()
-			dial, err := m.server.mgr.DialerFor(node.Tag)
-			var latency time.Duration
-			if err == nil {
-				latency, err = nodedetect.MeasureLatency(task.ctx, nodedetect.DialFunc(dial), task.settings.LatencyURL, task.settings.LatencyTimeout, task.settings.IncludeHandshake)
-			}
-			now := time.Now().UTC()
-			result := &store.NodeDetectionResult{NodeID: node.NodeID, TaskID: task.snapshot.ID, LatencyStatus: "success", SpeedStatus: "untested", ExitIPStatus: "untested", LatencyCheckedAt: now}
-			status, errText := "success", ""
-			if err != nil {
-				status, errText, result.LatencyStatus, result.LatencyError = "failed", err.Error(), "failed", err.Error()
-			} else {
-				value := latency.Milliseconds()
-				if value < 1 {
-					value = 1
-				}
-				result.LatencyMs = &value
-				task.mu.Lock()
-				task.latencyOK[node.NodeID] = true
-				task.mu.Unlock()
-			}
-			_ = m.server.store.UpsertNodeDetectionResult(context.Background(), result)
-			m.server.enqueueRetag(node.NodeID)
-			task.updateStage("latency", status)
-			event := nodeCheckEvent{Type: "result", Phase: "latency", NodeID: node.NodeID, Tag: node.Tag, Name: node.Name, Status: status, Error: errText, LatencyMs: result.LatencyMs}
-			task.publish(event)
-			m.persist(task)
-		}(node)
-	}
-	wg.Wait()
+			result.LatencyMs = &value
+			task.mu.Lock()
+			task.latencyOK[node.NodeID] = true
+			task.mu.Unlock()
+		}
+		_ = m.server.store.UpsertNodeDetectionResult(context.Background(), result)
+		m.server.enqueueRetag(node.NodeID)
+		task.updateStage("latency", status)
+		event := nodeCheckEvent{Type: "result", Phase: "latency", NodeID: node.NodeID, Tag: node.Tag, Name: node.Name, Status: status, Error: errText, LatencyMs: result.LatencyMs}
+		task.publish(event)
+		m.persist(task)
+	})
 }
 
 func (m *nodeCheckManager) runSpeed(task *nodeCheckTask) {
-	sem := make(chan struct{}, task.settings.SpeedConcurrency)
-	var wg sync.WaitGroup
+	nodes := make([]Snapshot, 0, len(task.nodes))
 	for _, node := range task.nodes {
 		if task.ctx.Err() != nil {
 			break
@@ -356,45 +344,41 @@ func (m *nodeCheckManager) runSpeed(task *nodeCheckTask) {
 				continue
 			}
 		}
-		wg.Add(1)
-		go func(node Snapshot) {
-			defer wg.Done()
-			if !acquire(task.ctx, sem) {
-				return
-			}
-			defer func() { <-sem }()
-			dial, err := m.server.mgr.DialerFor(node.Tag)
-			var speed nodedetect.SpeedResult
-			if err == nil {
-				speed, err = nodedetect.MeasureSpeed(task.ctx, nodedetect.DialFunc(dial), nodedetect.SpeedOptions{URL: task.settings.SpeedURL, Duration: task.settings.SpeedDuration, RequestTimeout: task.settings.SpeedRequestTimeout, MaxBytes: task.settings.MaxDownloadBytes, PeakSampleInterval: task.settings.PeakSampleInterval}, func(progress nodedetect.SpeedProgress) {
-					task.publish(nodeCheckEvent{Type: "progress", Phase: "speed", NodeID: node.NodeID, Tag: node.Tag, Name: node.Name, Status: "running", SpeedProgress: &progress})
-				})
-			}
-			now := time.Now().UTC()
-			result := &store.NodeDetectionResult{NodeID: node.NodeID, TaskID: task.snapshot.ID, LatencyStatus: "untested", SpeedStatus: "success", SpeedCheckedAt: now, ExitIPStatus: "untested"}
-			status, errText := "success", ""
-			if speed.BytesDownloaded > 0 {
-				result.AverageBytesPerSecond, result.PeakBytesPerSecond = &speed.AverageBytesPerSecond, &speed.PeakBytesPerSecond
-				result.BytesDownloaded, result.SpeedDurationMs = speed.BytesDownloaded, speed.DurationMs
-				task.mu.Lock()
-				task.snapshot.DownloadedBytes += speed.BytesDownloaded
-				task.mu.Unlock()
-			}
-			if err != nil {
-				status, errText, result.SpeedStatus, result.SpeedError = "failed", err.Error(), "failed", err.Error()
-			}
-			_ = m.server.store.UpsertNodeDetectionResult(context.Background(), result)
-			m.server.enqueueRetag(node.NodeID)
-			task.updateStage("speed", status)
-			task.publish(nodeCheckEvent{Type: "result", Phase: "speed", NodeID: node.NodeID, Tag: node.Tag, Name: node.Name, Status: status, Error: errText, Speed: &speed, DownloadedBytes: speed.BytesDownloaded})
-			m.persist(task)
-		}(node)
+		nodes = append(nodes, node)
 	}
-	wg.Wait()
+	runLimited(task.settings.SpeedConcurrency, nodes, func(node Snapshot) {
+		if task.ctx.Err() != nil {
+			return
+		}
+		dial, err := m.server.mgr.DialerFor(node.Tag)
+		var speed nodedetect.SpeedResult
+		if err == nil {
+			speed, err = nodedetect.MeasureSpeed(task.ctx, nodedetect.DialFunc(dial), nodedetect.SpeedOptions{URL: task.settings.SpeedURL, Duration: task.settings.SpeedDuration, RequestTimeout: task.settings.SpeedRequestTimeout, MaxBytes: task.settings.MaxDownloadBytes, PeakSampleInterval: task.settings.PeakSampleInterval}, func(progress nodedetect.SpeedProgress) {
+				task.publish(nodeCheckEvent{Type: "progress", Phase: "speed", NodeID: node.NodeID, Tag: node.Tag, Name: node.Name, Status: "running", SpeedProgress: &progress})
+			})
+		}
+		now := time.Now().UTC()
+		result := &store.NodeDetectionResult{NodeID: node.NodeID, TaskID: task.snapshot.ID, LatencyStatus: "untested", SpeedStatus: "success", SpeedCheckedAt: now, ExitIPStatus: "untested"}
+		status, errText := "success", ""
+		if speed.BytesDownloaded > 0 {
+			result.AverageBytesPerSecond, result.PeakBytesPerSecond = &speed.AverageBytesPerSecond, &speed.PeakBytesPerSecond
+			result.BytesDownloaded, result.SpeedDurationMs = speed.BytesDownloaded, speed.DurationMs
+			task.mu.Lock()
+			task.snapshot.DownloadedBytes += speed.BytesDownloaded
+			task.mu.Unlock()
+		}
+		if err != nil {
+			status, errText, result.SpeedStatus, result.SpeedError = "failed", err.Error(), "failed", err.Error()
+		}
+		_ = m.server.store.UpsertNodeDetectionResult(context.Background(), result)
+		m.server.enqueueRetag(node.NodeID)
+		task.updateStage("speed", status)
+		task.publish(nodeCheckEvent{Type: "result", Phase: "speed", NodeID: node.NodeID, Tag: node.Tag, Name: node.Name, Status: status, Error: errText, Speed: &speed, DownloadedBytes: speed.BytesDownloaded})
+		m.persist(task)
+	})
 }
 
 func (m *nodeCheckManager) runQuality(task *nodeCheckTask) {
-	sem := make(chan struct{}, task.settings.QualityConcurrency)
 	outcomes := make(map[int64][]string)
 	var outcomesMu sync.Mutex
 	var locationMu sync.Mutex
@@ -422,63 +406,49 @@ func (m *nodeCheckManager) runQuality(task *nodeCheckTask) {
 		outcomes[nodeID] = append(outcomes[nodeID], status)
 		outcomesMu.Unlock()
 	}
-	var wg sync.WaitGroup
-	for _, node := range task.nodes {
-		wg.Add(1)
-		go func(node Snapshot) {
-			defer wg.Done()
-			if !acquire(task.ctx, sem) {
-				return
+	runLimited(task.settings.QualityConcurrency, task.nodes, func(node Snapshot) {
+		if task.ctx.Err() != nil {
+			return
+		}
+		dial, err := m.server.mgr.DialerFor(node.Tag)
+		var ip string
+		if err == nil {
+			ip, err = nodedetect.DiscoverExitIP(task.ctx, nodedetect.DialFunc(dial), task.settings.LandingIPURL, task.settings.QualityTimeout)
+		}
+		now := time.Now().UTC()
+		result := &store.NodeDetectionResult{NodeID: node.NodeID, TaskID: task.snapshot.ID, LatencyStatus: "untested", SpeedStatus: "untested", ExitIPStatus: "success", ExitIP: ip, ExitIPFamily: detectIPFamily(ip), ExitIPCheckedAt: now}
+		if err != nil {
+			result.ExitIPStatus, result.ExitIPError = "failed", err.Error()
+		} else {
+			if lookup := m.server.geoipLookupForCheck(); lookup != nil {
+				region := lookup.LookupIP(ip)
+				result.ExitCountry = region.Country
+				result.ExitCountryCode = strings.ToUpper(strings.TrimSpace(region.ISOCode))
 			}
-			defer func() { <-sem }()
-			dial, err := m.server.mgr.DialerFor(node.Tag)
-			var ip string
-			if err == nil {
-				ip, err = nodedetect.DiscoverExitIP(task.ctx, nodedetect.DialFunc(dial), task.settings.LandingIPURL, task.settings.QualityTimeout)
-			}
-			now := time.Now().UTC()
-			result := &store.NodeDetectionResult{NodeID: node.NodeID, TaskID: task.snapshot.ID, LatencyStatus: "untested", SpeedStatus: "untested", ExitIPStatus: "success", ExitIP: ip, ExitIPFamily: detectIPFamily(ip), ExitIPCheckedAt: now}
-			if err != nil {
-				result.ExitIPStatus, result.ExitIPError = "failed", err.Error()
-			} else {
-				if lookup := m.server.geoipLookupForCheck(); lookup != nil {
-					region := lookup.LookupIP(ip)
-					result.ExitCountry = region.Country
-					result.ExitCountryCode = strings.ToUpper(strings.TrimSpace(region.ISOCode))
-				}
-				task.mu.Lock()
-				task.landingIPs[node.NodeID] = ip
-				task.mu.Unlock()
-			}
-			if saveErr := m.server.store.UpsertNodeDetectionResult(context.Background(), result); saveErr == nil && result.ExitIPStatus == "success" {
-				markLocation(node, result.ExitCountryCode, result.ExitCountry)
-			}
-			m.server.enqueueRetag(node.NodeID)
-		}(node)
-	}
-	wg.Wait()
+			task.mu.Lock()
+			task.landingIPs[node.NodeID] = ip
+			task.mu.Unlock()
+		}
+		if saveErr := m.server.store.UpsertNodeDetectionResult(context.Background(), result); saveErr == nil && result.ExitIPStatus == "success" {
+			markLocation(node, result.ExitCountryCode, result.ExitCountry)
+		}
+		m.server.enqueueRetag(node.NodeID)
+	})
 
 	if task.settings.IPPureEnabled {
 		provider := ipquality.IPPureProvider{URL: task.settings.IPPureURL, Timeout: task.settings.QualityTimeout}
-		wg = sync.WaitGroup{}
-		for _, node := range task.nodes {
-			wg.Add(1)
-			go func(node Snapshot) {
-				defer wg.Done()
-				if !acquire(task.ctx, sem) {
-					return
-				}
-				defer func() { <-sem }()
-				dial, err := m.server.mgr.DialerFor(node.Tag)
-				quality := ipquality.Result{Provider: "ippure", Status: ipquality.StatusFailed, Reason: "dialer unavailable", CheckedAt: time.Now().UTC()}
-				if err == nil {
-					quality = provider.Check(task.ctx, nodedetect.DialFunc(dial))
-				}
-				m.saveQuality(task, node, quality)
-				recordOutcome(node.NodeID, quality.Status)
-			}(node)
-		}
-		wg.Wait()
+		runLimited(task.settings.QualityConcurrency, task.nodes, func(node Snapshot) {
+			if task.ctx.Err() != nil {
+				return
+			}
+			dial, err := m.server.mgr.DialerFor(node.Tag)
+			quality := ipquality.Result{Provider: "ippure", Status: ipquality.StatusFailed, Reason: "dialer unavailable", CheckedAt: time.Now().UTC()}
+			if err == nil {
+				quality = provider.Check(task.ctx, nodedetect.DialFunc(dial))
+			}
+			m.saveQuality(task, node, quality)
+			recordOutcome(node.NodeID, quality.Status)
+		})
 	} else {
 		for _, node := range task.nodes {
 			quality := ipquality.Result{Provider: "ippure", Status: ipquality.StatusDisabled, Reason: "provider disabled", CheckedAt: time.Now().UTC()}
@@ -565,42 +535,25 @@ func (m *nodeCheckManager) saveQuality(task *nodeCheckTask, node Snapshot, quali
 }
 
 func (m *nodeCheckManager) runUnlock(task *nodeCheckTask) {
-	sem := make(chan struct{}, task.settings.QualityConcurrency)
-	var wg sync.WaitGroup
-	for _, node := range task.nodes {
-		wg.Add(1)
-		go func(node Snapshot) {
-			defer wg.Done()
-			if !acquire(task.ctx, sem) {
-				return
-			}
-			defer func() { <-sem }()
-			dial, err := m.server.mgr.DialerFor(node.Tag)
-			var result *unlock.Result
-			if err == nil {
-				result, err = unlock.Check(task.ctx, unlock.DialFunc(dial), node.Tag, node.Name, m.server.geoipLookupForCheck(), 25*time.Second)
-			}
-			status, errText := "success", ""
-			if err != nil {
-				status, errText = "failed", err.Error()
-			} else {
-				m.server.persistUnlockResult(&node, result)
-			}
-			task.updateStage("unlock", status)
-			task.publish(nodeCheckEvent{Type: "result", Phase: "unlock", NodeID: node.NodeID, Tag: node.Tag, Name: node.Name, Status: status, Error: errText})
-			m.persist(task)
-		}(node)
-	}
-	wg.Wait()
-}
-
-func acquire(ctx context.Context, semaphore chan struct{}) bool {
-	select {
-	case semaphore <- struct{}{}:
-		return true
-	case <-ctx.Done():
-		return false
-	}
+	runLimited(task.settings.QualityConcurrency, task.nodes, func(node Snapshot) {
+		if task.ctx.Err() != nil {
+			return
+		}
+		dial, err := m.server.mgr.DialerFor(node.Tag)
+		var result *unlock.Result
+		if err == nil {
+			result, err = unlock.Check(task.ctx, unlock.DialFunc(dial), node.Tag, node.Name, m.server.geoipLookupForCheck(), 25*time.Second)
+		}
+		status, errText := "success", ""
+		if err != nil {
+			status, errText = "failed", err.Error()
+		} else {
+			m.server.persistUnlockResult(&node, result)
+		}
+		task.updateStage("unlock", status)
+		task.publish(nodeCheckEvent{Type: "result", Phase: "unlock", NodeID: node.NodeID, Tag: node.Tag, Name: node.Name, Status: status, Error: errText})
+		m.persist(task)
+	})
 }
 
 func detectIPFamily(raw string) string {

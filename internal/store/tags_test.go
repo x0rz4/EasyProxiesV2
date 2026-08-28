@@ -511,7 +511,7 @@ func TestBatchFactReadsSubset(t *testing.T) {
 	if err := db.CreateSubscription(ctx, sub); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.db.Exec(
+	if _, err := db.writerDB.Exec(
 		"INSERT INTO subscription_nodes(subscription_id,node_id,position) VALUES(?,?,?)",
 		sub.ID, second.ID, 0); err != nil {
 		t.Fatal(err)
