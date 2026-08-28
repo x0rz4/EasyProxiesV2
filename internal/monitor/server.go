@@ -369,17 +369,13 @@ func (s *Server) closeGeoipLookup() {
 }
 
 // SetStore sets the data store for session persistence and other operations.
+// The node-check manager is process-local state and must survive repeated
+// bindings; startup orphan repair is owned by app.Run before runtimes start.
 func (s *Server) SetStore(st store.Store) {
 	if s != nil {
 		s.store = st
-		s.nodeChecks = newNodeCheckManager(s)
-		if st != nil {
-			if err := st.InterruptRunningNodeDetectionTasks(context.Background()); err != nil && s.logger != nil {
-				s.logger.Printf("[node-check] interrupt stale tasks: %v", err)
-			}
-			if err := st.PruneNodeDetectionTasks(context.Background(), 20); err != nil && s.logger != nil {
-				s.logger.Printf("[node-check] prune task history: %v", err)
-			}
+		if s.nodeChecks == nil {
+			s.nodeChecks = newNodeCheckManager(s)
 		}
 	}
 }

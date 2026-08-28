@@ -7,6 +7,60 @@ import (
 	"time"
 )
 
+func TestInterruptRunningNodeDetectionTasksPreservesProgress(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "interrupt-tasks.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	createdAt := time.Now().UTC().Add(-time.Hour)
+	startedAt := createdAt.Add(time.Minute)
+	statuses := []string{"pending", "running", "completed", "failed", "cancelled"}
+	for _, status := range statuses {
+		task := &NodeDetectionTask{
+			ID: status, Status: status, StagesJSON: `{"latency":true}`, SettingsJSON: `{"latency_concurrency":2}`,
+			StatsJSON:  `{"latency":{"total":10,"completed":4,"success":3,"failed":1,"skipped":0}}`,
+			TotalNodes: 10, CompletedNodes: 4, DownloadedBytes: 12345, Error: "original error",
+			CreatedAt: createdAt, StartedAt: startedAt,
+		}
+		if err := db.UpsertNodeDetectionTask(ctx, task); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := db.InterruptRunningNodeDetectionTasks(ctx); err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := db.ListNodeDetectionTasks(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := make(map[string]NodeDetectionTask, len(tasks))
+	for _, task := range tasks {
+		byID[task.ID] = task
+	}
+	for _, id := range []string{"pending", "running"} {
+		task := byID[id]
+		if task.Status != "interrupted" || task.Error != "服务重启，检测任务已中断" {
+			t.Fatalf("task %q was not interrupted correctly: %+v", id, task)
+		}
+		if task.FinishedAt.IsZero() || time.Since(task.FinishedAt) > 5*time.Second {
+			t.Fatalf("task %q finished_at = %v, want restart time", id, task.FinishedAt)
+		}
+		if task.TotalNodes != 10 || task.CompletedNodes != 4 || task.DownloadedBytes != 12345 || task.StatsJSON == "" {
+			t.Fatalf("task %q progress changed: %+v", id, task)
+		}
+	}
+	for _, id := range []string{"completed", "failed", "cancelled"} {
+		task := byID[id]
+		if task.Status != id || task.Error != "original error" || !task.FinishedAt.IsZero() {
+			t.Fatalf("terminal task %q changed: %+v", id, task)
+		}
+	}
+}
+
 func TestNodeDetectionNullableRoundTripAndTaskPruning(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(filepath.Join(t.TempDir(), "diagnostics.db"))

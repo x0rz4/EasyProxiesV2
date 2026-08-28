@@ -37,6 +37,71 @@ func TestNodeCheckSettingsAPIRejectsEnabledIPPureWithoutURL(t *testing.T) {
 	}
 }
 
+func TestSetStoreKeepsNodeCheckManagerAndDoesNotInterruptLiveTasks(t *testing.T) {
+	server, _, _ := newOperationsTestServer(t)
+	db, err := store.Open(filepath.Join(t.TempDir(), "set-store.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.UpsertNodeDetectionTask(context.Background(), &store.NodeDetectionTask{
+		ID: "live", Status: nodeCheckTaskRunning, StagesJSON: `{}`, SettingsJSON: `{}`, StatsJSON: `{}`, CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	server.SetStore(db)
+	manager := server.nodeChecks
+	server.SetStore(db)
+	if server.nodeChecks != manager {
+		t.Fatal("repeated SetStore replaced the node check manager")
+	}
+	tasks, err := db.ListNodeDetectionTasks(context.Background(), 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 || tasks[0].Status != nodeCheckTaskRunning {
+		t.Fatalf("SetStore interrupted a live task: %+v", tasks)
+	}
+}
+
+func TestNodeCheckTasksAPIReturnsInterruptedTask(t *testing.T) {
+	server, _, _ := newOperationsTestServer(t)
+	db, err := store.Open(filepath.Join(t.TempDir(), "interrupted-api.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.UpsertNodeDetectionTask(context.Background(), &store.NodeDetectionTask{
+		ID: "orphan", Status: nodeCheckTaskRunning, StagesJSON: `{"latency":true}`, SettingsJSON: `{}`, StatsJSON: `{}`,
+		TotalNodes: 10, CompletedNodes: 4, CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InterruptRunningNodeDetectionTasks(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	server.SetStore(db)
+
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/node-check/tasks", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("GET status=%d body=%s", response.Code, response.Body.String())
+	}
+	var body struct {
+		Tasks []nodeCheckTaskSnapshot `json:"tasks"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Tasks) != 1 || body.Tasks[0].Status != nodeCheckTaskInterrupted || body.Tasks[0].Error != "服务重启，检测任务已中断" {
+		t.Fatalf("tasks response = %+v", body.Tasks)
+	}
+	if !nodeCheckTerminal(body.Tasks[0].Status) {
+		t.Fatalf("interrupted task is not terminal: %+v", body.Tasks[0])
+	}
+}
+
 func TestNodeCheckLatencyDoesNotMutateHealth(t *testing.T) {
 	server, mgr, _ := newOperationsTestServer(t)
 	db, err := store.Open(filepath.Join(t.TempDir(), "node-check.db"))

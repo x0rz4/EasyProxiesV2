@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
+	"path/filepath"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -14,6 +16,31 @@ import (
 	"easy_proxies/internal/runtimetag"
 	"easy_proxies/internal/store"
 )
+
+func TestEnsureMonitorBindsStoreBeforeListen(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "monitor-startup.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	port := reserveTCPPorts(t, 1)[0]
+	manager := New(&config.Config{}, monitor.Config{Enabled: true, Listen: fmt.Sprintf("127.0.0.1:%d", port)}, WithStore(db))
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if err := manager.ensureMonitor(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+
+	response, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/api/node-check/tasks", port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("node-check API status = %d, want initialized before listen", response.StatusCode)
+	}
+}
 
 func TestRuntimeConfigEqual(t *testing.T) {
 	a := &config.Config{Nodes: []config.NodeConfig{{Name: "a", URI: "http://a.example:80"}}}

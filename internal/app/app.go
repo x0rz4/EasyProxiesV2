@@ -71,6 +71,12 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("open database: %w", err)
 	}
 	defer dataStore.Close()
+	if err := dataStore.InterruptRunningNodeDetectionTasks(ctx); err != nil {
+		return fmt.Errorf("interrupt stale node detection tasks: %w", err)
+	}
+	if err := dataStore.PruneNodeDetectionTasks(ctx, 20); err != nil {
+		log.Printf("⚠️ Failed to prune node detection task history: %v", err)
+	}
 
 	// ── 3. Load nodes from Store into config (if any exist) ──
 	if err := loadNodesFromStore(ctx, cfg, dataStore); err != nil {
@@ -123,12 +129,6 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("start box manager: %w", err)
 	}
 	defer boxMgr.Close()
-
-	// Wire up config and store to monitor server for settings API
-	if server := boxMgr.MonitorServer(); server != nil {
-		server.SetConfig(cfg)
-		server.SetStore(dataStore)
-	}
 
 	// ── 5b. Automatic node tagging ──
 	// The queue is what keeps a detection from writing tags inline: detections

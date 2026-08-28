@@ -1787,7 +1787,7 @@ func (s *sqliteStore) ListNodeDetectionTasks(ctx context.Context, limit int) ([]
 
 func (s *sqliteStore) InterruptRunningNodeDetectionTasks(ctx context.Context) error {
 	now := formatTime(time.Now().UTC())
-	_, err := s.writeConn().ExecContext(ctx, `UPDATE node_detection_tasks SET status='interrupted',error='application restarted',finished_at=?,updated_at=? WHERE status IN ('pending','running')`, now, now)
+	_, err := s.writeConn().ExecContext(ctx, `UPDATE node_detection_tasks SET status='interrupted',error='服务重启，检测任务已中断',finished_at=?,updated_at=? WHERE status IN ('pending','running')`, now, now)
 	return err
 }
 

@@ -1,10 +1,10 @@
-import { useDeferredValue, useMemo, useState } from 'react'
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import type { ConfigNodeConfig, ConfigNodePayload, NodeSnapshot } from '../types'
 import {
   fetchConfigNodes, createConfigNode, updateConfigNode, deleteConfigNode,
   toggleConfigNode, batchToggleConfigNodes, batchDeleteConfigNodes, triggerReload,
   importNodes, exportProxies,
-  fetchNodes, probeNode, releaseNode, listSubscriptions,
+  fetchNodes, fetchProbeStatus, probeNode, releaseNode, listSubscriptions,
 } from '../api/client'
 import type { ImportNodesResult } from '../api/client'
 import { regionFlag } from '../utils/region'
@@ -39,6 +39,9 @@ interface MergedNode extends ConfigNodeConfig {
 type ManageSortKey = 'name' | 'status' | 'latency' | 'region' | 'port' | 'source'
 type SortDir = 'asc' | 'desc'
 type StatusFilter = '' | 'normal' | 'unavailable' | 'blacklisted' | 'pending' | 'disabled'
+
+const activeProbeRefreshInterval = 1000
+const pendingProbeRefreshInterval = 5000
 
 function statusOrder(s: MergedNode['runtimeStatus']): number {
   switch (s) {
@@ -113,6 +116,20 @@ function typeLabel(t: string): string {
   }
 }
 
+function hasPendingRuntimeNodes(configNodes: ConfigNodeConfig[], snapshots: NodeSnapshot[]): boolean {
+  const enabledNodes = configNodes.filter((node) => !node.disabled)
+  if (enabledNodes.length === 0) {
+    return snapshots.some((snapshot) => !snapshot.initial_check_done)
+  }
+
+  const snapshotsByURI = new Map(snapshots.filter((snapshot) => snapshot.uri).map((snapshot) => [snapshot.uri, snapshot]))
+  const snapshotsByName = new Map(snapshots.map((snapshot) => [snapshot.name, snapshot]))
+  return enabledNodes.some((node) => {
+    const snapshot = snapshotsByURI.get(node.uri) || snapshotsByName.get(node.name)
+    return !snapshot?.initial_check_done
+  })
+}
+
 function SortIcon({ active, dir }: { active: boolean; dir: SortDir }) {
   if (!active) {
     return <ArrowUpDown className="h-3 w-3 opacity-30 ml-0.5 inline" />
@@ -152,9 +169,33 @@ const emptyPayload: ConfigNodePayload = {
 export default function ManagePanel() {
   const queryClient = useQueryClient()
 
+  const { data: probeStatus } = useQuery({
+    queryKey: ['probeStatus'],
+    queryFn: fetchProbeStatus,
+    refetchInterval: (query) => query.state.data?.round.in_flight
+      ? activeProbeRefreshInterval
+      : pendingProbeRefreshInterval,
+  })
+  const probeInFlight = Boolean(probeStatus?.round.in_flight)
   const { data: configRes, isLoading: configLoading } = useQuery({ queryKey: ['configNodes'], queryFn: () => fetchConfigNodes() })
-  const { data: monitorRes, isLoading: monitorLoading } = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes().catch(() => null) })
+  const { data: monitorRes, isLoading: monitorLoading } = useQuery({
+    queryKey: ['nodes'],
+    queryFn: () => fetchNodes().catch(() => null),
+    refetchInterval: (query) => {
+      if (probeInFlight) return activeProbeRefreshInterval
+      const hasPendingNodes = hasPendingRuntimeNodes(configRes?.nodes || [], query.state.data?.nodes || [])
+      return hasPendingNodes ? pendingProbeRefreshInterval : false
+    },
+  })
   const { data: subRes, isLoading: subLoading } = useQuery({ queryKey: ['subscriptions'], queryFn: listSubscriptions })
+
+  const previousProbeInFlight = useRef(false)
+  useEffect(() => {
+    if (previousProbeInFlight.current && !probeInFlight) {
+      void queryClient.invalidateQueries({ queryKey: ['nodes'] })
+    }
+    previousProbeInFlight.current = probeInFlight
+  }, [probeInFlight, queryClient])
 
   const configNodes = useMemo(() => configRes?.nodes || [], [configRes?.nodes])
   const monitorData = monitorRes

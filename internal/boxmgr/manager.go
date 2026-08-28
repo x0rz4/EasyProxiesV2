@@ -1736,6 +1736,8 @@ func (m *Manager) ensureMonitor(ctx context.Context) error {
 	if m.monitorCfg.Enabled {
 		if m.monitorServer == nil {
 			serverToStart = monitor.NewServer(m.monitorCfg, monitorMgr, log.Default())
+			serverToStart.SetConfig(m.cfg)
+			serverToStart.SetStore(m.store)
 			m.monitorServer = serverToStart
 		}
 		// Set NodeManager for config CRUD endpoints
