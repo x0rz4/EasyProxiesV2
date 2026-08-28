@@ -114,23 +114,22 @@ func TestNodeMutationsRequestAFullRecompute(t *testing.T) {
 	for _, mutation := range []struct {
 		name    string
 		request *http.Request
-		handler func(http.ResponseWriter, *http.Request)
 	}{
 		{"create", httptest.NewRequest(http.MethodPost, "/api/nodes/config",
-			strings.NewReader(payload)), server.handleConfigNodes},
+			strings.NewReader(payload))},
 		{"update", httptest.NewRequest(http.MethodPut, "/api/nodes/config/node-a",
-			strings.NewReader(payload)), server.handleConfigNodeItem},
+			strings.NewReader(payload))},
 		{"toggle", httptest.NewRequest(http.MethodPatch, "/api/nodes/config/node-a",
-			strings.NewReader(`{"enabled":false}`)), server.handleConfigNodeItem},
+			strings.NewReader(`{"enabled":false}`))},
 		{"delete", httptest.NewRequest(http.MethodDelete, "/api/nodes/config/node-a",
-			nil), server.handleConfigNodeItem},
+			nil)},
 		{"batch-toggle", httptest.NewRequest(http.MethodPost, "/api/nodes/config/batch-toggle",
-			strings.NewReader(`{"names":["node-a"],"enabled":true}`)), server.handleConfigNodesBatchToggle},
+			strings.NewReader(`{"names":["node-a"],"enabled":true}`))},
 		{"batch-delete", httptest.NewRequest(http.MethodPost, "/api/nodes/config/batch-delete",
-			strings.NewReader(`{"names":["node-a"]}`)), server.handleConfigNodesBatchDelete},
+			strings.NewReader(`{"names":["node-a"]}`))},
 	} {
 		before := queue.all
-		mutation.handler(httptest.NewRecorder(), mutation.request)
+		server.routes().ServeHTTP(httptest.NewRecorder(), mutation.request)
 		if queue.all != before+1 {
 			t.Fatalf("%s did not request a recompute", mutation.name)
 		}

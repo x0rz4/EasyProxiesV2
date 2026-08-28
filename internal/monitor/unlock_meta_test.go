@@ -12,7 +12,7 @@ import (
 func TestHandleUnlockMetaListsModularProviders(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/api/nodes/unlock-meta", nil)
 	response := httptest.NewRecorder()
-	new(Server).handleUnlockMeta(response, request)
+	new(Server).routes().ServeHTTP(response, request)
 	if response.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
@@ -42,7 +42,7 @@ func TestHandleUnlockMetaListsModularProviders(t *testing.T) {
 func TestHandleUnlockMetaRejectsNonGET(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/api/nodes/unlock-meta", nil)
 	response := httptest.NewRecorder()
-	new(Server).handleUnlockMeta(response, request)
+	new(Server).routes().ServeHTTP(response, request)
 	if response.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status=%d", response.Code)
 	}

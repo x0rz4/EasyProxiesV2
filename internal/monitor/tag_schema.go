@@ -70,10 +70,6 @@ type tagSchemaResponse struct {
 }
 
 func (s *Server) handleTagSchema(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeAPIError(w, http.StatusMethodNotAllowed, "请求方法不允许")
-		return
-	}
 	registry := NewTagFactRegistry()
 	limits := nodefacts.DefaultLimits()
 	if s.tagSvc != nil {

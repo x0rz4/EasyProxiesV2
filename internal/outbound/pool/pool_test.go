@@ -15,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"easy_proxies/internal/group"
@@ -531,23 +532,54 @@ func TestLockFreeSelectionModesAndNetworkCandidates(t *testing.T) {
 }
 
 func TestBlacklistExpiryRepublishesCandidate(t *testing.T) {
-	state := acquireSharedState("expiry")
-	member := &memberState{tag: "expiry", outbound: &fakeOutbound{}, shared: state}
-	p := &poolOutbound{logger: boxlog.NewNOPFactory().Logger(), mode: modeSequential,
-		options: Options{FailureThreshold: 1, BlacklistDuration: 20 * time.Millisecond}}
-	storeTestSnapshot(p, member)
-	p.recordFailure(member, errors.New("down"), "test")
-	if got := len(p.current.Load().Members); got != 0 {
-		t.Fatalf("blacklisted snapshot has %d candidates", got)
-	}
-	deadline := time.Now().Add(time.Second)
-	for len(p.current.Load().Members) == 0 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
-	if got := len(p.current.Load().Members); got != 1 {
-		t.Fatalf("expired blacklist snapshot has %d candidates", got)
-	}
-	_ = p.Close()
+	synctest.Test(t, func(t *testing.T) {
+		state := acquireSharedState("expiry")
+		member := &memberState{tag: "expiry", outbound: &fakeOutbound{}, shared: state}
+		p := &poolOutbound{logger: boxlog.NewNOPFactory().Logger(), mode: modeSequential,
+			options: Options{FailureThreshold: 1, BlacklistDuration: 20 * time.Millisecond}}
+		initial := storeTestSnapshot(p, member)
+		p.recordFailure(member, errors.New("down"), "test")
+		if got := len(p.current.Load().Members); got != 0 {
+			t.Fatalf("blacklisted snapshot has %d candidates", got)
+		}
+		time.Sleep(20 * time.Millisecond)
+		synctest.Wait()
+		if got := len(p.current.Load().Members); got != 0 {
+			t.Fatalf("candidate returned before guarded expiry: %d", got)
+		}
+		time.Sleep(time.Millisecond)
+		synctest.Wait()
+		expired := p.current.Load()
+		if got := len(expired.Members); got != 1 {
+			t.Fatalf("expired blacklist snapshot has %d candidates", got)
+		}
+		if expired.Version != initial.Version+2 {
+			t.Fatalf("snapshot version = %d, want %d", expired.Version, initial.Version+2)
+		}
+		_ = p.Close()
+	})
+}
+
+func TestHealthSuccessCoalescesCandidateRebuild(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		member := &memberState{tag: "healthy", outbound: &fakeOutbound{}, shared: acquireSharedState("healthy")}
+		p := &poolOutbound{logger: boxlog.NewNOPFactory().Logger(), mode: modeLowestLatency}
+		initial := storeTestSnapshot(p, member)
+
+		p.handleHealthResult(monitor.HealthResultEvent{Tag: member.tag, Success: true, Latency: 20 * time.Millisecond})
+		p.handleHealthResult(monitor.HealthResultEvent{Tag: member.tag, Success: true, Latency: 10 * time.Millisecond})
+		time.Sleep(99 * time.Millisecond)
+		synctest.Wait()
+		if version := p.current.Load().Version; version != initial.Version {
+			t.Fatalf("snapshot published before coalescing window: %d", version)
+		}
+		time.Sleep(time.Millisecond)
+		synctest.Wait()
+		if version := p.current.Load().Version; version != initial.Version+1 {
+			t.Fatalf("coalesced snapshot version = %d, want %d", version, initial.Version+1)
+		}
+		_ = p.Close()
+	})
 }
 
 func TestDialContextKeepsLoadedSnapshotAcrossRetry(t *testing.T) {

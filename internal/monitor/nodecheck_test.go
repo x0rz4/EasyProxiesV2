@@ -19,7 +19,7 @@ import (
 func TestNodeCheckSettingsAPIRejectsEnabledIPPureWithoutURL(t *testing.T) {
 	server, _, _ := newOperationsTestServer(t)
 	get := httptest.NewRecorder()
-	server.handleNodeCheckSettings(get, httptest.NewRequest(http.MethodGet, "/api/operations/node-check-settings", nil))
+	server.routes().ServeHTTP(get, httptest.NewRequest(http.MethodGet, "/api/operations/node-check-settings", nil))
 	if get.Code != http.StatusOK {
 		t.Fatalf("GET status=%d body=%s", get.Code, get.Body.String())
 	}
@@ -31,7 +31,7 @@ func TestNodeCheckSettingsAPIRejectsEnabledIPPureWithoutURL(t *testing.T) {
 	settings.IPPureURL = ""
 	body, _ := json.Marshal(settings)
 	put := httptest.NewRecorder()
-	server.handleNodeCheckSettings(put, httptest.NewRequest(http.MethodPut, "/api/operations/node-check-settings", strings.NewReader(string(body))))
+	server.routes().ServeHTTP(put, httptest.NewRequest(http.MethodPut, "/api/operations/node-check-settings", strings.NewReader(string(body))))
 	if put.Code != http.StatusBadRequest {
 		t.Fatalf("PUT status=%d body=%s", put.Code, put.Body.String())
 	}

@@ -33,14 +33,14 @@ func TestGroupSubscriptionEntryAndToken(t *testing.T) {
 	server := &Server{store: db, cfgSrc: &config.Config{ExternalIP: "203.0.113.10"}}
 
 	unauthorized := httptest.NewRecorder()
-	server.handleGroupSubscription(unauthorized, httptest.NewRequest(http.MethodGet, "/sub/"+strconv.FormatInt(groupPool.ID, 10)+"?format=clash", nil))
+	server.routes().ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "/sub/"+strconv.FormatInt(groupPool.ID, 10)+"?format=clash", nil))
 	if unauthorized.Code != http.StatusUnauthorized {
 		t.Fatalf("status=%d", unauthorized.Code)
 	}
 
 	request := httptest.NewRequest(http.MethodGet, "/sub/"+strconv.FormatInt(groupPool.ID, 10)+"?token=secret-token&format=clash&mode=entry", nil)
 	response := httptest.NewRecorder()
-	server.handleGroupSubscription(response, request)
+	server.routes().ServeHTTP(response, request)
 	if response.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
@@ -52,7 +52,7 @@ func TestGroupSubscriptionEntryAndToken(t *testing.T) {
 	}
 
 	reset := httptest.NewRecorder()
-	server.handleGroupItem(reset, httptest.NewRequest(http.MethodPost,
+	server.routes().ServeHTTP(reset, httptest.NewRequest(http.MethodPost,
 		"/api/groups/"+strconv.FormatInt(groupPool.ID, 10)+"/subscription/reset-token", nil))
 	if reset.Code != http.StatusOK {
 		t.Fatalf("reset status=%d body=%s", reset.Code, reset.Body.String())
@@ -64,13 +64,13 @@ func TestGroupSubscriptionEntryAndToken(t *testing.T) {
 		t.Fatalf("reset token=%q err=%v", resetBody.Token, err)
 	}
 	oldToken := httptest.NewRecorder()
-	server.handleGroupSubscription(oldToken, httptest.NewRequest(http.MethodGet,
+	server.routes().ServeHTTP(oldToken, httptest.NewRequest(http.MethodGet,
 		"/sub/"+strconv.FormatInt(groupPool.ID, 10)+"?token=secret-token&format=clash", nil))
 	if oldToken.Code != http.StatusUnauthorized {
 		t.Fatalf("old token remained valid: %d", oldToken.Code)
 	}
 	newToken := httptest.NewRecorder()
-	server.handleGroupSubscription(newToken, httptest.NewRequest(http.MethodGet,
+	server.routes().ServeHTTP(newToken, httptest.NewRequest(http.MethodGet,
 		"/sub/"+strconv.FormatInt(groupPool.ID, 10)+"?token="+resetBody.Token+"&format=clash", nil))
 	if newToken.Code != http.StatusOK {
 		t.Fatalf("new token status=%d body=%s", newToken.Code, newToken.Body.String())
@@ -100,7 +100,7 @@ func TestGroupMembersSubscriptionFiltersEvicted(t *testing.T) {
 	server := &Server{store: db}
 	path := "/sub/" + strconv.FormatInt(groupPool.ID, 10) + "?token=members-token&format=uri&mode=members"
 	response := httptest.NewRecorder()
-	server.handleGroupSubscription(response, httptest.NewRequest(http.MethodGet, path, nil))
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), node.URI) {
 		t.Fatalf("unexpected response: %d %s", response.Code, response.Body.String())
 	}
@@ -110,7 +110,7 @@ func TestGroupMembersSubscriptionFiltersEvicted(t *testing.T) {
 		group.RecordFailure(groupPool.ID, "node-tag", errors.New("down"), now.Add(time.Duration(i)*time.Second))
 	}
 	response = httptest.NewRecorder()
-	server.handleGroupSubscription(response, httptest.NewRequest(http.MethodGet, path, nil))
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
 	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("evicted node leaked, status=%d body=%s", response.Code, response.Body.String())
 	}

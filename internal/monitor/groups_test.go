@@ -191,7 +191,7 @@ func TestUpdateGroupAPIReportsRemovedUnavailableNodes(t *testing.T) {
 	server := &Server{store: db, mgr: mgr, nodeMgr: &reloadNodeManager{}}
 	request := httptest.NewRequest(http.MethodPut, "/api/groups/"+strconv.FormatInt(groupPool.ID, 10), bytes.NewReader(body))
 	response := httptest.NewRecorder()
-	server.handleGroupItem(response, request)
+	server.routes().ServeHTTP(response, request)
 	if response.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
@@ -238,7 +238,7 @@ func TestUpdateGroupPersistsAutoExcludedEvictedNode(t *testing.T) {
 	runtimeManager := &isolatedGroupRuntimeManager{}
 	server := &Server{store: db, nodeMgr: runtimeManager}
 	response := httptest.NewRecorder()
-	server.handleGroupItem(response, httptest.NewRequest(http.MethodPut,
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPut,
 		"/api/groups/"+strconv.FormatInt(groupPool.ID, 10), bytes.NewReader(body)))
 	if response.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
@@ -268,7 +268,7 @@ func TestProbeFailureReturnsErrorStatus(t *testing.T) {
 	handle.SetProbe(func(context.Context) (time.Duration, error) { return 0, errors.New("dial failed") })
 	server := &Server{mgr: mgr}
 	response := httptest.NewRecorder()
-	server.handleNodeAction(response, httptest.NewRequest(http.MethodPost, "/api/nodes/broken/probe", nil))
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/nodes/broken/probe", nil))
 	if response.Code != http.StatusBadGateway {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
@@ -302,7 +302,7 @@ func TestConcurrentGroupAutoPortAllocationIsUnique(t *testing.T) {
 				Protocol: "mixed", DispatchMode: "fixed", FailureWindowSeconds: 300,
 				FailureThreshold: 3, HealthCheckSeconds: 60})
 			response := httptest.NewRecorder()
-			server.handleGroups(response, httptest.NewRequest(http.MethodPost, "/api/groups", bytes.NewReader(body)))
+			server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/groups", bytes.NewReader(body)))
 			responses <- response
 		}(name)
 	}
@@ -343,7 +343,7 @@ func TestRemoveRunningMemberPersistsGroupExclusion(t *testing.T) {
 	nodeManager := &reloadNodeManager{}
 	server := &Server{store: db, nodeMgr: nodeManager}
 	response := httptest.NewRecorder()
-	server.handleGroupItem(response, httptest.NewRequest(http.MethodDelete,
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodDelete,
 		"/api/groups/"+strconv.FormatInt(groupPool.ID, 10)+"/members/"+strconv.FormatInt(node.ID, 10), nil))
 	if response.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
@@ -377,7 +377,7 @@ func TestUnexcludeGroupMemberRebuildsRuntime(t *testing.T) {
 	runtimeManager := &isolatedGroupRuntimeManager{}
 	server := &Server{store: db, nodeMgr: runtimeManager}
 	response := httptest.NewRecorder()
-	server.handleGroupItem(response, httptest.NewRequest(http.MethodDelete,
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodDelete,
 		"/api/groups/"+strconv.FormatInt(groupPool.ID, 10)+"/exclusions/"+strconv.FormatInt(node.ID, 10), nil))
 	if response.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
@@ -408,7 +408,7 @@ func TestUnexcludeGroupMemberRuntimeFailureRollsBack(t *testing.T) {
 	runtimeManager := &isolatedGroupRuntimeManager{applyErr: errors.New("group start failed")}
 	server := &Server{store: db, nodeMgr: runtimeManager}
 	response := httptest.NewRecorder()
-	server.handleGroupItem(response, httptest.NewRequest(http.MethodDelete,
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodDelete,
 		"/api/groups/"+strconv.FormatInt(groupPool.ID, 10)+"/exclusions/"+strconv.FormatInt(node.ID, 10), nil))
 	if response.Code != http.StatusConflict {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
@@ -473,7 +473,7 @@ func TestConcurrentGroupExclusionMutationsAreSerialized(t *testing.T) {
 		go func(nodeID int64) {
 			defer wg.Done()
 			response := httptest.NewRecorder()
-			server.handleGroupItem(response, httptest.NewRequest(http.MethodDelete,
+			server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodDelete,
 				"/api/groups/"+strconv.FormatInt(groupPool.ID, 10)+"/exclusions/"+strconv.FormatInt(nodeID, 10), nil))
 			responses <- response
 		}(nodeID)
@@ -512,7 +512,7 @@ func TestActivateRunningMemberUsesRuntimeHandler(t *testing.T) {
 	defer unregister()
 	server := &Server{store: db}
 	response := httptest.NewRecorder()
-	server.handleGroupItem(response, httptest.NewRequest(http.MethodPost, "/api/groups/"+strconv.FormatInt(groupPool.ID, 10)+"/members/9/activate", nil))
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/groups/"+strconv.FormatInt(groupPool.ID, 10)+"/members/9/activate", nil))
 	if response.Code != http.StatusOK || activated != 9 {
 		t.Fatalf("status=%d activated=%d body=%s", response.Code, activated, response.Body.String())
 	}
@@ -554,7 +554,7 @@ func TestUpdateGroupUsesIsolatedRuntimeWithoutGlobalReload(t *testing.T) {
 	body, _ := json.Marshal(groupPoolInput{Name: "after", BindAddress: "127.0.0.1", BindPort: groupPool.BindPort,
 		Protocol: "mixed", DispatchMode: "fixed", FailureWindowSeconds: 300, FailureThreshold: 3, HealthCheckSeconds: 60})
 	response := httptest.NewRecorder()
-	server.handleGroupItem(response, httptest.NewRequest(http.MethodPut,
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPut,
 		"/api/groups/"+strconv.FormatInt(groupPool.ID, 10), bytes.NewReader(body)))
 	if response.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
@@ -581,7 +581,7 @@ func TestUpdateGroupRuntimeFailureRollsBackDatabase(t *testing.T) {
 	body, _ := json.Marshal(groupPoolInput{Name: "after", BindAddress: "127.0.0.1", BindPort: groupPool.BindPort,
 		Protocol: "mixed", DispatchMode: "random", FailureWindowSeconds: 300, FailureThreshold: 3, HealthCheckSeconds: 60})
 	response := httptest.NewRecorder()
-	server.handleGroupItem(response, httptest.NewRequest(http.MethodPut,
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPut,
 		"/api/groups/"+strconv.FormatInt(groupPool.ID, 10), bytes.NewReader(body)))
 	if response.Code != http.StatusConflict {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())

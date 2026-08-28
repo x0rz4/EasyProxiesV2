@@ -37,7 +37,7 @@ func TestNodeCRUDTriggersReloadAndReportsResult(t *testing.T) {
 
 	createReq := httptest.NewRequest(http.MethodPost, "/api/nodes/config", strings.NewReader(payload))
 	createResp := httptest.NewRecorder()
-	server.handleConfigNodes(createResp, createReq)
+	server.routes().ServeHTTP(createResp, createReq)
 	assertReloadResponse(t, createResp)
 	if nodeManager.reloads.Load() != 1 {
 		t.Fatalf("reloads after create = %d", nodeManager.reloads.Load())
@@ -45,7 +45,7 @@ func TestNodeCRUDTriggersReloadAndReportsResult(t *testing.T) {
 
 	updateReq := httptest.NewRequest(http.MethodPut, "/api/nodes/config/node-a", strings.NewReader(payload))
 	updateResp := httptest.NewRecorder()
-	server.handleConfigNodeItem(updateResp, updateReq)
+	server.routes().ServeHTTP(updateResp, updateReq)
 	assertReloadResponse(t, updateResp)
 	if nodeManager.reloads.Load() != 2 {
 		t.Fatalf("reloads after update = %d", nodeManager.reloads.Load())
@@ -53,7 +53,7 @@ func TestNodeCRUDTriggersReloadAndReportsResult(t *testing.T) {
 
 	deleteReq := httptest.NewRequest(http.MethodDelete, "/api/nodes/config/node-a", nil)
 	deleteResp := httptest.NewRecorder()
-	server.handleConfigNodeItem(deleteResp, deleteReq)
+	server.routes().ServeHTTP(deleteResp, deleteReq)
 	assertReloadResponse(t, deleteResp)
 	if nodeManager.reloads.Load() != 3 {
 		t.Fatalf("reloads after delete = %d", nodeManager.reloads.Load())

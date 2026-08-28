@@ -59,7 +59,7 @@ func TestProbeSettingsAPIHotAppliesAndPersists(t *testing.T) {
         "routine_probe_retries":2
     }`
 	response := httptest.NewRecorder()
-	server.handleProbeSettings(response, httptest.NewRequest(http.MethodPut, "/api/operations/probe-settings", strings.NewReader(body)))
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/api/operations/probe-settings", strings.NewReader(body)))
 	if response.Code != http.StatusOK {
 		t.Fatalf("PUT status=%d body=%s", response.Code, response.Body.String())
 	}
@@ -80,7 +80,7 @@ func TestProbeSettingsAPIHotAppliesAndPersists(t *testing.T) {
 	}
 
 	getResponse := httptest.NewRecorder()
-	server.handleProbeSettings(getResponse, httptest.NewRequest(http.MethodGet, "/api/operations/probe-settings", nil))
+	server.routes().ServeHTTP(getResponse, httptest.NewRequest(http.MethodGet, "/api/operations/probe-settings", nil))
 	if getResponse.Code != http.StatusOK || !strings.Contains(getResponse.Body.String(), `"probe_concurrency":64`) {
 		t.Fatalf("GET status=%d body=%s", getResponse.Code, getResponse.Body.String())
 	}
@@ -94,7 +94,7 @@ func TestProbeSettingsAPIRejectsInvalidPolicyWithoutSaving(t *testing.T) {
 	}
 	invalid := `{"probe_target":"http://example.com","health_check_interval":"1h","probe_concurrency":513,"startup_probe_timeout":"5s","routine_probe_timeout":"10s","probe_dial_timeout":"3s","probe_response_timeout":"2s","routine_probe_retries":1}`
 	response := httptest.NewRecorder()
-	server.handleProbeSettings(response, httptest.NewRequest(http.MethodPut, "/api/operations/probe-settings", strings.NewReader(invalid)))
+	server.routes().ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/api/operations/probe-settings", strings.NewReader(invalid)))
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}

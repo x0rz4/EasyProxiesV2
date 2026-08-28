@@ -47,21 +47,21 @@ type mutexGroupInput struct {
 	Description *string `json:"description"`
 }
 
-func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleTags(w http.ResponseWriter, r *http.Request, action string) {
 	limitTagRequestBody(w, r)
 	if s.store == nil {
 		writeAPIError(w, http.StatusServiceUnavailable, "数据存储不可用")
 		return
 	}
-	switch r.Method {
-	case http.MethodGet:
+	switch action {
+	case "list":
 		tags, groups, err := s.tagViews(r.Context())
 		if err != nil {
 			writeAPIError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		writeJSON(w, map[string]any{"tags": tags, "mutex_groups": groups})
-	case http.MethodPost:
+	case "create":
 		var input tagInput
 		if err := decodeTagJSON(w, r, &input); err != nil {
 			writeAPIError(w, http.StatusBadRequest, err.Error())
@@ -91,71 +91,53 @@ func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleTagItem dispatches literal tag subresources before trying a numeric
-// tag ID. In particular, schema and nodes must never be parsed as tag IDs.
-func (s *Server) handleTagItem(w http.ResponseWriter, r *http.Request) {
+// handleTagItem receives an action selected by the method-aware ServeMux
+// registration. Literal resources therefore never compete with numeric IDs.
+func (s *Server) handleTagItem(w http.ResponseWriter, r *http.Request, action string) {
 	limitTagRequestBody(w, r)
-	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/tags/"), "/")
-	if path == "" {
-		writeAPIError(w, http.StatusNotFound, "接口不存在")
+	switch action {
+	case "schema":
+		s.handleTagSchema(w, r)
+		return
+	case "preview":
+		s.handleTagPreview(w, r)
+		return
+	case "recompute":
+		s.handleTagRecompute(w, r)
+		return
+	case "templates":
+		s.handleTagTemplates(w, r)
+		return
+	case "assignments":
+		s.handleTagAssignments(w, r)
+		return
+	case "nodes-batch":
+		s.handleTagNodes(w, r, "batch")
+		return
+	case "node":
+		s.handleTagNodes(w, r, r.PathValue("nodeID"))
+		return
+	case "list-mutex-groups", "create-mutex-group":
+		s.handleTagMutexGroups(w, r, action, "")
+		return
+	case "get-mutex-group", "update-mutex-group", "delete-mutex-group":
+		s.handleTagMutexGroups(w, r, action, r.PathValue("mutexGroupID"))
 		return
 	}
-	parts := strings.Split(path, "/")
-	switch parts[0] {
-	case "schema":
-		if len(parts) == 1 {
-			s.handleTagSchema(w, r)
-			return
-		}
-	case "preview":
-		if len(parts) == 1 {
-			s.handleTagPreview(w, r)
-			return
-		}
-	case "recompute":
-		if len(parts) == 1 {
-			s.handleTagRecompute(w, r)
-			return
-		}
-	case "templates":
-		if len(parts) == 1 {
-			s.handleTagTemplates(w, r)
-			return
-		}
-	case "assignments":
-		if len(parts) == 1 {
-			s.handleTagAssignments(w, r)
-			return
-		}
-	case "mutex-groups":
-		if len(parts) <= 2 {
-			s.handleTagMutexGroups(w, r, parts[1:])
-			return
-		}
-	case "nodes":
-		if len(parts) == 2 {
-			s.handleTagNodes(w, r, parts[1])
-			return
-		}
-	}
 
-	tagID, err := strconv.ParseInt(parts[0], 10, 64)
+	tagID, err := strconv.ParseInt(r.PathValue("tagID"), 10, 64)
 	if err != nil || tagID <= 0 {
 		writeAPIError(w, http.StatusBadRequest, "无效的标签 ID")
 		return
 	}
-	if len(parts) == 2 && parts[1] == "auto" {
+	if action == "auto" {
 		s.handleTagAuto(w, r, tagID)
 		return
 	}
-	if len(parts) != 1 {
-		writeAPIError(w, http.StatusNotFound, "接口不存在")
-		return
-	}
-	s.handleTagByID(w, r, tagID)
+	s.handleTagByID(w, r, tagID, action)
 }
 
-func (s *Server) handleTagByID(w http.ResponseWriter, r *http.Request, tagID int64) {
+func (s *Server) handleTagByID(w http.ResponseWriter, r *http.Request, tagID int64, action string) {
 	if s.store == nil {
 		writeAPIError(w, http.StatusServiceUnavailable, "数据存储不可用")
 		return
@@ -169,22 +151,22 @@ func (s *Server) handleTagByID(w http.ResponseWriter, r *http.Request, tagID int
 		writeAPIError(w, http.StatusNotFound, "标签不存在")
 		return
 	}
-	switch r.Method {
-	case http.MethodGet:
+	switch action {
+	case "get-tag":
 		view, err := s.tagViewByID(r.Context(), tagID)
 		if err != nil {
 			writeAPIError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		writeJSON(w, map[string]any{"tag": view})
-	case http.MethodPut:
+	case "update-tag":
 		var input tagInput
 		if err := decodeTagJSON(w, r, &input); err != nil {
 			writeAPIError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		s.updateTag(w, r, existing, input)
-	case http.MethodDelete:
+	case "delete-tag":
 		s.deleteTag(w, r, existing)
 	default:
 		writeAPIError(w, http.StatusMethodNotAllowed, "请求方法不允许")
@@ -192,10 +174,6 @@ func (s *Server) handleTagByID(w http.ResponseWriter, r *http.Request, tagID int
 }
 
 func (s *Server) handleTagAuto(w http.ResponseWriter, r *http.Request, tagID int64) {
-	if r.Method != http.MethodPatch {
-		writeAPIError(w, http.StatusMethodNotAllowed, "请求方法不允许")
-		return
-	}
 	if s.store == nil {
 		writeAPIError(w, http.StatusServiceUnavailable, "数据存储不可用")
 		return
@@ -322,10 +300,6 @@ func (s *Server) deleteTag(w http.ResponseWriter, r *http.Request, tag *store.Ta
 }
 
 func (s *Server) handleTagPreview(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeAPIError(w, http.StatusMethodNotAllowed, "请求方法不允许")
-		return
-	}
 	if s.tagSvc == nil {
 		writeAPIError(w, http.StatusServiceUnavailable, "标签服务不可用")
 		return
@@ -366,10 +340,6 @@ func (s *Server) handleTagPreview(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTagRecompute(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeAPIError(w, http.StatusMethodNotAllowed, "请求方法不允许")
-		return
-	}
 	if s.tagSvc == nil {
 		writeAPIError(w, http.StatusServiceUnavailable, "标签服务不可用")
 		return
@@ -398,10 +368,6 @@ func (s *Server) handleTagRecompute(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTagTemplates(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeAPIError(w, http.StatusMethodNotAllowed, "请求方法不允许")
-		return
-	}
 	if s.tagSvc == nil {
 		writeAPIError(w, http.StatusServiceUnavailable, "标签服务不可用")
 		return
@@ -415,10 +381,6 @@ func (s *Server) handleTagTemplates(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTagAssignments(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeAPIError(w, http.StatusMethodNotAllowed, "请求方法不允许")
-		return
-	}
 	if s.store == nil {
 		writeAPIError(w, http.StatusServiceUnavailable, "数据存储不可用")
 		return
@@ -463,10 +425,6 @@ func (s *Server) handleTagNodes(w http.ResponseWriter, r *http.Request, target s
 		return
 	}
 	if target == "batch" {
-		if r.Method != http.MethodPost {
-			writeAPIError(w, http.StatusMethodNotAllowed, "请求方法不允许")
-			return
-		}
 		var input struct {
 			NodeIDs      []int64 `json:"node_ids"`
 			AddTagIDs    []int64 `json:"add_tag_ids"`
@@ -511,10 +469,6 @@ func (s *Server) handleTagNodes(w http.ResponseWriter, r *http.Request, target s
 		return
 	}
 
-	if r.Method != http.MethodPut {
-		writeAPIError(w, http.StatusMethodNotAllowed, "请求方法不允许")
-		return
-	}
 	nodeID, err := strconv.ParseInt(target, 10, 64)
 	if err != nil || nodeID <= 0 {
 		writeAPIError(w, http.StatusBadRequest, "无效的节点 ID")
@@ -553,7 +507,7 @@ func (s *Server) handleTagNodes(w http.ResponseWriter, r *http.Request, target s
 	writeJSON(w, map[string]any{"assignment": assignment, "reload_error": reloadError})
 }
 
-func (s *Server) handleTagMutexGroups(w http.ResponseWriter, r *http.Request, tail []string) {
+func (s *Server) handleTagMutexGroups(w http.ResponseWriter, r *http.Request, action, rawID string) {
 	if s.store == nil {
 		writeAPIError(w, http.StatusServiceUnavailable, "数据存储不可用")
 		return
@@ -563,11 +517,11 @@ func (s *Server) handleTagMutexGroups(w http.ResponseWriter, r *http.Request, ta
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if len(tail) == 0 {
-		switch r.Method {
-		case http.MethodGet:
+	if rawID == "" {
+		switch action {
+		case "list-mutex-groups":
 			writeJSON(w, map[string]any{"mutex_groups": groups})
-		case http.MethodPost:
+		case "create-mutex-group":
 			var input mutexGroupInput
 			if err := decodeTagJSON(w, r, &input); err != nil {
 				writeAPIError(w, http.StatusBadRequest, err.Error())
@@ -589,7 +543,7 @@ func (s *Server) handleTagMutexGroups(w http.ResponseWriter, r *http.Request, ta
 		}
 		return
 	}
-	groupID, err := strconv.ParseInt(tail[0], 10, 64)
+	groupID, err := strconv.ParseInt(rawID, 10, 64)
 	if err != nil || groupID <= 0 {
 		writeAPIError(w, http.StatusBadRequest, "无效的互斥组 ID")
 		return
@@ -605,10 +559,10 @@ func (s *Server) handleTagMutexGroups(w http.ResponseWriter, r *http.Request, ta
 		writeAPIError(w, http.StatusNotFound, "互斥组不存在")
 		return
 	}
-	switch r.Method {
-	case http.MethodGet:
+	switch action {
+	case "get-mutex-group":
 		writeJSON(w, map[string]any{"mutex_group": existing})
-	case http.MethodPut:
+	case "update-mutex-group":
 		var input mutexGroupInput
 		if err := decodeTagJSON(w, r, &input); err != nil {
 			writeAPIError(w, http.StatusBadRequest, err.Error())
@@ -624,7 +578,7 @@ func (s *Server) handleTagMutexGroups(w http.ResponseWriter, r *http.Request, ta
 			return
 		}
 		writeJSON(w, map[string]any{"mutex_group": updated})
-	case http.MethodDelete:
+	case "delete-mutex-group":
 		if err := s.store.DeleteTagMutexGroup(r.Context(), groupID); err != nil {
 			writeAPIError(w, http.StatusInternalServerError, err.Error())
 			return

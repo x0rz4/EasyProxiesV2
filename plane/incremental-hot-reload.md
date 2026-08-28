@@ -377,6 +377,8 @@ hybrid 和 group listener 在 dispatcher 设计稳定并通过测试后再接入
 - 按 tag active 计数不会被其他节点或全局 reset 干扰。
 - reload 版本冲突时候选资源被完整清理。
 
+纯内存的 timer/channel/WaitGroup 并发场景使用 Go 1.25 `testing/synctest`：以虚拟时间验证候选重建合并窗口、黑名单到期和 group gate 阻塞顺序，禁止用固定 `Sleep` 猜测 goroutine 状态。真实 socket、SQLite、sing-box 生命周期和系统调用不放进 synctest bubble，继续使用显式屏障、业务超时与 race detector。
+
 ### 12.2 集成测试
 
 1. 在固定 pool listener 上持续发起短连接，同时添加 100 个节点：请求失败数必须为 0。
@@ -385,7 +387,7 @@ hybrid 和 group listener 在 dispatcher 设计稳定并通过测试后再接入
 4. Prepare 中注入 Create/Start/健康检查失败：旧 snapshot 和旧配置继续服务，无资源泄漏。
 5. Commit 后注入 Remove 失败：新 snapshot 正常服务，清理任务可重试。
 6. 并发触发多次 reload：只有最新合法 generation 被提交。
-7. `go test -race ./...` 无数据竞争。
+7. `go test -race ./...` 无数据竞争；synctest 负责确定性调度断言，不能替代 race detector。
 
 ### 12.3 multi-port 验收
 

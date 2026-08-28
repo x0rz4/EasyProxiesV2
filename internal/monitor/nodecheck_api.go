@@ -76,7 +76,7 @@ func (r nodeCheckSettingsResponse) toConfig() (config.NodeCheckConfig, error) {
 	return value, nil
 }
 
-func (s *Server) handleNodeCheckSettings(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleNodeCheckSettings(w http.ResponseWriter, r *http.Request, action string) {
 	s.cfgMu.RLock()
 	source := s.cfgSrc
 	s.cfgMu.RUnlock()
@@ -84,10 +84,10 @@ func (s *Server) handleNodeCheckSettings(w http.ResponseWriter, r *http.Request)
 		writeAPIError(w, http.StatusServiceUnavailable, "配置存储未初始化")
 		return
 	}
-	switch r.Method {
-	case http.MethodGet:
+	switch action {
+	case "get":
 		writeJSON(w, nodeCheckSettingsFromConfig(source.Snapshot().Management.NodeCheck))
-	case http.MethodPut:
+	case "update":
 		var request nodeCheckSettingsResponse
 		if err := decodeJSON(r, &request); err != nil {
 			writeAPIError(w, http.StatusBadRequest, err.Error())
@@ -118,13 +118,13 @@ func (s *Server) handleNodeCheckSettings(w http.ResponseWriter, r *http.Request)
 	}
 }
 
-func (s *Server) handleNodeCheckTasks(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleNodeCheckTasks(w http.ResponseWriter, r *http.Request, action string) {
 	if s.nodeChecks == nil || s.store == nil {
 		writeAPIError(w, http.StatusServiceUnavailable, "综合检测服务未初始化")
 		return
 	}
-	switch r.Method {
-	case http.MethodPost:
+	switch action {
+	case "create":
 		var request nodeCheckCreateRequest
 		if err := decodeJSON(r, &request); err != nil {
 			writeAPIError(w, http.StatusBadRequest, err.Error())
@@ -136,7 +136,7 @@ func (s *Server) handleNodeCheckTasks(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeNodeCheckJSONStatus(w, http.StatusAccepted, map[string]any{"task": task.copySnapshot()})
-	case http.MethodGet:
+	case "list":
 		tasks, err := s.store.ListNodeDetectionTasks(r.Context(), 20)
 		if err != nil {
 			writeAPIError(w, http.StatusInternalServerError, err.Error())
@@ -152,28 +152,22 @@ func (s *Server) handleNodeCheckTasks(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) handleNodeCheckTaskItem(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleNodeCheckTaskItem(w http.ResponseWriter, r *http.Request, action string) {
 	if s.nodeChecks == nil {
 		writeAPIError(w, http.StatusServiceUnavailable, "综合检测服务未初始化")
 		return
 	}
-	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/node-check/tasks/"), "/")
-	parts := strings.Split(path, "/")
-	if path == "" {
+	id := r.PathValue("taskID")
+	if id == "" {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
-	id := parts[0]
-	if len(parts) == 2 && parts[1] == "events" {
+	if action == "events" {
 		s.streamNodeCheckTask(w, r, id)
 		return
 	}
-	if len(parts) != 1 {
-		w.WriteHeader(http.StatusNotFound)
-		return
-	}
-	switch r.Method {
-	case http.MethodGet:
+	switch action {
+	case "get":
 		if task := s.nodeChecks.get(id); task != nil {
 			writeJSON(w, map[string]any{"task": task.copySnapshot()})
 			return
@@ -190,7 +184,7 @@ func (s *Server) handleNodeCheckTaskItem(w http.ResponseWriter, r *http.Request)
 			}
 		}
 		writeAPIError(w, http.StatusNotFound, "检测任务不存在")
-	case http.MethodDelete:
+	case "cancel":
 		if !s.nodeChecks.cancel(id) {
 			writeAPIError(w, http.StatusNotFound, "检测任务不存在或已结束")
 			return
@@ -202,10 +196,6 @@ func (s *Server) handleNodeCheckTaskItem(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) streamNodeCheckTask(w http.ResponseWriter, r *http.Request, id string) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeAPIError(w, http.StatusInternalServerError, "Streaming unsupported")
@@ -259,10 +249,6 @@ func writeNodeCheckJSONStatus(w http.ResponseWriter, status int, value any) {
 }
 
 func (s *Server) handleNodeCheckResults(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
 	if s.store == nil {
 		writeAPIError(w, http.StatusServiceUnavailable, "数据存储未初始化")
 		return

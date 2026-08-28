@@ -243,48 +243,7 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 	// Start session cleanup goroutine
 	go s.cleanupExpiredSessions()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/auth", s.handleAuth)
-	mux.HandleFunc("/api/settings", s.withAuth(s.handleSettings))
-	mux.HandleFunc("/api/operations/probe-settings", s.withAuth(s.handleProbeSettings))
-	mux.HandleFunc("/api/operations/probe-status", s.withAuth(s.handleProbeStatus))
-	mux.HandleFunc("/api/operations/node-check-settings", s.withAuth(s.handleNodeCheckSettings))
-	mux.HandleFunc("/api/node-check/results", s.withAuth(s.handleNodeCheckResults))
-	mux.HandleFunc("/api/node-check/tasks", s.withAuth(s.handleNodeCheckTasks))
-	mux.HandleFunc("/api/node-check/tasks/", s.withAuth(s.handleNodeCheckTaskItem))
-	mux.HandleFunc("/api/nodes", s.withAuth(s.handleNodes))
-	mux.HandleFunc("/api/nodes/config", s.withAuth(s.handleConfigNodes))
-	mux.HandleFunc("/api/nodes/config/batch-toggle", s.withAuth(s.handleConfigNodesBatchToggle))
-	mux.HandleFunc("/api/nodes/config/batch-delete", s.withAuth(s.handleConfigNodesBatchDelete))
-	mux.HandleFunc("/api/nodes/config/", s.withAuth(s.handleConfigNodeItem))
-	mux.HandleFunc("/api/nodes/probe-all", s.withAuth(s.handleProbeAll))
-	mux.HandleFunc("/api/nodes/unlock-all", s.withAuth(s.handleUnlockAll))
-	mux.HandleFunc("/api/nodes/unlock-meta", s.withAuth(s.handleUnlockMeta))
-	mux.HandleFunc("/api/nodes/unlock-results", s.withAuth(s.handleUnlockResults))
-	mux.HandleFunc("/api/nodes/traffic/stream", s.withAuth(s.handleTrafficStream))
-	mux.HandleFunc("/api/nodes/", s.withAuth(s.handleNodeAction))
-	mux.HandleFunc("/api/debug", s.withAuth(s.handleDebug))
-	mux.HandleFunc("/api/debug/stream", s.withAuth(s.handleDebugStream))
-	mux.HandleFunc("/api/export", s.withAuth(s.handleExport))
-	mux.HandleFunc("/api/import", s.withAuth(s.handleImport))
-	mux.HandleFunc("/api/subscription/status", s.withAuth(s.handleSubscriptionStatus))
-	mux.HandleFunc("/api/subscription/refresh", s.withAuth(s.handleSubscriptionRefresh))
-	mux.HandleFunc("/api/subscriptions", s.withAuth(s.handleSubscriptions))
-	mux.HandleFunc("/api/subscriptions/", s.withAuth(s.handleSubscriptionItem))
-	mux.HandleFunc("/api/reload", s.withAuth(s.handleReload))
-	mux.HandleFunc("/api/groups", s.withAuth(s.handleGroups))
-	mux.HandleFunc("/api/groups/", s.withAuth(s.handleGroupItem))
-	mux.HandleFunc("/api/tags", s.withAuth(s.handleTags))
-	mux.HandleFunc("/api/tags/", s.withAuth(s.handleTagItem))
-	mux.HandleFunc("/sub/", s.handleGroupSubscription)
-
-	// GeoIP database management
-	mux.HandleFunc("/api/geoip/status", s.withAuth(s.handleGeoipStatus))
-	mux.HandleFunc("/api/geoip/download", s.withAuth(s.handleGeoipDownload))
-	mux.HandleFunc("/api/geoip/update", s.withAuth(s.handleGeoipUpdate))
-
-	// Default handler for static assets (React App)
-	mux.HandleFunc("/", s.handleIndex)
+	mux := s.routes()
 	s.srv = &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           mux,
@@ -541,9 +500,9 @@ func parsePositiveDuration(name, value string) (time.Duration, error) {
 	return duration, nil
 }
 
-func (s *Server) handleProbeSettings(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
+func (s *Server) handleProbeSettings(w http.ResponseWriter, r *http.Request, action string) {
+	switch action {
+	case "get":
 		s.cfgMu.RLock()
 		cfg := s.cfgSrc
 		s.cfgMu.RUnlock()
@@ -553,7 +512,7 @@ func (s *Server) handleProbeSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		snapshot := cfg.Snapshot()
 		writeJSON(w, probeSettingsFromConfig(snapshot))
-	case http.MethodPut:
+	case "update":
 		var request probeSettingsResponse
 		if err := decodeJSON(r, &request); err != nil {
 			writeAPIError(w, http.StatusBadRequest, err.Error())
@@ -644,10 +603,6 @@ func (s *Server) handleProbeSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleProbeStatus(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeAPIError(w, http.StatusMethodNotAllowed, "请求方法不允许")
-		return
-	}
 	policy := s.mgr.ProbePolicy()
 	nodeCount := s.mgr.ProbeNodeCount()
 	effective := effectiveProbeConcurrency(policy.Concurrency, nodeCount)
@@ -1111,10 +1066,6 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
 	// 返回所有注册节点，让前端根据状态过滤展示
 	allNodes := s.mgr.Snapshot()
 	totalNodes := len(allNodes)
@@ -1151,10 +1102,6 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDebug(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
 	snapshots := s.mgr.Snapshot()
 	var totalCalls, totalSuccess int64
 	debugNodes := make([]map[string]any, 0, len(snapshots))
@@ -1192,10 +1139,6 @@ func (s *Server) handleDebug(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDebugStream(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -1237,27 +1180,14 @@ func (s *Server) handleDebugStream(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/nodes/"), "/")
-	if len(parts) < 1 {
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
-	tag := parts[0]
+func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request, action string) {
+	tag := r.PathValue("tag")
 	if tag == "" {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	action := ""
-	if len(parts) > 1 {
-		action = parts[1]
-	}
 	switch action {
 	case "probe":
-		if r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 		defer cancel()
 		latency, err := s.mgr.Probe(ctx, tag)
@@ -1271,20 +1201,12 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, map[string]any{"message": "探测成功", "latency_ms": latencyMs})
 	case "release":
-		if r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
 		if err := s.mgr.Release(tag); err != nil {
 			writeJSON(w, map[string]any{"error": err.Error()})
 			return
 		}
 		writeJSON(w, map[string]any{"message": "已解除拉黑"})
 	case "speedtest":
-		if r.Method != http.MethodGet {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
@@ -1342,10 +1264,6 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	case "unlock":
-		if r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
 		// Unlock checks issue several HTTP requests through the node, so allow
 		// more time than a single latency probe.
 		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
@@ -1374,10 +1292,6 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 
 // handleProbeAll probes all nodes in batches and returns results via SSE
 func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "SSE not supported", http.StatusInternalServerError)
@@ -1437,10 +1351,6 @@ func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 // and a final {"type":"complete",...}. Each progress event contains the
 // node's unlock.Result serialized as the "result" field.
 func (s *Server) handleUnlockAll(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
 
 	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -1551,10 +1461,6 @@ func (s *Server) handleUnlockAll(w http.ResponseWriter, r *http.Request) {
 // saved detections without re-running the checks. It is read-only and never
 // touches the live probes.
 func (s *Server) handleUnlockResults(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
 	if s.store == nil {
 		writeJSON(w, map[string]any{"results": map[string]any{}})
 		return
@@ -1602,10 +1508,6 @@ func (s *Server) handleUnlockResults(w http.ResponseWriter, r *http.Request) {
 // handleUnlockMeta exposes detector and status metadata independently from a
 // live node check so clients can render new registered modules dynamically.
 func (s *Server) handleUnlockMeta(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
 	writeJSON(w, map[string]any{
 		"providers": unlock.ListProviderMetas(),
 		"statuses":  unlock.ListStatusMetas(),
@@ -1613,10 +1515,6 @@ func (s *Server) handleUnlockMeta(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTrafficStream(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -1820,7 +1718,7 @@ func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // handleAuth 处理登录认证
-func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request, action string) {
 	s.cfgMu.RLock()
 	password := s.cfg.Password
 	s.cfgMu.RUnlock()
@@ -1831,13 +1729,8 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// GET 请求用于检查是否需要密码（供前端初始化时使用）
-	if r.Method == http.MethodGet {
+	if action == "status" {
 		writeJSON(w, map[string]any{"message": "需要密码", "no_password": false})
-		return
-	}
-
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -1889,10 +1782,6 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 // handleExport 导出所有可用节点的原始代理 URI（如 trojan://、vless:// 等），每行一个
 // 导出的内容可以直接用于导入
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
 
 	// 只导出初始检查通过的可用节点
 	snapshots := s.mgr.SnapshotFiltered(true)
@@ -1921,10 +1810,6 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 //
 // 解析出的节点统一转成标准 URI 后入库，与导出格式互通。
 func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
 	if !s.ensureNodeManager(w) {
 		return
 	}
@@ -2089,12 +1974,12 @@ func truncateStr(s string, maxLen int) string {
 }
 
 // handleSettings handles GET/PUT for all system settings.
-func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
+func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request, action string) {
+	switch action {
+	case "get":
 		resp := s.getAllSettings()
 		writeJSON(w, resp)
-	case http.MethodPut:
+	case "update":
 		var req allSettingsRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
@@ -2122,10 +2007,6 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 // handleSubscriptionStatus returns the current subscription refresh status.
 // Works even when subRefresher is nil by reading config directly.
 func (s *Server) handleSubscriptionStatus(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
 
 	if s.subRefresher == nil {
 		// No subscription manager — read config directly to provide accurate status
@@ -2168,10 +2049,6 @@ func (s *Server) handleSubscriptionStatus(w http.ResponseWriter, r *http.Request
 
 // handleSubscriptionRefresh triggers an immediate subscription refresh.
 func (s *Server) handleSubscriptionRefresh(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
 
 	if s.subRefresher == nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -2201,20 +2078,20 @@ func (s *Server) handleSubscriptionRefresh(w http.ResponseWriter, r *http.Reques
 	})
 }
 
-func (s *Server) handleSubscriptions(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleSubscriptions(w http.ResponseWriter, r *http.Request, action string) {
 	if s.subRefresher == nil {
 		writeAPIError(w, http.StatusServiceUnavailable, "订阅管理器未初始化")
 		return
 	}
-	switch r.Method {
-	case http.MethodGet:
+	switch action {
+	case "list":
 		subs, err := s.subRefresher.List(r.Context())
 		if err != nil {
 			writeAPIError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		writeJSON(w, map[string]any{"subscriptions": subs})
-	case http.MethodPost:
+	case "create":
 		var input store.Subscription
 		if err := decodeJSON(r, &input); err != nil {
 			writeAPIError(w, http.StatusBadRequest, err.Error())
@@ -2232,32 +2109,22 @@ func (s *Server) handleSubscriptions(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) handleSubscriptionItem(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleSubscriptionItem(w http.ResponseWriter, r *http.Request, action string) {
 	if s.subRefresher == nil {
 		writeAPIError(w, http.StatusServiceUnavailable, "订阅管理器未初始化")
 		return
 	}
-	path := strings.TrimPrefix(r.URL.Path, "/api/subscriptions/")
-	parts := strings.Split(path, "/")
-	if len(parts) < 1 || len(parts) > 2 || parts[0] == "" {
-		writeAPIError(w, http.StatusNotFound, "接口不存在")
-		return
-	}
-	id, err := strconv.ParseInt(parts[0], 10, 64)
+	id, err := strconv.ParseInt(r.PathValue("subscriptionID"), 10, 64)
 	if err != nil || id <= 0 {
 		writeAPIError(w, http.StatusBadRequest, "无效的订阅 ID")
 		return
 	}
-	if len(parts) == 1 {
-		s.handleSubscriptionCRUD(w, r, id)
+	if action == "get" || action == "update" || action == "delete" {
+		s.handleSubscriptionCRUD(w, r, id, action)
 		return
 	}
-	switch parts[1] {
+	switch action {
 	case "enabled":
-		if r.Method != http.MethodPatch {
-			writeAPIError(w, http.StatusMethodNotAllowed, "请求方法不允许")
-			return
-		}
 		var input struct {
 			Enabled *bool `json:"enabled"`
 		}
@@ -2267,16 +2134,8 @@ func (s *Server) handleSubscriptionItem(w http.ResponseWriter, r *http.Request) 
 		}
 		err = s.subRefresher.SetEnabled(r.Context(), id, *input.Enabled)
 	case "activate":
-		if r.Method != http.MethodPost {
-			writeAPIError(w, http.StatusMethodNotAllowed, "请求方法不允许")
-			return
-		}
 		err = s.subRefresher.ActivateExclusive(r.Context(), id)
 	case "refresh":
-		if r.Method != http.MethodPost {
-			writeAPIError(w, http.StatusMethodNotAllowed, "请求方法不允许")
-			return
-		}
 		err = s.subRefresher.RefreshOne(r.Context(), id)
 		if err == nil {
 			status := s.subRefresher.Status()
@@ -2285,10 +2144,6 @@ func (s *Server) handleSubscriptionItem(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 	case "nodes":
-		if r.Method != http.MethodGet {
-			writeAPIError(w, http.StatusMethodNotAllowed, "请求方法不允许")
-			return
-		}
 		var nodes []store.SubscriptionNode
 		nodes, err = s.subRefresher.Nodes(r.Context(), id)
 		if err == nil {
@@ -2306,16 +2161,16 @@ func (s *Server) handleSubscriptionItem(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, map[string]any{"ok": true})
 }
 
-func (s *Server) handleSubscriptionCRUD(w http.ResponseWriter, r *http.Request, id int64) {
-	switch r.Method {
-	case http.MethodGet:
+func (s *Server) handleSubscriptionCRUD(w http.ResponseWriter, r *http.Request, id int64, action string) {
+	switch action {
+	case "get":
 		sub, err := s.subRefresher.Get(r.Context(), id)
 		if err != nil {
 			writeAPIError(w, subscriptionErrorStatus(err), err.Error())
 			return
 		}
 		writeJSON(w, sub)
-	case http.MethodPut:
+	case "update":
 		var input store.Subscription
 		if err := decodeJSON(r, &input); err != nil {
 			writeAPIError(w, http.StatusBadRequest, err.Error())
@@ -2327,7 +2182,7 @@ func (s *Server) handleSubscriptionCRUD(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 		writeJSON(w, sub)
-	case http.MethodDelete:
+	case "delete":
 		if err := s.subRefresher.Delete(r.Context(), id); err != nil {
 			writeAPIError(w, subscriptionErrorStatus(err), err.Error())
 			return
@@ -2387,13 +2242,13 @@ func (p nodePayload) toConfig() config.NodeConfig {
 }
 
 // handleConfigNodes handles GET (list) and POST (create) for config nodes.
-func (s *Server) handleConfigNodes(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleConfigNodes(w http.ResponseWriter, r *http.Request, action string) {
 	if !s.ensureNodeManager(w) {
 		return
 	}
 
-	switch r.Method {
-	case http.MethodGet:
+	switch action {
+	case "list":
 		var subscriptionID *int64
 		if raw := r.URL.Query().Get("subscription_id"); raw != "" {
 			id, err := strconv.ParseInt(raw, 10, 64)
@@ -2410,7 +2265,7 @@ func (s *Server) handleConfigNodes(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, map[string]any{"nodes": nodes})
-	case http.MethodPost:
+	case "create":
 		var payload nodePayload
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
@@ -2431,21 +2286,20 @@ func (s *Server) handleConfigNodes(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleConfigNodeItem handles PUT (update) and DELETE for a specific config node.
-func (s *Server) handleConfigNodeItem(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleConfigNodeItem(w http.ResponseWriter, r *http.Request, action string) {
 	if !s.ensureNodeManager(w) {
 		return
 	}
 
-	namePart := strings.TrimPrefix(r.URL.Path, "/api/nodes/config/")
-	nodeName, err := url.PathUnescape(namePart)
-	if err != nil || nodeName == "" {
+	nodeName := r.PathValue("name")
+	if nodeName == "" {
 		w.WriteHeader(http.StatusBadRequest)
 		writeJSON(w, map[string]any{"error": "节点名称无效"})
 		return
 	}
 
-	switch r.Method {
-	case http.MethodPut:
+	switch action {
+	case "update":
 		var payload nodePayload
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
@@ -2462,7 +2316,7 @@ func (s *Server) handleConfigNodeItem(w http.ResponseWriter, r *http.Request) {
 		s.enqueueRetagAll()
 		reloadError := s.reloadAfterGroupMutation(r.Context())
 		writeJSON(w, map[string]any{"node": node, "message": "节点已更新", "reloaded": reloadError == "", "reload_error": reloadError})
-	case http.MethodPatch:
+	case "toggle":
 		var body struct {
 			Enabled *bool `json:"enabled"`
 		}
@@ -2494,7 +2348,7 @@ func (s *Server) handleConfigNodeItem(w http.ResponseWriter, r *http.Request) {
 			reloadMsg = "（已自动重载）"
 		}
 		writeJSON(w, map[string]any{"message": fmt.Sprintf("节点 %s %s%s", nodeName, action, reloadMsg)})
-	case http.MethodDelete:
+	case "delete":
 		if err := s.nodeMgr.DeleteNode(r.Context(), nodeName); err != nil {
 			s.respondNodeError(w, err)
 			return
@@ -2509,10 +2363,6 @@ func (s *Server) handleConfigNodeItem(w http.ResponseWriter, r *http.Request) {
 
 // handleConfigNodesBatchToggle handles batch enable/disable for multiple nodes.
 func (s *Server) handleConfigNodesBatchToggle(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
 	if !s.ensureNodeManager(w) {
 		return
 	}
@@ -2573,10 +2423,6 @@ func (s *Server) handleConfigNodesBatchToggle(w http.ResponseWriter, r *http.Req
 
 // handleConfigNodesBatchDelete handles batch deletion for multiple nodes.
 func (s *Server) handleConfigNodesBatchDelete(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
 	if !s.ensureNodeManager(w) {
 		return
 	}
@@ -2630,10 +2476,6 @@ func (s *Server) handleConfigNodesBatchDelete(w http.ResponseWriter, r *http.Req
 
 // handleReload triggers a configuration reload.
 func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
 	if !s.ensureNodeManager(w) {
 		return
 	}
@@ -2776,15 +2618,15 @@ type groupPoolResponse struct {
 	EvictedCount     int                   `json:"evicted_count"`
 }
 
-func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request, action string) {
 	if s.store == nil {
 		writeAPIError(w, http.StatusServiceUnavailable, "数据存储不可用")
 		return
 	}
-	switch r.Method {
-	case http.MethodGet:
+	switch action {
+	case "list":
 		s.writeGroupList(w, r)
-	case http.MethodPost:
+	case "create":
 		var input groupPoolInput
 		if err := decodeJSON(r, &input); err != nil {
 			writeAPIError(w, http.StatusBadRequest, "无效的请求数据")
@@ -2816,26 +2658,24 @@ func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) handleGroupItem(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleGroupItem(w http.ResponseWriter, r *http.Request, action string) {
 	if s.store == nil {
 		writeAPIError(w, http.StatusServiceUnavailable, "数据存储不可用")
 		return
 	}
-	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/groups/"), "/"), "/")
-	groupID, err := strconv.ParseInt(parts[0], 10, 64)
+	groupID, err := strconv.ParseInt(r.PathValue("groupID"), 10, 64)
 	if err != nil || groupID <= 0 {
 		writeAPIError(w, http.StatusBadRequest, "无效的分组 ID")
 		return
 	}
-	mutationRequest := (len(parts) == 3 && (parts[1] == "members" || parts[1] == "exclusions") && r.Method == http.MethodDelete) ||
-		(len(parts) == 1 && (r.Method == http.MethodPut || r.Method == http.MethodDelete))
+	mutationRequest := action == "remove-member" || action == "remove-exclusion" || action == "update" || action == "delete"
 	if mutationRequest {
 		operationLock := s.groupOperationLock(groupID)
 		operationLock.Lock()
 		defer operationLock.Unlock()
 	}
-	if len(parts) == 4 && parts[1] == "members" && parts[3] == "activate" && r.Method == http.MethodPost {
-		nodeID, err := strconv.ParseInt(parts[2], 10, 64)
+	if action == "activate" {
+		nodeID, err := strconv.ParseInt(r.PathValue("nodeID"), 10, 64)
 		if err != nil || nodeID <= 0 {
 			writeAPIError(w, http.StatusBadRequest, "无效的节点 ID")
 			return
@@ -2862,8 +2702,8 @@ func (s *Server) handleGroupItem(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"message": "当前出口已切换", "group_id": groupID, "node_id": nodeID})
 		return
 	}
-	if len(parts) == 4 && parts[1] == "members" && parts[3] == "restore" && r.Method == http.MethodPost {
-		nodeID, err := strconv.ParseInt(parts[2], 10, 64)
+	if action == "restore" {
+		nodeID, err := strconv.ParseInt(r.PathValue("nodeID"), 10, 64)
 		if err != nil || nodeID <= 0 {
 			writeAPIError(w, http.StatusBadRequest, "无效的节点 ID")
 			return
@@ -2880,8 +2720,8 @@ func (s *Server) handleGroupItem(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"message": "节点已恢复", "group_id": groupID, "node_id": nodeID})
 		return
 	}
-	if len(parts) == 3 && parts[1] == "members" && r.Method == http.MethodDelete {
-		nodeID, err := strconv.ParseInt(parts[2], 10, 64)
+	if action == "remove-member" {
+		nodeID, err := strconv.ParseInt(r.PathValue("nodeID"), 10, 64)
 		if err != nil || nodeID <= 0 {
 			writeAPIError(w, http.StatusBadRequest, "无效的节点 ID")
 			return
@@ -2934,8 +2774,8 @@ func (s *Server) handleGroupItem(w http.ResponseWriter, r *http.Request) {
 			"reloaded": true, "reload_error": ""})
 		return
 	}
-	if len(parts) == 3 && parts[1] == "exclusions" && r.Method == http.MethodDelete {
-		nodeID, err := strconv.ParseInt(parts[2], 10, 64)
+	if action == "remove-exclusion" {
+		nodeID, err := strconv.ParseInt(r.PathValue("nodeID"), 10, 64)
 		if err != nil || nodeID <= 0 {
 			writeAPIError(w, http.StatusBadRequest, "无效的节点 ID")
 			return
@@ -2972,7 +2812,7 @@ func (s *Server) handleGroupItem(w http.ResponseWriter, r *http.Request) {
 			"reloaded": true, "reload_error": ""})
 		return
 	}
-	if len(parts) == 3 && parts[1] == "subscription" && parts[2] == "reset-token" && r.Method == http.MethodPost {
+	if action == "reset-token" {
 		groupPool, err := s.store.GetGroupPool(r.Context(), groupID)
 		if err != nil || groupPool == nil {
 			writeAPIError(w, http.StatusNotFound, "分组不存在")
@@ -2991,10 +2831,6 @@ func (s *Server) handleGroupItem(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"message": "订阅 Token 已重置", "token": token})
 		return
 	}
-	if len(parts) != 1 {
-		writeAPIError(w, http.StatusNotFound, "接口不存在")
-		return
-	}
 	existing, err := s.store.GetGroupPool(r.Context(), groupID)
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
@@ -3004,8 +2840,8 @@ func (s *Server) handleGroupItem(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusNotFound, "分组不存在")
 		return
 	}
-	switch r.Method {
-	case http.MethodPut:
+	switch action {
+	case "update":
 		var input groupPoolInput
 		if err := decodeJSON(r, &input); err != nil {
 			writeAPIError(w, http.StatusBadRequest, "无效的请求数据")
@@ -3029,7 +2865,7 @@ func (s *Server) handleGroupItem(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, map[string]any{"group": updated, "reloaded": reloadError == "", "reload_error": reloadError,
 			"removed_unavailable_node_ids": removedNodeIDs})
-	case http.MethodDelete:
+	case "delete":
 		if reloadError := s.applyGroupRuntimeMutation(r.Context(), existing, nil); reloadError != "" {
 			w.WriteHeader(http.StatusConflict)
 			writeJSON(w, map[string]any{"error": reloadError, "reloaded": false, "reload_error": reloadError, "rolled_back": true})
@@ -3579,10 +3415,6 @@ func removeInt64(values []int64, target int64) []int64 {
 
 // handleGeoipStatus reports the on-disk state of the GeoIP database.
 func (s *Server) handleGeoipStatus(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
 	dbPath := s.geoipDatabasePath()
 	writeJSON(w, geoipResponse{
 		Enabled:  s.geoipEnabled(),
@@ -3592,10 +3424,6 @@ func (s *Server) handleGeoipStatus(w http.ResponseWriter, r *http.Request) {
 
 // handleGeoipDownload downloads the GeoIP database if it is missing.
 func (s *Server) handleGeoipDownload(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
 	dbPath := s.geoipDatabasePath()
 	if dbPath == "" {
 		writeAPIError(w, http.StatusBadRequest, "GeoIP 数据库路径未配置")
@@ -3618,10 +3446,6 @@ func (s *Server) handleGeoipDownload(w http.ResponseWriter, r *http.Request) {
 // handleGeoipUpdate forces a re-download (update) of the GeoIP database,
 // overwriting the existing file.
 func (s *Server) handleGeoipUpdate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
 	dbPath := s.geoipDatabasePath()
 	if dbPath == "" {
 		writeAPIError(w, http.StatusBadRequest, "GeoIP 数据库路径未配置")

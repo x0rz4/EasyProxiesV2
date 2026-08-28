@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"easy_proxies/internal/config"
@@ -258,36 +259,39 @@ func TestApplyGroupPolicyUpdateKeepsGroupBoxAndListener(t *testing.T) {
 }
 
 func TestActivateGroupMemberWaitsForSameGroupRebuild(t *testing.T) {
-	group.Reset()
-	defer group.Reset()
-	manager := New(&config.Config{}, monitor.Config{})
-	slot := manager.groupSlot(91)
-	if err := acquireGroupSlot(context.Background(), slot); err != nil {
-		t.Fatal(err)
-	}
-	manager.setGroupRuntimeStatus(91, "reconfiguring", "")
-	activated := make(chan int64, 1)
-	unregister := group.RegisterActivationHandler(91, func(nodeID int64) error {
-		activated <- nodeID
-		return nil
-	})
-	defer unregister()
+	synctest.Test(t, func(t *testing.T) {
+		group.Reset()
+		defer group.Reset()
+		manager := New(&config.Config{}, monitor.Config{})
+		slot := manager.groupSlot(91)
+		if err := acquireGroupSlot(t.Context(), slot); err != nil {
+			t.Fatal(err)
+		}
+		manager.setGroupRuntimeStatus(91, "reconfiguring", "")
+		activated := make(chan int64, 1)
+		unregister := group.RegisterActivationHandler(91, func(nodeID int64) error {
+			activated <- nodeID
+			return nil
+		})
+		defer unregister()
 
-	result := make(chan error, 1)
-	go func() { result <- manager.ActivateGroupMember(context.Background(), 91, 7) }()
-	select {
-	case err := <-result:
-		t.Fatalf("activation returned before rebuild completed: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-	manager.setGroupRuntimeStatus(91, "ready", "")
-	releaseGroupSlot(slot)
-	if err := <-result; err != nil {
-		t.Fatal(err)
-	}
-	if nodeID := <-activated; nodeID != 7 {
-		t.Fatalf("activated node = %d, want 7", nodeID)
-	}
+		result := make(chan error, 1)
+		go func() { result <- manager.ActivateGroupMember(t.Context(), 91, 7) }()
+		synctest.Wait()
+		select {
+		case err := <-result:
+			t.Fatalf("activation returned before rebuild completed: %v", err)
+		default:
+		}
+		manager.setGroupRuntimeStatus(91, "ready", "")
+		releaseGroupSlot(slot)
+		if err := <-result; err != nil {
+			t.Fatal(err)
+		}
+		if nodeID := <-activated; nodeID != 7 {
+			t.Fatalf("activated node = %d, want 7", nodeID)
+		}
+	})
 }
 
 func TestGroupRuntimeTopologyOnlyChangesForAffectedMembers(t *testing.T) {

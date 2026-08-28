@@ -32,11 +32,7 @@ func newTagAPITestServer(t *testing.T) (*Server, store.Store) {
 func serveTagAPI(server *Server, method, path, body string) *httptest.ResponseRecorder {
 	response := httptest.NewRecorder()
 	request := httptest.NewRequest(method, path, strings.NewReader(body))
-	if path == "/api/tags" {
-		server.handleTags(response, request)
-	} else {
-		server.handleTagItem(response, request)
-	}
+	server.routes().ServeHTTP(response, request)
 	return response
 }
 

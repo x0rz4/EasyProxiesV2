@@ -25,17 +25,12 @@ type subscriptionNode struct {
 // handleGroupSubscription serves token-protected, real-time group
 // subscriptions without requiring a WebUI session.
 func (s *Server) handleGroupSubscription(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
 	if s.store == nil {
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/sub/"), "/"), "/")
-	groupID, err := strconv.ParseInt(parts[0], 10, 64)
-	if err != nil || groupID <= 0 || len(parts) > 2 {
+	groupID, err := strconv.ParseInt(r.PathValue("groupID"), 10, 64)
+	if err != nil || groupID <= 0 {
 		http.NotFound(w, r)
 		return
 	}
@@ -59,7 +54,7 @@ func (s *Server) handleGroupSubscription(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	mode := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("mode")))
-	if len(parts) == 2 && parts[1] == "entry" {
+	if r.Pattern == "GET /sub/{groupID}/entry" {
 		mode = "entry"
 	}
 	if mode == "" {
