@@ -234,7 +234,14 @@ func (m *Manager) Start(ctx context.Context) error {
 		}
 	}
 
-	// Start periodic health check after nodes are registered
+	// Submit the initial convergence request before the periodic scheduler can
+	// acquire the shared batch gate. The request is queued and does not delay
+	// listener readiness.
+	if m.monitorMgr != nil {
+		m.monitorMgr.RequestStartupProbeAllOnce()
+	}
+
+	// Start periodic health check after nodes are registered and queued.
 	m.mu.Lock()
 	if m.monitorMgr != nil && !m.healthCheckStarted {
 		interval := effectiveHealthCheckInterval(cfg)
@@ -242,9 +249,6 @@ func (m *Manager) Start(ctx context.Context) error {
 		m.healthCheckStarted = true
 	}
 	m.mu.Unlock()
-	if m.monitorMgr != nil {
-		m.monitorMgr.RequestStartupProbeAllOnce()
-	}
 
 	// Wait for initial health check if min nodes configured
 	if cfg.SubscriptionRefresh.MinAvailableNodes > 0 {

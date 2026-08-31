@@ -121,7 +121,28 @@ func TestProbeStatusReportsAutoConcurrencyAndEstimates(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &status); err != nil {
 		t.Fatal(err)
 	}
-	if status.NodeCount != 1000 || status.EffectiveConcurrency != 100 || status.EstimatedStartupWorstSeconds != 50 {
+	if status.NodeCount != 1000 || status.EffectiveConcurrency != 100 || status.EstimatedStartupWorstSeconds != 105 || status.InitialPending != 1000 {
+		t.Fatalf("probe status = %+v", status)
+	}
+}
+
+func TestProbeStatusReportsInitialConvergenceQueue(t *testing.T) {
+	server, mgr, _ := newOperationsTestServer(t)
+	mgr.Register(NodeInfo{Tag: "queued-status"}).SetProbe(func(context.Context) (time.Duration, error) {
+		return time.Millisecond, nil
+	})
+	if !mgr.beginTagProbe("queued-status") {
+		t.Fatal("failed to reserve status test tag")
+	}
+	defer mgr.endTagProbe("queued-status")
+	mgr.RequestProbeTagsOnce([]string{"queued-status"})
+	response := httptest.NewRecorder()
+	server.handleProbeStatus(response, httptest.NewRequest(http.MethodGet, "/api/operations/probe-status", nil))
+	var status probeStatusResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if !status.Converging || status.InitialPending != 1 || status.Queued != 1 {
 		t.Fatalf("probe status = %+v", status)
 	}
 }

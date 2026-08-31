@@ -48,7 +48,7 @@ export default function OperationsPanel() {
   const statusQuery = useQuery({
     queryKey: ['probeStatus'],
     queryFn: fetchProbeStatus,
-    refetchInterval: (query) => query.state.data?.round.in_flight || probing ? 1000 : 5000,
+    refetchInterval: (query) => query.state.data?.round.in_flight || query.state.data?.converging || probing ? 1000 : 5000,
   })
 
   useEffect(() => () => abortRef.current?.abort(), [])
@@ -158,10 +158,11 @@ export default function OperationsPanel() {
       />
 
       <PageContent>
-        <section aria-label="探测运行概览" className="grid grid-cols-2 gap-4 xl:grid-cols-4">
+        <section aria-label="探测运行概览" className="grid grid-cols-2 gap-4 xl:grid-cols-5">
           <Metric label="节点规模" value={status?.node_count ?? 0} detail="本轮可调度节点" tone="text-primary" />
+          <Metric label="首次探测剩余" value={status?.initial_pending ?? 0} detail={status?.converging ? `后台收敛中 · 队列等待 ${status.queued}` : status?.initial_pending ? '等待首次探测调度' : '首次探测已收敛'} tone={status?.initial_pending ? 'text-warning' : 'text-success'} />
           <Metric label="有效 Worker" value={status?.effective_concurrency ?? 0} detail={status?.concurrency_mode === 'auto' ? '自动并发模式' : `固定值 ${status?.configured_concurrency ?? 0}`} tone="text-info" />
-          <Metric label="启动最坏估算" value={status?.estimated_startup_worst_case || '0s'} detail="启动策略 · 单次不重试" tone="text-success" />
+          <Metric label="启动最坏估算" value={status?.estimated_startup_worst_case || '0s'} detail="启动策略 · 失败等待 500ms 后重试一次" tone="text-success" />
           <Metric label="Routine 最坏估算" value={status?.estimated_routine_worst_case || '0s'} detail="周期与手动总预算" tone="text-warning" />
         </section>
 
@@ -174,8 +175,8 @@ export default function OperationsPanel() {
             <Field id="probe-target" label="探测目标" hint="支持 HTTP/HTTPS；未填路径时使用 /generate_204" className="md:col-span-2 xl:col-span-3"><input id="probe-target" className={cn('input w-full font-mono text-sm', controlClass)} value={form.probe_target} onChange={(event) => update('probe_target', event.target.value)} placeholder="https://cp.cloudflare.com/generate_204" /></Field>
             <Field id="health-interval" label="健康检查间隔" hint="周期调度只探测已到期节点"><input id="health-interval" className={cn('input w-full font-mono', controlClass)} value={form.health_check_interval} onChange={(event) => update('health_check_interval', event.target.value)} /></Field>
             <Field id="probe-concurrency" label="批量并发" hint="0=自动：min(128, max(32, ceil(节点数/10)))"><input id="probe-concurrency" type="number" min={0} max={512} className={cn('input w-full tabular-nums', controlClass)} value={form.probe_concurrency} onChange={(event) => update('probe_concurrency', Number(event.target.value))} /></Field>
-            <Field id="routine-retries" label="Routine 失败重试" hint="允许 0-2；启动探测固定不重试"><input id="routine-retries" type="number" min={0} max={2} className={cn('input w-full tabular-nums', controlClass)} value={form.routine_probe_retries} onChange={(event) => update('routine_probe_retries', Number(event.target.value))} /></Field>
-            <Field id="startup-timeout" label="启动单节点总预算" hint="默认 5s，快速筛掉明显不可用节点"><input id="startup-timeout" className={cn('input w-full font-mono', controlClass)} value={form.startup_probe_timeout} onChange={(event) => update('startup_probe_timeout', event.target.value)} /></Field>
+            <Field id="routine-retries" label="Routine 失败重试" hint="允许 0-2；首次探测固定重试一次"><input id="routine-retries" type="number" min={0} max={2} className={cn('input w-full tabular-nums', controlClass)} value={form.routine_probe_retries} onChange={(event) => update('routine_probe_retries', Number(event.target.value))} /></Field>
+            <Field id="startup-timeout" label="启动单次尝试预算" hint="每次尝试独立计时，首次失败 500ms 后再试一次"><input id="startup-timeout" className={cn('input w-full font-mono', controlClass)} value={form.startup_probe_timeout} onChange={(event) => update('startup_probe_timeout', event.target.value)} /></Field>
             <Field id="routine-timeout" label="Routine 单节点总预算" hint="包含所有失败重试，默认 10s"><input id="routine-timeout" className={cn('input w-full font-mono', controlClass)} value={form.routine_probe_timeout} onChange={(event) => update('routine_probe_timeout', event.target.value)} /></Field>
             <Field id="dial-timeout" label="拨号阶段上限" hint="代理连接与出站握手的独立 deadline"><input id="dial-timeout" className={cn('input w-full font-mono', controlClass)} value={form.probe_dial_timeout} onChange={(event) => update('probe_dial_timeout', event.target.value)} /></Field>
             <Field id="response-timeout" label="响应阶段上限" hint="覆盖 TLS、HTTP 写入和响应头读取"><input id="response-timeout" className={cn('input w-full font-mono', controlClass)} value={form.probe_response_timeout} onChange={(event) => update('probe_response_timeout', event.target.value)} /></Field>

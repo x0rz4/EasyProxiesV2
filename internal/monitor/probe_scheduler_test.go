@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -145,24 +146,56 @@ func TestProbeBatchKeepsPhaseTimeoutSnapshot(t *testing.T) {
 	}
 }
 
-func TestStartupProbeDoesNotRetry(t *testing.T) {
-	mgr, err := NewManager(Config{ProbeTarget: "http://example.com", RoutineProbeRetries: 2})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer mgr.Stop()
-	var attempts atomic.Int32
-	mgr.Register(NodeInfo{Tag: "startup-node"}).SetProbe(func(context.Context) (time.Duration, error) {
-		attempts.Add(1)
-		return 0, errors.New("offline")
+func TestStartupProbeRetriesOnceAfterBackoff(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		mgr, err := NewManager(Config{ProbeTarget: "http://example.com", RoutineProbeRetries: 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer mgr.Stop()
+		started := time.Now()
+		var attempts atomic.Int32
+		mgr.Register(NodeInfo{Tag: "startup-node"}).SetProbe(func(context.Context) (time.Duration, error) {
+			attempts.Add(1)
+			return 0, errors.New("offline")
+		})
+		summary, err := mgr.RunProbeBatch(t.Context(), ProbeRoundStartup, false, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if attempts.Load() != 2 || summary.Failed != 1 || time.Since(started) != initialProbeRetryDelay {
+			t.Fatalf("attempts=%d elapsed=%v summary=%+v", attempts.Load(), time.Since(started), summary)
+		}
+		snapshot := mgr.SnapshotForTag("startup-node")
+		if snapshot == nil || !snapshot.InitialCheckDone || snapshot.Available || snapshot.LastError != "offline" {
+			t.Fatalf("failed startup probe did not reach unavailable: %+v", snapshot)
+		}
 	})
-	summary, err := mgr.RunProbeBatch(t.Context(), ProbeRoundStartup, false, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if attempts.Load() != 1 || summary.Failed != 1 {
-		t.Fatalf("attempts=%d summary=%+v", attempts.Load(), summary)
-	}
+}
+
+func TestStartupProbeSecondAttemptCanRecover(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		mgr, err := NewManager(Config{ProbeTarget: "http://example.com"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer mgr.Stop()
+		var attempts atomic.Int32
+		mgr.Register(NodeInfo{Tag: "startup-recovers"}).SetProbe(func(context.Context) (time.Duration, error) {
+			if attempts.Add(1) == 1 {
+				return 0, errors.New("temporary")
+			}
+			return 23 * time.Millisecond, nil
+		})
+		summary, runErr := mgr.RunProbeBatch(t.Context(), ProbeRoundStartup, false, nil, nil)
+		if runErr != nil {
+			t.Fatal(runErr)
+		}
+		snapshot := mgr.SnapshotForTag("startup-recovers")
+		if attempts.Load() != 2 || summary.Success != 1 || snapshot == nil || !snapshot.InitialCheckDone || !snapshot.Available || snapshot.LastLatencyMs != 23 {
+			t.Fatalf("attempts=%d summary=%+v snapshot=%+v", attempts.Load(), summary, snapshot)
+		}
+	})
 }
 
 func TestProbeBatchCompletesFailuresAndSerializesResults(t *testing.T) {
@@ -336,5 +369,281 @@ func TestProbeBatchDueOnlySkipsFreshNodes(t *testing.T) {
 	}
 	if summary.Total != 0 || attempts.Load() != 0 {
 		t.Fatalf("fresh node was probed: summary=%+v attempts=%d", summary, attempts.Load())
+	}
+}
+
+func waitForInitialConvergence(t *testing.T, mgr *Manager) InitialProbeStatus {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		status := mgr.InitialProbeStatus()
+		if !status.Converging && status.Pending == 0 {
+			return status
+		}
+		time.Sleep(time.Millisecond)
+	}
+	status := mgr.InitialProbeStatus()
+	t.Fatalf("initial convergence did not finish: %+v round=%+v", status, mgr.ProbeRoundStatus())
+	return status
+}
+
+func TestInitialConvergenceQueuedDuringManualRoundIsNotDropped(t *testing.T) {
+	mgr, err := NewManager(Config{ProbeTarget: "http://example.com", ProbeConcurrency: 1, StartupProbeTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	manualStarted := make(chan struct{})
+	releaseManual := make(chan struct{})
+	mgr.Register(NodeInfo{Tag: "manual-blocker"}).SetProbe(func(context.Context) (time.Duration, error) {
+		close(manualStarted)
+		<-releaseManual
+		return time.Millisecond, nil
+	})
+	done := make(chan error, 1)
+	go func() {
+		_, runErr := mgr.RunProbeBatch(t.Context(), ProbeRoundManual, false, nil, nil)
+		done <- runErr
+	}()
+	<-manualStarted
+	var queuedCalls atomic.Int32
+	mgr.Register(NodeInfo{Tag: "queued-after-manual"}).SetProbe(func(context.Context) (time.Duration, error) {
+		queuedCalls.Add(1)
+		return time.Millisecond, nil
+	})
+	mgr.RequestProbeTagsOnce([]string{"queued-after-manual"})
+	if status := mgr.InitialProbeStatus(); !status.Converging || status.Queued != 1 {
+		t.Fatalf("startup request was not retained: %+v", status)
+	}
+	close(releaseManual)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	waitForInitialConvergence(t, mgr)
+	if queuedCalls.Load() != 1 {
+		t.Fatalf("queued probe calls = %d, want 1", queuedCalls.Load())
+	}
+}
+
+func TestPeriodicRequestQueuedDuringManualRoundIsNotDropped(t *testing.T) {
+	mgr, err := NewManager(Config{ProbeTarget: "http://example.com", ProbeConcurrency: 1, RoutineProbeTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	manualStarted := make(chan struct{})
+	releaseManual := make(chan struct{})
+	var manualCalls atomic.Int32
+	mgr.Register(NodeInfo{Tag: "manual-owner"}).SetProbe(func(context.Context) (time.Duration, error) {
+		if manualCalls.Add(1) == 1 {
+			close(manualStarted)
+			<-releaseManual
+		}
+		return time.Millisecond, nil
+	})
+	done := make(chan error, 1)
+	go func() {
+		_, runErr := mgr.RunProbeBatch(t.Context(), ProbeRoundManual, false, nil, nil)
+		done <- runErr
+	}()
+	<-manualStarted
+	var queuedCalls atomic.Int32
+	mgr.Register(NodeInfo{Tag: "periodic-queued"}).SetProbe(func(context.Context) (time.Duration, error) {
+		queuedCalls.Add(1)
+		return time.Millisecond, nil
+	})
+	mgr.RequestRoutineProbeAllOnce()
+	close(releaseManual)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for queuedCalls.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if queuedCalls.Load() != 1 {
+		t.Fatalf("queued periodic calls = %d, want 1", queuedCalls.Load())
+	}
+}
+
+func TestInitialConvergenceBoundsTargetedProbeConcurrency(t *testing.T) {
+	mgr, err := NewManager(Config{ProbeTarget: "http://example.com", ProbeConcurrency: 17, StartupProbeTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	const count = 1000
+	tags := make([]string, 0, count)
+	var calls, active, maximum atomic.Int64
+	for index := range count {
+		tag := fmt.Sprintf("targeted-%04d", index)
+		tags = append(tags, tag)
+		mgr.Register(NodeInfo{Tag: tag}).SetProbe(func(context.Context) (time.Duration, error) {
+			calls.Add(1)
+			current := active.Add(1)
+			for {
+				previous := maximum.Load()
+				if current <= previous || maximum.CompareAndSwap(previous, current) {
+					break
+				}
+			}
+			time.Sleep(time.Millisecond)
+			active.Add(-1)
+			return time.Millisecond, nil
+		})
+	}
+	mgr.RequestProbeTagsOnce(tags)
+	waitForInitialConvergence(t, mgr)
+	if calls.Load() != count || maximum.Load() > 17 {
+		t.Fatalf("calls=%d maximum=%d", calls.Load(), maximum.Load())
+	}
+}
+
+func TestInitialConvergenceRetriesBusyTagAfterLeaseRelease(t *testing.T) {
+	mgr, err := NewManager(Config{ProbeTarget: "http://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	var calls atomic.Int32
+	mgr.Register(NodeInfo{Tag: "busy-initial"}).SetProbe(func(context.Context) (time.Duration, error) {
+		calls.Add(1)
+		return time.Millisecond, nil
+	})
+	if !mgr.beginTagProbe("busy-initial") {
+		t.Fatal("failed to reserve test tag")
+	}
+	mgr.RequestProbeTagsOnce([]string{"busy-initial"})
+	time.Sleep(10 * time.Millisecond)
+	if calls.Load() != 0 || mgr.InitialProbeStatus().Queued != 1 {
+		t.Fatalf("busy tag did not remain queued: calls=%d status=%+v", calls.Load(), mgr.InitialProbeStatus())
+	}
+	mgr.endTagProbe("busy-initial")
+	waitForInitialConvergence(t, mgr)
+	if calls.Load() != 1 {
+		t.Fatalf("busy tag calls = %d, want 1", calls.Load())
+	}
+}
+
+func TestInitialConvergenceMissingProbeBecomesUnavailable(t *testing.T) {
+	mgr, err := NewManager(Config{ProbeTarget: "http://example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	mgr.Register(NodeInfo{Tag: "missing-probe"})
+	mgr.RequestProbeTagsOnce([]string{"missing-probe"})
+	waitForInitialConvergence(t, mgr)
+	snapshot := mgr.SnapshotForTag("missing-probe")
+	if snapshot == nil || !snapshot.InitialCheckDone || snapshot.Available || snapshot.LastError != "probe function not configured" {
+		t.Fatalf("missing probe snapshot = %+v", snapshot)
+	}
+}
+
+func TestInitialProbeAttemptsUseIndependentTimeouts(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const attemptTimeout = 2 * time.Second
+		mgr, err := NewManager(Config{ProbeTarget: "http://example.com", StartupProbeTimeout: attemptTimeout})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer mgr.Stop()
+		var attempts atomic.Int32
+		mgr.Register(NodeInfo{Tag: "timeout-twice"}).SetProbe(func(ctx context.Context) (time.Duration, error) {
+			attempts.Add(1)
+			<-ctx.Done()
+			return 0, ctx.Err()
+		})
+		started := time.Now()
+		summary, runErr := mgr.RunProbeBatch(t.Context(), ProbeRoundStartup, false, nil, nil)
+		if runErr != nil {
+			t.Fatal(runErr)
+		}
+		wantElapsed := 2*attemptTimeout + initialProbeRetryDelay
+		if attempts.Load() != 2 || summary.Failed != 1 || time.Since(started) != wantElapsed {
+			t.Fatalf("attempts=%d elapsed=%v want=%v summary=%+v", attempts.Load(), time.Since(started), wantElapsed, summary)
+		}
+	})
+}
+
+func TestStoppingInitialConvergenceReleasesLeaseWithoutMarkingFailure(t *testing.T) {
+	mgr, err := NewManager(Config{ProbeTarget: "http://example.com", ProbeConcurrency: 1, StartupProbeTimeout: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	mgr.Register(NodeInfo{Tag: "cancel-initial"}).SetProbe(func(ctx context.Context) (time.Duration, error) {
+		close(started)
+		<-ctx.Done()
+		return 0, ctx.Err()
+	})
+	mgr.RequestStartupProbeAllOnce()
+	<-started
+	mgr.Stop()
+	deadline := time.Now().Add(time.Second)
+	released := false
+	for time.Now().Before(deadline) {
+		if mgr.beginTagProbe("cancel-initial") {
+			mgr.endTagProbe("cancel-initial")
+			released = true
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !released {
+		t.Fatal("initial probe lease was not released after shutdown")
+	}
+	snapshot := mgr.SnapshotForTag("cancel-initial")
+	if snapshot == nil || snapshot.InitialCheckDone || snapshot.LastError != "" {
+		t.Fatalf("shutdown synthesized an unavailable result: %+v", snapshot)
+	}
+}
+
+func TestProbeBatchRuntimeTagMigrationReleasesOldLeaseAndSkipsOldResult(t *testing.T) {
+	mgr, err := NewManager(Config{ProbeTarget: "http://example.com", ProbeConcurrency: 1, RoutineProbeTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	probeStarted := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	var oldCalls, newCalls atomic.Int32
+	handle := mgr.Register(NodeInfo{NodeID: 2, Tag: "node@v1"})
+	oldProbe := func(context.Context) (time.Duration, error) {
+		oldCalls.Add(1)
+		close(probeStarted)
+		<-releaseProbe
+		return time.Millisecond, nil
+	}
+	handle.SetProbe(oldProbe)
+	if !mgr.beginTagProbe("node@v1") {
+		t.Fatal("failed to reserve old runtime tag")
+	}
+	done := make(chan ProbeBatchResult, 1)
+	go func() {
+		done <- mgr.probeBatchItem(t.Context(), probeWorkItem{entry: handle.ref, tag: "node@v1", name: "old", probe: oldProbe}, time.Second, 0, time.Second, time.Second)
+	}()
+	<-probeStarted
+	migrated := mgr.MigrateRuntimeTag(2, NodeInfo{NodeID: 2, Tag: "node@v2"})
+	migrated.SetProbe(func(context.Context) (time.Duration, error) {
+		newCalls.Add(1)
+		return time.Millisecond, nil
+	})
+	close(releaseProbe)
+	<-done
+	if oldCalls.Load() != 1 {
+		t.Fatalf("captured v1 probe calls = %d, want 1", oldCalls.Load())
+	}
+	if snapshot := mgr.SnapshotForTag("node@v2"); snapshot == nil || snapshot.InitialCheckDone {
+		t.Fatalf("old generation result leaked into v2: %+v", snapshot)
+	}
+	if !mgr.beginTagProbe("node@v1") {
+		t.Fatal("old runtime tag lease was not released")
+	}
+	mgr.endTagProbe("node@v1")
+	mgr.RequestProbeTagsOnce([]string{"node@v2"})
+	waitForInitialConvergence(t, mgr)
+	if newCalls.Load() != 1 {
+		t.Fatalf("new generation calls = %d, want 1", newCalls.Load())
 	}
 }

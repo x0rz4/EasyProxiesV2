@@ -746,6 +746,9 @@ export interface ProbeOperationsStatus {
   estimated_startup_worst_seconds: number
   estimated_routine_worst_case: string
   estimated_routine_worst_seconds: number
+  converging: boolean
+  initial_pending: number
+  queued: number
   round: ProbeRoundStatus
 }
 

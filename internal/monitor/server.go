@@ -472,6 +472,9 @@ type probeStatusResponse struct {
 	EstimatedStartupWorstSeconds float64          `json:"estimated_startup_worst_seconds"`
 	EstimatedRoutineWorstCase    string           `json:"estimated_routine_worst_case"`
 	EstimatedRoutineWorstSeconds float64          `json:"estimated_routine_worst_seconds"`
+	Converging                   bool             `json:"converging"`
+	InitialPending               int              `json:"initial_pending"`
+	Queued                       int              `json:"queued"`
 	Round                        ProbeRoundStatus `json:"round"`
 }
 
@@ -606,8 +609,9 @@ func (s *Server) handleProbeStatus(w http.ResponseWriter, r *http.Request) {
 	if effective > 0 {
 		rounds = (nodeCount + effective - 1) / effective
 	}
-	startupEstimate := time.Duration(rounds) * policy.StartupTimeout
+	startupEstimate := time.Duration(rounds) * (2*policy.StartupTimeout + initialProbeRetryDelay)
 	routineEstimate := time.Duration(rounds) * policy.RoutineTimeout
+	initial := s.mgr.InitialProbeStatus()
 	mode := "fixed"
 	if policy.Concurrency == 0 {
 		mode = "auto"
@@ -617,6 +621,7 @@ func (s *Server) handleProbeStatus(w http.ResponseWriter, r *http.Request) {
 		ConfiguredConcurrency: policy.Concurrency, EffectiveConcurrency: effective,
 		EstimatedStartupWorstCase: startupEstimate.String(), EstimatedStartupWorstSeconds: startupEstimate.Seconds(),
 		EstimatedRoutineWorstCase: routineEstimate.String(), EstimatedRoutineWorstSeconds: routineEstimate.Seconds(),
+		Converging: initial.Converging, InitialPending: initial.Pending, Queued: initial.Queued,
 		Round: s.mgr.ProbeRoundStatus(),
 	})
 }

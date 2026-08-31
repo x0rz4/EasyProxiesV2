@@ -44,6 +44,8 @@ const (
 
 var ErrProbeRoundInProgress = errors.New("probe round already in progress")
 
+const initialProbeRetryDelay = 500 * time.Millisecond
+
 type ProbePolicy struct {
 	Concurrency     int           `json:"probe_concurrency"`
 	StartupTimeout  time.Duration `json:"-"`
@@ -78,6 +80,17 @@ type ProbeBatchSummary struct {
 	Failed  int
 }
 
+// probeWorkItem binds a probe to the concrete runtime generation that was
+// reserved. Runtime tags can migrate while a worker is waiting for its turn;
+// keeping this immutable snapshot prevents releasing or updating the new tag
+// with an old outbound's result.
+type probeWorkItem struct {
+	entry *entry
+	tag   string
+	name  string
+	probe probeFunc
+}
+
 type ProbeRoundStatus struct {
 	InFlight  bool           `json:"in_flight"`
 	Kind      ProbeRoundKind `json:"kind,omitempty"`
@@ -86,6 +99,12 @@ type ProbeRoundStatus struct {
 	Completed int            `json:"completed"`
 	Success   int            `json:"success"`
 	Failed    int            `json:"failed"`
+}
+
+type InitialProbeStatus struct {
+	Converging bool
+	Pending    int
+	Queued     int
 }
 
 func normalizeProbePolicy(policy ProbePolicy) ProbePolicy {
@@ -297,6 +316,13 @@ type Manager struct {
 	probeRound        ProbeRoundStatus
 	probeTagMu        sync.Mutex
 	probeTagsInFlight map[string]struct{}
+	probeWake         chan struct{}
+	initialMu         sync.Mutex
+	initialQueue      map[string]struct{}
+	initialRunning    bool
+	routineRequestMu  sync.Mutex
+	routinePending    bool
+	routineDueOnly    bool
 	debugSubMu        sync.RWMutex
 	debugSubscribers  map[chan DebugLogEvent]struct{}
 	healthSubMu       sync.RWMutex
@@ -330,6 +356,8 @@ func NewManager(cfg Config) (*Manager, error) {
 		cancel:            cancel,
 		debugSubscribers:  make(map[chan DebugLogEvent]struct{}),
 		probeTagsInFlight: make(map[string]struct{}),
+		probeWake:         make(chan struct{}, 1),
+		initialQueue:      make(map[string]struct{}),
 		healthSubscribers: make(map[uint64]func(HealthResultEvent)),
 		groupSchedules:    make(map[int64]groupHealthSchedule),
 		probePolicy: normalizeProbePolicy(ProbePolicy{
@@ -348,6 +376,7 @@ func NewManager(cfg Config) (*Manager, error) {
 		m.probeReady = true
 	}
 	go m.startTrafficSpeedSampler()
+	go m.runProbeCoordinator()
 	return m, nil
 }
 
@@ -527,30 +556,356 @@ func (m *Manager) RequestStartupProbeAllOnce() {
 		}
 		return
 	}
-	m.requestProbeBatch(ProbeRoundStartup, false)
+	m.mu.RLock()
+	tags := make([]string, 0, len(m.nodes))
+	for tag := range m.nodes {
+		tags = append(tags, tag)
+	}
+	m.mu.RUnlock()
+	m.enqueueInitialProbeTags(tags)
 }
 
 // RequestRoutineProbeAllOnce triggers a periodic-policy full round.
 func (m *Manager) RequestRoutineProbeAllOnce() {
-	m.requestProbeBatch(ProbeRoundPeriodic, false)
+	m.requestProbeBatch(false)
 }
 
 // RequestDueProbesOnce checks only nodes whose effective management/group
 // interval has elapsed. Batch rounds never overlap.
 func (m *Manager) RequestDueProbesOnce() {
-	m.requestProbeBatch(ProbeRoundPeriodic, true)
+	m.requestProbeBatch(true)
 }
 
-func (m *Manager) requestProbeBatch(kind ProbeRoundKind, dueOnly bool) {
-	if _, ready := m.TargetForProbe(); !ready || m.probeAllInFlight.Load() {
+func (m *Manager) requestProbeBatch(dueOnly bool) {
+	if _, ready := m.TargetForProbe(); !ready {
 		return
 	}
-	go func() {
-		if _, err := m.RunProbeBatch(m.ctx, kind, dueOnly, nil, nil); err != nil &&
-			!errors.Is(err, ErrProbeRoundInProgress) && !errors.Is(err, context.Canceled) && m.logger != nil {
-			m.logger.Warn("probe round failed: ", err)
+	m.routineRequestMu.Lock()
+	if !m.routinePending {
+		m.routineDueOnly = dueOnly
+	} else if !dueOnly {
+		// A full request subsumes every due-only request accumulated while a
+		// different round owns the global gate.
+		m.routineDueOnly = false
+	}
+	m.routinePending = true
+	m.routineRequestMu.Unlock()
+	m.signalProbeCoordinator()
+}
+
+func (m *Manager) signalProbeCoordinator() {
+	select {
+	case m.probeWake <- struct{}{}:
+	default:
+	}
+}
+
+func (m *Manager) enqueueInitialProbeTags(tags []string) {
+	if len(tags) == 0 {
+		return
+	}
+	started := false
+	added := 0
+	m.initialMu.Lock()
+	if !m.initialRunning {
+		m.initialRunning = true
+		started = true
+	}
+	for _, tag := range tags {
+		if tag != "" {
+			if _, exists := m.initialQueue[tag]; !exists {
+				m.initialQueue[tag] = struct{}{}
+				added++
+			}
 		}
+	}
+	queued := len(m.initialQueue)
+	m.initialMu.Unlock()
+	if started && m.logger != nil {
+		m.logger.Info("initial health convergence started with ", queued, " queued nodes")
+	} else if added > 0 && m.logger != nil {
+		m.logger.Info("initial health convergence queued ", added, " additional nodes; ", queued, " waiting")
+	}
+	m.signalProbeCoordinator()
+}
+
+func (m *Manager) runProbeCoordinator() {
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-m.probeWake:
+		}
+
+		for m.ctx.Err() == nil {
+			ranInitial, blockedInitial := m.runInitialConvergenceBatch()
+			if ranInitial {
+				continue
+			}
+			if blockedInitial {
+				break
+			}
+			ranRoutine, blockedRoutine := m.runPendingRoutineRound()
+			if ranRoutine {
+				continue
+			}
+			if blockedRoutine {
+				break
+			}
+			break
+		}
+	}
+}
+
+// runInitialConvergenceBatch returns whether a batch ran and whether work is
+// waiting on the global round gate or a per-tag probe lease.
+func (m *Manager) runInitialConvergenceBatch() (bool, bool) {
+	m.initialMu.Lock()
+	active := m.initialRunning
+	m.initialMu.Unlock()
+	if !active {
+		return false, false
+	}
+	if !m.probeAllInFlight.CompareAndSwap(false, true) {
+		return false, true
+	}
+
+	items, pending, waiting := m.collectInitialProbeItems()
+	if len(items) == 0 {
+		m.probeAllInFlight.Store(false)
+		if pending == 0 {
+			m.finishInitialConvergence()
+			return false, false
+		}
+		return false, waiting
+	}
+
+	policy := m.ProbePolicy()
+	m.probeRoundMu.Lock()
+	m.probeRound = ProbeRoundStatus{InFlight: true, Kind: ProbeRoundStartup, StartedAt: time.Now(), Total: len(items)}
+	m.probeRoundMu.Unlock()
+	defer func() {
+		m.probeAllInFlight.Store(false)
+		m.probeRoundMu.Lock()
+		m.probeRound.InFlight = false
+		m.probeRoundMu.Unlock()
+		m.signalProbeCoordinator()
 	}()
+
+	workerLimit := effectiveProbeConcurrency(policy.Concurrency, len(items))
+	results := collectLimited(workerLimit, items, func(item probeWorkItem) ProbeBatchResult {
+		return m.probeInitialItem(m.ctx, item, policy)
+	})
+	summary := ProbeBatchSummary{Total: len(items)}
+	for result := range results {
+		if result.Err != nil {
+			summary.Failed++
+			if m.logger != nil && !errors.Is(result.Err, context.Canceled) {
+				m.logger.Warn("initial probe failed for ", result.Tag, ": ", result.Err)
+			}
+		} else {
+			summary.Success++
+		}
+		m.probeRoundMu.Lock()
+		m.probeRound.Completed++
+		m.probeRound.Success = summary.Success
+		m.probeRound.Failed = summary.Failed
+		m.probeRoundMu.Unlock()
+	}
+	if m.logger != nil {
+		m.logger.Info("initial health convergence batch completed: ", summary.Success, " available, ", summary.Failed, " unavailable")
+	}
+	m.refreshInitialQueue()
+	return true, false
+}
+
+func (m *Manager) collectInitialProbeItems() ([]probeWorkItem, int, bool) {
+	m.mu.RLock()
+	current := make(map[string]probeWorkItem, len(m.nodes))
+	pendingTags := make([]string, 0, len(m.nodes))
+	for tag, item := range m.nodes {
+		item.mu.RLock()
+		work := probeWorkItem{entry: item, tag: tag, name: item.info.Name, probe: item.probe}
+		pending := !item.initialCheckDone
+		item.mu.RUnlock()
+		current[tag] = work
+		if pending {
+			pendingTags = append(pendingTags, tag)
+		}
+	}
+	m.mu.RUnlock()
+	pendingSet := make(map[string]struct{}, len(pendingTags))
+	for _, tag := range pendingTags {
+		pendingSet[tag] = struct{}{}
+	}
+
+	m.initialMu.Lock()
+	for tag := range m.initialQueue {
+		if _, exists := pendingSet[tag]; !exists {
+			delete(m.initialQueue, tag)
+		}
+	}
+	for _, tag := range pendingTags {
+		m.initialQueue[tag] = struct{}{}
+	}
+	queuedTags := make([]string, 0, len(m.initialQueue))
+	for tag := range m.initialQueue {
+		queuedTags = append(queuedTags, tag)
+	}
+	m.initialMu.Unlock()
+
+	items := make([]probeWorkItem, 0, len(queuedTags))
+	m.probeTagMu.Lock()
+	for _, tag := range queuedTags {
+		work, exists := current[tag]
+		if !exists {
+			continue
+		}
+		if _, busy := m.probeTagsInFlight[tag]; busy {
+			continue
+		}
+		m.probeTagsInFlight[tag] = struct{}{}
+		items = append(items, work)
+	}
+	m.probeTagMu.Unlock()
+	if len(items) > 0 {
+		m.initialMu.Lock()
+		for _, item := range items {
+			delete(m.initialQueue, item.tag)
+		}
+		m.initialMu.Unlock()
+	}
+	return items, len(pendingTags), len(items) == 0 && len(queuedTags) > 0
+}
+
+func (m *Manager) probeInitialItem(ctx context.Context, item probeWorkItem, policy ProbePolicy) ProbeBatchResult {
+	result := ProbeBatchResult{Tag: item.tag, Name: item.name}
+	defer m.endTagProbe(item.tag)
+	if ctx.Err() != nil {
+		result.Err = ctx.Err()
+		return result
+	}
+	if item.probe == nil {
+		result.Attempts = 1
+		result.Err = errors.New("probe function not configured")
+	} else {
+		for attempt := 1; attempt <= 2; attempt++ {
+			if ctx.Err() != nil {
+				result.Err = ctx.Err()
+				break
+			}
+			attemptCtx, cancel := context.WithTimeout(ctx, policy.StartupTimeout)
+			attemptCtx = withProbePhaseTimeouts(attemptCtx, policy.DialTimeout, policy.ResponseTimeout)
+			result.Attempts = attempt
+			result.Latency, result.Err = item.probe(attemptCtx)
+			cancel()
+			if result.Err == nil || ctx.Err() != nil || attempt == 2 {
+				break
+			}
+			timer := time.NewTimer(initialProbeRetryDelay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				result.Err = ctx.Err()
+			case <-timer.C:
+			}
+		}
+	}
+	if ctx.Err() == nil && entryRuntimeTag(item.entry) == item.tag {
+		m.applyHealthResult(item.entry, result.Latency, result.Err, time.Now())
+	}
+	return result
+}
+
+func (m *Manager) refreshInitialQueue() {
+	m.mu.RLock()
+	pending := make([]string, 0, len(m.nodes))
+	for tag, item := range m.nodes {
+		item.mu.RLock()
+		isPending := !item.initialCheckDone
+		item.mu.RUnlock()
+		if isPending {
+			pending = append(pending, tag)
+		}
+	}
+	m.mu.RUnlock()
+	if len(pending) == 0 {
+		m.finishInitialConvergence()
+		return
+	}
+	m.initialMu.Lock()
+	if m.initialRunning {
+		for _, tag := range pending {
+			m.initialQueue[tag] = struct{}{}
+		}
+	}
+	m.initialMu.Unlock()
+}
+
+func (m *Manager) finishInitialConvergence() {
+	finished := false
+	m.initialMu.Lock()
+	// Revalidate while enqueue operations are excluded. A subscription may
+	// register a new pending generation between the preceding batch scan and
+	// this transition; its follow-up enqueue will either be visible here or
+	// reopen convergence after this lock is released.
+	m.mu.RLock()
+	pending := make([]string, 0)
+	for tag, item := range m.nodes {
+		item.mu.RLock()
+		isPending := !item.initialCheckDone
+		item.mu.RUnlock()
+		if isPending {
+			pending = append(pending, tag)
+		}
+	}
+	m.mu.RUnlock()
+	if len(pending) > 0 {
+		for _, tag := range pending {
+			m.initialQueue[tag] = struct{}{}
+		}
+		m.initialMu.Unlock()
+		m.signalProbeCoordinator()
+		return
+	}
+	if m.initialRunning {
+		m.initialRunning = false
+		clear(m.initialQueue)
+		finished = true
+	}
+	m.initialMu.Unlock()
+	if finished && m.logger != nil {
+		m.logger.Info("initial health convergence completed: pending nodes reached zero")
+	}
+}
+
+func (m *Manager) runPendingRoutineRound() (bool, bool) {
+	m.routineRequestMu.Lock()
+	if !m.routinePending {
+		m.routineRequestMu.Unlock()
+		return false, false
+	}
+	dueOnly := m.routineDueOnly
+	m.routinePending = false
+	m.routineDueOnly = false
+	m.routineRequestMu.Unlock()
+
+	_, err := m.RunProbeBatch(m.ctx, ProbeRoundPeriodic, dueOnly, nil, nil)
+	if errors.Is(err, ErrProbeRoundInProgress) {
+		m.routineRequestMu.Lock()
+		if !m.routinePending {
+			m.routineDueOnly = dueOnly
+		} else if !dueOnly {
+			m.routineDueOnly = false
+		}
+		m.routinePending = true
+		m.routineRequestMu.Unlock()
+		return false, true
+	}
+	if err != nil && !errors.Is(err, context.Canceled) && m.logger != nil {
+		m.logger.Warn("probe round failed: ", err)
+	}
+	return true, false
 }
 
 // RunProbeBatch executes one mutually exclusive worker-pool round. The result
@@ -564,7 +919,7 @@ func (m *Manager) RunProbeBatch(ctx context.Context, kind ProbeRoundKind, dueOnl
 		return ProbeBatchSummary{}, errors.New("probe target not configured")
 	}
 	m.mu.RLock()
-	entries := make([]*entry, 0, len(m.nodes))
+	items := make([]probeWorkItem, 0, len(m.nodes))
 	for _, e := range m.nodes {
 		e.mu.RLock()
 		probeFn := e.probe
@@ -575,20 +930,20 @@ func (m *Manager) RunProbeBatch(ctx context.Context, kind ProbeRoundKind, dueOnl
 		if probeFn == nil || (dueOnly && !m.probeDue(tag, nodeID, lastHealthCheck, time.Now())) {
 			continue
 		}
-		entries = append(entries, e)
+		items = append(items, probeWorkItem{entry: e, tag: tag, name: e.info.Name, probe: probeFn})
 	}
 	m.mu.RUnlock()
 
 	if !m.probeAllInFlight.CompareAndSwap(false, true) {
 		return ProbeBatchSummary{}, ErrProbeRoundInProgress
 	}
-	entries = m.reserveBatchProbeEntries(entries)
+	items = m.reserveBatchProbeItems(items)
 	policy := m.ProbePolicy()
 	timeout, retries := policy.RoutineTimeout, policy.RoutineRetries
 	if kind == ProbeRoundStartup {
 		timeout, retries = policy.StartupTimeout, 0
 	}
-	status := ProbeRoundStatus{InFlight: true, Kind: kind, StartedAt: time.Now(), Total: len(entries)}
+	status := ProbeRoundStatus{InFlight: true, Kind: kind, StartedAt: time.Now(), Total: len(items)}
 	m.probeRoundMu.Lock()
 	m.probeRound = status
 	m.probeRoundMu.Unlock()
@@ -597,22 +952,26 @@ func (m *Manager) RunProbeBatch(ctx context.Context, kind ProbeRoundKind, dueOnl
 		m.probeRoundMu.Lock()
 		m.probeRound.InFlight = false
 		m.probeRoundMu.Unlock()
+		m.signalProbeCoordinator()
 	}()
 	if onStart != nil {
-		onStart(len(entries))
+		onStart(len(items))
 	}
-	if len(entries) == 0 {
+	if len(items) == 0 {
 		return ProbeBatchSummary{}, nil
 	}
 
 	if m.logger != nil {
-		m.logger.Info("starting ", kind, " health check for ", len(entries), " nodes")
+		m.logger.Info("starting ", kind, " health check for ", len(items), " nodes")
 	}
-	workerLimit := effectiveProbeConcurrency(policy.Concurrency, len(entries))
-	results := collectLimited(workerLimit, entries, func(entry *entry) ProbeBatchResult {
-		return m.probeBatchEntry(ctx, entry, timeout, retries, policy.DialTimeout, policy.ResponseTimeout)
+	workerLimit := effectiveProbeConcurrency(policy.Concurrency, len(items))
+	results := collectLimited(workerLimit, items, func(item probeWorkItem) ProbeBatchResult {
+		if kind == ProbeRoundStartup {
+			return m.probeInitialItem(ctx, item, policy)
+		}
+		return m.probeBatchItem(ctx, item, timeout, retries, policy.DialTimeout, policy.ResponseTimeout)
 	})
-	summary := ProbeBatchSummary{Total: len(entries)}
+	summary := ProbeBatchSummary{Total: len(items)}
 	for result := range results {
 		if result.Err != nil {
 			summary.Failed++
@@ -637,13 +996,10 @@ func (m *Manager) RunProbeBatch(ctx context.Context, kind ProbeRoundKind, dueOnl
 	return summary, ctx.Err()
 }
 
-func (m *Manager) probeBatchEntry(ctx context.Context, entry *entry, timeout time.Duration, retries int, dialTimeout, responseTimeout time.Duration) ProbeBatchResult {
-	entry.mu.RLock()
-	probe, tag, name := entry.probe, entry.info.Tag, entry.info.Name
-	entry.mu.RUnlock()
-	result := ProbeBatchResult{Tag: tag, Name: name}
-	defer m.endTagProbe(tag)
-	if probe == nil {
+func (m *Manager) probeBatchItem(ctx context.Context, item probeWorkItem, timeout time.Duration, retries int, dialTimeout, responseTimeout time.Duration) ProbeBatchResult {
+	result := ProbeBatchResult{Tag: item.tag, Name: item.name}
+	defer m.endTagProbe(item.tag)
+	if item.probe == nil {
 		result.Err = errors.New("probe function not configured")
 		return result
 	}
@@ -652,30 +1008,27 @@ func (m *Manager) probeBatchEntry(ctx context.Context, entry *entry, timeout tim
 	nodeCtx = withProbePhaseTimeouts(nodeCtx, dialTimeout, responseTimeout)
 	for attempt := 0; attempt <= retries; attempt++ {
 		result.Attempts = attempt + 1
-		result.Latency, result.Err = probe(nodeCtx)
+		result.Latency, result.Err = item.probe(nodeCtx)
 		if result.Err == nil || nodeCtx.Err() != nil {
 			break
 		}
 	}
-	if ctx.Err() == nil && entryRuntimeTag(entry) == result.Tag {
-		m.applyHealthResult(entry, result.Latency, result.Err, time.Now())
+	if ctx.Err() == nil && entryRuntimeTag(item.entry) == result.Tag {
+		m.applyHealthResult(item.entry, result.Latency, result.Err, time.Now())
 	}
 	return result
 }
 
-func (m *Manager) reserveBatchProbeEntries(entries []*entry) []*entry {
+func (m *Manager) reserveBatchProbeItems(items []probeWorkItem) []probeWorkItem {
 	m.probeTagMu.Lock()
 	defer m.probeTagMu.Unlock()
-	reserved := entries[:0]
-	for _, entry := range entries {
-		entry.mu.RLock()
-		tag := entry.info.Tag
-		entry.mu.RUnlock()
-		if _, exists := m.probeTagsInFlight[tag]; exists {
+	reserved := items[:0]
+	for _, item := range items {
+		if _, exists := m.probeTagsInFlight[item.tag]; exists {
 			continue
 		}
-		m.probeTagsInFlight[tag] = struct{}{}
-		reserved = append(reserved, entry)
+		m.probeTagsInFlight[item.tag] = struct{}{}
+		reserved = append(reserved, item)
 	}
 	return reserved
 }
@@ -718,6 +1071,23 @@ func (m *Manager) ProbeNodeCount() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return len(m.nodes)
+}
+
+func (m *Manager) InitialProbeStatus() InitialProbeStatus {
+	m.mu.RLock()
+	pending := 0
+	for _, item := range m.nodes {
+		item.mu.RLock()
+		if !item.initialCheckDone {
+			pending++
+		}
+		item.mu.RUnlock()
+	}
+	m.mu.RUnlock()
+	m.initialMu.Lock()
+	status := InitialProbeStatus{Converging: m.initialRunning, Pending: pending, Queued: len(m.initialQueue)}
+	m.initialMu.Unlock()
+	return status
 }
 
 // Stop stops the periodic health check.
@@ -777,6 +1147,7 @@ func (m *Manager) SweepStaleNodes() {
 			delete(m.nodes, tag)
 		}
 	}
+	m.signalProbeCoordinator()
 }
 
 // ClearNodes removes all registered nodes. Use BeginReload + SweepStaleNodes
@@ -875,10 +1246,11 @@ func (m *Manager) UnregisterRuntimeTag(tag string) {
 		}
 	}
 	m.mu.Unlock()
+	m.signalProbeCoordinator()
 }
 
-// RequestProbeTagsOnce schedules startup-policy probes only for the supplied
-// concrete tags. It intentionally does not occupy the global batch gate.
+// RequestProbeTagsOnce adds concrete runtime generations to the same bounded
+// initial-convergence queue used by startup and full reloads.
 func (m *Manager) RequestProbeTagsOnce(tags []string) {
 	if len(tags) == 0 {
 		return
@@ -889,25 +1261,7 @@ func (m *Manager) RequestProbeTagsOnce(tags []string) {
 		}
 		return
 	}
-	policy := m.ProbePolicy()
-	for _, tag := range tags {
-		m.mu.RLock()
-		nodeEntry := m.nodes[tag]
-		m.mu.RUnlock()
-		if nodeEntry == nil {
-			continue
-		}
-		m.probeTagMu.Lock()
-		if _, busy := m.probeTagsInFlight[tag]; busy {
-			m.probeTagMu.Unlock()
-			continue
-		}
-		m.probeTagsInFlight[tag] = struct{}{}
-		m.probeTagMu.Unlock()
-		go func(item *entry) {
-			_ = m.probeBatchEntry(m.ctx, item, policy.StartupTimeout, 0, policy.DialTimeout, policy.ResponseTimeout)
-		}(nodeEntry)
-	}
+	m.enqueueInitialProbeTags(tags)
 }
 
 // HandleForTag returns an existing monitor entry without changing its reload
@@ -1244,6 +1598,7 @@ func (m *Manager) endTagProbe(tag string) {
 	m.probeTagMu.Lock()
 	delete(m.probeTagsInFlight, tag)
 	m.probeTagMu.Unlock()
+	m.signalProbeCoordinator()
 }
 
 func (m *Manager) applyHealthResult(e *entry, latency time.Duration, probeErr error, checkedAt time.Time) {
