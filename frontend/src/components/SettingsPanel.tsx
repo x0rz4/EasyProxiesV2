@@ -20,6 +20,7 @@ const settingResultLabels: Record<string, string> = {
   management_server: '管理服务',
   management_password: 'WebUI 密码',
   management_probe_target: '探测目标',
+  management_startup_availability_policy: '启动准入策略',
   management_health_check_interval: '健康检查间隔',
   external_ip: '外部 IP',
   sub_refresh_enabled: '订阅自动刷新',
@@ -70,6 +71,7 @@ const defaultSettings: SettingsData = {
   management_enabled: true,
   management_listen: '0.0.0.0:9090',
   management_probe_target: '',
+  management_startup_availability_policy: 'optimistic',
   management_password: '',
   management_health_check_interval: '2h0m0s',
 
@@ -611,6 +613,14 @@ export default function SettingsPanel() {
               onChange={(e) => updateField('management_password', e.target.value)}
             />
             <p className="label text-base-content/50 mt-1">为空则不需要登录密码</p>
+          </fieldset>
+
+          <fieldset className="fieldset">
+            <legend className="fieldset-legend font-semibold text-base-content/80">启动准入策略</legend>
+            <select className="select select-md w-full bg-base-200/50" value={settings.management_startup_availability_policy} onChange={(e) => updateField('management_startup_availability_policy', e.target.value as 'optimistic' | 'strict')}>
+              <option value="optimistic">optimistic · 待复检节点先运行</option>
+              <option value="strict">strict · 本轮成功后运行</option>
+            </select>
           </fieldset>
         </div>
 

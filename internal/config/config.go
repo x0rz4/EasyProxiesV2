@@ -134,19 +134,25 @@ type MultiPortConfig struct {
 
 // ManagementConfig controls the monitoring HTTP endpoint.
 type ManagementConfig struct {
-	Enabled              *bool           `yaml:"enabled"`
-	Listen               string          `yaml:"listen"`
-	ProbeTarget          string          `yaml:"probe_target"`
-	Password             string          `yaml:"password"` // WebUI 访问密码，为空则不需要密码
-	HealthCheckInterval  time.Duration   `yaml:"health_check_interval"`
-	ProbeConcurrency     int             `yaml:"probe_concurrency"`
-	StartupProbeTimeout  time.Duration   `yaml:"startup_probe_timeout"`
-	RoutineProbeTimeout  time.Duration   `yaml:"routine_probe_timeout"`
-	ProbeDialTimeout     time.Duration   `yaml:"probe_dial_timeout"`
-	ProbeResponseTimeout time.Duration   `yaml:"probe_response_timeout"`
-	RoutineProbeRetries  *int            `yaml:"routine_probe_retries"`
-	NodeCheck            NodeCheckConfig `yaml:"node_check"`
+	Enabled                   *bool           `yaml:"enabled"`
+	Listen                    string          `yaml:"listen"`
+	ProbeTarget               string          `yaml:"probe_target"`
+	StartupAvailabilityPolicy string          `yaml:"startup_availability_policy"`
+	Password                  string          `yaml:"password"` // WebUI 访问密码，为空则不需要密码
+	HealthCheckInterval       time.Duration   `yaml:"health_check_interval"`
+	ProbeConcurrency          int             `yaml:"probe_concurrency"`
+	StartupProbeTimeout       time.Duration   `yaml:"startup_probe_timeout"`
+	RoutineProbeTimeout       time.Duration   `yaml:"routine_probe_timeout"`
+	ProbeDialTimeout          time.Duration   `yaml:"probe_dial_timeout"`
+	ProbeResponseTimeout      time.Duration   `yaml:"probe_response_timeout"`
+	RoutineProbeRetries       *int            `yaml:"routine_probe_retries"`
+	NodeCheck                 NodeCheckConfig `yaml:"node_check"`
 }
+
+const (
+	StartupAvailabilityOptimistic = "optimistic"
+	StartupAvailabilityStrict     = "strict"
+)
 
 // NodeCheckConfig controls manually-triggered diagnostics. These checks are
 // intentionally separate from health probes and never affect routing state.
@@ -429,6 +435,13 @@ func (c *Config) applyDefaults() error {
 	}
 	if c.Management.ProbeTarget == "" {
 		c.Management.ProbeTarget = "www.apple.com:80"
+	}
+	c.Management.StartupAvailabilityPolicy = strings.ToLower(strings.TrimSpace(c.Management.StartupAvailabilityPolicy))
+	if c.Management.StartupAvailabilityPolicy == "" {
+		c.Management.StartupAvailabilityPolicy = StartupAvailabilityOptimistic
+	}
+	if c.Management.StartupAvailabilityPolicy != StartupAvailabilityOptimistic && c.Management.StartupAvailabilityPolicy != StartupAvailabilityStrict {
+		return fmt.Errorf("management.startup_availability_policy must be %q or %q", StartupAvailabilityOptimistic, StartupAvailabilityStrict)
 	}
 	if c.Management.Enabled == nil {
 		defaultEnabled := true

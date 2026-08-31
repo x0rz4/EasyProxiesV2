@@ -284,6 +284,55 @@ func TestBasePoolExcludesActiveProbeFailures(t *testing.T) {
 	}
 }
 
+func TestStartupAvailabilityPolicyControlsPoolEligibility(t *testing.T) {
+	group.Reset()
+	ResetSharedStateStore()
+	t.Cleanup(group.Reset)
+	t.Cleanup(ResetSharedStateStore)
+	mgr, err := monitor.NewManager(monitor.Config{ProbeTarget: "http://example.com/generate_204", StartupAvailabilityPolicy: monitor.StartupAvailabilityOptimistic})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+
+	pendingHandle := mgr.Register(monitor.NodeInfo{Tag: "pending"})
+	pending := &memberState{tag: "pending", shared: acquireSharedState("pending")}
+	base := &poolOutbound{monitor: mgr}
+	if !base.memberAvailableForSnapshot(pending, time.Now()) {
+		t.Fatal("optimistic pending member was excluded")
+	}
+	mgr.SetStartupAvailabilityPolicy(monitor.StartupAvailabilityStrict)
+	if base.memberAvailableForSnapshot(pending, time.Now()) {
+		t.Fatal("strict pending member was admitted")
+	}
+	mgr.SetStartupAvailabilityPolicy(monitor.StartupAvailabilityOptimistic)
+	pendingHandle.MarkInitialCheckDone(false)
+	if base.memberAvailableForSnapshot(pending, time.Now()) {
+		t.Fatal("verified failed member remained eligible")
+	}
+
+	blacklistedHandle := mgr.Register(monitor.NodeInfo{Tag: "blacklisted"})
+	blacklistedHandle.Blacklist(time.Now().Add(time.Hour))
+	blacklisted := &memberState{tag: "blacklisted", shared: acquireSharedState("blacklisted")}
+	if base.memberAvailableForSnapshot(blacklisted, time.Now()) {
+		t.Fatal("blacklisted provisional member was admitted")
+	}
+
+	mgr.Register(monitor.NodeInfo{Tag: "recoverable"})
+	mgr.Register(monitor.NodeInfo{Tag: "evicted"})
+	group.Register(301, time.Hour, 3, "", map[string]group.GroupInitialState{
+		"recoverable": {NodeID: 1, FailureHistory: []int64{time.Now().UnixNano()}},
+		"evicted":     {NodeID: 2, Evicted: true},
+	})
+	groupPool := &poolOutbound{monitor: mgr, options: Options{GroupID: 301}}
+	if !groupPool.memberAvailableForSnapshot(&memberState{tag: "recoverable", shared: acquireSharedState("recoverable")}, time.Now()) {
+		t.Fatal("recoverable historical failure blocked provisional member")
+	}
+	if groupPool.memberAvailableForSnapshot(&memberState{tag: "evicted", shared: acquireSharedState("evicted")}, time.Now()) {
+		t.Fatal("permanently evicted provisional member was admitted")
+	}
+}
+
 func TestDialSuccessDoesNotClearPassiveFailuresBeforeResponse(t *testing.T) {
 	ResetSharedStateStore()
 	t.Cleanup(ResetSharedStateStore)

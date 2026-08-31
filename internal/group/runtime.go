@@ -304,6 +304,21 @@ func MemberAvailable(groupID int64, tag string) bool {
 	return member != nil && !member.evicted && len(member.failureHistory) == 0
 }
 
+// MemberNotEvicted is the optimistic-startup gate. Pending members may ignore
+// a recoverable failure history, but an explicit/permanent eviction is always
+// authoritative.
+func MemberNotEvicted(groupID int64, tag string) bool {
+	value, ok := groupRuntimeStore.Load(groupID)
+	if !ok {
+		return true
+	}
+	runtime := value.(*groupRuntime)
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	member := runtime.members[tag]
+	return member != nil && !member.evicted
+}
+
 func CurrentTag(groupID int64) string {
 	value, ok := groupRuntimeStore.Load(groupID)
 	if !ok {

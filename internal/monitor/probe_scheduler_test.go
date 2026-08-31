@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -596,6 +597,101 @@ func TestInitialProbeAttemptsUseIndependentTimeouts(t *testing.T) {
 			t.Fatalf("attempts=%d elapsed=%v want=%v summary=%+v", attempts.Load(), time.Since(started), wantElapsed, summary)
 		}
 	})
+}
+
+func TestInitialProbeHardTimeoutCannotWedgeRoundOrCommitLateSuccess(t *testing.T) {
+	mgr, err := NewManager(Config{ProbeTarget: "http://example.com", ProbeConcurrency: 1, StartupProbeTimeout: 20 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	release := make(chan struct{})
+	var calls atomic.Int32
+	mgr.Register(NodeInfo{Tag: "ignores-context"}).SetProbe(func(context.Context) (time.Duration, error) {
+		calls.Add(1)
+		<-release
+		return time.Millisecond, nil
+	})
+	started := time.Now()
+	summary, runErr := mgr.RunProbeBatch(t.Context(), ProbeRoundStartup, false, nil, nil)
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("hard timeout round took %v", elapsed)
+	}
+	if summary.Failed != 1 {
+		t.Fatalf("summary = %+v", summary)
+	}
+	snapshot := mgr.SnapshotForTag("ignores-context")
+	if snapshot == nil || !snapshot.InitialCheckDone || snapshot.Available {
+		t.Fatalf("hard timeout was not committed unavailable: %+v", snapshot)
+	}
+	status := mgr.ProbeRoundStatus()
+	if status.HardTimeouts != 1 || status.DetachedProbes != 1 {
+		t.Fatalf("status = %+v", status)
+	}
+	second, secondErr := mgr.RunProbeBatch(t.Context(), ProbeRoundStartup, false, nil, nil)
+	if secondErr != nil || second.Failed != 1 || calls.Load() != 1 {
+		t.Fatalf("second round=%+v err=%v calls=%d", second, secondErr, calls.Load())
+	}
+	close(release)
+	time.Sleep(20 * time.Millisecond)
+	snapshot = mgr.SnapshotForTag("ignores-context")
+	if snapshot.Available {
+		t.Fatalf("late success overwrote hard timeout: %+v", snapshot)
+	}
+}
+
+func TestLargeStartupBatchAdvancesWithDetachedProbesAndSlowSubscriber(t *testing.T) {
+	const nodeCount = 1126
+	mgr, err := NewManager(Config{ProbeTarget: "http://example.com", ProbeConcurrency: 113, StartupProbeTimeout: 15 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	releaseProbes := make(chan struct{})
+	releaseSubscriber := make(chan struct{})
+	var slowOnce sync.Once
+	unsubscribe := mgr.SubscribeHealthResults(func(HealthResultEvent) {
+		slowOnce.Do(func() { <-releaseSubscriber })
+	})
+	defer unsubscribe()
+	blocked := 0
+	failed := 0
+	for index := range nodeCount {
+		handle := mgr.Register(NodeInfo{Tag: fmt.Sprintf("large-%04d", index)})
+		switch {
+		case index%100 == 0:
+			blocked++
+			handle.SetProbe(func(context.Context) (time.Duration, error) {
+				<-releaseProbes
+				return time.Millisecond, nil
+			})
+		case index%37 == 0:
+			failed++
+			handle.SetProbe(func(context.Context) (time.Duration, error) { return 0, errors.New("failed") })
+		default:
+			handle.SetProbe(func(context.Context) (time.Duration, error) { return time.Millisecond, nil })
+		}
+	}
+	started := time.Now()
+	summary, runErr := mgr.RunProbeBatch(t.Context(), ProbeRoundStartup, false, nil, nil)
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("large startup batch took %v", elapsed)
+	}
+	if summary.Total != nodeCount || summary.Failed != blocked+failed || summary.Success != nodeCount-blocked-failed {
+		t.Fatalf("summary=%+v blocked=%d failed=%d", summary, blocked, failed)
+	}
+	status := mgr.ProbeRoundStatus()
+	if status.HardTimeouts != blocked || status.DetachedProbes != blocked || status.Completed != nodeCount {
+		t.Fatalf("status=%+v blocked=%d", status, blocked)
+	}
+	close(releaseSubscriber)
+	close(releaseProbes)
 }
 
 func TestCancellingStartupRoundDuringBackoffReturnsPromptly(t *testing.T) {

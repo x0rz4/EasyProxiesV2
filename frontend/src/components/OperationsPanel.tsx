@@ -10,6 +10,7 @@ import { controlClass, PageContent, PageHeader, PageLayout, surfaceClass } from 
 
 const EMPTY_SETTINGS: ProbeOperationsSettings = {
   probe_target: '',
+  startup_availability_policy: 'optimistic',
   health_check_interval: '2h0m0s',
   probe_concurrency: 0,
   startup_probe_timeout: '5s',
@@ -160,7 +161,7 @@ export default function OperationsPanel() {
       <PageContent>
         <section aria-label="探测运行概览" className="grid grid-cols-2 gap-4 xl:grid-cols-5">
           <Metric label="节点规模" value={status?.node_count ?? 0} detail="本轮可调度节点" tone="text-primary" />
-          <Metric label="首次探测剩余" value={status?.initial_pending ?? 0} detail={status?.converging ? `后台收敛中 · 队列等待 ${status.queued}` : status?.initial_pending ? '等待首次探测调度' : '首次探测已收敛'} tone={status?.initial_pending ? 'text-warning' : 'text-success'} />
+          <Metric label="首次探测剩余" value={status?.initial_pending ?? 0} detail={status?.waiting_for_manual ? '后台收敛等待手动探测结束' : status?.converging ? `后台收敛中 · 队列等待 ${status.queued} · 已调度 ${status.scheduled}` : status?.initial_pending ? '等待首次探测调度' : '首次探测已收敛'} tone={status?.initial_pending ? 'text-warning' : 'text-success'} />
           <Metric label="有效 Worker" value={status?.effective_concurrency ?? 0} detail={status?.concurrency_mode === 'auto' ? '自动并发模式' : `固定值 ${status?.configured_concurrency ?? 0}`} tone="text-info" />
           <Metric label="启动最坏估算" value={status?.estimated_startup_worst_case || '0s'} detail="启动策略 · 失败等待 500ms 后重试一次" tone="text-success" />
           <Metric label="Routine 最坏估算" value={status?.estimated_routine_worst_case || '0s'} detail="周期与手动总预算" tone="text-warning" />
@@ -173,6 +174,7 @@ export default function OperationsPanel() {
           </div>
           <div className="grid gap-4 p-5 md:grid-cols-2 xl:grid-cols-3 lg:p-6">
             <Field id="probe-target" label="探测目标" hint="支持 HTTP/HTTPS；未填路径时使用 /generate_204" className="md:col-span-2 xl:col-span-3"><input id="probe-target" className={cn('input w-full font-mono text-sm', controlClass)} value={form.probe_target} onChange={(event) => update('probe_target', event.target.value)} placeholder="https://cp.cloudflare.com/generate_204" /></Field>
+            <Field id="startup-policy" label="启动准入策略" hint="乐观模式先提供服务，最终失败后立即移出"><select id="startup-policy" className={cn('select w-full', controlClass)} value={form.startup_availability_policy} onChange={(event) => update('startup_availability_policy', event.target.value as 'optimistic' | 'strict')}><option value="optimistic">optimistic · 待复检节点临时可用</option><option value="strict">strict · 本轮成功后才可用</option></select></Field>
             <Field id="health-interval" label="健康检查间隔" hint="周期调度只探测已到期节点"><input id="health-interval" className={cn('input w-full font-mono', controlClass)} value={form.health_check_interval} onChange={(event) => update('health_check_interval', event.target.value)} /></Field>
             <Field id="probe-concurrency" label="批量并发" hint="0=自动：min(128, max(32, ceil(节点数/10)))"><input id="probe-concurrency" type="number" min={0} max={512} className={cn('input w-full tabular-nums', controlClass)} value={form.probe_concurrency} onChange={(event) => update('probe_concurrency', Number(event.target.value))} /></Field>
             <Field id="routine-retries" label="Routine 失败重试" hint="允许 0-2；首次探测固定重试一次"><input id="routine-retries" type="number" min={0} max={2} className={cn('input w-full tabular-nums', controlClass)} value={form.routine_probe_retries} onChange={(event) => update('routine_probe_retries', Number(event.target.value))} /></Field>
@@ -191,6 +193,7 @@ export default function OperationsPanel() {
           <div className="space-y-5 p-5 lg:p-6">
             {visibleProgress ? <>
               <div className="grid gap-3 sm:grid-cols-4"><SmallMetric label="已完成" value={`${visibleProgress.current}/${visibleProgress.total}`} /><SmallMetric label="成功" value={visibleProgress.success} tone="text-success" /><SmallMetric label="失败" value={visibleProgress.failed} tone="text-error" /><SmallMetric label="进度" value={`${visibleProgress.percent.toFixed(1)}%`} tone="text-primary" /></div>
+              {liveRound?.in_flight && <div className="flex flex-wrap gap-2 text-xs"><span className="badge badge-info badge-outline">第 {liveRound.attempt || 1} 次尝试</span><span className="badge badge-outline">活跃 Worker {liveRound.active_workers}</span>{liveRound.hard_timeouts > 0 && <span className="badge badge-warning badge-outline">硬超时 {liveRound.hard_timeouts}</span>}{liveRound.detached_probes > 0 && <span className="badge badge-error badge-outline">遗留调用 {liveRound.detached_probes}</span>}{liveRound.last_progress_at && <span className="badge badge-ghost" title={new Date(liveRound.last_progress_at).toLocaleString()}>最后进度 {new Date(liveRound.last_progress_at).toLocaleTimeString()}</span>}</div>}
               <progress className="progress progress-primary h-2 w-full" value={visibleProgress.percent} max="100" aria-label="全量探测进度" />
             </> : <div className="rounded-xl border border-dashed border-base-300 bg-base-200/20 px-5 py-8 text-center"><p className="font-medium text-base-content/65">当前没有运行中的全量探测</p><p className="mt-1 text-sm text-base-content/45">可从页面顶部启动，进度和最终结果会实时显示在这里</p></div>}
 

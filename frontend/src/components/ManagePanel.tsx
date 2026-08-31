@@ -30,6 +30,8 @@ interface MergedNode extends ConfigNodeConfig {
   active_connections: number
   success_count: number
   failure_count: number
+  provisional: boolean
+  health_source: NodeSnapshot['health_source']
   tag?: string
   tags?: string[]
 }
@@ -161,16 +163,16 @@ function SortIcon({ active, dir }: { active: boolean; dir: SortDir }) {
     : <ArrowDown className="h-3 w-3 opacity-70 ml-0.5 inline" />
 }
 
-function StatusBadge({ status }: { status: MergedNode['runtimeStatus'] }) {
+function StatusBadge({ status, provisional }: { status: MergedNode['runtimeStatus']; provisional?: boolean }) {
   switch (status) {
     case 'normal':
-      return <span className={cn("badge badge-success badge-sm border-none bg-success/15 text-success font-medium flex gap-1 items-center px-2 py-3.5")}><div className="w-1.5 h-1.5 rounded-full bg-success"></div>正常</span>
+      return <span className={cn("badge badge-success badge-sm border-none bg-success/15 text-success font-medium flex gap-1 items-center px-2 py-3.5")}><div className="w-1.5 h-1.5 rounded-full bg-success"></div>已验证可用</span>
     case 'unavailable':
-      return <span className={cn("badge badge-error badge-sm border-none bg-error/15 text-error font-medium flex gap-1 items-center px-2 py-3.5")}><div className="w-1.5 h-1.5 rounded-full bg-error"></div>不可用</span>
+      return <span className={cn("badge badge-error badge-sm border-none bg-error/15 text-error font-medium flex gap-1 items-center px-2 py-3.5")}><div className="w-1.5 h-1.5 rounded-full bg-error"></div>已验证不可用</span>
     case 'blacklisted':
       return <span className={cn("badge badge-error badge-sm border-none bg-error/30 text-error font-bold flex gap-1 items-center px-2 py-3.5")}><Ban className="h-3 w-3" />黑名单</span>
     case 'pending':
-      return <span className={cn("badge badge-warning badge-sm border-none bg-warning/15 text-warning-content font-medium flex gap-1 items-center px-2 py-3.5")}><div className="w-1.5 h-1.5 rounded-full bg-warning animate-pulse"></div>待检查</span>
+      return <span className={cn("badge badge-warning badge-sm border-none bg-warning/15 text-warning-content font-medium flex gap-1 items-center px-2 py-3.5")}><div className="w-1.5 h-1.5 rounded-full bg-warning animate-pulse"></div>{provisional ? '临时可用 · 待复检' : '待复检'}</span>
     case 'unloaded':
       return (
         <span
@@ -297,6 +299,8 @@ export default function ManagePanel() {
           active_connections: 0,
           success_count: 0,
           failure_count: 0,
+          provisional: false,
+          health_source: 'none',
           tag: undefined,
           tags: cfg.tags,
         }
@@ -315,6 +319,8 @@ export default function ManagePanel() {
           active_connections: 0,
           success_count: 0,
           failure_count: 0,
+          provisional: false,
+          health_source: 'none',
           tag: undefined,
           tags: cfg.tags,
         }
@@ -340,6 +346,8 @@ export default function ManagePanel() {
         active_connections: snap.active_connections,
         success_count: typeof snap.success_count === 'number' ? snap.success_count : 0,
         failure_count: snap.failure_count,
+        provisional: snap.provisional,
+        health_source: snap.health_source,
         tag: snap.tag,
         tags: cfg.tags,
       }
@@ -987,7 +995,7 @@ export default function ManagePanel() {
                       </div>
                       <NodeTagPicker nodeId={node.id} currentTagNames={node.tags} />
                     </td>
-                    <td><StatusBadge status={node.runtimeStatus} /></td>
+                    <td><div className="flex flex-wrap items-center gap-1"><StatusBadge status={node.runtimeStatus} provisional={node.provisional} />{(node.health_source === 'persisted' || node.health_source === 'previous_generation') && <span className="badge badge-ghost badge-xs">历史延迟</span>}</div></td>
                     <td className={`font-mono text-sm font-medium ${latencyColor(node.latency_ms)}`}>
                       {node.latency_ms < 0 ? <span className="text-base-content/30">-</span> : `${node.latency_ms} ms`}
                     </td>

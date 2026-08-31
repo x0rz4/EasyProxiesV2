@@ -33,6 +33,10 @@ export interface NodeSnapshot extends NodeInfo {
   last_latency_ms: number
   available: boolean
   initial_check_done: boolean
+  provisional: boolean
+  routing_eligible: boolean
+  health_source: 'none' | 'persisted' | 'previous_generation' | 'runtime'
+  health_updated_at?: string
   total_upload: number
   total_download: number
   timeline?: TimelineEvent[]
@@ -67,6 +71,8 @@ export interface GroupNodeOption {
   available: boolean
   initial_check_done: boolean
   selectable: boolean
+  provisional: boolean
+  health_source: 'none' | 'persisted' | 'previous_generation' | 'runtime'
 }
 
 export type GroupMemberStatus = 'ALIVE' | 'SUSPECT' | 'EVICTED'
@@ -83,6 +89,8 @@ export interface GroupMember {
   evicted_at?: string
   latency_ms: number
   available: boolean
+  provisional: boolean
+  health_source: 'none' | 'persisted' | 'previous_generation' | 'runtime'
   is_active: boolean
 }
 
@@ -214,6 +222,7 @@ export interface SettingsData {
   management_enabled: boolean
   management_listen: string
   management_probe_target: string
+  management_startup_availability_policy: 'optimistic' | 'strict'
   management_password: string
   management_health_check_interval: string
 
@@ -718,6 +727,7 @@ export interface NodeCheckEvent {
 
 export interface ProbeOperationsSettings {
   probe_target: string
+  startup_availability_policy: 'optimistic' | 'strict'
   health_check_interval: string
   probe_concurrency: number
   startup_probe_timeout: string
@@ -735,6 +745,11 @@ export interface ProbeRoundStatus {
   completed: number
   success: number
   failed: number
+  attempt: number
+  active_workers: number
+  hard_timeouts: number
+  detached_probes: number
+  last_progress_at?: string
 }
 
 export interface ProbeOperationsStatus {
@@ -749,6 +764,8 @@ export interface ProbeOperationsStatus {
   converging: boolean
   initial_pending: number
   queued: number
+  scheduled: number
+  waiting_for_manual: boolean
   round: ProbeRoundStatus
 }
 

@@ -32,8 +32,8 @@ const statusStyle: Record<GroupMemberStatus, { label: string; badge: string; ico
 }
 
 const nodeStatusStyle: Record<GroupNodeOption['status'], { label: string; badge: string }> = {
-  normal: { label: '可用', badge: 'badge-success' },
-  unavailable: { label: '不可用', badge: 'badge-error' },
+  normal: { label: '已验证可用', badge: 'badge-success' },
+  unavailable: { label: '已验证不可用', badge: 'badge-error' },
   blacklisted: { label: '已拉黑', badge: 'badge-warning' },
   pending: { label: '待检测', badge: 'badge-ghost' },
   disabled: { label: '已禁用', badge: 'badge-ghost' },
@@ -565,7 +565,7 @@ function NodeOptionRow({ node, latency, probing, action, onAction, onExclude, on
 }) {
   const style = nodeStatusStyle[node.status]
   return <div className="flex min-w-0 items-center gap-2 rounded-xl border border-base-200 bg-base-100/75 px-3 py-2.5 transition-colors hover:border-base-300">
-    <div className="min-w-0 flex-1"><div className="flex min-w-0 items-center gap-2"><span className="truncate text-sm font-medium" title={node.name}>{node.name}</span>{node.region && <span className="shrink-0 text-[10px] font-bold uppercase text-base-content/45">{node.region}</span>}</div><div className="mt-1 flex items-center gap-2"><span className={cn('badge badge-xs', style.badge)}>{style.label}</span><LatencyValue value={latency} /></div></div>
+    <div className="min-w-0 flex-1"><div className="flex min-w-0 items-center gap-2"><span className="truncate text-sm font-medium" title={node.name}>{node.name}</span>{node.region && <span className="shrink-0 text-[10px] font-bold uppercase text-base-content/45">{node.region}</span>}</div><div className="mt-1 flex flex-wrap items-center gap-1.5"><span className={cn('badge badge-xs', style.badge)}>{style.label}</span>{node.provisional && <span className="badge badge-warning badge-outline badge-xs">临时可用 · 待复检</span>}{(node.health_source === 'persisted' || node.health_source === 'previous_generation') && <span className="badge badge-ghost badge-xs">历史延迟</span>}<LatencyValue value={latency} /></div></div>
     <button type="button" className="btn btn-ghost btn-xs btn-square text-primary" onClick={onProbe} disabled={!node.tag || probing} aria-label={`测试 ${node.name} 延迟`} title={node.tag ? '测试延迟' : '节点暂无运行时标识'}>{probing ? <span className="loading loading-spinner loading-xs" /> : <Activity className="h-3.5 w-3.5" />}</button>
     {onExclude && <button type="button" className="btn btn-ghost btn-xs btn-square text-error" onClick={onExclude} aria-label={`排除 ${node.name}`} title="加入已排除名单（即使匹配地区也不入池）"><ShieldOff className="h-3.5 w-3.5" /></button>}
     <button type="button" className={cn('btn btn-ghost btn-xs btn-square', action === 'remove' ? 'text-error' : 'text-success')} onClick={onAction} aria-label={`${action === 'remove' ? '移除' : '添加'} ${node.name}`} title={action === 'remove' ? '取消手动指定' : '添加到手动节点'}>{action === 'remove' ? <Trash2 className="h-3.5 w-3.5" /> : <Plus className="h-3.5 w-3.5" />}</button>
@@ -585,7 +585,7 @@ function RuntimeMemberRow({ member, manual, regional, latency, probing, onProbe,
 }) {
   const style = statusStyle[member.status]
   return <div className="flex min-w-0 items-center gap-2 rounded-xl border border-base-200 bg-base-100/70 px-3 py-2.5">
-    <div className="min-w-0 flex-1"><div className="flex min-w-0 items-center gap-2"><span className="truncate text-sm font-medium">{member.name || member.tag}</span>{member.region && <span className="shrink-0 text-[10px] font-bold uppercase text-base-content/45">{member.region}</span>}</div><div className="mt-1 flex flex-wrap items-center gap-1.5"><span className={cn('badge badge-xs', style.badge)}>{style.label}</span>{manual && <span className="badge badge-outline badge-xs">手动</span>}{regional && <span className="badge badge-ghost badge-xs">地区</span>}{member.is_active && <span className="badge badge-success badge-outline badge-xs">当前出口</span>}<LatencyValue value={latency} /></div></div>
+    <div className="min-w-0 flex-1"><div className="flex min-w-0 items-center gap-2"><span className="truncate text-sm font-medium">{member.name || member.tag}</span>{member.region && <span className="shrink-0 text-[10px] font-bold uppercase text-base-content/45">{member.region}</span>}</div><div className="mt-1 flex flex-wrap items-center gap-1.5"><span className={cn('badge badge-xs', style.badge)}>{style.label}</span>{member.provisional && <span className="badge badge-warning badge-outline badge-xs">临时可用 · 待复检</span>}{(member.health_source === 'persisted' || member.health_source === 'previous_generation') && <span className="badge badge-ghost badge-xs">历史延迟</span>}{manual && <span className="badge badge-outline badge-xs">手动</span>}{regional && <span className="badge badge-ghost badge-xs">地区</span>}{member.is_active && <span className="badge badge-success badge-outline badge-xs">当前出口</span>}<LatencyValue value={latency} /></div></div>
     {onActivate && member.status === 'ALIVE' && !member.is_active && (
       <button type="button" className="btn btn-ghost btn-xs btn-square text-primary" onClick={onActivate} disabled={isActivateBusy} title="强制设为当前出口" aria-label={`将 ${member.name || member.tag} 设为当前出口`}>
         <Crosshair className="h-3.5 w-3.5" />

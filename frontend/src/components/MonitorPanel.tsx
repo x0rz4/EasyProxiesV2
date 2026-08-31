@@ -136,6 +136,13 @@ export default function MonitorPanel() {
     [allNodes]
   )
 
+  const provisionalNodes = useMemo(
+    () => allNodes.filter((n: NodeSnapshot) => n.provisional && !n.blacklisted).length,
+    [allNodes]
+  )
+
+  const strictPendingNodes = pendingNodes - provisionalNodes
+
   const healthRate = useMemo(() => {
     const checked = allNodes.filter((n: NodeSnapshot) => n.initial_check_done).length
     if (checked === 0) return -1
@@ -330,7 +337,8 @@ export default function MonitorPanel() {
             <span className="badge badge-success badge-sm badge-outline border-success/30 bg-success/5 font-medium">可用 {availableNodes}</span>
             {unavailableNodes > 0 && <span className="badge badge-error badge-sm badge-outline border-error/30 bg-error/5 font-medium">不可用 {unavailableNodes}</span>}
             {blacklistedNodes > 0 && <span className="badge badge-error badge-sm badge-outline border-error/30 bg-error/5 font-medium">黑名单 {blacklistedNodes}</span>}
-            {pendingNodes > 0 && <span className="badge badge-warning badge-sm badge-outline border-warning/30 bg-warning/5 font-medium">待检查 {pendingNodes}</span>}
+            {provisionalNodes > 0 && <span className="badge badge-warning badge-sm badge-outline border-warning/30 bg-warning/5 font-medium">临时可用 · 待复检 {provisionalNodes}</span>}
+            {strictPendingNodes > 0 && <span className="badge badge-warning badge-sm badge-outline border-warning/30 bg-warning/5 font-medium">待复检 {strictPendingNodes}</span>}
             {disabledNodes > 0 && <span className="badge badge-ghost badge-sm bg-base-200/50 font-medium text-base-content/50">禁用 {disabledNodes}</span>}
           </div>
         </div>

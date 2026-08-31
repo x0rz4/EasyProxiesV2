@@ -18,21 +18,27 @@ import (
 
 // Config mirrors user settings needed by the monitoring server.
 type Config struct {
-	Enabled              bool
-	Listen               string
-	ProbeTarget          string
-	Password             string
-	ProxyUsername        string // 代理池的用户名（用于导出）
-	ProxyPassword        string // 代理池的密码（用于导出）
-	ExternalIP           string // 外部 IP 地址，用于导出时替换 0.0.0.0
-	SkipCertVerify       bool   // 全局跳过 SSL 证书验证
-	ProbeConcurrency     int
-	StartupProbeTimeout  time.Duration
-	RoutineProbeTimeout  time.Duration
-	ProbeDialTimeout     time.Duration
-	ProbeResponseTimeout time.Duration
-	RoutineProbeRetries  int
+	Enabled                   bool
+	Listen                    string
+	ProbeTarget               string
+	StartupAvailabilityPolicy string
+	Password                  string
+	ProxyUsername             string // 代理池的用户名（用于导出）
+	ProxyPassword             string // 代理池的密码（用于导出）
+	ExternalIP                string // 外部 IP 地址，用于导出时替换 0.0.0.0
+	SkipCertVerify            bool   // 全局跳过 SSL 证书验证
+	ProbeConcurrency          int
+	StartupProbeTimeout       time.Duration
+	RoutineProbeTimeout       time.Duration
+	ProbeDialTimeout          time.Duration
+	ProbeResponseTimeout      time.Duration
+	RoutineProbeRetries       int
 }
+
+const (
+	StartupAvailabilityOptimistic = "optimistic"
+	StartupAvailabilityStrict     = "strict"
+)
 
 type ProbeRoundKind string
 
@@ -92,13 +98,18 @@ type probeWorkItem struct {
 }
 
 type ProbeRoundStatus struct {
-	InFlight  bool           `json:"in_flight"`
-	Kind      ProbeRoundKind `json:"kind,omitempty"`
-	StartedAt time.Time      `json:"started_at,omitempty"`
-	Total     int            `json:"total"`
-	Completed int            `json:"completed"`
-	Success   int            `json:"success"`
-	Failed    int            `json:"failed"`
+	InFlight       bool           `json:"in_flight"`
+	Kind           ProbeRoundKind `json:"kind,omitempty"`
+	StartedAt      time.Time      `json:"started_at,omitempty"`
+	Total          int            `json:"total"`
+	Completed      int            `json:"completed"`
+	Success        int            `json:"success"`
+	Failed         int            `json:"failed"`
+	Attempt        int            `json:"attempt"`
+	ActiveWorkers  int            `json:"active_workers"`
+	HardTimeouts   int            `json:"hard_timeouts"`
+	DetachedProbes int            `json:"detached_probes"`
+	LastProgressAt time.Time      `json:"last_progress_at,omitempty"`
 }
 
 type InitialProbeStatus struct {
@@ -206,6 +217,9 @@ type HealthResultEvent struct {
 	Latency   time.Duration
 	Error     string
 	CheckedAt time.Time
+	// SnapshotOnly asks routing observers to rebuild from the current monitor
+	// snapshot without treating the notification as a new health result.
+	SnapshotOnly bool
 }
 
 const maxTimelineSize = 20
@@ -225,11 +239,34 @@ type Snapshot struct {
 	LastLatencyMs     int64           `json:"last_latency_ms"`
 	Available         bool            `json:"available"`
 	InitialCheckDone  bool            `json:"initial_check_done"`
+	Provisional       bool            `json:"provisional"`
+	RoutingEligible   bool            `json:"routing_eligible"`
+	HealthSource      string          `json:"health_source"`
+	HealthUpdatedAt   time.Time       `json:"health_updated_at,omitempty"`
 	TotalUpload       int64           `json:"total_upload"`
 	TotalDownload     int64           `json:"total_download"`
 	UploadSpeed       int64           `json:"upload_speed"`   // bytes/sec
 	DownloadSpeed     int64           `json:"download_speed"` // bytes/sec
 	Timeline          []TimelineEvent `json:"timeline,omitempty"`
+}
+
+// PersistedHealthState is the storage-neutral health snapshot restored before
+// startup convergence. It intentionally does not restore InitialCheckDone:
+// every concrete runtime generation must still be probed in the background.
+type PersistedHealthState struct {
+	NodeID           int64
+	FailureCount     int
+	SuccessCount     int64
+	Blacklisted      bool
+	BlacklistedUntil time.Time
+	LastError        string
+	LastFailure      time.Time
+	LastSuccess      time.Time
+	LastLatencyMs    int64
+	Available        bool
+	TotalUpload      int64
+	TotalDownload    int64
+	UpdatedAt        time.Time
 }
 
 type NodeTrafficSpeed struct {
@@ -287,6 +324,8 @@ type entry struct {
 	dialer           DialerFunc
 	initialCheckDone bool
 	available        bool
+	healthSource     string
+	healthUpdatedAt  time.Time
 	reloadGen        uint64 // generation counter to track active registrations
 	mu               sync.RWMutex
 	onTimeline       func(DebugLogEvent)
@@ -304,18 +343,20 @@ type Manager struct {
 	logger      Logger
 
 	// periodic health check control
-	healthMu          sync.Mutex
-	healthInterval    time.Duration
-	healthStarted     bool
-	policyMu          sync.RWMutex
-	probePolicy       ProbePolicy
-	probeScheduler    *probeScheduler
-	debugSubMu        sync.RWMutex
-	debugSubscribers  map[chan DebugLogEvent]struct{}
-	healthEvents      *healthEventHub
-	groupScheduleMu   sync.RWMutex
-	groupSchedules    map[int64]groupHealthSchedule
-	groupScheduleNext uint64
+	healthMu                  sync.Mutex
+	healthInterval            time.Duration
+	healthStarted             bool
+	policyMu                  sync.RWMutex
+	probePolicy               ProbePolicy
+	probeScheduler            *probeScheduler
+	debugSubMu                sync.RWMutex
+	debugSubscribers          map[chan DebugLogEvent]struct{}
+	healthEvents              *healthEventHub
+	groupScheduleMu           sync.RWMutex
+	groupSchedules            map[int64]groupHealthSchedule
+	groupScheduleNext         uint64
+	availabilityMu            sync.RWMutex
+	startupAvailabilityPolicy string
 }
 
 type groupHealthSchedule struct {
@@ -353,6 +394,7 @@ func NewManager(cfg Config) (*Manager, error) {
 			ResponseTimeout: cfg.ProbeResponseTimeout, RoutineRetries: cfg.RoutineProbeRetries,
 		}),
 	}
+	m.SetStartupAvailabilityPolicy(cfg.StartupAvailabilityPolicy)
 	if strings.TrimSpace(cfg.ProbeTarget) != "" {
 		target, err := parseProbeTarget(cfg.ProbeTarget)
 		if err != nil {
@@ -368,6 +410,31 @@ func NewManager(cfg Config) (*Manager, error) {
 	go m.startTrafficSpeedSampler()
 	go m.probeScheduler.run()
 	return m, nil
+}
+
+func normalizeStartupAvailabilityPolicy(policy string) string {
+	if strings.EqualFold(strings.TrimSpace(policy), StartupAvailabilityStrict) {
+		return StartupAvailabilityStrict
+	}
+	return StartupAvailabilityOptimistic
+}
+
+func (m *Manager) SetStartupAvailabilityPolicy(policy string) {
+	normalized := normalizeStartupAvailabilityPolicy(policy)
+	m.availabilityMu.Lock()
+	changed := m.startupAvailabilityPolicy != "" && m.startupAvailabilityPolicy != normalized
+	m.startupAvailabilityPolicy = normalized
+	m.cfg.StartupAvailabilityPolicy = m.startupAvailabilityPolicy
+	m.availabilityMu.Unlock()
+	if changed && m.healthEvents != nil {
+		m.healthEvents.broadcast(HealthResultEvent{SnapshotOnly: true, CheckedAt: time.Now()})
+	}
+}
+
+func (m *Manager) StartupAvailabilityPolicy() string {
+	m.availabilityMu.RLock()
+	defer m.availabilityMu.RUnlock()
+	return m.startupAvailabilityPolicy
 }
 
 // SetLogger sets the logger for the manager.
@@ -652,6 +719,9 @@ func (m *Manager) Stop() {
 	if m.cancel != nil {
 		m.cancel()
 	}
+	if m.healthEvents != nil {
+		m.healthEvents.close()
+	}
 }
 
 func (m *Manager) startTrafficSpeedSampler() {
@@ -884,7 +954,7 @@ func (m *Manager) SnapshotForTag(tag string) *Snapshot {
 	if e == nil {
 		return nil
 	}
-	snap := e.snapshot()
+	snap := m.decorateSnapshot(e.snapshot())
 	return &snap
 }
 
@@ -895,7 +965,7 @@ func (m *Manager) SnapshotForNodeID(nodeID int64) *Snapshot {
 	if handle == nil {
 		return nil
 	}
-	snapshot := handle.ref.snapshot()
+	snapshot := m.decorateSnapshot(handle.ref.snapshot())
 	return &snapshot
 }
 
@@ -906,7 +976,7 @@ func (m *Manager) SnapshotFiltered(onlyAvailable bool) []Snapshot {
 	list := m.registry.entries()
 	snapshots := make([]Snapshot, 0, len(list))
 	for _, e := range list {
-		snap := e.snapshot()
+		snap := m.decorateSnapshot(e.snapshot())
 		// 如果只要可用节点：
 		// - 跳过已完成检查但不可用的节点
 		// - 保留未完成检查的节点（它们会在首次使用时被检查）
@@ -935,6 +1005,52 @@ func (m *Manager) SnapshotFiltered(onlyAvailable bool) []Snapshot {
 		return latencyI < latencyJ
 	})
 	return snapshots
+}
+
+func (m *Manager) decorateSnapshot(snapshot Snapshot) Snapshot {
+	snapshot.Provisional = !snapshot.InitialCheckDone && m.StartupAvailabilityPolicy() == StartupAvailabilityOptimistic && !snapshot.Blacklisted
+	snapshot.RoutingEligible = !snapshot.Blacklisted && ((snapshot.InitialCheckDone && snapshot.Available) || snapshot.Provisional)
+	if snapshot.HealthSource == "" {
+		snapshot.HealthSource = "none"
+	}
+	return snapshot
+}
+
+// RestorePersistedHealth restores display/history fields by stable node ID.
+// Runtime eligibility remains provisional and startup convergence still probes
+// every restored entry because InitialCheckDone is deliberately left false.
+func (m *Manager) RestorePersistedHealth(states map[int64]PersistedHealthState) int {
+	restored := 0
+	now := time.Now()
+	for nodeID, state := range states {
+		entry := m.registry.byNodeID(nodeID)
+		if entry == nil {
+			continue
+		}
+		entry.mu.Lock()
+		entry.failure = state.FailureCount
+		entry.success = state.SuccessCount
+		entry.blacklist = state.Blacklisted && (state.BlacklistedUntil.IsZero() || state.BlacklistedUntil.After(now))
+		entry.until = state.BlacklistedUntil
+		entry.lastError = state.LastError
+		entry.lastFail = state.LastFailure
+		entry.lastOK = state.LastSuccess
+		if state.LastLatencyMs > 0 {
+			entry.lastProbe = time.Duration(state.LastLatencyMs) * time.Millisecond
+		}
+		entry.available = state.Available
+		entry.initialCheckDone = false
+		entry.healthSource = "persisted"
+		entry.healthUpdatedAt = state.UpdatedAt
+		entry.totalUpload.Store(state.TotalUpload)
+		entry.totalDownload.Store(state.TotalDownload)
+		entry.mu.Unlock()
+		restored++
+	}
+	if restored > 0 && m.healthEvents != nil {
+		m.healthEvents.broadcast(HealthResultEvent{SnapshotOnly: true, CheckedAt: time.Now()})
+	}
+	return restored
 }
 
 // TrafficSummary returns aggregated traffic totals/speeds and per-node speeds.
@@ -1048,11 +1164,15 @@ func (m *Manager) applyHealthResult(e *entry, latency time.Duration, probeErr er
 		e.initialCheckDone = true
 		e.lastProbe = 0
 		e.lastHealthCheck = checkedAt
+		e.healthSource = "runtime"
+		e.healthUpdatedAt = checkedAt
 		e.mu.Unlock()
 	} else {
 		e.recordSuccessWithLatency(latency)
 		e.mu.Lock()
 		e.lastHealthCheck = checkedAt
+		e.healthSource = "runtime"
+		e.healthUpdatedAt = checkedAt
 		e.mu.Unlock()
 	}
 	e.mu.RLock()
@@ -1152,6 +1272,8 @@ func (e *entry) snapshot() Snapshot {
 		LastLatencyMs:     latencyMs,
 		Available:         e.available,
 		InitialCheckDone:  e.initialCheckDone,
+		HealthSource:      e.healthSource,
+		HealthUpdatedAt:   e.healthUpdatedAt,
 		TotalUpload:       e.totalUpload.Load(),
 		TotalDownload:     e.totalDownload.Load(),
 		UploadSpeed:       e.uploadSpeed,
@@ -1187,11 +1309,14 @@ func (e *entry) recordSuccess(destination string) {
 func (e *entry) recordSuccessWithLatency(latency time.Duration) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	now := time.Now()
 	e.success++
-	e.lastOK = time.Now()
+	e.lastOK = now
 	e.lastProbe = latency
 	e.available = true
 	e.initialCheckDone = true
+	e.healthSource = "runtime"
+	e.healthUpdatedAt = now
 	latencyMs := latency.Milliseconds()
 	if latencyMs == 0 && latency > 0 {
 		latencyMs = 1

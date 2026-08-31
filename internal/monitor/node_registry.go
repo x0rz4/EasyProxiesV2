@@ -112,10 +112,11 @@ func (r *nodeRegistry) register(info NodeInfo) *entry {
 	item := r.byTag[info.Tag]
 	if item == nil {
 		item = &entry{
-			info:       info,
-			timeline:   make([]TimelineEvent, 0, maxTimelineSize),
-			reloadGen:  r.reload,
-			onTimeline: r.manager.publishDebugLog,
+			info:         info,
+			timeline:     make([]TimelineEvent, 0, maxTimelineSize),
+			healthSource: "none",
+			reloadGen:    r.reload,
+			onTimeline:   r.manager.publishDebugLog,
 		}
 		r.byTag[info.Tag] = item
 	} else {
@@ -162,7 +163,7 @@ func (r *nodeRegistry) migrate(nodeID int64, info NodeInfo) *entry {
 		item.mu.RUnlock()
 		delete(r.byTag, oldTag)
 	} else {
-		item = &entry{timeline: make([]TimelineEvent, 0, maxTimelineSize), onTimeline: r.manager.publishDebugLog}
+		item = &entry{timeline: make([]TimelineEvent, 0, maxTimelineSize), healthSource: "none", onTimeline: r.manager.publishDebugLog}
 	}
 	item.mu.Lock()
 	item.info = info
@@ -174,6 +175,9 @@ func (r *nodeRegistry) migrate(nodeID int64, info NodeInfo) *entry {
 		item.initialCheckDone = false
 		item.available = false
 		item.lastHealthCheck = time.Time{}
+		if item.healthSource != "none" {
+			item.healthSource = "previous_generation"
+		}
 	}
 	item.mu.Unlock()
 	r.byTag[info.Tag] = item

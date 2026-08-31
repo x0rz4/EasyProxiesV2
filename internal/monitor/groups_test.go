@@ -62,7 +62,7 @@ func TestGroupNodeOptionsUseManagedAvailableNodes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	mgr, err := NewManager(Config{})
+	mgr, err := NewManager(Config{StartupAvailabilityPolicy: StartupAvailabilityStrict})
 	if err != nil {
 		t.Fatal(err)
 	}

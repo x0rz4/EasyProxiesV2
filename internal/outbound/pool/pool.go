@@ -537,13 +537,11 @@ func (p *poolOutbound) publishSnapshotLocked(members []*memberState) *PoolSnapsh
 }
 
 func (p *poolOutbound) memberAvailableForSnapshot(member *MemberRef, now time.Time) bool {
-	if p.options.GroupID != 0 && !group.MemberAvailable(p.options.GroupID, member.tag) {
-		return false
-	}
 	probeConfigured := false
+	var monitorSnapshot *monitor.Snapshot
 	if p.monitor != nil {
 		_, probeConfigured = p.monitor.TargetForProbe()
-		monitorSnapshot := p.monitor.SnapshotForTag(member.tag)
+		monitorSnapshot = p.monitor.SnapshotForTag(member.tag)
 		if p.options.MonitorObserverOnly && p.memberMeta(member).NodeID != 0 {
 			monitorSnapshot = p.monitor.SnapshotForNodeID(p.memberMeta(member).NodeID)
 		}
@@ -551,7 +549,16 @@ func (p *poolOutbound) memberAvailableForSnapshot(member *MemberRef, now time.Ti
 			member.latencyMs.Store(monitorSnapshot.LastLatencyMs)
 		}
 		if (p.options.GroupID != 0 || probeConfigured) &&
-			(monitorSnapshot == nil || !monitorSnapshot.InitialCheckDone || !monitorSnapshot.Available || monitorSnapshot.Blacklisted) {
+			(monitorSnapshot == nil || !monitorSnapshot.RoutingEligible) {
+			return false
+		}
+	}
+	if p.options.GroupID != 0 {
+		if monitorSnapshot != nil && monitorSnapshot.Provisional {
+			if !group.MemberNotEvicted(p.options.GroupID, member.tag) {
+				return false
+			}
+		} else if !group.MemberAvailable(p.options.GroupID, member.tag) {
 			return false
 		}
 	}
@@ -1315,6 +1322,14 @@ func (p *poolOutbound) handleGroupState(event group.GroupStateEvent) {
 }
 
 func (p *poolOutbound) handleHealthResult(event monitor.HealthResultEvent) {
+	if event.SnapshotOnly {
+		if p.closed.Load() {
+			return
+		}
+		p.rebuildCandidatesNow()
+		p.reconcileCurrent()
+		return
+	}
 	tag := event.Tag
 	if p.options.GroupID != 0 && event.NodeID != 0 {
 		p.mu.Lock()
@@ -1352,8 +1367,8 @@ func (p *poolOutbound) handleHealthResult(event monitor.HealthResultEvent) {
 		p.scheduleCandidateRebuild()
 	} else {
 		p.rebuildCandidatesNow()
+		p.reconcileCurrent()
 	}
-	p.reconcileCurrent()
 }
 
 func (p *poolOutbound) hasMember(tag string) bool {
@@ -1370,10 +1385,15 @@ func (p *poolOutbound) scheduleCandidateRebuild() {
 		return
 	}
 	if p.rebuildTimer == nil {
-		p.rebuildTimer = time.AfterFunc(100*time.Millisecond, p.rebuildCandidatesNow)
+		p.rebuildTimer = time.AfterFunc(100*time.Millisecond, p.rebuildAndReconcileCandidatesNow)
 	} else {
 		p.rebuildTimer.Reset(100 * time.Millisecond)
 	}
+}
+
+func (p *poolOutbound) rebuildAndReconcileCandidatesNow() {
+	p.rebuildCandidatesNow()
+	p.reconcileCurrent()
 }
 
 func (p *poolOutbound) scheduleExpiryRebuild(after time.Duration) {

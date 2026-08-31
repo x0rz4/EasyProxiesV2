@@ -55,6 +55,7 @@ management:
   enabled: true                                      # 是否启用管理面板
   listen: 0.0.0.0:9888                               # 监听地址
   probe_target: https://cp.cloudflare.com/generate_204 # 必须返回 204；HTTPS 会执行 TLS/SNI/证书校验
+  startup_availability_policy: optimistic             # optimistic=待复检节点先进入池；strict=本轮成功后才进入池
   health_check_interval: 2h                          # 周期健康检查间隔（默认 2 小时）
   probe_concurrency: 0                               # 0=按节点数自动计算；也可固定为 1-512
   startup_probe_timeout: 5s                         # 启动/重载时每个节点的总探测预算

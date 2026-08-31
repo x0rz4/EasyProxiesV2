@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -63,19 +64,35 @@ type probeScheduler struct {
 	leaseMu      sync.Mutex
 	tagsInFlight map[string]struct{}
 
-	statusMu       sync.RWMutex
-	round          ProbeRoundStatus
-	initialRunning bool
-	initialQueued  int
-	periodicDirty  atomic.Bool
+	statusMu        sync.RWMutex
+	round           ProbeRoundStatus
+	initialRunning  bool
+	initialQueued   int
+	periodicDirty   atomic.Bool
+	attemptMu       sync.Mutex
+	runningAttempts map[probeAttemptKey]*probeAttemptState
+	detachedProbes  atomic.Int64
+}
+
+type probeAttemptKey struct {
+	entry *entry
+	tag   string
+}
+
+type probeAttemptState struct{ detached bool }
+
+type probeCallResult struct {
+	latency time.Duration
+	err     error
 }
 
 func newProbeScheduler(manager *Manager) *probeScheduler {
 	return &probeScheduler{
-		manager:      manager,
-		commands:     make(chan any, 128),
-		events:       make(chan probeExecutionEvent, 256),
-		tagsInFlight: make(map[string]struct{}),
+		manager:         manager,
+		commands:        make(chan any, 128),
+		events:          make(chan probeExecutionEvent, 256),
+		tagsInFlight:    make(map[string]struct{}),
+		runningAttempts: make(map[probeAttemptKey]*probeAttemptState),
 	}
 }
 
@@ -345,6 +362,9 @@ func (s *probeScheduler) run() {
 				continue
 			}
 			active.attempt = 2
+			s.statusMu.Lock()
+			s.round.Attempt = 2
+			s.statusMu.Unlock()
 			s.launchInitialWave(active, active.retry, 2, true)
 		case <-activeC:
 			if active == nil {
@@ -402,7 +422,9 @@ func (s *probeScheduler) newActiveRound(id uint64, request *probeBatchRequest, i
 }
 
 func (s *probeScheduler) startActiveRound(active *activeProbeRound) {
-	status := ProbeRoundStatus{InFlight: true, Kind: active.request.kind, StartedAt: time.Now(), Total: active.summary.Total}
+	now := time.Now()
+	status := ProbeRoundStatus{InFlight: true, Kind: active.request.kind, StartedAt: now, Total: active.summary.Total, Attempt: active.attempt, LastProgressAt: now,
+		DetachedProbes: int(s.detachedProbes.Load())}
 	s.statusMu.Lock()
 	s.round = status
 	s.statusMu.Unlock()
@@ -485,6 +507,7 @@ func (s *probeScheduler) handleExecutionResult(active *activeProbeRound, result 
 	}
 	s.statusMu.Lock()
 	s.round.Completed++
+	s.round.LastProgressAt = time.Now()
 	if result.Err != nil {
 		s.round.Failed++
 	} else {
@@ -493,6 +516,76 @@ func (s *probeScheduler) handleExecutionResult(active *activeProbeRound, result 
 	s.statusMu.Unlock()
 	if active.request.onResult != nil {
 		active.request.onResult(result)
+	}
+}
+
+func (s *probeScheduler) updateWorkerStatus(delta int) {
+	s.statusMu.Lock()
+	s.round.ActiveWorkers += delta
+	if s.round.ActiveWorkers < 0 {
+		s.round.ActiveWorkers = 0
+	}
+	s.statusMu.Unlock()
+}
+
+// runProbeAttempt adds an outer deadline around outbound implementations that
+// fail to honor context cancellation. The caller is released at the deadline;
+// the detached call remains tracked and cannot be started again concurrently.
+func (s *probeScheduler) runProbeAttempt(ctx context.Context, item probeWorkItem, timeout time.Duration) (time.Duration, error) {
+	if ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
+	key := probeAttemptKey{entry: item.entry, tag: item.tag}
+	state := &probeAttemptState{}
+	s.attemptMu.Lock()
+	if _, running := s.runningAttempts[key]; running {
+		s.attemptMu.Unlock()
+		return 0, errors.New("previous probe call is still running")
+	}
+	s.runningAttempts[key] = state
+	s.attemptMu.Unlock()
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+	resultC := make(chan probeCallResult, 1)
+	s.updateWorkerStatus(1)
+	go func() {
+		latency, err := item.probe(attemptCtx)
+		resultC <- probeCallResult{latency: latency, err: err}
+		s.attemptMu.Lock()
+		if s.runningAttempts[key] == state {
+			delete(s.runningAttempts, key)
+			if state.detached {
+				s.detachedProbes.Add(-1)
+				s.statusMu.Lock()
+				s.round.DetachedProbes = int(s.detachedProbes.Load())
+				s.statusMu.Unlock()
+			}
+		}
+		s.attemptMu.Unlock()
+	}()
+	select {
+	case result := <-resultC:
+		cancel()
+		s.updateWorkerStatus(-1)
+		return result.latency, result.err
+	case <-attemptCtx.Done():
+		cancel()
+		s.attemptMu.Lock()
+		if s.runningAttempts[key] == state {
+			state.detached = true
+			s.detachedProbes.Add(1)
+			s.statusMu.Lock()
+			s.round.DetachedProbes = int(s.detachedProbes.Load())
+			if errors.Is(attemptCtx.Err(), context.DeadlineExceeded) {
+				s.round.HardTimeouts++
+			}
+			s.statusMu.Unlock()
+		}
+		s.attemptMu.Unlock()
+		s.updateWorkerStatus(-1)
+		if errors.Is(attemptCtx.Err(), context.DeadlineExceeded) {
+			return 0, fmt.Errorf("probe hard timeout after %s: %w", timeout, context.DeadlineExceeded)
+		}
+		return 0, attemptCtx.Err()
 	}
 }
 
@@ -625,10 +718,8 @@ func (s *probeScheduler) probeInitialAttempt(ctx context.Context, item probeWork
 	if item.probe == nil {
 		result.Err = errors.New("probe function not configured")
 	} else {
-		attemptCtx, cancel := context.WithTimeout(ctx, policy.StartupTimeout)
-		attemptCtx = withProbePhaseTimeouts(attemptCtx, policy.DialTimeout, policy.ResponseTimeout)
-		result.Latency, result.Err = item.probe(attemptCtx)
-		cancel()
+		probeCtx := withProbePhaseTimeouts(ctx, policy.DialTimeout, policy.ResponseTimeout)
+		result.Latency, result.Err = s.runProbeAttempt(probeCtx, item, policy.StartupTimeout)
 	}
 	if ctx.Err() == nil && entryRuntimeTag(item.entry) == item.tag && (result.Err == nil || commitFailure || item.probe == nil) {
 		s.manager.applyHealthResult(item.entry, result.Latency, result.Err, time.Now())
@@ -651,7 +742,7 @@ func (s *probeScheduler) probeRoutineItem(ctx context.Context, item probeWorkIte
 	nodeCtx = withProbePhaseTimeouts(nodeCtx, policy.DialTimeout, policy.ResponseTimeout)
 	for attempt := 0; attempt <= policy.RoutineRetries; attempt++ {
 		result.Attempts = attempt + 1
-		result.Latency, result.Err = item.probe(nodeCtx)
+		result.Latency, result.Err = s.runProbeAttempt(nodeCtx, item, policy.RoutineTimeout)
 		if result.Err == nil || nodeCtx.Err() != nil {
 			break
 		}

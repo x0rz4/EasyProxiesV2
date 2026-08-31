@@ -22,7 +22,8 @@ func TestManagementProbeSettingsDefaultsAndExplicitZeroRetries(t *testing.T) {
 	}
 	if cfg.Management.ProbeConcurrency != 0 || cfg.Management.StartupProbeTimeout != 5*time.Second ||
 		cfg.Management.RoutineProbeTimeout != 10*time.Second || cfg.Management.ProbeDialTimeout != 3*time.Second ||
-		cfg.Management.ProbeResponseTimeout != 2*time.Second || cfg.RoutineProbeRetryCount() != 1 {
+		cfg.Management.ProbeResponseTimeout != 2*time.Second || cfg.RoutineProbeRetryCount() != 1 ||
+		cfg.Management.StartupAvailabilityPolicy != StartupAvailabilityOptimistic {
 		t.Fatalf("unexpected defaults: %+v", cfg.Management)
 	}
 
@@ -82,6 +83,7 @@ func TestManagementProbeSettingsCloneAndSaveRoundTrip(t *testing.T) {
 	}
 	retries := 2
 	cfg.Management.ProbeConcurrency = 64
+	cfg.Management.StartupAvailabilityPolicy = StartupAvailabilityStrict
 	cfg.Management.StartupProbeTimeout = 6 * time.Second
 	cfg.Management.RoutineProbeTimeout = 18 * time.Second
 	cfg.Management.ProbeDialTimeout = 3 * time.Second
@@ -99,8 +101,18 @@ func TestManagementProbeSettingsCloneAndSaveRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reloaded.Management.ProbeConcurrency != 64 || reloaded.Management.RoutineProbeTimeout != 18*time.Second || reloaded.RoutineProbeRetryCount() != 2 {
+	if reloaded.Management.ProbeConcurrency != 64 || reloaded.Management.RoutineProbeTimeout != 18*time.Second || reloaded.RoutineProbeRetryCount() != 2 || reloaded.Management.StartupAvailabilityPolicy != StartupAvailabilityStrict {
 		t.Fatalf("saved probe settings = %+v", reloaded.Management)
+	}
+}
+
+func TestManagementRejectsUnknownStartupAvailabilityPolicy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("management:\n  startup_availability_policy: maybe\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadForReload(path); err == nil || !strings.Contains(err.Error(), "startup_availability_policy") {
+		t.Fatalf("unknown policy error = %v", err)
 	}
 }
 

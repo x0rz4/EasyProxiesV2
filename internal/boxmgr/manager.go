@@ -180,6 +180,9 @@ func (m *Manager) Start(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		if err := m.restorePersistedMonitorHealth(ctx); err != nil {
+			m.logger.Warnf("restore persisted node health: %v", err)
+		}
 		if err = instance.Start(); err != nil {
 			_ = instance.Close()
 			// Check if it's a port conflict error
@@ -207,6 +210,9 @@ func (m *Manager) Start(ctx context.Context) error {
 		instance, err = m.createBaseBox(ctx, cfg)
 		if err != nil {
 			return fmt.Errorf("rebuild base with landing locations: %w", err)
+		}
+		if err := m.restorePersistedMonitorHealth(ctx); err != nil {
+			m.logger.Warnf("restore persisted node health after rebuild: %v", err)
 		}
 		if err = instance.Start(); err != nil {
 			_ = instance.Close()
@@ -435,6 +441,7 @@ func (m *Manager) reload(newCfg *config.Config) error {
 			RoutineTimeout: newCfg.Management.RoutineProbeTimeout, DialTimeout: newCfg.Management.ProbeDialTimeout,
 			ResponseTimeout: newCfg.Management.ProbeResponseTimeout, RoutineRetries: newCfg.RoutineProbeRetryCount(),
 		})
+		m.monitorMgr.SetStartupAvailabilityPolicy(newCfg.Management.StartupAvailabilityPolicy)
 		if err := m.monitorMgr.SetProbeTarget(newCfg.Management.ProbeTarget); err != nil {
 			m.logger.Warnf("apply reloaded probe target: %v", err)
 		}
@@ -447,6 +454,31 @@ func (m *Manager) reload(newCfg *config.Config) error {
 		m.logger.Infof("reload completed successfully with %d nodes", len(newCfg.Nodes))
 	}
 	return groupReloadErr
+}
+
+func (m *Manager) restorePersistedMonitorHealth(ctx context.Context) error {
+	if m.store == nil || m.monitorMgr == nil {
+		return nil
+	}
+	stored, err := m.store.ListNodeStats(ctx, nil)
+	if err != nil {
+		return err
+	}
+	states := make(map[int64]monitor.PersistedHealthState, len(stored))
+	for nodeID, stats := range stored {
+		if stats == nil {
+			continue
+		}
+		states[nodeID] = monitor.PersistedHealthState{
+			NodeID: nodeID, FailureCount: stats.FailureCount, SuccessCount: stats.SuccessCount,
+			Blacklisted: stats.Blacklisted, BlacklistedUntil: stats.BlacklistedUntil,
+			LastError: stats.LastError, LastFailure: stats.LastFailureAt, LastSuccess: stats.LastSuccessAt,
+			LastLatencyMs: stats.LastLatencyMs, Available: stats.Available,
+			TotalUpload: stats.TotalUploadBytes, TotalDownload: stats.TotalDownloadBytes, UpdatedAt: stats.UpdatedAt,
+		}
+	}
+	m.monitorMgr.RestorePersistedHealth(states)
+	return nil
 }
 
 func (m *Manager) retryDegradedGroupRuntimes(ctx context.Context, cfg *config.Config) error {

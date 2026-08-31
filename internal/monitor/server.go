@@ -447,20 +447,22 @@ func (s *Server) SetConfig(cfg *config.Config) {
 		cfg.RLock()
 		s.cfg.ExternalIP = cfg.ExternalIP
 		s.cfg.ProbeTarget = cfg.Management.ProbeTarget
+		s.cfg.StartupAvailabilityPolicy = cfg.Management.StartupAvailabilityPolicy
 		s.cfg.SkipCertVerify = cfg.SkipCertVerify
 		cfg.RUnlock()
 	}
 }
 
 type probeSettingsResponse struct {
-	ProbeTarget          string `json:"probe_target"`
-	HealthCheckInterval  string `json:"health_check_interval"`
-	ProbeConcurrency     int    `json:"probe_concurrency"`
-	StartupProbeTimeout  string `json:"startup_probe_timeout"`
-	RoutineProbeTimeout  string `json:"routine_probe_timeout"`
-	ProbeDialTimeout     string `json:"probe_dial_timeout"`
-	ProbeResponseTimeout string `json:"probe_response_timeout"`
-	RoutineProbeRetries  int    `json:"routine_probe_retries"`
+	ProbeTarget               string `json:"probe_target"`
+	StartupAvailabilityPolicy string `json:"startup_availability_policy"`
+	HealthCheckInterval       string `json:"health_check_interval"`
+	ProbeConcurrency          int    `json:"probe_concurrency"`
+	StartupProbeTimeout       string `json:"startup_probe_timeout"`
+	RoutineProbeTimeout       string `json:"routine_probe_timeout"`
+	ProbeDialTimeout          string `json:"probe_dial_timeout"`
+	ProbeResponseTimeout      string `json:"probe_response_timeout"`
+	RoutineProbeRetries       int    `json:"routine_probe_retries"`
 }
 
 type probeStatusResponse struct {
@@ -475,19 +477,22 @@ type probeStatusResponse struct {
 	Converging                   bool             `json:"converging"`
 	InitialPending               int              `json:"initial_pending"`
 	Queued                       int              `json:"queued"`
+	Scheduled                    int              `json:"scheduled"`
+	WaitingForManual             bool             `json:"waiting_for_manual"`
 	Round                        ProbeRoundStatus `json:"round"`
 }
 
 func probeSettingsFromConfig(c *config.Config) probeSettingsResponse {
 	return probeSettingsResponse{
-		ProbeTarget:          c.Management.ProbeTarget,
-		HealthCheckInterval:  c.Management.HealthCheckInterval.String(),
-		ProbeConcurrency:     c.Management.ProbeConcurrency,
-		StartupProbeTimeout:  c.Management.StartupProbeTimeout.String(),
-		RoutineProbeTimeout:  c.Management.RoutineProbeTimeout.String(),
-		ProbeDialTimeout:     c.Management.ProbeDialTimeout.String(),
-		ProbeResponseTimeout: c.Management.ProbeResponseTimeout.String(),
-		RoutineProbeRetries:  c.RoutineProbeRetryCount(),
+		ProbeTarget:               c.Management.ProbeTarget,
+		StartupAvailabilityPolicy: c.Management.StartupAvailabilityPolicy,
+		HealthCheckInterval:       c.Management.HealthCheckInterval.String(),
+		ProbeConcurrency:          c.Management.ProbeConcurrency,
+		StartupProbeTimeout:       c.Management.StartupProbeTimeout.String(),
+		RoutineProbeTimeout:       c.Management.RoutineProbeTimeout.String(),
+		ProbeDialTimeout:          c.Management.ProbeDialTimeout.String(),
+		ProbeResponseTimeout:      c.Management.ProbeResponseTimeout.String(),
+		RoutineProbeRetries:       c.RoutineProbeRetryCount(),
 	}
 }
 
@@ -549,6 +554,11 @@ func (s *Server) handleProbeSettings(w http.ResponseWriter, r *http.Request, act
 				return
 			}
 		}
+		availabilityPolicy := normalizeStartupAvailabilityPolicy(request.StartupAvailabilityPolicy)
+		if strings.TrimSpace(request.StartupAvailabilityPolicy) != "" && availabilityPolicy != strings.ToLower(strings.TrimSpace(request.StartupAvailabilityPolicy)) {
+			writeAPIError(w, http.StatusBadRequest, "启动可用策略必须是 optimistic 或 strict")
+			return
+		}
 		if err := config.ValidateManagementProbeSettings(request.ProbeConcurrency, startupTimeout,
 			routineTimeout, dialTimeout, responseTimeout, request.RoutineProbeRetries); err != nil {
 			writeAPIError(w, http.StatusBadRequest, err.Error())
@@ -567,6 +577,7 @@ func (s *Server) handleProbeSettings(w http.ResponseWriter, r *http.Request, act
 		updated := current.Snapshot()
 		oldTarget := updated.Management.ProbeTarget
 		updated.Management.ProbeTarget = probeTarget
+		updated.Management.StartupAvailabilityPolicy = availabilityPolicy
 		updated.Management.HealthCheckInterval = healthInterval
 		updated.Management.ProbeConcurrency = request.ProbeConcurrency
 		updated.Management.StartupProbeTimeout = startupTimeout
@@ -588,6 +599,7 @@ func (s *Server) handleProbeSettings(w http.ResponseWriter, r *http.Request, act
 			RoutineTimeout: routineTimeout, DialTimeout: dialTimeout,
 			ResponseTimeout: responseTimeout, RoutineRetries: retries,
 		})
+		s.mgr.SetStartupAvailabilityPolicy(availabilityPolicy)
 		s.mgr.SetHealthCheckInterval(healthInterval)
 		if oldTarget != probeTarget {
 			if err := s.mgr.UpdateProbeTarget(probeTarget); err != nil {
@@ -616,13 +628,19 @@ func (s *Server) handleProbeStatus(w http.ResponseWriter, r *http.Request) {
 	if policy.Concurrency == 0 {
 		mode = "auto"
 	}
+	round := s.mgr.ProbeRoundStatus()
+	scheduled := 0
+	if round.InFlight && round.Kind == ProbeRoundStartup {
+		scheduled = max(0, round.Total-round.Completed)
+	}
 	writeJSON(w, probeStatusResponse{
 		NodeCount: nodeCount, ConcurrencyMode: mode,
 		ConfiguredConcurrency: policy.Concurrency, EffectiveConcurrency: effective,
 		EstimatedStartupWorstCase: startupEstimate.String(), EstimatedStartupWorstSeconds: startupEstimate.Seconds(),
 		EstimatedRoutineWorstCase: routineEstimate.String(), EstimatedRoutineWorstSeconds: routineEstimate.Seconds(),
 		Converging: initial.Converging, InitialPending: initial.Pending, Queued: initial.Queued,
-		Round: s.mgr.ProbeRoundStatus(),
+		Scheduled: scheduled, WaitingForManual: initial.Converging && round.InFlight && round.Kind == ProbeRoundManual,
+		Round: round,
 	})
 }
 
@@ -655,11 +673,12 @@ type allSettingsResponse struct {
 	PoolBlacklistDuration string `json:"pool_blacklist_duration"`
 
 	// Management
-	ManagementEnabled             bool   `json:"management_enabled"`
-	ManagementListen              string `json:"management_listen"`
-	ManagementProbeTarget         string `json:"management_probe_target"`
-	ManagementPassword            string `json:"management_password"`
-	ManagementHealthCheckInterval string `json:"management_health_check_interval"`
+	ManagementEnabled                   bool   `json:"management_enabled"`
+	ManagementListen                    string `json:"management_listen"`
+	ManagementProbeTarget               string `json:"management_probe_target"`
+	ManagementStartupAvailabilityPolicy string `json:"management_startup_availability_policy"`
+	ManagementPassword                  string `json:"management_password"`
+	ManagementHealthCheckInterval       string `json:"management_health_check_interval"`
 
 	// Subscription refresh
 	SubRefreshEnabled            bool   `json:"sub_refresh_enabled"`
@@ -708,11 +727,12 @@ type allSettingsRequest struct {
 	PoolBlacklistDuration string `json:"pool_blacklist_duration"`
 
 	// Management
-	ManagementEnabled             *bool  `json:"management_enabled"`
-	ManagementListen              string `json:"management_listen"`
-	ManagementProbeTarget         string `json:"management_probe_target"`
-	ManagementPassword            string `json:"management_password"`
-	ManagementHealthCheckInterval string `json:"management_health_check_interval"`
+	ManagementEnabled                   *bool  `json:"management_enabled"`
+	ManagementListen                    string `json:"management_listen"`
+	ManagementProbeTarget               string `json:"management_probe_target"`
+	ManagementStartupAvailabilityPolicy string `json:"management_startup_availability_policy"`
+	ManagementPassword                  string `json:"management_password"`
+	ManagementHealthCheckInterval       string `json:"management_health_check_interval"`
 
 	// Subscription refresh
 	SubRefreshEnabled            bool   `json:"sub_refresh_enabled"`
@@ -772,11 +792,12 @@ func (s *Server) getAllSettings() allSettingsResponse {
 		PoolFailureThreshold:  c.Pool.FailureThreshold,
 		PoolBlacklistDuration: c.Pool.BlacklistDuration.String(),
 
-		ManagementEnabled:             mgmtEnabled,
-		ManagementListen:              c.Management.Listen,
-		ManagementProbeTarget:         c.Management.ProbeTarget,
-		ManagementPassword:            c.Management.Password,
-		ManagementHealthCheckInterval: c.Management.HealthCheckInterval.String(),
+		ManagementEnabled:                   mgmtEnabled,
+		ManagementListen:                    c.Management.Listen,
+		ManagementProbeTarget:               c.Management.ProbeTarget,
+		ManagementStartupAvailabilityPolicy: c.Management.StartupAvailabilityPolicy,
+		ManagementPassword:                  c.Management.Password,
+		ManagementHealthCheckInterval:       c.Management.HealthCheckInterval.String(),
 
 		SubRefreshEnabled:            c.SubscriptionRefresh.Enabled,
 		SubRefreshInterval:           c.SubscriptionRefresh.Interval.String(),
@@ -810,6 +831,10 @@ func (s *Server) updateAllSettings(ctx context.Context, req allSettingsRequest) 
 		if _, err := parseProbeTarget(target); err != nil {
 			return SettingsUpdateResult{}, settingsValidationError{fmt.Errorf("参数验证失败: 探测目标无效: %w", err)}
 		}
+	}
+	availabilityPolicy := normalizeStartupAvailabilityPolicy(req.ManagementStartupAvailabilityPolicy)
+	if strings.TrimSpace(req.ManagementStartupAvailabilityPolicy) != "" && availabilityPolicy != strings.ToLower(strings.TrimSpace(req.ManagementStartupAvailabilityPolicy)) {
+		return SettingsUpdateResult{}, settingsValidationError{errors.New("参数验证失败: 启动可用策略必须是 optimistic 或 strict")}
 	}
 	s.configMutationMu.Lock()
 	defer s.configMutationMu.Unlock()
@@ -863,6 +888,7 @@ func (s *Server) updateAllSettings(ctx context.Context, req allSettingsRequest) 
 	}
 	c.Management.Listen = req.ManagementListen
 	c.Management.ProbeTarget = strings.TrimSpace(req.ManagementProbeTarget)
+	c.Management.StartupAvailabilityPolicy = availabilityPolicy
 	c.Management.Password = req.ManagementPassword
 	if d, err := time.ParseDuration(req.ManagementHealthCheckInterval); err == nil && d > 0 {
 		c.Management.HealthCheckInterval = d
@@ -905,11 +931,13 @@ func (s *Server) updateAllSettings(ctx context.Context, req allSettingsRequest) 
 	s.cfgSrc = c
 	s.cfg.ExternalIP = c.ExternalIP
 	s.cfg.ProbeTarget = c.Management.ProbeTarget
+	s.cfg.StartupAvailabilityPolicy = c.Management.StartupAvailabilityPolicy
 	s.cfg.SkipCertVerify = c.SkipCertVerify
 	s.cfg.Password = c.Management.Password
 	s.cfgMu.Unlock()
 
 	if s.mgr != nil {
+		s.mgr.SetStartupAvailabilityPolicy(c.Management.StartupAvailabilityPolicy)
 		if err := s.mgr.UpdateProbeTarget(c.Management.ProbeTarget); err != nil {
 			s.logger.Printf("更新探测目标失败: %v", err)
 		}
@@ -958,6 +986,7 @@ func settingsApplyPlan(old, updated *config.Config) ApplyPlan {
 	a.Management.Listen, b.Management.Listen = "", ""
 	a.Management.Password, b.Management.Password = "", ""
 	a.Management.ProbeTarget, b.Management.ProbeTarget = "", ""
+	a.Management.StartupAvailabilityPolicy, b.Management.StartupAvailabilityPolicy = "", ""
 	a.Management.HealthCheckInterval, b.Management.HealthCheckInterval = 0, 0
 	a.ExternalIP, b.ExternalIP = "", ""
 	a.SubscriptionRefresh.Enabled, b.SubscriptionRefresh.Enabled = false, false
@@ -974,6 +1003,9 @@ func settingsApplyPlan(old, updated *config.Config) ApplyPlan {
 	}
 	if old.Management.ProbeTarget != updated.Management.ProbeTarget {
 		plan.Applied = append(plan.Applied, "management_probe_target")
+	}
+	if old.Management.StartupAvailabilityPolicy != updated.Management.StartupAvailabilityPolicy {
+		plan.Applied = append(plan.Applied, "management_startup_availability_policy")
 	}
 	if old.Management.HealthCheckInterval != updated.Management.HealthCheckInterval {
 		plan.Applied = append(plan.Applied, "management_health_check_interval")
@@ -2597,6 +2629,8 @@ type groupMemberResponse struct {
 	EvictedAt    time.Time `json:"evicted_at,omitempty"`
 	LatencyMs    int64     `json:"latency_ms"`
 	Available    bool      `json:"available"`
+	Provisional  bool      `json:"provisional"`
+	HealthSource string    `json:"health_source"`
 	IsActive     bool      `json:"is_active"`
 }
 
@@ -2613,6 +2647,8 @@ type groupNodeOptionResponse struct {
 	Available        bool   `json:"available"`
 	InitialCheckDone bool   `json:"initial_check_done"`
 	Selectable       bool   `json:"selectable"`
+	Provisional      bool   `json:"provisional"`
+	HealthSource     string `json:"health_source"`
 }
 
 type groupPoolResponse struct {
@@ -2946,7 +2982,8 @@ func (s *Server) writeGroupList(w http.ResponseWriter, r *http.Request) {
 				item := groupMemberResponse{NodeID: member.NodeID, Tag: member.Tag, Name: node.Name,
 					Region: mon.Region, Country: mon.Country, Status: status, FailureCount: member.FailureCount,
 					LastError: member.LastError, EvictedAt: member.EvictedAt, LatencyMs: mon.LastLatencyMs,
-					Available: mon.Available, IsActive: member.NodeID == runtimeState.CurrentNodeID}
+					Available: mon.RoutingEligible, Provisional: mon.Provisional, HealthSource: mon.HealthSource,
+					IsActive: member.NodeID == runtimeState.CurrentNodeID}
 				if item.Region == "" {
 					item.Region = node.Region
 				}
@@ -3014,7 +3051,7 @@ func (s *Server) groupNodeOptions(ctx context.Context, groups []store.GroupPool,
 		} else if found && snapshot.InitialCheckDone {
 			status = "unavailable"
 		}
-		selectable := managed.Enabled && found && snapshot.InitialCheckDone && snapshot.Available && !snapshot.Blacklisted
+		selectable := managed.Enabled && found && snapshot.RoutingEligible
 		if _, isReferenced := referenced[managed.ID]; !selectable && !isReferenced {
 			continue
 		}
@@ -3031,8 +3068,9 @@ func (s *Server) groupNodeOptions(ctx context.Context, groups []store.GroupPool,
 		}
 		options = append(options, groupNodeOptionResponse{ID: managed.ID, Name: managed.Name, URI: managed.URI,
 			Region: region, Country: country, Enabled: managed.Enabled, Tag: snapshot.Tag, Status: status,
-			LatencyMs: latencyMs, Available: found && snapshot.Available,
-			InitialCheckDone: found && snapshot.InitialCheckDone, Selectable: selectable})
+			LatencyMs: latencyMs, Available: found && snapshot.RoutingEligible,
+			InitialCheckDone: found && snapshot.InitialCheckDone, Selectable: selectable,
+			Provisional: found && snapshot.Provisional, HealthSource: snapshot.HealthSource})
 	}
 	return options, nil
 }

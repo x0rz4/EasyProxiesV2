@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -52,22 +53,52 @@ func TestHealthResultsDispatchOnlyToMatchingSubscriptions(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer mgr.Stop()
-	var global, matching, unrelated int
-	unsubscribeGlobal := mgr.SubscribeHealthResults(func(HealthResultEvent) { global++ })
-	unsubscribeMatching := mgr.SubscribeHealthResultsFor([]string{"node-a"}, []int64{7}, func(HealthResultEvent) { matching++ })
-	unsubscribeUnrelated := mgr.SubscribeHealthResultsFor([]string{"node-b"}, []int64{8}, func(HealthResultEvent) { unrelated++ })
+	var global, matching, unrelated atomic.Int32
+	unsubscribeGlobal := mgr.SubscribeHealthResults(func(HealthResultEvent) { global.Add(1) })
+	unsubscribeMatching := mgr.SubscribeHealthResultsFor([]string{"node-a"}, []int64{7}, func(HealthResultEvent) { matching.Add(1) })
+	unsubscribeUnrelated := mgr.SubscribeHealthResultsFor([]string{"node-b"}, []int64{8}, func(HealthResultEvent) { unrelated.Add(1) })
 	defer unsubscribeGlobal()
 	defer unsubscribeMatching()
 	defer unsubscribeUnrelated()
 
 	// Matching both indexes must still invoke the subscription exactly once.
 	mgr.publishHealthResult(HealthResultEvent{Tag: "node-a", NodeID: 7, Success: true})
-	if global != 1 || matching != 1 || unrelated != 0 {
-		t.Fatalf("first dispatch: global=%d matching=%d unrelated=%d", global, matching, unrelated)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && (global.Load() != 1 || matching.Load() != 1) {
+		time.Sleep(time.Millisecond)
+	}
+	if global.Load() != 1 || matching.Load() != 1 || unrelated.Load() != 0 {
+		t.Fatalf("first dispatch: global=%d matching=%d unrelated=%d", global.Load(), matching.Load(), unrelated.Load())
 	}
 	mgr.publishHealthResult(HealthResultEvent{Tag: "node-c", NodeID: 9, Success: true})
-	if global != 2 || matching != 1 || unrelated != 0 {
-		t.Fatalf("second dispatch: global=%d matching=%d unrelated=%d", global, matching, unrelated)
+	deadline = time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && global.Load() != 2 {
+		time.Sleep(time.Millisecond)
+	}
+	if global.Load() != 2 || matching.Load() != 1 || unrelated.Load() != 0 {
+		t.Fatalf("second dispatch: global=%d matching=%d unrelated=%d", global.Load(), matching.Load(), unrelated.Load())
+	}
+}
+
+func TestRestorePersistedHealthRemainsPendingAndProvisional(t *testing.T) {
+	mgr, err := NewManager(Config{StartupAvailabilityPolicy: StartupAvailabilityOptimistic})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	mgr.Register(NodeInfo{NodeID: 7, Tag: "restored"})
+	updatedAt := time.Now().Add(-time.Hour)
+	if restored := mgr.RestorePersistedHealth(map[int64]PersistedHealthState{7: {NodeID: 7, Available: false, LastLatencyMs: 42, SuccessCount: 9, UpdatedAt: updatedAt}}); restored != 1 {
+		t.Fatalf("restored = %d", restored)
+	}
+	snapshot := mgr.SnapshotForNodeID(7)
+	if snapshot == nil || snapshot.InitialCheckDone || !snapshot.Provisional || !snapshot.RoutingEligible || snapshot.HealthSource != "persisted" || snapshot.LastLatencyMs != 42 {
+		t.Fatalf("snapshot = %+v", snapshot)
+	}
+	mgr.SetStartupAvailabilityPolicy(StartupAvailabilityStrict)
+	snapshot = mgr.SnapshotForNodeID(7)
+	if snapshot.Provisional || snapshot.RoutingEligible {
+		t.Fatalf("strict restored snapshot = %+v", snapshot)
 	}
 }
 
@@ -133,6 +164,9 @@ func TestMigrateRuntimeTagPreservesHistoryWithoutDuplicate(t *testing.T) {
 	}
 	if snapshots[0].InitialCheckDone || snapshots[0].Available {
 		t.Fatalf("new concrete runtime inherited availability: %+v", snapshots[0])
+	}
+	if snapshots[0].HealthSource != "previous_generation" {
+		t.Fatalf("migrated health source = %q", snapshots[0].HealthSource)
 	}
 }
 

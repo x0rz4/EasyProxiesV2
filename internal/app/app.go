@@ -101,20 +101,21 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	}
 
 	monitorCfg := monitor.Config{
-		Enabled:              cfg.ManagementEnabled(),
-		Listen:               cfg.Management.Listen,
-		ProbeTarget:          cfg.Management.ProbeTarget,
-		Password:             cfg.Management.Password,
-		ProxyUsername:        proxyUsername,
-		ProxyPassword:        proxyPassword,
-		ExternalIP:           cfg.ExternalIP,
-		SkipCertVerify:       cfg.SkipCertVerify,
-		ProbeConcurrency:     cfg.Management.ProbeConcurrency,
-		StartupProbeTimeout:  cfg.Management.StartupProbeTimeout,
-		RoutineProbeTimeout:  cfg.Management.RoutineProbeTimeout,
-		ProbeDialTimeout:     cfg.Management.ProbeDialTimeout,
-		ProbeResponseTimeout: cfg.Management.ProbeResponseTimeout,
-		RoutineProbeRetries:  cfg.RoutineProbeRetryCount(),
+		Enabled:                   cfg.ManagementEnabled(),
+		Listen:                    cfg.Management.Listen,
+		ProbeTarget:               cfg.Management.ProbeTarget,
+		StartupAvailabilityPolicy: cfg.Management.StartupAvailabilityPolicy,
+		Password:                  cfg.Management.Password,
+		ProxyUsername:             proxyUsername,
+		ProxyPassword:             proxyPassword,
+		ExternalIP:                cfg.ExternalIP,
+		SkipCertVerify:            cfg.SkipCertVerify,
+		ProbeConcurrency:          cfg.Management.ProbeConcurrency,
+		StartupProbeTimeout:       cfg.Management.StartupProbeTimeout,
+		RoutineProbeTimeout:       cfg.Management.RoutineProbeTimeout,
+		ProbeDialTimeout:          cfg.Management.ProbeDialTimeout,
+		ProbeResponseTimeout:      cfg.Management.ProbeResponseTimeout,
+		RoutineProbeRetries:       cfg.RoutineProbeRetryCount(),
 	}
 
 	// ── 5. Create and start BoxManager ──
@@ -508,6 +509,11 @@ func flushStatsToStore(ctx context.Context, boxMgr *boxmgr.Manager, s store.Stor
 
 	var updates []store.StatsUpdate
 	for _, snap := range snapshots {
+		// Preserve the last committed database health snapshot until this concrete
+		// runtime generation has completed its own startup verification.
+		if !snap.InitialCheckDone {
+			continue
+		}
 		nodeID, ok := snap.NodeID, snap.NodeID > 0
 		if !ok {
 			nodeID, ok = uriToID[snap.URI]
