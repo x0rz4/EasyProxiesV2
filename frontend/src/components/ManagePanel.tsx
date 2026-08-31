@@ -23,7 +23,7 @@ import {
 // ---- Merged node type ----
 interface MergedNode extends ConfigNodeConfig {
   // Runtime state from monitor
-  runtimeStatus: 'normal' | 'unavailable' | 'blacklisted' | 'pending' | 'disabled'
+  runtimeStatus: 'normal' | 'unavailable' | 'blacklisted' | 'pending' | 'unloaded' | 'disabled'
   latency_ms: number
   region?: string
   country?: string
@@ -38,7 +38,7 @@ interface MergedNode extends ConfigNodeConfig {
 
 type ManageSortKey = 'name' | 'status' | 'latency' | 'region' | 'port' | 'source'
 type SortDir = 'asc' | 'desc'
-type StatusFilter = '' | 'normal' | 'unavailable' | 'blacklisted' | 'pending' | 'disabled'
+type StatusFilter = '' | 'normal' | 'unavailable' | 'blacklisted' | 'pending' | 'unloaded' | 'disabled'
 
 const activeProbeRefreshInterval = 1000
 const pendingProbeRefreshInterval = 5000
@@ -49,8 +49,9 @@ function statusOrder(s: MergedNode['runtimeStatus']): number {
     case 'pending': return 1
     case 'unavailable': return 2
     case 'blacklisted': return 3
-    case 'disabled': return 4
-    default: return 5
+    case 'unloaded': return 4
+    case 'disabled': return 5
+    default: return 6
   }
 }
 
@@ -116,17 +117,38 @@ function typeLabel(t: string): string {
   }
 }
 
+// matchSnapshot resolves a config node to its runtime entry. Node ID is the
+// authoritative link (it is what the runtime carries as node_id); URI and name
+// are only fallbacks for rows the API served without an id. Matching on
+// URI/name alone made healthy nodes look 待检查 whenever two nodes shared a
+// name or a snapshot arrived without a URI.
+function buildSnapshotMatcher(snapshots: NodeSnapshot[]): (node: ConfigNodeConfig) => NodeSnapshot | undefined {
+  const byID = new Map<number, NodeSnapshot>()
+  const byURI = new Map<string, NodeSnapshot>()
+  const byName = new Map<string, NodeSnapshot>()
+  for (const snapshot of snapshots) {
+    if (snapshot.node_id) byID.set(snapshot.node_id, snapshot)
+    if (snapshot.uri) byURI.set(snapshot.uri, snapshot)
+    byName.set(snapshot.name, snapshot)
+  }
+  return (node) => (node.id ? byID.get(node.id) : undefined) || byURI.get(node.uri) || byName.get(node.name)
+}
+
+// hasPendingRuntimeNodes reports whether any enabled node is still waiting for
+// its first health check, which is what keeps the panel polling. A node with no
+// runtime entry at all is deliberately excluded: it was never loaded into
+// sing-box, so no amount of polling will resolve it and the poll would never
+// stop.
 function hasPendingRuntimeNodes(configNodes: ConfigNodeConfig[], snapshots: NodeSnapshot[]): boolean {
   const enabledNodes = configNodes.filter((node) => !node.disabled)
   if (enabledNodes.length === 0) {
     return snapshots.some((snapshot) => !snapshot.initial_check_done)
   }
 
-  const snapshotsByURI = new Map(snapshots.filter((snapshot) => snapshot.uri).map((snapshot) => [snapshot.uri, snapshot]))
-  const snapshotsByName = new Map(snapshots.map((snapshot) => [snapshot.name, snapshot]))
+  const matchSnapshot = buildSnapshotMatcher(snapshots)
   return enabledNodes.some((node) => {
-    const snapshot = snapshotsByURI.get(node.uri) || snapshotsByName.get(node.name)
-    return !snapshot?.initial_check_done
+    const snapshot = matchSnapshot(node)
+    return Boolean(snapshot) && !snapshot!.initial_check_done
   })
 }
 
@@ -149,6 +171,15 @@ function StatusBadge({ status }: { status: MergedNode['runtimeStatus'] }) {
       return <span className={cn("badge badge-error badge-sm border-none bg-error/30 text-error font-bold flex gap-1 items-center px-2 py-3.5")}><Ban className="h-3 w-3" />黑名单</span>
     case 'pending':
       return <span className={cn("badge badge-warning badge-sm border-none bg-warning/15 text-warning-content font-medium flex gap-1 items-center px-2 py-3.5")}><div className="w-1.5 h-1.5 rounded-full bg-warning animate-pulse"></div>待检查</span>
+    case 'unloaded':
+      return (
+        <span
+          className={cn("badge badge-warning badge-sm border border-warning/40 bg-warning/5 text-warning font-medium flex gap-1 items-center px-2 py-3.5")}
+          title="该节点已启用但没有进入运行时：通常是协议或参数无法构建出站而被跳过（详见服务端日志），因此永远不会被健康检查。"
+        >
+          <AlertTriangle className="h-3 w-3" />未加载
+        </span>
+      )
     case 'disabled':
       return <span className={cn("badge badge-ghost badge-sm border-none bg-base-300/50 text-base-content/50 font-medium px-2 py-3.5")}>已禁用</span>
     default:
@@ -251,15 +282,10 @@ export default function ManagePanel() {
 
   const mergedNodes = useMemo((): MergedNode[] => {
     const snapshots = monitorData?.nodes || []
-    const snapByURI = new Map<string, NodeSnapshot>()
-    const snapByName = new Map<string, NodeSnapshot>()
-    for (const s of snapshots) {
-      if (s.uri) snapByURI.set(s.uri, s)
-      snapByName.set(s.name, s)
-    }
+    const matchSnapshot = buildSnapshotMatcher(snapshots)
 
     return configNodes.map((cfg: ConfigNodeConfig): MergedNode => {
-      const snap = snapByURI.get(cfg.uri) || snapByName.get(cfg.name)
+      const snap = matchSnapshot(cfg)
 
       if (cfg.disabled) {
         return {
@@ -277,9 +303,12 @@ export default function ManagePanel() {
       }
 
       if (!snap) {
+        // Enabled but absent from the runtime: the outbound was never built, so
+        // it will never be probed. Reporting this as 待检查 made it look like a
+        // pending check that would eventually resolve on its own.
         return {
           ...cfg,
-          runtimeStatus: 'pending',
+          runtimeStatus: 'unloaded',
           latency_ms: -1,
           region: cfg.region,
           country: cfg.country,
@@ -687,6 +716,7 @@ export default function ManagePanel() {
   const disabledCount = mergedNodes.filter(n => n.runtimeStatus === 'disabled').length
   const blacklistedCount = mergedNodes.filter(n => n.runtimeStatus === 'blacklisted').length
   const normalCount = mergedNodes.filter(n => n.runtimeStatus === 'normal').length
+  const unloadedCount = mergedNodes.filter(n => n.runtimeStatus === 'unloaded').length
 
   // ---- Render ----
 
@@ -708,6 +738,14 @@ export default function ManagePanel() {
               <span>共 <strong className="text-base-content/80">{mergedNodes.length}</strong> 个节点</span>
               {normalCount > 0 && <span className="badge badge-success badge-xs border-none bg-success/15 text-success">正常 {normalCount}</span>}
               {blacklistedCount > 0 && <span className="badge badge-error badge-xs border-none bg-error/15 text-error">黑名单 {blacklistedCount}</span>}
+              {unloadedCount > 0 && (
+                <span
+                  className="badge badge-warning badge-xs border border-warning/40 bg-warning/5 text-warning"
+                  title="已启用但未进入运行时，通常是协议或参数无法构建出站而被跳过（详见服务端日志）"
+                >
+                  未加载 {unloadedCount}
+                </span>
+              )}
               {disabledCount > 0 && <span className="badge badge-ghost badge-xs bg-base-200 text-base-content/50">禁用 {disabledCount}</span>}
             </div>}
         icon={<Server className="h-5 w-5" />}
@@ -783,6 +821,7 @@ export default function ManagePanel() {
               <option value="unavailable">❌ 不可用</option>
               <option value="blacklisted">🔴 黑名单</option>
               <option value="pending">⚠️ 待检查</option>
+              <option value="unloaded">⚠️ 未加载</option>
               <option value="disabled">🚫 已禁用</option>
             </select>
             {regions.length > 0 && (

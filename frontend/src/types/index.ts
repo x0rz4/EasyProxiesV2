@@ -811,9 +811,12 @@ export interface UnlockResult {
   // Only present on results loaded from the persisted store
   // (/api/nodes/unlock-results); omitted on live check responses.
   checked_at?: string
+  node_id?: number
 }
 
-// Response from GET /api/nodes/unlock-results: last-saved detection per tag.
+// Response from GET /api/nodes/unlock-results: last-saved detection per node,
+// keyed by the stable node ID rendered as a string. Runtime tags carry a
+// generation suffix and change on every reload, so they cannot key this map.
 export interface UnlockResultsResponse {
   results: Record<string, UnlockResult>
 }

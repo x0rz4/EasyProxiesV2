@@ -1453,9 +1453,12 @@ func (s *Server) handleUnlockAll(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleUnlockResults returns the latest persisted unlock detection result for
-// every node that has one, keyed by node tag. It lets the WebUI show previously
-// saved detections without re-running the checks. It is read-only and never
-// touches the live probes.
+// every node that has one, keyed by the stable node ID. Runtime tags carry a
+// generation suffix and are regenerated whenever a node is rebuilt by a reload,
+// so keying the response by tag would strand every stored result behind a tag
+// the WebUI no longer knows about. It lets the WebUI show previously saved
+// detections without re-running the checks. It is read-only and never touches
+// the live probes.
 func (s *Server) handleUnlockResults(w http.ResponseWriter, r *http.Request) {
 	if s.store == nil {
 		writeJSON(w, map[string]any{"results": map[string]any{}})
@@ -1470,10 +1473,13 @@ func (s *Server) handleUnlockResults(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// unlockResultView is the JSON shape served to the WebUI. It mirrors the
-	// live unlock.Result plus a checked_at timestamp, omitting the internal
-	// node id and the redundant result_json blob (Services are already
-	// reconstructed server-side from that blob).
+	// live unlock.Result plus the owning node ID and a checked_at timestamp,
+	// omitting the redundant result_json blob (Services are already
+	// reconstructed server-side from that blob). Tag is retained for display
+	// only; it is the tag recorded at check time, not necessarily the current
+	// runtime tag.
 	type unlockResultView struct {
+		NodeID    int64                       `json:"node_id"`
 		Tag       string                      `json:"tag"`
 		Name      string                      `json:"name"`
 		Services  []store.UnlockServiceResult `json:"services"`
@@ -1484,11 +1490,12 @@ func (s *Server) handleUnlockResults(w http.ResponseWriter, r *http.Request) {
 	}
 
 	out := make(map[string]unlockResultView, len(stored))
-	for _, res := range stored {
-		if res == nil || res.Tag == "" {
+	for nodeID, res := range stored {
+		if res == nil || nodeID <= 0 {
 			continue
 		}
-		out[res.Tag] = unlockResultView{
+		out[strconv.FormatInt(nodeID, 10)] = unlockResultView{
+			NodeID:    nodeID,
 			Tag:       res.Tag,
 			Name:      res.Name,
 			Services:  res.Services,

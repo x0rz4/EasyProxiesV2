@@ -484,7 +484,13 @@ func (m *Manager) UnregisterGroupHealthSchedule(groupID int64) {
 	m.groupScheduleMu.Unlock()
 }
 
-func (m *Manager) probeDue(tag string, lastCheck, now time.Time) bool {
+// probeDue reports whether a node's effective interval has elapsed. The caller
+// supplies nodeID rather than letting this look it up: RunProbeBatch calls this
+// while holding m.mu for reading, and a nested m.mu.RLock() deadlocks for good
+// as soon as any writer (Register, MigrateRuntimeTag, SweepStaleNodes, a
+// reload) is queued between the two acquisitions. sync.RWMutex does not allow
+// recursive read locking.
+func (m *Manager) probeDue(tag string, nodeID int64, lastCheck, now time.Time) bool {
 	if lastCheck.IsZero() {
 		return true
 	}
@@ -494,14 +500,6 @@ func (m *Manager) probeDue(tag string, lastCheck, now time.Time) bool {
 	if interval <= 0 {
 		interval = 2 * time.Hour
 	}
-	var nodeID int64
-	m.mu.RLock()
-	if item := m.nodes[tag]; item != nil {
-		item.mu.RLock()
-		nodeID = item.info.NodeID
-		item.mu.RUnlock()
-	}
-	m.mu.RUnlock()
 	m.groupScheduleMu.RLock()
 	for _, schedule := range m.groupSchedules {
 		_, tagMatch := schedule.tags[tag]
@@ -572,8 +570,9 @@ func (m *Manager) RunProbeBatch(ctx context.Context, kind ProbeRoundKind, dueOnl
 		probeFn := e.probe
 		lastHealthCheck := e.lastHealthCheck
 		tag := e.info.Tag
+		nodeID := e.info.NodeID
 		e.mu.RUnlock()
-		if probeFn == nil || (dueOnly && !m.probeDue(tag, lastHealthCheck, time.Now())) {
+		if probeFn == nil || (dueOnly && !m.probeDue(tag, nodeID, lastHealthCheck, time.Now())) {
 			continue
 		}
 		entries = append(entries, e)

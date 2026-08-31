@@ -59,10 +59,10 @@ func TestProbeDueUsesShortestScheduleForMemberOnly(t *testing.T) {
 
 	now := time.Now()
 	lastCheck := now.Add(-3 * time.Minute)
-	if !mgr.probeDue("node-a", lastCheck, now) {
+	if !mgr.probeDue("node-a", 0, lastCheck, now) {
 		t.Fatal("group member was not due at its shorter interval")
 	}
-	if mgr.probeDue("node-b", lastCheck, now) {
+	if mgr.probeDue("node-b", 0, lastCheck, now) {
 		t.Fatal("unrelated node inherited another group's interval")
 	}
 }

@@ -73,17 +73,32 @@ const unlockBadgeClasses: Record<string, string> = {
   tiktok: 'bg-neutral-900 text-white',
 }
 
+// normalizeUnlockResults re-keys the persisted unlock payload by numeric node
+// ID. The transport keys are strings because JSON object keys always are; the
+// embedded node_id is preferred so the map survives a key format change.
+function normalizeUnlockResults(raw: Record<string, UnlockResult>): Record<number, UnlockResult> {
+  const out: Record<number, UnlockResult> = {}
+  for (const [key, value] of Object.entries(raw)) {
+    const nodeID = value.node_id ?? Number(key)
+    if (Number.isFinite(nodeID) && nodeID > 0) out[nodeID] = value
+  }
+  return out
+}
+
 export default function UnlockPanel() {
   const [nodes, setNodes] = useState<NodeSnapshot[]>([])
   const [configNodes, setConfigNodes] = useState<ConfigNodeConfig[]>([])
   const [subscriptions, setSubscriptions] = useState<Subscription[]>([])
   const [loading, setLoading] = useState(true)
 
-  // tag -> result. Results are kept across batch runs and single runs alike.
-  const [results, setResults] = useState<Record<string, UnlockResult>>({})
-  const [errors, setErrors] = useState<Record<string, string>>({})
-  // Per-node in-flight state. Either set (batch) or tag (single).
-  const [checking, setChecking] = useState<Record<string, boolean>>({})
+  // node_id -> result. Results are kept across batch runs and single runs alike.
+  // Keyed by the stable node ID, never by the runtime tag: tags carry a
+  // generation suffix and are regenerated on every reload, which used to strand
+  // persisted results and render the node as 未检测.
+  const [results, setResults] = useState<Record<number, UnlockResult>>({})
+  const [errors, setErrors] = useState<Record<number, string>>({})
+  // Per-node in-flight state, keyed by node ID for the same reason.
+  const [checking, setChecking] = useState<Record<number, boolean>>({})
   const [diagnostics, setDiagnostics] = useState<Record<number, NodeCheckResultItem>>({})
   const [checkSettings, setCheckSettings] = useState<NodeCheckSettings | null>(null)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
@@ -123,24 +138,32 @@ export default function UnlockPanel() {
   }
 
   // ---- Node list ----
+  // The runtime node list is refetched whenever detection data is refreshed, so
+  // nodes that only finished their initial health check after this panel mounted
+  // stop being permanently invisible here.
+  const loadNodeList = useCallback(async () => {
+    const [res, configRes, subscriptionRes] = await Promise.all([
+      fetchNodes(),
+      fetchConfigNodes().catch(() => null),
+      listSubscriptions().catch(() => null),
+    ])
+    // unlock-checked; the dialer is registered per member tag.
+    const usable = (res.nodes || []).filter((n) => n.tag && n.initial_check_done && n.available && !n.blacklisted)
+    setNodes(usable)
+    setConfigNodes(configRes?.nodes || [])
+    setSubscriptions(subscriptionRes?.subscriptions || [])
+  }, [])
+
   const loadNodes = useCallback(async () => {
     try {
-      const [res, configRes, subscriptionRes] = await Promise.all([
-        fetchNodes(),
-        fetchConfigNodes().catch(() => null),
-        listSubscriptions().catch(() => null),
-      ])
-      // unlock-checked; the dialer is registered per member tag.
-      const usable = (res.nodes || []).filter((n) => n.tag && n.initial_check_done && n.available && !n.blacklisted)
-      setNodes(usable)
-      setConfigNodes(configRes?.nodes || [])
-      setSubscriptions(subscriptionRes?.subscriptions || [])
+      await loadNodeList()
       // Load any previously persisted detection results so the user sees
       // last-saved state without re-running checks.
       try {
         const saved = await fetchUnlockResults()
         if (saved?.results) {
-          setResults((prev) => ({ ...saved.results, ...prev }))
+          const normalized = normalizeUnlockResults(saved.results)
+          setResults((prev) => ({ ...normalized, ...prev }))
         }
       } catch {
         /* persisted results are optional */
@@ -161,7 +184,7 @@ export default function UnlockPanel() {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [loadNodeList])
 
   useEffect(() => {
     const t = setTimeout(() => void loadNodes(), 0)
@@ -177,34 +200,39 @@ export default function UnlockPanel() {
   }, [])
 
   // ---- Single-node unlock ----
-  const runSingle = useCallback(async (tag: string) => {
-    setChecking((s) => ({ ...s, [tag]: true }))
+  const runSingle = useCallback(async (node: NodeSnapshot) => {
+    const nodeID = node.node_id
+    setChecking((s) => ({ ...s, [nodeID]: true }))
     setErrors((s) => {
       const next = { ...s }
-      delete next[tag]
+      delete next[nodeID]
       return next
     })
     try {
-      const res = await unlockNode(tag)
-      setResults((s) => ({ ...s, [tag]: res }))
-      toast.success(`节点 ${tag} 检测完成`)
+      const res = await unlockNode(node.tag)
+      setResults((s) => ({ ...s, [nodeID]: res }))
+      toast.success(`节点 ${node.name || node.tag} 检测完成`)
     } catch (err) {
-      setErrors((s) => ({ ...s, [tag]: err instanceof Error ? err.message : '检测失败' }))
+      setErrors((s) => ({ ...s, [nodeID]: err instanceof Error ? err.message : '检测失败' }))
     } finally {
       setChecking((s) => {
         const next = { ...s }
-        delete next[tag]
+        delete next[nodeID]
         return next
       })
     }
   }, [])
 
   const refreshCheckResults = useCallback(async () => {
+    // Refresh the runtime node list alongside the results: a reload during the
+    // task may have rebuilt nodes under new runtime tags, and newly available
+    // nodes should appear without a manual refresh.
+    await loadNodeList().catch(() => undefined)
     const [savedDiagnostics, savedUnlock, tasks] = await Promise.all([fetchNodeCheckResults(), fetchUnlockResults(), fetchNodeCheckTasks()])
     setDiagnostics(Object.fromEntries(savedDiagnostics.results.map((item) => [item.node_id, item])))
-    setResults(savedUnlock.results || {})
+    setResults(normalizeUnlockResults(savedUnlock.results || {}))
     setTaskHistory(tasks.tasks)
-  }, [])
+  }, [loadNodeList])
 
   const connectTask = useCallback((task: NodeCheckTask) => {
     taskAbortRef.current?.abort()
@@ -218,8 +246,19 @@ export default function UnlockPanel() {
         const total = Object.values(event.task.stats).reduce((sum, stage) => sum + stage.total, 0)
         setBatchProgress({ current: completed, total })
       }
-      if (event.type === 'result' && event.tag) {
-        setChecking((current) => { const next = { ...current }; delete next[event.tag!]; return next })
+      if (event.type === 'result' && event.node_id) {
+        const nodeID = event.node_id
+        setChecking((current) => { const next = { ...current }; delete next[nodeID]; return next })
+        // A failed unlock stage persists no result row, so without recording the
+        // error here the node would fall back to 未检测 instead of 解锁失败.
+        if (event.phase === 'unlock') {
+          setErrors((current) => {
+            const next = { ...current }
+            if (event.status === 'failed') next[nodeID] = event.error || '解锁检测失败'
+            else delete next[nodeID]
+            return next
+          })
+        }
       }
       if (event.type === 'done') {
         taskAbortRef.current = null
@@ -243,15 +282,21 @@ export default function UnlockPanel() {
     if (nodeIds.length === 0) { toast.error('请选择至少一个节点'); return }
     try {
       const task = await createNodeCheckTask(nodeIds, stages, settings)
-      const checkingMap: Record<string, boolean> = {}
-      nodes.filter((node) => nodeIds.includes(node.node_id)).forEach((node) => { checkingMap[node.tag] = true })
+      const checkingMap: Record<number, boolean> = {}
+      nodeIds.forEach((nodeID) => { checkingMap[nodeID] = true })
       setChecking(checkingMap)
+      // Drop stale per-node errors for the nodes about to be re-checked.
+      setErrors((current) => {
+        const next = { ...current }
+        nodeIds.forEach((nodeID) => { delete next[nodeID] })
+        return next
+      })
       setCheckDialogOpen(false)
       connectTask(task)
     } catch (error) {
       toast.error(error instanceof Error ? error.message : '创建检测任务失败')
     }
-  }, [connectTask, nodes])
+  }, [connectTask])
 
   // Quick unlock uses the same task scheduler as comprehensive diagnostics.
   const runBatch = useCallback(() => {
@@ -280,8 +325,8 @@ export default function UnlockPanel() {
     let qualityTested = 0
 
     for (const node of nodes) {
-      const r = results[node.tag]
-      const err = errors[node.tag]
+      const r = results[node.node_id]
+      const err = errors[node.node_id]
       const quality = diagnostics[node.node_id]?.quality || []
       if (quality.some((item) => item.status === 'success' || item.status === 'partial')) qualityTested++
       if (quality.some((item) => item.is_residential === true)) pureIp++
@@ -328,7 +373,7 @@ export default function UnlockPanel() {
   const countries = useMemo(() => {
     const counts = new Map<string, number>()
     for (const n of nodes) {
-      const code = unlockNetworkInfo(diagnostics[n.node_id], results[n.tag]).countryCode
+      const code = unlockNetworkInfo(diagnostics[n.node_id], results[n.node_id]).countryCode
       if (code) {
         counts.set(code.toUpperCase(), (counts.get(code.toUpperCase()) || 0) + 1)
       }
@@ -357,13 +402,13 @@ export default function UnlockPanel() {
   const filterableNodes = useMemo(() => {
     return nodes.filter((n) => {
       if (countryFilter) {
-        const c = unlockNetworkInfo(diagnostics[n.node_id], results[n.tag]).countryCode
+        const c = unlockNetworkInfo(diagnostics[n.node_id], results[n.node_id]).countryCode
         if (c !== countryFilter.toUpperCase()) return false
       }
 
       if (statusFilter) {
-        const r = results[n.tag]
-        const err = errors[n.tag]
+        const r = results[n.node_id]
+        const err = errors[n.node_id]
         if (statusFilter === 'untested') {
           return !r && !err
         }
@@ -416,7 +461,7 @@ export default function UnlockPanel() {
 
   const searchRecords = useMemo<UnlockSearchRecord[]>(() => filterableNodes.map((node) => {
     const config = nodeConfigByID.get(node.node_id)
-    const result = results[node.tag]
+    const result = results[node.node_id]
     const diagnostic = diagnostics[node.node_id]
     const network = unlockNetworkInfo(diagnostic, result)
     const source = nodeSourceLabel(config, subscriptionNamesByID)
@@ -912,17 +957,17 @@ export default function UnlockPanel() {
                     node={n}
                     config={nodeConfigByID.get(n.node_id)}
                     source={nodeSourceLabel(nodeConfigByID.get(n.node_id), subscriptionNamesByID)}
-                    result={results[n.tag]}
+                    result={results[n.node_id]}
                     diagnostic={diagnostics[n.node_id]}
-                    nodeError={errors[n.tag]}
-                    checking={Boolean(checking[n.tag])}
+                    nodeError={errors[n.node_id]}
+                    checking={Boolean(checking[n.node_id])}
                     isSelected={selectedNode?.tag === n.tag}
                     checked={selectedIds.has(n.node_id)}
                     onToggle={() => setSelectedIds((current) => { const next = new Set(current); if (next.has(n.node_id)) next.delete(n.node_id); else next.add(n.node_id); return next })}
                     onClick={() => openDrawer(n)}
                     onCheck={(e) => {
                       e.stopPropagation()
-                      void runSingle(n.tag)
+                      void runSingle(n)
                     }}
                   />
                 ))}
@@ -934,7 +979,7 @@ export default function UnlockPanel() {
 
       <UnlockDrawer
         node={selectedNode}
-        result={selectedNode ? results[selectedNode.tag] || null : null}
+        result={selectedNode ? results[selectedNode.node_id] || null : null}
         diagnostic={selectedNode ? diagnostics[selectedNode.node_id] || null : null}
         isOpen={drawerOpen}
         onClose={() => setDrawerOpen(false)}
