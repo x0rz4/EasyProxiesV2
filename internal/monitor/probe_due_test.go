@@ -7,8 +7,8 @@ import (
 )
 
 // TestProbeDueDoesNotReenterNodeLock is the regression test for nodes staying
-// stuck at 待检查. RunProbeBatch enumerates m.nodes under m.mu.RLock() and used
-// to call probeDue, which took m.mu.RLock() again. sync.RWMutex forbids
+// stuck at 待检查. RunProbeBatch used to enumerate the registry under its
+// read lock and call probeDue, which re-entered that same lock. RWMutex forbids
 // recursive read locking: once a writer is queued between the two acquisitions
 // the inner RLock waits for the writer, the writer waits for the outer RLock,
 // and the periodic health-check goroutine wedges permanently — no node ever
@@ -31,9 +31,8 @@ func TestProbeDueDoesNotReenterNodeLock(t *testing.T) {
 		t.Fatal("register returned no handle")
 	}
 
-	// Hold the node map for reading, exactly as the RunProbeBatch enumeration
-	// loop does.
-	mgr.mu.RLock()
+	// Hold the registry for reading, exactly as the old batch enumeration did.
+	mgr.registry.mu.RLock()
 
 	// Queue a writer. Register/MigrateRuntimeTag do this on every reload and on
 	// every group runtime start.
@@ -46,7 +45,7 @@ func TestProbeDueDoesNotReenterNodeLock(t *testing.T) {
 		mgr.Register(NodeInfo{NodeID: 8, Tag: "node-b", Name: "node-b"})
 	}()
 	<-writerQueued
-	// Give the writer time to actually block on m.mu.Lock() so the nested read
+	// Give the writer time to block on the registry write lock so a nested read
 	// lock below has a pending writer ahead of it.
 	time.Sleep(50 * time.Millisecond)
 
@@ -57,13 +56,13 @@ func TestProbeDueDoesNotReenterNodeLock(t *testing.T) {
 
 	select {
 	case due := <-returned:
-		mgr.mu.RUnlock()
+		mgr.registry.mu.RUnlock()
 		if !due {
 			t.Fatal("group member was not due at its shorter interval")
 		}
 	case <-time.After(5 * time.Second):
-		mgr.mu.RUnlock()
-		t.Fatal("probeDue blocked while the node map was read-locked: it must not take m.mu")
+		mgr.registry.mu.RUnlock()
+		t.Fatal("probeDue blocked while the registry was read-locked: it must not enter the registry")
 	}
 	writer.Wait()
 }

@@ -295,11 +295,10 @@ type entry struct {
 // Manager aggregates all node states for the UI/API.
 type Manager struct {
 	cfg         Config
-	reloadGen   uint64 // current reload generation
 	probeTarget ProbeTarget
 	probeReady  bool
-	mu          sync.RWMutex
-	nodes       map[string]*entry
+	targetMu    sync.RWMutex
+	registry    *nodeRegistry
 	ctx         context.Context
 	cancel      context.CancelFunc
 	logger      Logger
@@ -307,27 +306,13 @@ type Manager struct {
 	// periodic health check control
 	healthMu          sync.Mutex
 	healthInterval    time.Duration
-	healthTicker      *time.Ticker
-	healthIntervalC   chan time.Duration
+	healthStarted     bool
 	policyMu          sync.RWMutex
 	probePolicy       ProbePolicy
-	probeAllInFlight  atomic.Bool
-	probeRoundMu      sync.RWMutex
-	probeRound        ProbeRoundStatus
-	probeTagMu        sync.Mutex
-	probeTagsInFlight map[string]struct{}
-	probeWake         chan struct{}
-	initialMu         sync.Mutex
-	initialQueue      map[string]struct{}
-	initialRunning    bool
-	routineRequestMu  sync.Mutex
-	routinePending    bool
-	routineDueOnly    bool
+	probeScheduler    *probeScheduler
 	debugSubMu        sync.RWMutex
 	debugSubscribers  map[chan DebugLogEvent]struct{}
-	healthSubMu       sync.RWMutex
-	healthSubNextID   atomic.Uint64
-	healthSubscribers map[uint64]func(HealthResultEvent)
+	healthEvents      *healthEventHub
 	groupScheduleMu   sync.RWMutex
 	groupSchedules    map[int64]groupHealthSchedule
 	groupScheduleNext uint64
@@ -340,6 +325,13 @@ type groupHealthSchedule struct {
 	token    uint64
 }
 
+type probeScheduleSnapshot struct {
+	started  bool
+	base     time.Duration
+	byTag    map[string]time.Duration
+	byNodeID map[int64]time.Duration
+}
+
 // Logger interface for logging
 type Logger interface {
 	Info(args ...any)
@@ -350,16 +342,11 @@ type Logger interface {
 func NewManager(cfg Config) (*Manager, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Manager{
-		cfg:               cfg,
-		nodes:             make(map[string]*entry),
-		ctx:               ctx,
-		cancel:            cancel,
-		debugSubscribers:  make(map[chan DebugLogEvent]struct{}),
-		probeTagsInFlight: make(map[string]struct{}),
-		probeWake:         make(chan struct{}, 1),
-		initialQueue:      make(map[string]struct{}),
-		healthSubscribers: make(map[uint64]func(HealthResultEvent)),
-		groupSchedules:    make(map[int64]groupHealthSchedule),
+		cfg:              cfg,
+		ctx:              ctx,
+		cancel:           cancel,
+		debugSubscribers: make(map[chan DebugLogEvent]struct{}),
+		groupSchedules:   make(map[int64]groupHealthSchedule),
 		probePolicy: normalizeProbePolicy(ProbePolicy{
 			Concurrency: cfg.ProbeConcurrency, StartupTimeout: cfg.StartupProbeTimeout,
 			RoutineTimeout: cfg.RoutineProbeTimeout, DialTimeout: cfg.ProbeDialTimeout,
@@ -375,8 +362,11 @@ func NewManager(cfg Config) (*Manager, error) {
 		m.probeTarget = target
 		m.probeReady = true
 	}
+	m.registry = newNodeRegistry(m)
+	m.healthEvents = newHealthEventHub()
+	m.probeScheduler = newProbeScheduler(m)
 	go m.startTrafficSpeedSampler()
-	go m.runProbeCoordinator()
+	go m.probeScheduler.run()
 	return m, nil
 }
 
@@ -393,38 +383,10 @@ func (m *Manager) StartPeriodicHealthCheck(interval time.Duration) {
 	}
 
 	m.healthMu.Lock()
-	if m.healthIntervalC == nil {
-		m.healthIntervalC = make(chan time.Duration, 1)
-	}
 	m.healthInterval = interval
-	if m.healthTicker != nil {
-		m.healthTicker.Stop()
-	}
-	m.healthTicker = time.NewTicker(time.Second)
-	ticker := m.healthTicker
-	intervalC := m.healthIntervalC
+	m.healthStarted = true
 	m.healthMu.Unlock()
-
-	go func() {
-		for {
-			select {
-			case <-m.ctx.Done():
-				return
-			case newInterval := <-intervalC:
-				if newInterval <= 0 {
-					newInterval = 2 * time.Hour
-				}
-				m.healthMu.Lock()
-				m.healthInterval = newInterval
-				m.healthMu.Unlock()
-				if m.logger != nil {
-					m.logger.Info("periodic health check interval updated: ", newInterval)
-				}
-			case <-ticker.C:
-				m.RequestDueProbesOnce()
-			}
-		}
-	}()
+	m.probeScheduler.reschedulePeriodic()
 
 	if m.logger != nil {
 		m.logger.Info("periodic health check started, interval: ", interval)
@@ -439,15 +401,10 @@ func (m *Manager) SetHealthCheckInterval(d time.Duration) {
 	}
 	m.healthMu.Lock()
 	m.healthInterval = d
-	intervalC := m.healthIntervalC
 	m.healthMu.Unlock()
-
-	if intervalC != nil {
-		select {
-		case intervalC <- d:
-		default:
-			// drop if a newer update is already queued
-		}
+	m.probeScheduler.reschedulePeriodic()
+	if m.logger != nil {
+		m.logger.Info("periodic health check interval updated: ", d)
 	}
 }
 
@@ -469,12 +426,14 @@ func (m *Manager) RegisterGroupHealthSchedule(groupID int64, tags []string, inte
 	token := m.groupScheduleNext
 	m.groupSchedules[groupID] = groupHealthSchedule{tags: tagSet, interval: interval, token: token}
 	m.groupScheduleMu.Unlock()
+	m.probeScheduler.reschedulePeriodic()
 	return func() {
 		m.groupScheduleMu.Lock()
 		if current, ok := m.groupSchedules[groupID]; ok && current.token == token {
 			delete(m.groupSchedules, groupID)
 		}
 		m.groupScheduleMu.Unlock()
+		m.probeScheduler.reschedulePeriodic()
 	}
 }
 
@@ -495,12 +454,14 @@ func (m *Manager) RegisterGroupHealthScheduleByNodeID(groupID int64, nodeIDs []i
 	token := m.groupScheduleNext
 	m.groupSchedules[groupID] = groupHealthSchedule{nodeIDs: set, interval: interval, token: token}
 	m.groupScheduleMu.Unlock()
+	m.probeScheduler.reschedulePeriodic()
 	return func() {
 		m.groupScheduleMu.Lock()
 		if current, ok := m.groupSchedules[groupID]; ok && current.token == token {
 			delete(m.groupSchedules, groupID)
 		}
 		m.groupScheduleMu.Unlock()
+		m.probeScheduler.reschedulePeriodic()
 	}
 }
 
@@ -511,533 +472,131 @@ func (m *Manager) UnregisterGroupHealthSchedule(groupID int64) {
 	m.groupScheduleMu.Lock()
 	delete(m.groupSchedules, groupID)
 	m.groupScheduleMu.Unlock()
+	m.probeScheduler.reschedulePeriodic()
 }
 
 // probeDue reports whether a node's effective interval has elapsed. The caller
-// supplies nodeID rather than letting this look it up: RunProbeBatch calls this
-// while holding m.mu for reading, and a nested m.mu.RLock() deadlocks for good
-// as soon as any writer (Register, MigrateRuntimeTag, SweepStaleNodes, a
-// reload) is queued between the two acquisitions. sync.RWMutex does not allow
-// recursive read locking.
+// supplies nodeID so due-time calculation stays independent of the registry
+// and can operate on an immutable scheduling snapshot.
 func (m *Manager) probeDue(tag string, nodeID int64, lastCheck, now time.Time) bool {
 	if lastCheck.IsZero() {
 		return true
 	}
+	schedule := m.probeScheduleSnapshot()
+	interval := schedule.intervalFor(tag, nodeID)
+	return !now.Before(lastCheck.Add(interval))
+}
+
+func (m *Manager) probeScheduleSnapshot() probeScheduleSnapshot {
 	m.healthMu.Lock()
-	interval := m.healthInterval
+	snapshot := probeScheduleSnapshot{started: m.healthStarted, base: m.healthInterval}
 	m.healthMu.Unlock()
-	if interval <= 0 {
-		interval = 2 * time.Hour
+	if snapshot.base <= 0 {
+		snapshot.base = 2 * time.Hour
 	}
+	snapshot.byTag = make(map[string]time.Duration)
+	snapshot.byNodeID = make(map[int64]time.Duration)
 	m.groupScheduleMu.RLock()
 	for _, schedule := range m.groupSchedules {
-		_, tagMatch := schedule.tags[tag]
-		_, nodeMatch := schedule.nodeIDs[nodeID]
-		if (tagMatch || nodeMatch) && schedule.interval > 0 && schedule.interval < interval {
-			interval = schedule.interval
+		if schedule.interval <= 0 {
+			continue
+		}
+		for tag := range schedule.tags {
+			if current := snapshot.byTag[tag]; current == 0 || schedule.interval < current {
+				snapshot.byTag[tag] = schedule.interval
+			}
+		}
+		for nodeID := range schedule.nodeIDs {
+			if current := snapshot.byNodeID[nodeID]; current == 0 || schedule.interval < current {
+				snapshot.byNodeID[nodeID] = schedule.interval
+			}
 		}
 	}
 	m.groupScheduleMu.RUnlock()
-	return !now.Before(lastCheck.Add(interval))
+	return snapshot
+}
+
+func (s probeScheduleSnapshot) intervalFor(tag string, nodeID int64) time.Duration {
+	interval := s.base
+	if candidate := s.byTag[tag]; candidate > 0 && candidate < interval {
+		interval = candidate
+	}
+	if candidate := s.byNodeID[nodeID]; candidate > 0 && candidate < interval {
+		interval = candidate
+	}
+	return interval
+}
+
+func (m *Manager) nextProbeDelay(now time.Time) (time.Duration, bool) {
+	if _, ready := m.TargetForProbe(); !ready {
+		return 0, false
+	}
+	schedule := m.probeScheduleSnapshot()
+	if !schedule.started {
+		return 0, false
+	}
+	found := false
+	var earliest time.Time
+	for _, item := range m.registry.entries() {
+		item.mu.RLock()
+		probe := item.probe
+		tag := item.info.Tag
+		nodeID := item.info.NodeID
+		lastCheck := item.lastHealthCheck
+		item.mu.RUnlock()
+		if probe == nil {
+			continue
+		}
+		due := now
+		if !lastCheck.IsZero() {
+			due = lastCheck.Add(schedule.intervalFor(tag, nodeID))
+		}
+		if !found || due.Before(earliest) {
+			earliest = due
+			found = true
+		}
+	}
+	if !found {
+		return 0, false
+	}
+	delay := earliest.Sub(now)
+	if delay < 0 {
+		delay = 0
+	}
+	return delay, true
 }
 
 // RequestStartupProbeAllOnce triggers the one fast full round used after all
 // nodes have been registered at startup or reload.
 func (m *Manager) RequestStartupProbeAllOnce() {
 	if _, ready := m.TargetForProbe(); !ready {
-		m.mu.RLock()
-		tags := make([]string, 0, len(m.nodes))
-		for tag := range m.nodes {
-			tags = append(tags, tag)
-		}
-		m.mu.RUnlock()
+		tags := m.registry.tags()
 		for _, tag := range tags {
 			_ = m.MarkAvailableWithoutProbe(tag)
 		}
 		return
 	}
-	m.mu.RLock()
-	tags := make([]string, 0, len(m.nodes))
-	for tag := range m.nodes {
-		tags = append(tags, tag)
-	}
-	m.mu.RUnlock()
-	m.enqueueInitialProbeTags(tags)
+	tags := m.registry.tags()
+	m.probeScheduler.enqueueInitial(tags)
 }
 
 // RequestRoutineProbeAllOnce triggers a periodic-policy full round.
 func (m *Manager) RequestRoutineProbeAllOnce() {
-	m.requestProbeBatch(false)
+	m.probeScheduler.requestRoutine(false)
 }
 
 // RequestDueProbesOnce checks only nodes whose effective management/group
 // interval has elapsed. Batch rounds never overlap.
 func (m *Manager) RequestDueProbesOnce() {
-	m.requestProbeBatch(true)
+	m.probeScheduler.requestRoutine(true)
 }
 
-func (m *Manager) requestProbeBatch(dueOnly bool) {
-	if _, ready := m.TargetForProbe(); !ready {
-		return
-	}
-	m.routineRequestMu.Lock()
-	if !m.routinePending {
-		m.routineDueOnly = dueOnly
-	} else if !dueOnly {
-		// A full request subsumes every due-only request accumulated while a
-		// different round owns the global gate.
-		m.routineDueOnly = false
-	}
-	m.routinePending = true
-	m.routineRequestMu.Unlock()
-	m.signalProbeCoordinator()
-}
-
-func (m *Manager) signalProbeCoordinator() {
-	select {
-	case m.probeWake <- struct{}{}:
-	default:
-	}
-}
-
-func (m *Manager) enqueueInitialProbeTags(tags []string) {
-	if len(tags) == 0 {
-		return
-	}
-	started := false
-	added := 0
-	m.initialMu.Lock()
-	if !m.initialRunning {
-		m.initialRunning = true
-		started = true
-	}
-	for _, tag := range tags {
-		if tag != "" {
-			if _, exists := m.initialQueue[tag]; !exists {
-				m.initialQueue[tag] = struct{}{}
-				added++
-			}
-		}
-	}
-	queued := len(m.initialQueue)
-	m.initialMu.Unlock()
-	if started && m.logger != nil {
-		m.logger.Info("initial health convergence started with ", queued, " queued nodes")
-	} else if added > 0 && m.logger != nil {
-		m.logger.Info("initial health convergence queued ", added, " additional nodes; ", queued, " waiting")
-	}
-	m.signalProbeCoordinator()
-}
-
-func (m *Manager) runProbeCoordinator() {
-	// The ticker is a low-frequency safety net for lost/coalesced notifications.
-	// Correctness does not depend on it during normal operation, but a pending
-	// convergence can always recover even if no further reload or lease-release
-	// event arrives to wake the coordinator.
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-m.ctx.Done():
-			return
-		case <-m.probeWake:
-		case <-ticker.C:
-		}
-
-		for m.ctx.Err() == nil {
-			ranInitial, blockedInitial := m.runInitialConvergenceBatch()
-			if ranInitial {
-				continue
-			}
-			if blockedInitial {
-				break
-			}
-			ranRoutine, blockedRoutine := m.runPendingRoutineRound()
-			if ranRoutine {
-				continue
-			}
-			if blockedRoutine {
-				break
-			}
-			break
-		}
-	}
-}
-
-// runInitialConvergenceBatch returns whether a batch ran and whether work is
-// waiting on the global round gate or a per-tag probe lease.
-func (m *Manager) runInitialConvergenceBatch() (bool, bool) {
-	m.initialMu.Lock()
-	active := m.initialRunning
-	m.initialMu.Unlock()
-	if !active {
-		return false, false
-	}
-	if !m.probeAllInFlight.CompareAndSwap(false, true) {
-		return false, true
-	}
-
-	items, pending, waiting := m.collectInitialProbeItems()
-	if len(items) == 0 {
-		m.probeAllInFlight.Store(false)
-		if pending == 0 {
-			m.finishInitialConvergence()
-			return false, false
-		}
-		return false, waiting
-	}
-
-	policy := m.ProbePolicy()
-	m.probeRoundMu.Lock()
-	m.probeRound = ProbeRoundStatus{InFlight: true, Kind: ProbeRoundStartup, StartedAt: time.Now(), Total: len(items)}
-	m.probeRoundMu.Unlock()
-	defer func() {
-		m.probeAllInFlight.Store(false)
-		m.probeRoundMu.Lock()
-		m.probeRound.InFlight = false
-		m.probeRoundMu.Unlock()
-		m.signalProbeCoordinator()
-	}()
-
-	workerLimit := effectiveProbeConcurrency(policy.Concurrency, len(items))
-	results := collectLimited(workerLimit, items, func(item probeWorkItem) ProbeBatchResult {
-		return m.probeInitialItem(m.ctx, item, policy)
-	})
-	summary := ProbeBatchSummary{Total: len(items)}
-	for result := range results {
-		if result.Err != nil {
-			summary.Failed++
-			if m.logger != nil && !errors.Is(result.Err, context.Canceled) {
-				m.logger.Warn("initial probe failed for ", result.Tag, ": ", result.Err)
-			}
-		} else {
-			summary.Success++
-		}
-		m.probeRoundMu.Lock()
-		m.probeRound.Completed++
-		m.probeRound.Success = summary.Success
-		m.probeRound.Failed = summary.Failed
-		m.probeRoundMu.Unlock()
-	}
-	if m.logger != nil {
-		m.logger.Info("initial health convergence batch completed: ", summary.Success, " available, ", summary.Failed, " unavailable")
-	}
-	m.refreshInitialQueue()
-	return true, false
-}
-
-func (m *Manager) collectInitialProbeItems() ([]probeWorkItem, int, bool) {
-	m.mu.RLock()
-	current := make(map[string]probeWorkItem, len(m.nodes))
-	pendingTags := make([]string, 0, len(m.nodes))
-	for tag, item := range m.nodes {
-		item.mu.RLock()
-		work := probeWorkItem{entry: item, tag: tag, name: item.info.Name, probe: item.probe}
-		pending := !item.initialCheckDone
-		item.mu.RUnlock()
-		current[tag] = work
-		if pending {
-			pendingTags = append(pendingTags, tag)
-		}
-	}
-	m.mu.RUnlock()
-	pendingSet := make(map[string]struct{}, len(pendingTags))
-	for _, tag := range pendingTags {
-		pendingSet[tag] = struct{}{}
-	}
-
-	m.initialMu.Lock()
-	for tag := range m.initialQueue {
-		if _, exists := pendingSet[tag]; !exists {
-			delete(m.initialQueue, tag)
-		}
-	}
-	for _, tag := range pendingTags {
-		m.initialQueue[tag] = struct{}{}
-	}
-	queuedTags := make([]string, 0, len(m.initialQueue))
-	for tag := range m.initialQueue {
-		queuedTags = append(queuedTags, tag)
-	}
-	m.initialMu.Unlock()
-
-	items := make([]probeWorkItem, 0, len(queuedTags))
-	m.probeTagMu.Lock()
-	for _, tag := range queuedTags {
-		work, exists := current[tag]
-		if !exists {
-			continue
-		}
-		if _, busy := m.probeTagsInFlight[tag]; busy {
-			continue
-		}
-		m.probeTagsInFlight[tag] = struct{}{}
-		items = append(items, work)
-	}
-	m.probeTagMu.Unlock()
-	if len(items) > 0 {
-		m.initialMu.Lock()
-		for _, item := range items {
-			delete(m.initialQueue, item.tag)
-		}
-		m.initialMu.Unlock()
-	}
-	return items, len(pendingTags), len(items) == 0 && len(queuedTags) > 0
-}
-
-func (m *Manager) probeInitialItem(ctx context.Context, item probeWorkItem, policy ProbePolicy) ProbeBatchResult {
-	result := ProbeBatchResult{Tag: item.tag, Name: item.name}
-	defer m.endTagProbe(item.tag)
-	if ctx.Err() != nil {
-		result.Err = ctx.Err()
-		return result
-	}
-	if item.probe == nil {
-		result.Attempts = 1
-		result.Err = errors.New("probe function not configured")
-	} else {
-		for attempt := 1; attempt <= 2; attempt++ {
-			if ctx.Err() != nil {
-				result.Err = ctx.Err()
-				break
-			}
-			attemptCtx, cancel := context.WithTimeout(ctx, policy.StartupTimeout)
-			attemptCtx = withProbePhaseTimeouts(attemptCtx, policy.DialTimeout, policy.ResponseTimeout)
-			result.Attempts = attempt
-			result.Latency, result.Err = item.probe(attemptCtx)
-			cancel()
-			if result.Err == nil || ctx.Err() != nil || attempt == 2 {
-				break
-			}
-			timer := time.NewTimer(initialProbeRetryDelay)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				result.Err = ctx.Err()
-			case <-timer.C:
-			}
-		}
-	}
-	if ctx.Err() == nil && entryRuntimeTag(item.entry) == item.tag {
-		m.applyHealthResult(item.entry, result.Latency, result.Err, time.Now())
-	}
-	return result
-}
-
-func (m *Manager) refreshInitialQueue() {
-	m.mu.RLock()
-	pending := make([]string, 0, len(m.nodes))
-	for tag, item := range m.nodes {
-		item.mu.RLock()
-		isPending := !item.initialCheckDone
-		item.mu.RUnlock()
-		if isPending {
-			pending = append(pending, tag)
-		}
-	}
-	m.mu.RUnlock()
-	if len(pending) == 0 {
-		m.finishInitialConvergence()
-		return
-	}
-	m.initialMu.Lock()
-	if m.initialRunning {
-		for _, tag := range pending {
-			m.initialQueue[tag] = struct{}{}
-		}
-	}
-	m.initialMu.Unlock()
-}
-
-func (m *Manager) finishInitialConvergence() {
-	finished := false
-	m.initialMu.Lock()
-	// Revalidate while enqueue operations are excluded. A subscription may
-	// register a new pending generation between the preceding batch scan and
-	// this transition; its follow-up enqueue will either be visible here or
-	// reopen convergence after this lock is released.
-	m.mu.RLock()
-	pending := make([]string, 0)
-	for tag, item := range m.nodes {
-		item.mu.RLock()
-		isPending := !item.initialCheckDone
-		item.mu.RUnlock()
-		if isPending {
-			pending = append(pending, tag)
-		}
-	}
-	m.mu.RUnlock()
-	if len(pending) > 0 {
-		for _, tag := range pending {
-			m.initialQueue[tag] = struct{}{}
-		}
-		m.initialMu.Unlock()
-		m.signalProbeCoordinator()
-		return
-	}
-	if m.initialRunning {
-		m.initialRunning = false
-		clear(m.initialQueue)
-		finished = true
-	}
-	m.initialMu.Unlock()
-	if finished && m.logger != nil {
-		m.logger.Info("initial health convergence completed: pending nodes reached zero")
-	}
-}
-
-func (m *Manager) runPendingRoutineRound() (bool, bool) {
-	m.routineRequestMu.Lock()
-	if !m.routinePending {
-		m.routineRequestMu.Unlock()
-		return false, false
-	}
-	dueOnly := m.routineDueOnly
-	m.routinePending = false
-	m.routineDueOnly = false
-	m.routineRequestMu.Unlock()
-
-	_, err := m.RunProbeBatch(m.ctx, ProbeRoundPeriodic, dueOnly, nil, nil)
-	if errors.Is(err, ErrProbeRoundInProgress) {
-		m.routineRequestMu.Lock()
-		if !m.routinePending {
-			m.routineDueOnly = dueOnly
-		} else if !dueOnly {
-			m.routineDueOnly = false
-		}
-		m.routinePending = true
-		m.routineRequestMu.Unlock()
-		return false, true
-	}
-	if err != nil && !errors.Is(err, context.Canceled) && m.logger != nil {
-		m.logger.Warn("probe round failed: ", err)
-	}
-	return true, false
-}
-
-// RunProbeBatch executes one mutually exclusive worker-pool round. The result
-// callback is serialized on the caller goroutine, which makes it safe for SSE.
+// RunProbeBatch submits one mutually exclusive round to the scheduler actor.
+// Result callbacks are serialized before the method returns, which is safe for
+// the SSE handler's single response writer.
 func (m *Manager) RunProbeBatch(ctx context.Context, kind ProbeRoundKind, dueOnly bool,
 	onStart func(total int), onResult func(ProbeBatchResult)) (ProbeBatchSummary, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if _, ready := m.TargetForProbe(); !ready {
-		return ProbeBatchSummary{}, errors.New("probe target not configured")
-	}
-	m.mu.RLock()
-	items := make([]probeWorkItem, 0, len(m.nodes))
-	for _, e := range m.nodes {
-		e.mu.RLock()
-		probeFn := e.probe
-		lastHealthCheck := e.lastHealthCheck
-		tag := e.info.Tag
-		nodeID := e.info.NodeID
-		e.mu.RUnlock()
-		if probeFn == nil || (dueOnly && !m.probeDue(tag, nodeID, lastHealthCheck, time.Now())) {
-			continue
-		}
-		items = append(items, probeWorkItem{entry: e, tag: tag, name: e.info.Name, probe: probeFn})
-	}
-	m.mu.RUnlock()
-
-	if !m.probeAllInFlight.CompareAndSwap(false, true) {
-		return ProbeBatchSummary{}, ErrProbeRoundInProgress
-	}
-	items = m.reserveBatchProbeItems(items)
-	policy := m.ProbePolicy()
-	timeout, retries := policy.RoutineTimeout, policy.RoutineRetries
-	if kind == ProbeRoundStartup {
-		timeout, retries = policy.StartupTimeout, 0
-	}
-	status := ProbeRoundStatus{InFlight: true, Kind: kind, StartedAt: time.Now(), Total: len(items)}
-	m.probeRoundMu.Lock()
-	m.probeRound = status
-	m.probeRoundMu.Unlock()
-	defer func() {
-		m.probeAllInFlight.Store(false)
-		m.probeRoundMu.Lock()
-		m.probeRound.InFlight = false
-		m.probeRoundMu.Unlock()
-		m.signalProbeCoordinator()
-	}()
-	if onStart != nil {
-		onStart(len(items))
-	}
-	if len(items) == 0 {
-		return ProbeBatchSummary{}, nil
-	}
-
-	if m.logger != nil {
-		m.logger.Info("starting ", kind, " health check for ", len(items), " nodes")
-	}
-	workerLimit := effectiveProbeConcurrency(policy.Concurrency, len(items))
-	results := collectLimited(workerLimit, items, func(item probeWorkItem) ProbeBatchResult {
-		if kind == ProbeRoundStartup {
-			return m.probeInitialItem(ctx, item, policy)
-		}
-		return m.probeBatchItem(ctx, item, timeout, retries, policy.DialTimeout, policy.ResponseTimeout)
-	})
-	summary := ProbeBatchSummary{Total: len(items)}
-	for result := range results {
-		if result.Err != nil {
-			summary.Failed++
-			if m.logger != nil {
-				m.logger.Warn("probe failed for ", result.Tag, ": ", result.Err)
-			}
-		} else {
-			summary.Success++
-		}
-		m.probeRoundMu.Lock()
-		m.probeRound.Completed++
-		m.probeRound.Success = summary.Success
-		m.probeRound.Failed = summary.Failed
-		m.probeRoundMu.Unlock()
-		if onResult != nil {
-			onResult(result)
-		}
-	}
-	if m.logger != nil {
-		m.logger.Info(kind, " health check completed: ", summary.Success, " available, ", summary.Failed, " failed")
-	}
-	return summary, ctx.Err()
-}
-
-func (m *Manager) probeBatchItem(ctx context.Context, item probeWorkItem, timeout time.Duration, retries int, dialTimeout, responseTimeout time.Duration) ProbeBatchResult {
-	result := ProbeBatchResult{Tag: item.tag, Name: item.name}
-	defer m.endTagProbe(item.tag)
-	if item.probe == nil {
-		result.Err = errors.New("probe function not configured")
-		return result
-	}
-	nodeCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	nodeCtx = withProbePhaseTimeouts(nodeCtx, dialTimeout, responseTimeout)
-	for attempt := 0; attempt <= retries; attempt++ {
-		result.Attempts = attempt + 1
-		result.Latency, result.Err = item.probe(nodeCtx)
-		if result.Err == nil || nodeCtx.Err() != nil {
-			break
-		}
-	}
-	if ctx.Err() == nil && entryRuntimeTag(item.entry) == result.Tag {
-		m.applyHealthResult(item.entry, result.Latency, result.Err, time.Now())
-	}
-	return result
-}
-
-func (m *Manager) reserveBatchProbeItems(items []probeWorkItem) []probeWorkItem {
-	m.probeTagMu.Lock()
-	defer m.probeTagMu.Unlock()
-	reserved := items[:0]
-	for _, item := range items {
-		if _, exists := m.probeTagsInFlight[item.tag]; exists {
-			continue
-		}
-		m.probeTagsInFlight[item.tag] = struct{}{}
-		reserved = append(reserved, item)
-	}
-	return reserved
+	return m.probeScheduler.runBatch(ctx, kind, dueOnly, onStart, onResult)
 }
 
 func (m *Manager) ProbePolicy() ProbePolicy {
@@ -1069,32 +628,23 @@ func (m *Manager) ProbePhaseTimeoutsFor(ctx context.Context) (time.Duration, tim
 }
 
 func (m *Manager) ProbeRoundStatus() ProbeRoundStatus {
-	m.probeRoundMu.RLock()
-	defer m.probeRoundMu.RUnlock()
-	return m.probeRound
+	return m.probeScheduler.roundStatus()
 }
 
 func (m *Manager) ProbeNodeCount() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return len(m.nodes)
+	return m.registry.count()
 }
 
 func (m *Manager) InitialProbeStatus() InitialProbeStatus {
-	m.mu.RLock()
 	pending := 0
-	for _, item := range m.nodes {
+	for _, item := range m.registry.entries() {
 		item.mu.RLock()
 		if !item.initialCheckDone {
 			pending++
 		}
 		item.mu.RUnlock()
 	}
-	m.mu.RUnlock()
-	m.initialMu.Lock()
-	status := InitialProbeStatus{Converging: m.initialRunning, Pending: pending, Queued: len(m.initialQueue)}
-	m.initialMu.Unlock()
-	return status
+	return m.probeScheduler.initialStatus(pending)
 }
 
 // Stop stops the periodic health check.
@@ -1119,14 +669,7 @@ func (m *Manager) startTrafficSpeedSampler() {
 }
 
 func (m *Manager) sampleTrafficSpeeds(now time.Time) {
-	m.mu.RLock()
-	entries := make([]*entry, 0, len(m.nodes))
-	for _, e := range m.nodes {
-		entries = append(entries, e)
-	}
-	m.mu.RUnlock()
-
-	for _, e := range entries {
+	for _, e := range m.registry.entries() {
 		e.updateTrafficSpeed(now)
 	}
 }
@@ -1135,59 +678,28 @@ func (m *Manager) sampleTrafficSpeeds(now time.Time) {
 // will be marked with the new generation. Call SweepStaleNodes after reload
 // to remove nodes that were not re-registered (disabled/deleted nodes).
 func (m *Manager) BeginReload() {
-	m.mu.Lock()
-	m.reloadGen++
-	m.mu.Unlock()
+	m.registry.beginReload()
 }
 
 // SweepStaleNodes removes nodes that were not re-registered during the current
 // reload cycle. This preserves monitoring data (latency, success/failure counts)
 // for nodes that are still active, while cleaning up disabled/removed nodes.
 func (m *Manager) SweepStaleNodes() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for tag, e := range m.nodes {
-		e.mu.RLock()
-		generation := e.reloadGen
-		e.mu.RUnlock()
-		if generation != m.reloadGen {
-			delete(m.nodes, tag)
-		}
-	}
-	m.signalProbeCoordinator()
+	m.registry.sweepStale()
+	m.probeScheduler.signal()
 }
 
 // ClearNodes removes all registered nodes. Use BeginReload + SweepStaleNodes
 // for reload scenarios to preserve data for active nodes.
 func (m *Manager) ClearNodes() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.nodes = make(map[string]*entry)
+	m.registry.clear()
 }
 
 // Register ensures a node is tracked and returns its entry.
 // If the node already exists, its info is updated but monitoring stats
 // (latency, success/failure counts, etc.) are preserved.
 func (m *Manager) Register(info NodeInfo) *EntryHandle {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	e, ok := m.nodes[info.Tag]
-	if !ok {
-		e = &entry{
-			info:       info,
-			timeline:   make([]TimelineEvent, 0, maxTimelineSize),
-			reloadGen:  m.reloadGen,
-			onTimeline: m.publishDebugLog,
-		}
-		m.nodes[info.Tag] = e
-	} else {
-		e.mu.Lock()
-		e.info = info
-		e.reloadGen = m.reloadGen
-		e.onTimeline = m.publishDebugLog
-		e.mu.Unlock()
-	}
-	return &EntryHandle{ref: e}
+	return &EntryHandle{ref: m.registry.register(info)}
 }
 
 // MigrateRuntimeTag atomically moves the monitor identity of a stable node to
@@ -1195,65 +707,14 @@ func (m *Manager) Register(info NodeInfo) *EntryHandle {
 // counters, traffic and timeline history survive an outbound replacement.
 // If no entry with nodeID exists this behaves like Register.
 func (m *Manager) MigrateRuntimeTag(nodeID int64, info NodeInfo) *EntryHandle {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if existing := m.nodes[info.Tag]; existing != nil {
-		existing.mu.Lock()
-		existing.info = info
-		existing.reloadGen = m.reloadGen
-		existing.onTimeline = m.publishDebugLog
-		existing.mu.Unlock()
-		return &EntryHandle{ref: existing}
-	}
-	var oldTag string
-	var existing *entry
-	if nodeID != 0 {
-		for tag, candidate := range m.nodes {
-			candidate.mu.RLock()
-			matches := candidate.info.NodeID == nodeID
-			candidate.mu.RUnlock()
-			if matches {
-				oldTag, existing = tag, candidate
-				break
-			}
-		}
-	}
-	if existing == nil {
-		existing = &entry{timeline: make([]TimelineEvent, 0, maxTimelineSize), onTimeline: m.publishDebugLog}
-	} else {
-		delete(m.nodes, oldTag)
-	}
-	existing.mu.Lock()
-	existing.info = info
-	existing.reloadGen = m.reloadGen
-	existing.onTimeline = m.publishDebugLog
-	if oldTag != "" && oldTag != info.Tag {
-		// Health belongs to the concrete outbound generation. Keep historical
-		// counters/timeline/latency for the stable node, but require the new
-		// runtime to prove availability before it becomes a pool candidate.
-		existing.initialCheckDone = false
-		existing.available = false
-		existing.lastHealthCheck = time.Time{}
-	}
-	existing.mu.Unlock()
-	m.nodes[info.Tag] = existing
-	return &EntryHandle{ref: existing}
+	return &EntryHandle{ref: m.registry.migrate(nodeID, info)}
 }
 
 // UnregisterRuntimeTag removes a retired runtime identity if it is still the
 // map owner. A migrated entry is keyed by its new tag and is left untouched.
 func (m *Manager) UnregisterRuntimeTag(tag string) {
-	m.mu.Lock()
-	if existing := m.nodes[tag]; existing != nil {
-		existing.mu.RLock()
-		currentTag := existing.info.Tag
-		existing.mu.RUnlock()
-		if currentTag == tag {
-			delete(m.nodes, tag)
-		}
-	}
-	m.mu.Unlock()
-	m.signalProbeCoordinator()
+	m.registry.unregister(tag)
+	m.probeScheduler.signal()
 }
 
 // RequestProbeTagsOnce adds concrete runtime generations to the same bounded
@@ -1268,16 +729,14 @@ func (m *Manager) RequestProbeTagsOnce(tags []string) {
 		}
 		return
 	}
-	m.enqueueInitialProbeTags(tags)
+	m.probeScheduler.enqueueInitial(tags)
 }
 
 // HandleForTag returns an existing monitor entry without changing its reload
 // generation, callbacks, or node metadata. Independent group runtimes use this
 // to observe the base runtime's health state without becoming probe owners.
 func (m *Manager) HandleForTag(tag string) *EntryHandle {
-	m.mu.RLock()
-	entry := m.nodes[tag]
-	m.mu.RUnlock()
+	entry := m.registry.byTagEntry(tag)
 	if entry == nil {
 		return nil
 	}
@@ -1286,26 +745,17 @@ func (m *Manager) HandleForTag(tag string) *EntryHandle {
 
 // HandleForNodeID resolves the current monitor owner for a stable node.
 func (m *Manager) HandleForNodeID(nodeID int64) *EntryHandle {
-	if nodeID == 0 {
+	item := m.registry.byNodeID(nodeID)
+	if item == nil {
 		return nil
 	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	for _, item := range m.nodes {
-		item.mu.RLock()
-		matches := item.info.NodeID == nodeID
-		item.mu.RUnlock()
-		if matches {
-			return &EntryHandle{ref: item}
-		}
-	}
-	return nil
+	return &EntryHandle{ref: item}
 }
 
 // DestinationForProbe exposes the configured destination for health checks.
 func (m *Manager) DestinationForProbe() (M.Socksaddr, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.targetMu.RLock()
+	defer m.targetMu.RUnlock()
 	if !m.probeReady {
 		return M.Socksaddr{}, false
 	}
@@ -1315,8 +765,8 @@ func (m *Manager) DestinationForProbe() (M.Socksaddr, bool) {
 // TargetForProbe returns the full endpoint needed for a scheme-aware HTTP
 // health check. Callers should prefer this over DestinationForProbe.
 func (m *Manager) TargetForProbe() (ProbeTarget, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.targetMu.RLock()
+	defer m.targetMu.RUnlock()
 	if !m.probeReady {
 		return ProbeTarget{}, false
 	}
@@ -1337,11 +787,12 @@ func (m *Manager) UpdateProbeTarget(target string) error {
 func (m *Manager) SetProbeTarget(target string) error {
 	target = strings.TrimSpace(target)
 	if target == "" {
-		m.mu.Lock()
+		m.targetMu.Lock()
 		m.probeTarget = ProbeTarget{}
 		m.probeReady = false
 		m.cfg.ProbeTarget = ""
-		m.mu.Unlock()
+		m.targetMu.Unlock()
+		m.probeScheduler.reschedulePeriodic()
 		return nil
 	}
 	parsed, err := parseProbeTarget(target)
@@ -1349,11 +800,12 @@ func (m *Manager) SetProbeTarget(target string) error {
 		return err
 	}
 
-	m.mu.Lock()
+	m.targetMu.Lock()
 	m.probeTarget = parsed
 	m.probeReady = true
 	m.cfg.ProbeTarget = target
-	m.mu.Unlock()
+	m.targetMu.Unlock()
+	m.probeScheduler.reschedulePeriodic()
 	return nil
 }
 
@@ -1415,13 +867,7 @@ func (m *Manager) Snapshot() []Snapshot {
 // every runtime registration of a stable node ID. It does not alter health,
 // failure counters, or routing availability.
 func (m *Manager) UpdateNodeLocation(nodeID int64, region, country string) {
-	m.mu.RLock()
-	entries := make([]*entry, 0, len(m.nodes))
-	for _, item := range m.nodes {
-		entries = append(entries, item)
-	}
-	m.mu.RUnlock()
-	for _, item := range entries {
+	for _, item := range m.registry.entries() {
 		item.mu.Lock()
 		if item.info.NodeID == nodeID {
 			item.info.Region = strings.ToLower(strings.TrimSpace(region))
@@ -1434,10 +880,8 @@ func (m *Manager) UpdateNodeLocation(nodeID int64, region, country string) {
 // SnapshotForTag returns a snapshot of a single node by tag, or nil if the
 // node is not registered.
 func (m *Manager) SnapshotForTag(tag string) *Snapshot {
-	m.mu.RLock()
-	e, ok := m.nodes[tag]
-	m.mu.RUnlock()
-	if !ok {
+	e := m.registry.byTagEntry(tag)
+	if e == nil {
 		return nil
 	}
 	snap := e.snapshot()
@@ -1459,12 +903,7 @@ func (m *Manager) SnapshotForNodeID(nodeID int64) *Snapshot {
 // If onlyAvailable is true, only returns nodes that passed initial health check.
 // Nodes that haven't been checked yet are also included (they will be checked on first use).
 func (m *Manager) SnapshotFiltered(onlyAvailable bool) []Snapshot {
-	m.mu.RLock()
-	list := make([]*entry, 0, len(m.nodes))
-	for _, e := range m.nodes {
-		list = append(list, e)
-	}
-	m.mu.RUnlock()
+	list := m.registry.entries()
 	snapshots := make([]Snapshot, 0, len(list))
 	for _, e := range list {
 		snap := e.snapshot()
@@ -1501,12 +940,7 @@ func (m *Manager) SnapshotFiltered(onlyAvailable bool) []Snapshot {
 // TrafficSummary returns aggregated traffic totals/speeds and per-node speeds.
 // includeNodes controls whether per-node details are returned.
 func (m *Manager) TrafficSummary(includeNodes bool) TrafficSummary {
-	m.mu.RLock()
-	list := make([]*entry, 0, len(m.nodes))
-	for _, e := range m.nodes {
-		list = append(list, e)
-	}
-	m.mu.RUnlock()
+	list := m.registry.entries()
 
 	summary := TrafficSummary{
 		NodeCount: len(list),
@@ -1592,20 +1026,11 @@ func entryRuntimeTag(e *entry) string {
 }
 
 func (m *Manager) beginTagProbe(tag string) bool {
-	m.probeTagMu.Lock()
-	defer m.probeTagMu.Unlock()
-	if _, exists := m.probeTagsInFlight[tag]; exists {
-		return false
-	}
-	m.probeTagsInFlight[tag] = struct{}{}
-	return true
+	return m.probeScheduler.beginTagProbe(tag)
 }
 
 func (m *Manager) endTagProbe(tag string) {
-	m.probeTagMu.Lock()
-	delete(m.probeTagsInFlight, tag)
-	m.probeTagMu.Unlock()
-	m.signalProbeCoordinator()
+	m.probeScheduler.endTagProbe(tag)
 }
 
 func (m *Manager) applyHealthResult(e *entry, latency time.Duration, probeErr error, checkedAt time.Time) {
@@ -1688,10 +1113,8 @@ func (m *Manager) DialerFor(tag string) (DialerFunc, error) {
 }
 
 func (m *Manager) entry(tag string) (*entry, error) {
-	m.mu.RLock()
-	e, ok := m.nodes[tag]
-	m.mu.RUnlock()
-	if !ok {
+	e := m.registry.byTagEntry(tag)
+	if e == nil {
 		return nil, fmt.Errorf("node %s not found", tag)
 	}
 	return e, nil
@@ -1822,30 +1245,17 @@ func (m *Manager) publishDebugLog(event DebugLogEvent) {
 // SubscribeHealthResults installs a lossless in-process health observer.
 // Callbacks run outside manager and entry locks and must remain lightweight.
 func (m *Manager) SubscribeHealthResults(callback func(HealthResultEvent)) func() {
-	if callback == nil {
-		return func() {}
-	}
-	id := m.healthSubNextID.Add(1)
-	m.healthSubMu.Lock()
-	m.healthSubscribers[id] = callback
-	m.healthSubMu.Unlock()
-	return func() {
-		m.healthSubMu.Lock()
-		delete(m.healthSubscribers, id)
-		m.healthSubMu.Unlock()
-	}
+	return m.healthEvents.subscribe(nil, nil, true, callback)
+}
+
+// SubscribeHealthResultsFor installs a targeted observer. A subscription
+// indexed by both tag and Node ID is invoked at most once for each event.
+func (m *Manager) SubscribeHealthResultsFor(tags []string, nodeIDs []int64, callback func(HealthResultEvent)) func() {
+	return m.healthEvents.subscribe(tags, nodeIDs, false, callback)
 }
 
 func (m *Manager) publishHealthResult(event HealthResultEvent) {
-	m.healthSubMu.RLock()
-	callbacks := make([]func(HealthResultEvent), 0, len(m.healthSubscribers))
-	for _, callback := range m.healthSubscribers {
-		callbacks = append(callbacks, callback)
-	}
-	m.healthSubMu.RUnlock()
-	for _, callback := range callbacks {
-		callback(event)
-	}
+	m.healthEvents.publish(event)
 }
 
 func (e *entry) blacklistUntil(until time.Time) {

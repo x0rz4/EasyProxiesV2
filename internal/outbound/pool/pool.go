@@ -410,12 +410,12 @@ func (p *poolOutbound) Start(stage adapter.StartStage) error {
 	}
 	p.mu.Lock()
 	err := p.initializeMembersLocked()
+	if err == nil {
+		p.refreshHealthSubscriptionLocked()
+	}
 	p.mu.Unlock()
 	if err != nil {
 		return err
-	}
-	if p.monitor != nil {
-		p.unsubscribeHealth = p.monitor.SubscribeHealthResults(p.handleHealthResult)
 	}
 	if p.monitor != nil && p.options.GroupID != 0 {
 		nodeIDs := make([]int64, 0, len(p.options.Members))
@@ -775,6 +775,7 @@ func (p *poolOutbound) reconcileMembersLocked(specs []RuntimeMemberSpec) (uint64
 	for _, member := range next {
 		p.topologyByTag[member.tag] = member
 	}
+	p.refreshHealthSubscriptionLocked()
 	var nextCurrent *MemberRef
 	if oldCurrent != nil {
 		nextCurrent = p.topologyByTag[oldCurrent.tag]
@@ -942,6 +943,28 @@ func (p *poolOutbound) attachMonitorMember(member *MemberRef) {
 	entry.SetRelease(p.makeReleaseFunc(member))
 	entry.SetProbe(p.makeProbeFunc(member))
 	entry.SetDialer(p.makeDialerFunc(member))
+}
+
+// refreshHealthSubscriptionLocked updates the monitor's reverse index to the
+// exact immutable topology being published. It must be called with p.mu held.
+func (p *poolOutbound) refreshHealthSubscriptionLocked() {
+	if p.monitor == nil {
+		return
+	}
+	tags := make([]string, 0, len(p.topology))
+	nodeIDs := make([]int64, 0, len(p.topology))
+	for _, member := range p.topology {
+		tags = append(tags, member.tag)
+		if nodeID := p.memberMeta(member).NodeID; nodeID != 0 {
+			nodeIDs = append(nodeIDs, nodeID)
+		}
+	}
+	next := p.monitor.SubscribeHealthResultsFor(tags, nodeIDs, p.handleHealthResult)
+	previous := p.unsubscribeHealth
+	p.unsubscribeHealth = next
+	if previous != nil {
+		previous()
+	}
 }
 
 func (p *poolOutbound) memberName(member *memberState) string {

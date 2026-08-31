@@ -46,6 +46,31 @@ func TestProbePublishesCommittedHealthResults(t *testing.T) {
 	}
 }
 
+func TestHealthResultsDispatchOnlyToMatchingSubscriptions(t *testing.T) {
+	mgr, err := NewManager(Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	var global, matching, unrelated int
+	unsubscribeGlobal := mgr.SubscribeHealthResults(func(HealthResultEvent) { global++ })
+	unsubscribeMatching := mgr.SubscribeHealthResultsFor([]string{"node-a"}, []int64{7}, func(HealthResultEvent) { matching++ })
+	unsubscribeUnrelated := mgr.SubscribeHealthResultsFor([]string{"node-b"}, []int64{8}, func(HealthResultEvent) { unrelated++ })
+	defer unsubscribeGlobal()
+	defer unsubscribeMatching()
+	defer unsubscribeUnrelated()
+
+	// Matching both indexes must still invoke the subscription exactly once.
+	mgr.publishHealthResult(HealthResultEvent{Tag: "node-a", NodeID: 7, Success: true})
+	if global != 1 || matching != 1 || unrelated != 0 {
+		t.Fatalf("first dispatch: global=%d matching=%d unrelated=%d", global, matching, unrelated)
+	}
+	mgr.publishHealthResult(HealthResultEvent{Tag: "node-c", NodeID: 9, Success: true})
+	if global != 2 || matching != 1 || unrelated != 0 {
+		t.Fatalf("second dispatch: global=%d matching=%d unrelated=%d", global, matching, unrelated)
+	}
+}
+
 func TestProbeDueUsesShortestScheduleForMemberOnly(t *testing.T) {
 	mgr, err := NewManager(Config{})
 	if err != nil {

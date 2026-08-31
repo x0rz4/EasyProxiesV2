@@ -372,6 +372,38 @@ func TestProbeBatchDueOnlySkipsFreshNodes(t *testing.T) {
 	}
 }
 
+func TestPeriodicSchedulerSleepsUntilNearestDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		mgr, err := NewManager(Config{ProbeTarget: "http://example.com", ProbeConcurrency: 1, RoutineProbeTimeout: time.Second})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer mgr.Stop()
+		var attempts atomic.Int32
+		handle := mgr.Register(NodeInfo{Tag: "scheduled"})
+		handle.SetProbe(func(context.Context) (time.Duration, error) {
+			attempts.Add(1)
+			return time.Millisecond, nil
+		})
+		handle.ref.mu.Lock()
+		handle.ref.lastHealthCheck = time.Now()
+		handle.ref.mu.Unlock()
+
+		mgr.StartPeriodicHealthCheck(10 * time.Second)
+		synctest.Wait()
+		time.Sleep(9 * time.Second)
+		synctest.Wait()
+		if attempts.Load() != 0 {
+			t.Fatalf("probe ran before deadline: %d", attempts.Load())
+		}
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if attempts.Load() != 1 {
+			t.Fatalf("probe calls at deadline = %d, want 1", attempts.Load())
+		}
+	})
+}
+
 func waitForInitialConvergence(t *testing.T, mgr *Manager) InitialProbeStatus {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -525,35 +557,6 @@ func TestInitialConvergenceRetriesBusyTagAfterLeaseRelease(t *testing.T) {
 	}
 }
 
-func TestInitialConvergenceRecoversWithoutWakeNotification(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		mgr, err := NewManager(Config{ProbeTarget: "http://example.com"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer mgr.Stop()
-		var calls atomic.Int32
-		mgr.Register(NodeInfo{Tag: "lost-wake"}).SetProbe(func(context.Context) (time.Duration, error) {
-			calls.Add(1)
-			return time.Millisecond, nil
-		})
-		// Install queued state without using enqueueInitialProbeTags, modeling a
-		// coalesced wake notification at the exact producer/consumer boundary.
-		mgr.initialMu.Lock()
-		mgr.initialRunning = true
-		mgr.initialQueue["lost-wake"] = struct{}{}
-		mgr.initialMu.Unlock()
-		time.Sleep(time.Second)
-		synctest.Wait()
-		if calls.Load() != 1 {
-			t.Fatalf("watchdog probe calls = %d, want 1", calls.Load())
-		}
-		if status := mgr.InitialProbeStatus(); status.Converging || status.Pending != 0 {
-			t.Fatalf("watchdog convergence status = %+v", status)
-		}
-	})
-}
-
 func TestInitialConvergenceMissingProbeBecomesUnavailable(t *testing.T) {
 	mgr, err := NewManager(Config{ProbeTarget: "http://example.com"})
 	if err != nil {
@@ -591,6 +594,98 @@ func TestInitialProbeAttemptsUseIndependentTimeouts(t *testing.T) {
 		wantElapsed := 2*attemptTimeout + initialProbeRetryDelay
 		if attempts.Load() != 2 || summary.Failed != 1 || time.Since(started) != wantElapsed {
 			t.Fatalf("attempts=%d elapsed=%v want=%v summary=%+v", attempts.Load(), time.Since(started), wantElapsed, summary)
+		}
+	})
+}
+
+func TestCancellingStartupRoundDuringBackoffReturnsPromptly(t *testing.T) {
+	mgr, err := NewManager(Config{ProbeTarget: "http://example.com", ProbeConcurrency: 1, StartupProbeTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	firstAttempt := make(chan struct{})
+	var attempts atomic.Int32
+	mgr.Register(NodeInfo{Tag: "cancel-backoff"}).SetProbe(func(context.Context) (time.Duration, error) {
+		if attempts.Add(1) == 1 {
+			close(firstAttempt)
+		}
+		return 0, errors.New("temporary failure")
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		_, runErr := mgr.RunProbeBatch(ctx, ProbeRoundStartup, false, nil, nil)
+		done <- runErr
+	}()
+	<-firstAttempt
+	cancel()
+	select {
+	case runErr := <-done:
+		if !errors.Is(runErr, context.Canceled) {
+			t.Fatalf("startup cancellation error = %v", runErr)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("startup round waited for retry timer after cancellation")
+	}
+	if attempts.Load() != 1 {
+		t.Fatalf("attempts after cancellation = %d, want 1", attempts.Load())
+	}
+	if !mgr.beginTagProbe("cancel-backoff") {
+		t.Fatal("probe lease was not released after cancelling retry delay")
+	}
+	mgr.endTagProbe("cancel-backoff")
+}
+
+func TestInitialProbeBackoffDoesNotOccupyWorker(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		mgr, err := NewManager(Config{
+			ProbeTarget:         "http://example.com",
+			ProbeConcurrency:    1,
+			StartupProbeTimeout: time.Second,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer mgr.Stop()
+
+		var order []string
+		var firstAttempts atomic.Int32
+		first := mgr.Register(NodeInfo{Tag: "retry-first"})
+		firstProbe := func(context.Context) (time.Duration, error) {
+			if firstAttempts.Add(1) == 1 {
+				order = append(order, "first-attempt")
+				return 0, errors.New("temporary failure")
+			}
+			order = append(order, "first-retry")
+			return time.Millisecond, nil
+		}
+		first.SetProbe(firstProbe)
+		second := mgr.Register(NodeInfo{Tag: "healthy-second"})
+		secondProbe := func(context.Context) (time.Duration, error) {
+			order = append(order, "second-attempt")
+			return time.Millisecond, nil
+		}
+		second.SetProbe(secondProbe)
+
+		summary, runErr := mgr.RunProbeBatch(t.Context(), ProbeRoundStartup, false, nil, nil)
+		if runErr != nil {
+			t.Fatal(runErr)
+		}
+		secondIndex, retryIndex := -1, -1
+		for index, step := range order {
+			if step == "second-attempt" {
+				secondIndex = index
+			}
+			if step == "first-retry" {
+				retryIndex = index
+			}
+		}
+		if secondIndex < 0 || retryIndex < 0 || secondIndex > retryIndex {
+			t.Fatalf("probe order = %s; healthy node must run before retry", fmt.Sprint(order))
+		}
+		if summary.Total != 2 || summary.Success != 2 || summary.Failed != 0 {
+			t.Fatalf("summary = %+v", summary)
 		}
 	})
 }
@@ -650,7 +745,9 @@ func TestProbeBatchRuntimeTagMigrationReleasesOldLeaseAndSkipsOldResult(t *testi
 	}
 	done := make(chan ProbeBatchResult, 1)
 	go func() {
-		done <- mgr.probeBatchItem(t.Context(), probeWorkItem{entry: handle.ref, tag: "node@v1", name: "old", probe: oldProbe}, time.Second, 0, time.Second, time.Second)
+		result := mgr.probeScheduler.probeRoutineItem(t.Context(), probeWorkItem{entry: handle.ref, tag: "node@v1", name: "old", probe: oldProbe}, ProbePolicy{RoutineTimeout: time.Second, DialTimeout: time.Second, ResponseTimeout: time.Second})
+		mgr.endTagProbe("node@v1")
+		done <- result
 	}()
 	<-probeStarted
 	migrated := mgr.MigrateRuntimeTag(2, NodeInfo{NodeID: 2, Tag: "node@v2"})
