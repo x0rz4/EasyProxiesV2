@@ -123,6 +123,42 @@ func TestStartRegistersVersionedRuntimeTagOnFirstBox(t *testing.T) {
 	}
 }
 
+func TestStartConvergesLoadedRuntimeNodeOutOfPending(t *testing.T) {
+	cfg := &config.Config{
+		Pool:                config.PoolConfig{Mode: "sequential", FailureThreshold: 3, BlacklistDuration: time.Minute},
+		Nodes:               []config.NodeConfig{{ID: 1, Name: "offline", URI: "http://127.0.0.1:65530", Region: "hk"}},
+		SubscriptionRefresh: config.SubscriptionRefreshConfig{HealthCheckTimeout: time.Millisecond},
+		LogLevel:            "error",
+	}
+	if err := cfg.NormalizeWithPortMap(nil); err != nil {
+		t.Fatal(err)
+	}
+	manager := New(cfg, monitor.Config{
+		ProbeTarget:          "http://127.0.0.1:65531/generate_204",
+		ProbeConcurrency:     1,
+		StartupProbeTimeout:  25 * time.Millisecond,
+		ProbeDialTimeout:     10 * time.Millisecond,
+		ProbeResponseTimeout: 10 * time.Millisecond,
+	})
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		snapshots := manager.monitorMgr.Snapshot()
+		if len(snapshots) == 1 && snapshots[0].InitialCheckDone {
+			if snapshots[0].Available {
+				t.Fatalf("offline test node unexpectedly available: %+v", snapshots[0])
+			}
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("loaded runtime node remained pending: snapshots=%+v status=%+v round=%+v", manager.monitorMgr.Snapshot(), manager.monitorMgr.InitialProbeStatus(), manager.monitorMgr.ProbeRoundStatus())
+}
+
 func TestNodeOnlyReloadCreatesPublishesAndDrainsInPlace(t *testing.T) {
 	cfg := &config.Config{
 		Pool:                config.PoolConfig{Mode: "sequential", FailureThreshold: 3, BlacklistDuration: time.Minute},

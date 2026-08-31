@@ -525,6 +525,35 @@ func TestInitialConvergenceRetriesBusyTagAfterLeaseRelease(t *testing.T) {
 	}
 }
 
+func TestInitialConvergenceRecoversWithoutWakeNotification(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		mgr, err := NewManager(Config{ProbeTarget: "http://example.com"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer mgr.Stop()
+		var calls atomic.Int32
+		mgr.Register(NodeInfo{Tag: "lost-wake"}).SetProbe(func(context.Context) (time.Duration, error) {
+			calls.Add(1)
+			return time.Millisecond, nil
+		})
+		// Install queued state without using enqueueInitialProbeTags, modeling a
+		// coalesced wake notification at the exact producer/consumer boundary.
+		mgr.initialMu.Lock()
+		mgr.initialRunning = true
+		mgr.initialQueue["lost-wake"] = struct{}{}
+		mgr.initialMu.Unlock()
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if calls.Load() != 1 {
+			t.Fatalf("watchdog probe calls = %d, want 1", calls.Load())
+		}
+		if status := mgr.InitialProbeStatus(); status.Converging || status.Pending != 0 {
+			t.Fatalf("watchdog convergence status = %+v", status)
+		}
+	})
+}
+
 func TestInitialConvergenceMissingProbeBecomesUnavailable(t *testing.T) {
 	mgr, err := NewManager(Config{ProbeTarget: "http://example.com"})
 	if err != nil {

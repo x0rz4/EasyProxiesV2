@@ -630,11 +630,18 @@ func (m *Manager) enqueueInitialProbeTags(tags []string) {
 }
 
 func (m *Manager) runProbeCoordinator() {
+	// The ticker is a low-frequency safety net for lost/coalesced notifications.
+	// Correctness does not depend on it during normal operation, but a pending
+	// convergence can always recover even if no further reload or lease-release
+	// event arrives to wake the coordinator.
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-m.ctx.Done():
 			return
 		case <-m.probeWake:
+		case <-ticker.C:
 		}
 
 		for m.ctx.Err() == nil {
