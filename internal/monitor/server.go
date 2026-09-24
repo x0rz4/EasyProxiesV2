@@ -2611,10 +2611,15 @@ type groupPoolInput struct {
 	FailureWindowSeconds int      `json:"failure_window_seconds"`
 	FailureThreshold     int      `json:"failure_threshold"`
 	HealthCheckSeconds   int      `json:"health_check_seconds"`
-	Enabled              *bool    `json:"enabled"`
-	SubscriptionEnabled  *bool    `json:"subscription_enabled"`
-	SubscriptionMode     string   `json:"subscription_mode"`
-	ExternalHost         string   `json:"external_host"`
+	// Automatic recovery of evicted members. Pointers keep a partial update
+	// from silently resetting stored values, matching Enabled.
+	RecoveryEnabled          *bool `json:"recovery_enabled"`
+	RecoverySuccessThreshold int   `json:"recovery_success_threshold"`
+	RecoveryCooldownSeconds  *int  `json:"recovery_cooldown_seconds"`
+	Enabled                  *bool `json:"enabled"`
+	SubscriptionEnabled      *bool `json:"subscription_enabled"`
+	SubscriptionMode         string `json:"subscription_mode"`
+	ExternalHost             string `json:"external_host"`
 }
 
 type groupMemberResponse struct {
@@ -2627,11 +2632,15 @@ type groupMemberResponse struct {
 	FailureCount int       `json:"failure_count"`
 	LastError    string    `json:"last_error,omitempty"`
 	EvictedAt    time.Time `json:"evicted_at,omitempty"`
-	LatencyMs    int64     `json:"latency_ms"`
-	Available    bool      `json:"available"`
-	Provisional  bool      `json:"provisional"`
-	HealthSource string    `json:"health_source"`
-	IsActive     bool      `json:"is_active"`
+	// Recovery progress of an evicted member that has automatic recovery on.
+	RecoverySuccesses   int       `json:"recovery_successes,omitempty"`
+	RecoveryThreshold   int       `json:"recovery_threshold,omitempty"`
+	RecoveryCooldownEnd time.Time `json:"recovery_cooldown_end,omitempty"`
+	LatencyMs           int64     `json:"latency_ms"`
+	Available           bool      `json:"available"`
+	Provisional         bool      `json:"provisional"`
+	HealthSource        string    `json:"health_source"`
+	IsActive            bool      `json:"is_active"`
 }
 
 type groupNodeOptionResponse struct {
@@ -2983,7 +2992,9 @@ func (s *Server) writeGroupList(w http.ResponseWriter, r *http.Request) {
 					Region: mon.Region, Country: mon.Country, Status: status, FailureCount: member.FailureCount,
 					LastError: member.LastError, EvictedAt: member.EvictedAt, LatencyMs: mon.LastLatencyMs,
 					Available: mon.RoutingEligible, Provisional: mon.Provisional, HealthSource: mon.HealthSource,
-					IsActive: member.NodeID == runtimeState.CurrentNodeID}
+					IsActive: member.NodeID == runtimeState.CurrentNodeID,
+					RecoverySuccesses: member.RecoverySuccesses, RecoveryThreshold: member.RecoveryThreshold,
+					RecoveryCooldownEnd: member.RecoveryCooldownEnd}
 				if item.Region == "" {
 					item.Region = node.Region
 				}
@@ -3130,6 +3141,28 @@ func (s *Server) groupFromInput(ctx context.Context, input groupPoolInput, exist
 	if input.HealthCheckSeconds <= 0 {
 		input.HealthCheckSeconds = 60
 	}
+	recoveryEnabled := true
+	if input.RecoveryEnabled != nil {
+		recoveryEnabled = *input.RecoveryEnabled
+	} else if existing != nil {
+		recoveryEnabled = existing.RecoveryEnabled
+	}
+	recoveryThreshold := input.RecoverySuccessThreshold
+	if recoveryThreshold <= 0 && existing != nil {
+		recoveryThreshold = existing.RecoverySuccessThreshold
+	}
+	if recoveryThreshold <= 0 {
+		recoveryThreshold = 3
+	}
+	recoveryCooldown := 300
+	if input.RecoveryCooldownSeconds != nil {
+		recoveryCooldown = *input.RecoveryCooldownSeconds
+	} else if existing != nil {
+		recoveryCooldown = existing.RecoveryCooldownSeconds
+	}
+	if recoveryCooldown < 0 {
+		recoveryCooldown = 0
+	}
 	autoPort := input.BindPort == 0
 	if autoPort {
 		input.BindPort, err = s.allocateGroupPort(ctx)
@@ -3231,6 +3264,7 @@ func (s *Server) groupFromInput(ctx context.Context, input groupPoolInput, exist
 		Regions: regions, ExplicitNodeIDs: keptNodeIDs, ExcludedNodeIDs: excludedNodeIDs, FailureWindowSeconds: input.FailureWindowSeconds,
 		TagWhitelist: tagWhitelist, TagBlacklist: tagBlacklist, TagFilterMatch: tagFilterMatch,
 		FailureThreshold: input.FailureThreshold, HealthCheckSeconds: input.HealthCheckSeconds, Enabled: enabled,
+		RecoveryEnabled: recoveryEnabled, RecoverySuccessThreshold: recoveryThreshold, RecoveryCooldownSeconds: recoveryCooldown,
 		SubscriptionEnabled: subscriptionEnabled, SubscriptionToken: subscriptionToken,
 		SubscriptionMode: input.SubscriptionMode, ExternalHost: strings.TrimSpace(input.ExternalHost)}
 	if existing != nil {

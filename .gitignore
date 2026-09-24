@@ -5,6 +5,10 @@ easy-proxies-*
 /easy_proxies-*
 *.exe
 
+# Kilo and Workbuddy (only root-level build outputs)
+.kilo/
+.workbuddy/
+
 # Configuration (contains sensitive data)
 config.yaml
 nodes.txt

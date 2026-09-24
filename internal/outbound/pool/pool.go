@@ -56,6 +56,11 @@ type Options struct {
 	InitialGroupState   map[string]group.GroupInitialState
 	SelectorTag         string
 	MonitorObserverOnly bool
+	// Recovery* carry the persisted per-group automatic recovery policy for
+	// evicted members. The zero value keeps automatic recovery disabled.
+	RecoveryEnabled          bool
+	RecoverySuccessThreshold int
+	RecoveryCooldown         time.Duration
 }
 
 // MemberMeta carries optional descriptive information for monitoring UI.
@@ -208,6 +213,9 @@ type RuntimeUpdate struct {
 	HealthCheckInterval time.Duration
 	PreferredNodeID     int64
 	InitialGroupState   map[string]group.GroupInitialState
+	RecoveryEnabled     bool
+	RecoveryThreshold   int
+	RecoveryCooldown    time.Duration
 }
 
 // PreparedUpdate contains only validated, detached input. Commit is the sole
@@ -291,7 +299,7 @@ func newPool(ctx context.Context, router adapter.Router, logger log.ContextLogge
 		p.waitForInitialLatency.Store(true)
 	}
 	p.unregisterRuntime = group.Register(normalized.GroupID, normalized.FailureWindow, normalized.FailureThreshold,
-		normalized.PreferredMember, normalized.InitialGroupState)
+		normalized.PreferredMember, normalized.InitialGroupState, p.recoveryPolicy())
 
 	// Register nodes immediately if monitor is available
 	if monitorMgr != nil && !normalized.MonitorObserverOnly {
@@ -362,6 +370,17 @@ func poolDependencies(options Options) []string {
 		return nil
 	}
 	return []string{options.SelectorTag}
+}
+
+// recoveryPolicy projects the live group settings onto the group runtime's
+// automatic recovery policy. The result is always normalized so that a
+// disabled policy is still distinguishable from "no policy provided".
+func (p *poolOutbound) recoveryPolicy() group.RecoveryPolicy {
+	return group.NormalizeRecoveryPolicy(group.RecoveryPolicy{
+		Enabled:          p.options.RecoveryEnabled,
+		SuccessThreshold: p.options.RecoverySuccessThreshold,
+		Cooldown:         p.options.RecoveryCooldown,
+	})
 }
 
 func normalizeOptions(options Options) Options {
@@ -846,6 +865,9 @@ func (p *poolOutbound) PrepareUpdate(update RuntimeUpdate) (PreparedUpdate, erro
 		HealthCheckInterval: update.HealthCheckInterval,
 		PreferredNodeID:     update.PreferredNodeID,
 		InitialGroupState:   make(map[string]group.GroupInitialState, len(update.InitialGroupState)),
+		RecoveryEnabled:     update.RecoveryEnabled,
+		RecoveryThreshold:   update.RecoveryThreshold,
+		RecoveryCooldown:    update.RecoveryCooldown,
 	}
 	copy(copyUpdate.Members, update.Members)
 	seen := make(map[string]struct{}, len(copyUpdate.Members))
@@ -895,11 +917,15 @@ func (u *preparedPoolUpdate) Commit() (uint64, []RetiredMember, error) {
 	p.options.FailureWindow = u.update.FailureWindow
 	p.options.FailureThreshold = u.update.FailureThreshold
 	p.options.HealthCheckInterval = u.update.HealthCheckInterval
+	p.options.RecoveryEnabled = u.update.RecoveryEnabled
+	p.options.RecoverySuccessThreshold = u.update.RecoveryThreshold
+	p.options.RecoveryCooldown = u.update.RecoveryCooldown
 	p.failureThreshold.Store(int64(u.update.FailureThreshold))
 	p.failureWindowNanos.Store(int64(u.update.FailureWindow))
 	events := group.ReconcileSilent(p.options.GroupID, group.RuntimeUpdate{
 		FailureWindow: u.update.FailureWindow, FailureThreshold: u.update.FailureThreshold,
 		PreferredNodeID: u.update.PreferredNodeID, Members: u.update.InitialGroupState,
+		Recovery: p.recoveryPolicy(),
 	})
 	version, retired, err := p.reconcileMembersLocked(u.update.Members)
 	if err != nil {

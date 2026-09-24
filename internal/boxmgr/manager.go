@@ -641,6 +641,8 @@ func storeGroupFromConfig(groupCfg config.GroupPoolConfig) *store.GroupPool {
 		TagFilterMatch:       groupCfg.TagFilterMatch,
 		FailureWindowSeconds: int(groupCfg.FailureWindow / time.Second), FailureThreshold: groupCfg.FailureThreshold,
 		HealthCheckSeconds: int(groupCfg.HealthCheckInterval / time.Second), CurrentActiveNodeID: groupCfg.CurrentActiveNodeID,
+		RecoveryEnabled: groupCfg.RecoveryEnabled, RecoverySuccessThreshold: groupCfg.RecoverySuccessThreshold,
+		RecoveryCooldownSeconds: int(groupCfg.RecoveryCooldown / time.Second),
 		Enabled: groupCfg.Enabled, SubscriptionEnabled: groupCfg.SubscriptionEnabled, SubscriptionToken: groupCfg.SubscriptionToken,
 		SubscriptionMode: groupCfg.SubscriptionMode, ExternalHost: groupCfg.ExternalHost,
 		CreatedAt: groupCfg.CreatedAt, UpdatedAt: groupCfg.UpdatedAt}
@@ -1310,6 +1312,8 @@ func (m *Manager) applyGroupRuntimeIncremental(cfg *config.Config, groupCfg conf
 	prepared, err := runtimePool.PrepareUpdate(pool.RuntimeUpdate{Members: specs, Mode: groupCfg.DispatchMode,
 		FailureWindow: groupCfg.FailureWindow, FailureThreshold: groupCfg.FailureThreshold,
 		HealthCheckInterval: groupCfg.HealthCheckInterval, PreferredNodeID: groupCfg.CurrentActiveNodeID,
+		RecoveryEnabled: groupCfg.RecoveryEnabled, RecoveryThreshold: groupCfg.RecoverySuccessThreshold,
+		RecoveryCooldown: groupCfg.RecoveryCooldown,
 		InitialGroupState: initial})
 	if err != nil {
 		m.cleanupCreatedMembers(instance, createdTags)
@@ -1610,7 +1614,9 @@ func groupRuntimeEqual(before, after *store.GroupPool) bool {
 		reflect.DeepEqual(before.TagWhitelist, after.TagWhitelist) && reflect.DeepEqual(before.TagBlacklist, after.TagBlacklist) &&
 		before.TagFilterMatch == after.TagFilterMatch &&
 		before.FailureWindowSeconds == after.FailureWindowSeconds && before.FailureThreshold == after.FailureThreshold &&
-		before.HealthCheckSeconds == after.HealthCheckSeconds && before.Enabled == after.Enabled
+		before.HealthCheckSeconds == after.HealthCheckSeconds && before.Enabled == after.Enabled &&
+		before.RecoveryEnabled == after.RecoveryEnabled && before.RecoverySuccessThreshold == after.RecoverySuccessThreshold &&
+		before.RecoveryCooldownSeconds == after.RecoveryCooldownSeconds
 }
 
 // createBaseBox builds the application-wide instance without group listeners.
@@ -2277,6 +2283,8 @@ func GroupConfigsFromStore(groups []store.GroupPool) []config.GroupPoolConfig {
 			TagFilterMatch:   group.TagFilterMatch,
 			FailureWindow:    time.Duration(group.FailureWindowSeconds) * time.Second,
 			FailureThreshold: group.FailureThreshold, HealthCheckInterval: time.Duration(group.HealthCheckSeconds) * time.Second,
+			RecoveryEnabled: group.RecoveryEnabled, RecoverySuccessThreshold: group.RecoverySuccessThreshold,
+			RecoveryCooldown:    time.Duration(group.RecoveryCooldownSeconds) * time.Second,
 			CurrentActiveNodeID: group.CurrentActiveNodeID, Enabled: group.Enabled,
 			SubscriptionEnabled: group.SubscriptionEnabled, SubscriptionToken: group.SubscriptionToken,
 			SubscriptionMode: group.SubscriptionMode, ExternalHost: group.ExternalHost,

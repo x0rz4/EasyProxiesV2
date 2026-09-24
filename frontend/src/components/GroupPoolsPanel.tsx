@@ -22,6 +22,7 @@ const emptyPayload = (): GroupPoolPayload => ({
   excluded_node_ids: [],
   tag_whitelist: [], tag_blacklist: [], tag_filter_match: 'any',
   failure_threshold: 3, health_check_seconds: 60, enabled: true,
+  recovery_enabled: true, recovery_success_threshold: 3, recovery_cooldown_seconds: 300,
 	subscription_enabled: true, subscription_mode: 'entry', external_host: '',
 })
 
@@ -94,6 +95,9 @@ function payloadFromGroup(group: GroupPool): GroupPoolPayload {
     tag_whitelist: group.tag_whitelist || [], tag_blacklist: group.tag_blacklist || [],
     tag_filter_match: group.tag_filter_match || 'any',
     failure_threshold: group.failure_threshold, health_check_seconds: group.health_check_seconds,
+    recovery_enabled: group.recovery_enabled !== false,
+    recovery_success_threshold: group.recovery_success_threshold || 3,
+    recovery_cooldown_seconds: group.recovery_cooldown_seconds ?? 300,
     enabled: group.enabled,
 		subscription_enabled: group.subscription_enabled, subscription_mode: group.subscription_mode || 'entry',
 		external_host: group.external_host || '',
@@ -197,7 +201,10 @@ export default function GroupPoolsPanel() {
       // the editor was open is persisted even if the polling cache is stale.
       const latestSnapshot = editing ? await listGroupPools() : data
       const latestGroup = editing ? latestSnapshot?.groups.find((group) => group.id === editing.id) : undefined
-      const latestEvictedIDs = latestGroup?.members
+      // An evicted node is only frozen into the permanent exclusion list while
+      // automatic recovery is off. With recovery on, eviction is provisional by
+      // design: excluding it here would defeat the whole feature.
+      const latestEvictedIDs = form.recovery_enabled ? [] : latestGroup?.members
         .filter((member) => member.status === 'EVICTED' && !manualEvictionOverrideIDs.has(member.node_id))
         .map((member) => member.node_id) || []
       const excludedNodeIDs = [...new Set([...form.excluded_node_ids, ...latestEvictedIDs])]
@@ -319,6 +326,7 @@ export default function GroupPoolsPanel() {
   const activeGroups = groups.filter((group) => group.runtime_status === 'ready' || group.runtime_status === 'degraded').length
   const totalMembers = groups.reduce((sum, group) => sum + group.member_count, 0)
   const evictedMembers = groups.reduce((sum, group) => sum + group.evicted_count, 0)
+  const autoRecoverGroups = groups.filter((group) => group.recovery_enabled).length
 
   if (isLoading) return <div className="flex h-64 items-center justify-center"><span className="loading loading-spinner loading-lg text-primary" /></div>
 
@@ -337,7 +345,7 @@ export default function GroupPoolsPanel() {
           <SummaryCard label="分组总数" value={groups.length} hint="独立入口池" icon={<Layers3 className="h-5 w-5" />} tone="text-primary" />
           <SummaryCard label="运行中" value={activeGroups} hint="已启用监听" icon={<Power className="h-5 w-5" />} tone="text-success" />
           <SummaryCard label="池内成员" value={totalMembers} hint="动态匹配节点" icon={<Network className="h-5 w-5" />} tone="text-info" />
-          <SummaryCard label="永久踢出" value={evictedMembers} hint="等待手动恢复" icon={<ShieldOff className="h-5 w-5" />} tone={evictedMembers ? 'text-error' : 'text-base-content'} />
+          <SummaryCard label="已踢出" value={evictedMembers} hint={autoRecoverGroups > 0 ? '等待自动恢复' : '等待手动恢复'} icon={<ShieldOff className="h-5 w-5" />} tone={evictedMembers ? 'text-error' : 'text-base-content'} />
         </section>
 
         {groups.length === 0 ? (
@@ -394,6 +402,23 @@ export default function GroupPoolsPanel() {
               <Field label="踢出阈值（次）"><input type="number" min={1} className={cn('input w-full', controlClass)} value={form.failure_threshold} onChange={(e) => setForm({ ...form, failure_threshold: Number(e.target.value) })} /></Field>
               <Field label="测活间隔（秒）"><input type="number" min={10} className={cn('input w-full', controlClass)} value={form.health_check_seconds} onChange={(e) => setForm({ ...form, health_check_seconds: Number(e.target.value) })} /></Field>
             </div>
+
+            <section className="rounded-2xl border border-base-300 bg-base-200/25 p-4 sm:p-5" aria-labelledby="recovery-title">
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <h4 id="recovery-title" className="font-bold">踢出后自动恢复</h4>
+                  <p className="mt-1 text-xs text-base-content/50">踢出不再永久生效：冷却期结束后，节点健康探测连续成功即自动重新入池。</p>
+                </div>
+                <label className="flex shrink-0 cursor-pointer items-center gap-2 rounded-xl border border-base-300 bg-base-100 px-3 py-2">
+                  <input type="checkbox" className="toggle toggle-sm toggle-primary" checked={form.recovery_enabled} onChange={(e) => setForm({ ...form, recovery_enabled: e.target.checked })} aria-label="启用自动恢复" />
+                  <span className="text-xs font-semibold">{form.recovery_enabled ? '已启用' : '仅手动恢复'}</span>
+                </label>
+              </div>
+              <div className="mt-4 grid gap-4 sm:grid-cols-2">
+                <Field label="连续成功次数" hint="冷却结束后需要连续通过多少次测活"><input type="number" min={1} disabled={!form.recovery_enabled} className={cn('input w-full', controlClass)} value={form.recovery_success_threshold} onChange={(e) => setForm({ ...form, recovery_success_threshold: Number(e.target.value) })} /></Field>
+                <Field label="恢复冷却（秒）" hint="踢出后的静默期，期间测活结果不计入恢复进度，0 表示立即累计"><input type="number" min={0} disabled={!form.recovery_enabled} className={cn('input w-full', controlClass)} value={form.recovery_cooldown_seconds} onChange={(e) => setForm({ ...form, recovery_cooldown_seconds: Number(e.target.value) })} /></Field>
+              </div>
+            </section>
 
             <Field label="地区自动入池" hint="ISO 地区码，用逗号或空格分隔，例如 hk, jp, us"><input className={cn('input w-full font-mono', controlClass)} value={regionsText} onChange={(e) => setRegionsText(e.target.value)} placeholder="hk, jp" /></Field>
 
@@ -550,6 +575,18 @@ function LatencyValue({ value }: { value: number }) {
   return <span className={cn('whitespace-nowrap font-mono text-[11px] font-semibold tabular-nums', tone)}>{value} ms</span>
 }
 
+// RecoveryBadge surfaces the automatic recovery progress of an evicted member.
+// Nothing is rendered when the group has automatic recovery turned off, so the
+// badge never implies a recovery that will not happen.
+function RecoveryBadge({ member }: { member: GroupMember }) {
+  if (member.status !== 'EVICTED' || !member.recovery_threshold) return null
+  const cooldownEnd = member.recovery_cooldown_end ? Date.parse(member.recovery_cooldown_end) : 0
+  if (cooldownEnd && cooldownEnd > Date.now()) {
+    return <span className="badge badge-ghost badge-xs" title={`冷却至 ${new Date(cooldownEnd).toLocaleTimeString()}`}>冷却中 · 待恢复</span>
+  }
+  return <span className="badge badge-warning badge-outline badge-xs">恢复中 {member.recovery_successes || 0}/{member.recovery_threshold}</span>
+}
+
 function EmptyMemberList({ message }: { message: string }) {
   return <div className="rounded-xl border border-dashed border-base-300 px-3 py-8 text-center text-xs text-base-content/45">{message}</div>
 }
@@ -585,7 +622,7 @@ function RuntimeMemberRow({ member, manual, regional, latency, probing, onProbe,
 }) {
   const style = statusStyle[member.status]
   return <div className="flex min-w-0 items-center gap-2 rounded-xl border border-base-200 bg-base-100/70 px-3 py-2.5">
-    <div className="min-w-0 flex-1"><div className="flex min-w-0 items-center gap-2"><span className="truncate text-sm font-medium">{member.name || member.tag}</span>{member.region && <span className="shrink-0 text-[10px] font-bold uppercase text-base-content/45">{member.region}</span>}</div><div className="mt-1 flex flex-wrap items-center gap-1.5"><span className={cn('badge badge-xs', style.badge)}>{style.label}</span>{member.provisional && <span className="badge badge-warning badge-outline badge-xs">临时可用 · 待复检</span>}{(member.health_source === 'persisted' || member.health_source === 'previous_generation') && <span className="badge badge-ghost badge-xs">历史延迟</span>}{manual && <span className="badge badge-outline badge-xs">手动</span>}{regional && <span className="badge badge-ghost badge-xs">地区</span>}{member.is_active && <span className="badge badge-success badge-outline badge-xs">当前出口</span>}<LatencyValue value={latency} /></div></div>
+    <div className="min-w-0 flex-1"><div className="flex min-w-0 items-center gap-2"><span className="truncate text-sm font-medium">{member.name || member.tag}</span>{member.region && <span className="shrink-0 text-[10px] font-bold uppercase text-base-content/45">{member.region}</span>}</div><div className="mt-1 flex flex-wrap items-center gap-1.5"><span className={cn('badge badge-xs', style.badge)}>{style.label}</span><RecoveryBadge member={member} />{member.provisional && <span className="badge badge-warning badge-outline badge-xs">临时可用 · 待复检</span>}{(member.health_source === 'persisted' || member.health_source === 'previous_generation') && <span className="badge badge-ghost badge-xs">历史延迟</span>}{manual && <span className="badge badge-outline badge-xs">手动</span>}{regional && <span className="badge badge-ghost badge-xs">地区</span>}{member.is_active && <span className="badge badge-success badge-outline badge-xs">当前出口</span>}<LatencyValue value={latency} /></div></div>
     {onActivate && member.status === 'ALIVE' && !member.is_active && (
       <button type="button" className="btn btn-ghost btn-xs btn-square text-primary" onClick={onActivate} disabled={isActivateBusy} title="强制设为当前出口" aria-label={`将 ${member.name || member.tag} 设为当前出口`}>
         <Crosshair className="h-3.5 w-3.5" />
@@ -626,7 +663,7 @@ function GroupCard({ group, nodeOptions, tags, busy, expanded, onToggleExpanded,
 	}
   return <article className={cn(surfaceClass, 'overflow-hidden transition-colors', !group.enabled && 'opacity-70')}>
     <div className="border-b border-base-200 p-5">
-      <div className="flex items-start gap-3"><div className={cn('flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl', runtimeReady ? 'bg-primary/10 text-primary' : 'bg-base-200 text-base-content/40')}><Layers3 className="h-5 w-5" /></div><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><h3 className="truncate text-lg font-bold">{group.name}</h3><span className={cn('badge badge-sm', runtimeStyle.badge)}>{runtimeStyle.label}</span><span className="badge badge-outline badge-sm">{dispatchModeLabel[group.dispatch_mode]}</span></div><div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-base-content/55"><code className="font-semibold text-primary">{group.bind_address}:{group.bind_port}</code><span className="uppercase">{group.protocol}</span><span>{group.failure_window_seconds / 60} 分钟 / {group.failure_threshold} 次踢出</span></div>{group.runtime_error && <p className="mt-1 truncate text-xs text-error" title={group.runtime_error}>{group.runtime_error}</p>}</div><div className="dropdown dropdown-end"><button tabIndex={0} className="btn btn-ghost btn-sm btn-square" aria-label="分组操作" disabled={runtimeUpdating}><Pencil className="h-4 w-4" /></button><ul tabIndex={0} className="dropdown-content z-20 mt-1 w-36 rounded-box border border-base-300 bg-base-100 p-1.5 shadow-xl"><li><button className="flex w-full cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-sm hover:bg-base-200" onClick={onEdit} disabled={runtimeUpdating}><Pencil className="h-4 w-4" />编辑</button></li><li><button className="flex w-full cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-sm hover:bg-base-200" onClick={onToggle} disabled={runtimeUpdating}><Power className="h-4 w-4" />{group.enabled ? '停用' : '启用'}</button></li><li><button className="flex w-full cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-sm text-error hover:bg-error/10" onClick={onDelete} disabled={runtimeUpdating}><Trash2 className="h-4 w-4" />删除</button></li></ul></div></div>
+      <div className="flex items-start gap-3"><div className={cn('flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl', runtimeReady ? 'bg-primary/10 text-primary' : 'bg-base-200 text-base-content/40')}><Layers3 className="h-5 w-5" /></div><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><h3 className="truncate text-lg font-bold">{group.name}</h3><span className={cn('badge badge-sm', runtimeStyle.badge)}>{runtimeStyle.label}</span><span className="badge badge-outline badge-sm">{dispatchModeLabel[group.dispatch_mode]}</span></div><div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-base-content/55"><code className="font-semibold text-primary">{group.bind_address}:{group.bind_port}</code><span className="uppercase">{group.protocol}</span><span>{group.failure_window_seconds / 60} 分钟 / {group.failure_threshold} 次踢出</span><span className={cn('badge badge-xs', group.recovery_enabled ? 'badge-success badge-outline' : 'badge-ghost')}>{group.recovery_enabled ? `自动恢复 ${group.recovery_success_threshold}×` : '仅手动恢复'}</span></div>{group.runtime_error && <p className="mt-1 truncate text-xs text-error" title={group.runtime_error}>{group.runtime_error}</p>}</div><div className="dropdown dropdown-end"><button tabIndex={0} className="btn btn-ghost btn-sm btn-square" aria-label="分组操作" disabled={runtimeUpdating}><Pencil className="h-4 w-4" /></button><ul tabIndex={0} className="dropdown-content z-20 mt-1 w-36 rounded-box border border-base-300 bg-base-100 p-1.5 shadow-xl"><li><button className="flex w-full cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-sm hover:bg-base-200" onClick={onEdit} disabled={runtimeUpdating}><Pencil className="h-4 w-4" />编辑</button></li><li><button className="flex w-full cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-sm hover:bg-base-200" onClick={onToggle} disabled={runtimeUpdating}><Power className="h-4 w-4" />{group.enabled ? '停用' : '启用'}</button></li><li><button className="flex w-full cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-sm text-error hover:bg-error/10" onClick={onDelete} disabled={runtimeUpdating}><Trash2 className="h-4 w-4" />删除</button></li></ul></div></div>
       <div className="mt-4 grid grid-cols-4 gap-2"><MiniMetric label="成员" value={group.member_count} /><MiniMetric label="健康" value={group.alive_count} tone="text-success" /><MiniMetric label="踢出" value={group.evicted_count} tone={group.evicted_count ? 'text-error' : ''} /><MiniMetric label="排除" value={excludedNodes.length} tone={excludedNodes.length ? 'text-error' : ''} /></div>
       {(group.regions?.length > 0 || group.explicit_node_ids?.length > 0) && <div className="mt-4 flex flex-wrap gap-1.5">{group.regions?.map((region) => <span key={region} className="badge badge-primary badge-outline badge-sm uppercase">{region}</span>)}{group.explicit_node_ids?.length > 0 && <span className="badge badge-ghost badge-sm">手动 {group.explicit_node_ids.length} 个</span>}</div>}
       {(group.tag_whitelist?.length > 0 || group.tag_blacklist?.length > 0) && (
@@ -643,7 +680,7 @@ function GroupCard({ group, nodeOptions, tags, busy, expanded, onToggleExpanded,
     </div>
     <div className="p-4 sm:p-5">
       {group.dispatch_mode !== 'random' && <div className={cn('mb-3 flex items-center gap-3 rounded-xl border px-3 py-2.5', active ? 'border-success/25 bg-success/5' : 'border-warning/25 bg-warning/5')}><Activity className={cn('h-4 w-4 shrink-0', active ? 'text-success' : 'text-warning')} /><div className="min-w-0 flex-1"><p className="text-[11px] font-semibold uppercase tracking-wider text-base-content/45">当前主出口</p><p className="truncate text-sm font-semibold">{active?.name || '等待首个连接选择'}</p></div>{active?.latency_ms && active.latency_ms > 0 ? <span className="text-xs font-mono text-base-content/55">{active.latency_ms} ms</span> : null}</div>}
-      <div className="space-y-2">{(expanded ? group.members : group.members.slice(0, 8)).map((member) => { const style = statusStyle[member.status]; const StatusIcon = style.icon; return <div key={member.node_id} className="flex min-w-0 items-center gap-2 rounded-xl border border-base-200 bg-base-200/20 px-3 py-2.5"><StatusIcon className={cn('h-4 w-4 shrink-0', member.status === 'ALIVE' ? 'text-success' : member.status === 'SUSPECT' ? 'text-warning' : 'text-error')} /><div className="min-w-0 flex-1"><div className="flex items-center gap-2"><span className="truncate text-sm font-medium">{member.name || member.tag}</span>{member.region && <span className="text-[10px] font-bold uppercase text-base-content/40">{member.region}</span>}</div>{member.last_error && <p className="mt-0.5 truncate text-[11px] text-error/75" title={member.last_error}>{member.last_error}</p>}</div><span className={cn('badge badge-sm', style.badge)}>{style.label}</span>{member.latency_ms > 0 && <span className="hidden w-14 text-right font-mono text-xs text-base-content/45 sm:block">{member.latency_ms} ms</span>}<div className="flex shrink-0 items-center gap-1">{member.status === 'ALIVE' && !member.is_active && <button className="btn btn-ghost btn-xs btn-square text-primary" disabled={!runtimeReady || busy === `activate-${group.id}-${member.node_id}`} onClick={() => onActivate(member.node_id)} title={group.dispatch_mode === 'random' ? '立即切换；random 模式下后续连接仍会随机选择' : '强制设为当前出口'} aria-label={`将 ${member.name || member.tag} 设为当前出口`}><Crosshair className="h-3.5 w-3.5" /></button>}{member.status === 'EVICTED' && <button className="btn btn-ghost btn-xs gap-1 text-primary" disabled={!runtimeReady || busy === `restore-${group.id}-${member.node_id}`} onClick={() => onRestore(member.node_id)} title="恢复入池"><RotateCcw className="h-3 w-3" /><span className="hidden sm:inline">恢复</span></button>}<button className="btn btn-ghost btn-xs btn-square text-error" disabled={!runtimeReady || busy === `remove-member-${group.id}-${member.node_id}`} onClick={() => onRemoveMember(member)} title="从此分组排除" aria-label={`从分组排除 ${member.name || member.tag}`}><ShieldOff className="h-3.5 w-3.5" /></button></div></div> })}</div>
+      <div className="space-y-2">{(expanded ? group.members : group.members.slice(0, 8)).map((member) => { const style = statusStyle[member.status]; const StatusIcon = style.icon; return <div key={member.node_id} className="flex min-w-0 items-center gap-2 rounded-xl border border-base-200 bg-base-200/20 px-3 py-2.5"><StatusIcon className={cn('h-4 w-4 shrink-0', member.status === 'ALIVE' ? 'text-success' : member.status === 'SUSPECT' ? 'text-warning' : 'text-error')} /><div className="min-w-0 flex-1"><div className="flex items-center gap-2"><span className="truncate text-sm font-medium">{member.name || member.tag}</span>{member.region && <span className="text-[10px] font-bold uppercase text-base-content/40">{member.region}</span>}</div>{member.last_error && <p className="mt-0.5 truncate text-[11px] text-error/75" title={member.last_error}>{member.last_error}</p>}</div><span className={cn('badge badge-sm', style.badge)}>{style.label}</span><RecoveryBadge member={member} />{member.latency_ms > 0 && <span className="hidden w-14 text-right font-mono text-xs text-base-content/45 sm:block">{member.latency_ms} ms</span>}<div className="flex shrink-0 items-center gap-1">{member.status === 'ALIVE' && !member.is_active && <button className="btn btn-ghost btn-xs btn-square text-primary" disabled={!runtimeReady || busy === `activate-${group.id}-${member.node_id}`} onClick={() => onActivate(member.node_id)} title={group.dispatch_mode === 'random' ? '立即切换；random 模式下后续连接仍会随机选择' : '强制设为当前出口'} aria-label={`将 ${member.name || member.tag} 设为当前出口`}><Crosshair className="h-3.5 w-3.5" /></button>}{member.status === 'EVICTED' && <button className="btn btn-ghost btn-xs gap-1 text-primary" disabled={!runtimeReady || busy === `restore-${group.id}-${member.node_id}`} onClick={() => onRestore(member.node_id)} title="恢复入池"><RotateCcw className="h-3 w-3" /><span className="hidden sm:inline">恢复</span></button>}<button className="btn btn-ghost btn-xs btn-square text-error" disabled={!runtimeReady || busy === `remove-member-${group.id}-${member.node_id}`} onClick={() => onRemoveMember(member)} title="从此分组排除" aria-label={`从分组排除 ${member.name || member.tag}`}><ShieldOff className="h-3.5 w-3.5" /></button></div></div> })}</div>
       {group.member_count === 0 && <div className="rounded-xl border border-dashed border-warning/40 bg-warning/5 px-4 py-8 text-center"><CircleAlert className="mx-auto h-6 w-6 text-warning" /><p className="mt-2 text-sm font-medium">当前没有匹配的有效节点</p><p className="mt-1 text-xs text-base-content/45">检查地区码、手动成员或节点启用状态</p></div>}
       {group.member_count > 8 && <button type="button" className="mt-3 flex min-h-9 w-full cursor-pointer items-center justify-center gap-1.5 rounded-lg text-xs font-medium text-base-content/55 transition-colors hover:bg-base-200/60 hover:text-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary" onClick={onToggleExpanded} aria-expanded={expanded}>
         <ChevronDown className={cn('h-3.5 w-3.5 transition-transform duration-200', expanded && 'rotate-180')} />{expanded ? '收起成员' : `展开其余 ${group.member_count - 8} 个成员`}

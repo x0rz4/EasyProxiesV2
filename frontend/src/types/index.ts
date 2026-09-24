@@ -87,6 +87,9 @@ export interface GroupMember {
   failure_count: number
   last_error?: string
   evicted_at?: string
+  recovery_successes?: number
+  recovery_threshold?: number
+  recovery_cooldown_end?: string
   latency_ms: number
   available: boolean
   provisional: boolean
@@ -112,6 +115,9 @@ export interface GroupPool {
   failure_window_seconds: number
   failure_threshold: number
   health_check_seconds: number
+  recovery_enabled: boolean
+  recovery_success_threshold: number
+  recovery_cooldown_seconds: number
   current_active_node_id?: number
   enabled: boolean
   runtime_status: 'starting' | 'ready' | 'degraded' | 'reconfiguring' | 'stopped' | 'error'
@@ -152,6 +158,9 @@ export interface GroupPoolPayload {
   failure_window_seconds: number
   failure_threshold: number
   health_check_seconds: number
+  recovery_enabled: boolean
+  recovery_success_threshold: number
+  recovery_cooldown_seconds: number
   enabled: boolean
   subscription_enabled: boolean
   subscription_mode: 'members' | 'entry'

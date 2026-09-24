@@ -404,6 +404,15 @@ FROM node_tag_names AS ntn
 JOIN tags ON tags.name = ntn.tag_name;
 `,
 		},
+		{
+			Version:     14,
+			Description: "add group member automatic recovery",
+			Up: `
+ALTER TABLE group_pools ADD COLUMN recovery_enabled           INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE group_pools ADD COLUMN recovery_success_threshold INTEGER NOT NULL DEFAULT 3;
+ALTER TABLE group_pools ADD COLUMN recovery_cooldown_seconds  INTEGER NOT NULL DEFAULT 300;
+`,
+		},
 	}
 }
 

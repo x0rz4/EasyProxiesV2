@@ -362,15 +362,21 @@ type GroupPool struct {
 	FailureWindowSeconds int              `json:"failure_window_seconds"`
 	FailureThreshold     int              `json:"failure_threshold"`
 	HealthCheckSeconds   int              `json:"health_check_seconds"`
-	CurrentActiveNodeID  int64            `json:"current_active_node_id,omitempty"`
-	Enabled              bool             `json:"enabled"`
-	SubscriptionEnabled  bool             `json:"subscription_enabled"`
-	SubscriptionToken    string           `json:"subscription_token,omitempty"`
-	SubscriptionMode     string           `json:"subscription_mode"`
-	ExternalHost         string           `json:"external_host,omitempty"`
-	CreatedAt            time.Time        `json:"created_at"`
-	UpdatedAt            time.Time        `json:"updated_at"`
-	NodeStates           []GroupNodeState `json:"node_states,omitempty"`
+	// Recovery* configure automatic re-admission of an evicted member: after
+	// RecoveryCooldownSeconds of quiet time, RecoverySuccessThreshold
+	// consecutive successful health probes restore it to the pool.
+	RecoveryEnabled          bool             `json:"recovery_enabled"`
+	RecoverySuccessThreshold int              `json:"recovery_success_threshold"`
+	RecoveryCooldownSeconds  int              `json:"recovery_cooldown_seconds"`
+	CurrentActiveNodeID      int64            `json:"current_active_node_id,omitempty"`
+	Enabled                  bool             `json:"enabled"`
+	SubscriptionEnabled      bool             `json:"subscription_enabled"`
+	SubscriptionToken        string           `json:"subscription_token,omitempty"`
+	SubscriptionMode         string           `json:"subscription_mode"`
+	ExternalHost             string           `json:"external_host,omitempty"`
+	CreatedAt                time.Time        `json:"created_at"`
+	UpdatedAt                time.Time        `json:"updated_at"`
+	NodeStates               []GroupNodeState `json:"node_states,omitempty"`
 }
 
 // GroupNodeState persists the sliding failure window and permanent eviction.

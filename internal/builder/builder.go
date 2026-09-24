@@ -291,7 +291,9 @@ func BuildVersion(cfg *config.Config, runtimeTagVersion uint64) (option.Options,
 			FailureThreshold: group.FailureThreshold, FailureWindow: group.FailureWindow,
 			HealthCheckInterval: group.HealthCheckInterval,
 			BlacklistDuration:   100 * 365 * 24 * time.Hour, Metadata: groupMeta,
-			GroupID: group.ID, PreferredMember: preferredTag, InitialGroupState: stateByTag}
+			GroupID: group.ID, PreferredMember: preferredTag, InitialGroupState: stateByTag,
+			RecoveryEnabled: group.RecoveryEnabled, RecoverySuccessThreshold: group.RecoverySuccessThreshold,
+			RecoveryCooldown: group.RecoveryCooldown}
 		outbounds = append(outbounds, option.Outbound{Type: poolout.Type, Tag: groupOutboundTag, Options: &groupOptions})
 
 		addr, err := parseAddr(group.BindAddress)

@@ -147,3 +147,107 @@ func TestReconcileSilentMigratesStateByNodeIDAndAppliesPolicy(t *testing.T) {
 		t.Fatalf("policy transition did not produce a deferred event: %+v", events)
 	}
 }
+
+// recoverablePolicy is the permissive policy used by the recovery tests: no
+// cooldown, so consecutive successes are counted immediately.
+func recoverablePolicy(successes int) RecoveryPolicy {
+	return RecoveryPolicy{Enabled: true, SuccessThreshold: successes, Cooldown: 0}
+}
+
+func TestEvictedMemberRecoversAfterConsecutiveSuccesses(t *testing.T) {
+	Reset()
+	defer Reset()
+	members := map[string]GroupInitialState{"node-a": {NodeID: 42}}
+	Register(301, time.Minute, 1, "node-a", members, recoverablePolicy(2))
+	Register(302, time.Minute, 1, "node-a", members, recoverablePolicy(2))
+
+	if !RecordFailure(301, "node-a", errors.New("down"), time.Now()) {
+		t.Fatal("member was not evicted")
+	}
+	if MemberAvailable(301, "node-a") || MemberAvailable(302, "node-a") {
+		t.Fatal("eviction did not propagate")
+	}
+
+	if RecordHealthSuccess(301, "node-a") {
+		t.Fatal("member recovered before the success threshold was reached")
+	}
+	progress := GroupRuntimeSnapshots()[301].Members[0]
+	if progress.Status != "EVICTED" || progress.RecoverySuccesses != 1 || progress.RecoveryThreshold != 2 {
+		t.Fatalf("recovery progress was not exposed: %+v", progress)
+	}
+
+	if !RecordHealthSuccess(301, "node-a") {
+		t.Fatal("member did not recover after the success threshold was reached")
+	}
+	if !MemberAvailable(301, "node-a") || !MemberAvailable(302, "node-a") {
+		t.Fatal("automatic recovery did not clear the eviction in every group")
+	}
+	recovered := GroupRuntimeSnapshots()[301].Members[0]
+	if recovered.Status != "ALIVE" || recovered.RecoverySuccesses != 0 || !recovered.EvictedAt.IsZero() {
+		t.Fatalf("recovered member kept eviction state: %+v", recovered)
+	}
+}
+
+func TestRecoveryCooldownIgnoresEarlySuccesses(t *testing.T) {
+	Reset()
+	defer Reset()
+	Register(303, time.Minute, 1, "node-a", map[string]GroupInitialState{"node-a": {NodeID: 43}},
+		RecoveryPolicy{Enabled: true, SuccessThreshold: 1, Cooldown: time.Hour})
+
+	RecordFailure(303, "node-a", errors.New("down"), time.Now())
+	for i := 0; i < 3; i++ {
+		if RecordHealthSuccess(303, "node-a") {
+			t.Fatal("member recovered during the cooldown")
+		}
+	}
+	if MemberAvailable(303, "node-a") {
+		t.Fatal("cooldown did not keep the member out of rotation")
+	}
+	if snapshot := GroupRuntimeSnapshots()[303].Members[0]; snapshot.RecoverySuccesses != 0 || snapshot.RecoveryCooldownEnd.IsZero() {
+		t.Fatalf("cooldown state was not exposed: %+v", snapshot)
+	}
+}
+
+func TestRecoveryDisabledStillRequiresManualRestore(t *testing.T) {
+	Reset()
+	defer Reset()
+	Register(304, time.Minute, 1, "node-a", map[string]GroupInitialState{"node-a": {NodeID: 44}},
+		RecoveryPolicy{Enabled: false, SuccessThreshold: 1, Cooldown: 0})
+
+	RecordFailure(304, "node-a", errors.New("down"), time.Now())
+	for i := 0; i < 3; i++ {
+		if RecordHealthSuccess(304, "node-a") {
+			t.Fatal("disabled recovery re-admitted the member")
+		}
+	}
+	if MemberAvailable(304, "node-a") {
+		t.Fatal("disabled recovery re-admitted the member")
+	}
+	if err := RestoreGroupMember(304, 44); err != nil {
+		t.Fatalf("manual restore: %v", err)
+	}
+	if !MemberAvailable(304, "node-a") {
+		t.Fatal("manual restore did not re-admit the member")
+	}
+}
+
+func TestObservedFailureResetsRecoveryStreak(t *testing.T) {
+	Reset()
+	defer Reset()
+	Register(305, time.Minute, 1, "node-a", map[string]GroupInitialState{"node-a": {NodeID: 45}}, recoverablePolicy(2))
+
+	RecordFailure(305, "node-a", errors.New("down"), time.Now())
+	RecordHealthSuccess(305, "node-a")
+	// A failure observed while evicted invalidates the streak, so the member
+	// must earn a full new run of successes.
+	RecordFailure(305, "node-a", errors.New("still down"), time.Now())
+	if progress := GroupRuntimeSnapshots()[305].Members[0]; progress.RecoverySuccesses != 0 {
+		t.Fatalf("failure did not reset the streak: %+v", progress)
+	}
+	if RecordHealthSuccess(305, "node-a") {
+		t.Fatal("member recovered from a single success after the streak was reset")
+	}
+	if !RecordHealthSuccess(305, "node-a") {
+		t.Fatal("member did not recover after a fresh run of successes")
+	}
+}

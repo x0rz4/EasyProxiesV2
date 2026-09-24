@@ -40,6 +40,60 @@ type GroupMemberSnapshot struct {
 	FailureHistory []int64   `json:"failure_history,omitempty"`
 	LastError      string    `json:"last_error,omitempty"`
 	EvictedAt      time.Time `json:"evicted_at,omitempty"`
+	// Recovery* describe the automatic re-admission progress of an evicted
+	// member so the management UI can show "2/3" instead of an opaque "已踢出".
+	RecoverySuccesses   int       `json:"recovery_successes,omitempty"`
+	RecoveryThreshold   int       `json:"recovery_threshold,omitempty"`
+	RecoveryCooldownEnd time.Time `json:"recovery_cooldown_end,omitempty"`
+}
+
+// RecoveryPolicy controls automatic re-admission of an evicted member.
+// Eviction is a global fact about a NodeID, so a recovery confirmed by any
+// group clears the eviction for every group holding that node.
+type RecoveryPolicy struct {
+	Enabled bool
+	// SuccessThreshold is the number of consecutive successful health probes
+	// required after the cooldown has elapsed.
+	SuccessThreshold int
+	// Cooldown is the quiet period after eviction during which successes are
+	// not counted at all. It keeps a flapping node from bouncing straight back
+	// into rotation.
+	Cooldown time.Duration
+}
+
+const (
+	defaultRecoverySuccessThreshold = 3
+	defaultRecoveryCooldown         = 5 * time.Minute
+)
+
+// DefaultRecoveryPolicy is used when a caller registers a group without an
+// explicit policy.
+func DefaultRecoveryPolicy() RecoveryPolicy {
+	return RecoveryPolicy{
+		Enabled:          true,
+		SuccessThreshold: defaultRecoverySuccessThreshold,
+		Cooldown:         defaultRecoveryCooldown,
+	}
+}
+
+// NormalizeRecoveryPolicy only fills in missing numbers; it never flips
+// Enabled, so an explicitly disabled policy stays disabled. Callers outside
+// this package use it to guarantee a persisted policy is always "provided"
+// (see recoveryPolicyProvided).
+func NormalizeRecoveryPolicy(policy RecoveryPolicy) RecoveryPolicy {
+	if policy.SuccessThreshold <= 0 {
+		policy.SuccessThreshold = defaultRecoverySuccessThreshold
+	}
+	if policy.Cooldown < 0 {
+		policy.Cooldown = 0
+	}
+	return policy
+}
+
+// recoveryPolicyProvided distinguishes "the caller left this unset" from an
+// explicit policy. ReconcileSilent keeps the live policy when it is unset.
+func recoveryPolicyProvided(policy RecoveryPolicy) bool {
+	return policy.Enabled || policy.SuccessThreshold != 0 || policy.Cooldown != 0
 }
 
 // GroupRuntimeSnapshot is a concurrency-safe group runtime view.
@@ -57,6 +111,9 @@ type groupMemberRuntime struct {
 	evicted        bool
 	lastError      string
 	evictedAt      time.Time
+	// recoverySuccesses counts consecutive successful health probes since the
+	// eviction cooldown elapsed. Any observed failure resets it to zero.
+	recoverySuccesses int
 }
 
 type groupRuntime struct {
@@ -64,6 +121,7 @@ type groupRuntime struct {
 	id         int64
 	window     time.Duration
 	threshold  int
+	recovery   RecoveryPolicy
 	currentTag string
 	members    map[string]*groupMemberRuntime
 }
@@ -153,6 +211,8 @@ type RuntimeUpdate struct {
 	FailureThreshold int
 	PreferredNodeID  int64
 	Members          map[string]GroupInitialState
+	// Recovery is optional; a zero value keeps the live policy untouched.
+	Recovery RecoveryPolicy
 }
 
 // ReconcileSilent migrates mutable member state by stable NodeID without
@@ -189,6 +249,7 @@ func ReconcileSilent(groupID int64, update RuntimeUpdate) []GroupStateEvent {
 		if old := oldByNodeID[initial.NodeID]; old != nil {
 			member.failureHistory = append([]int64(nil), old.failureHistory...)
 			member.evicted, member.lastError, member.evictedAt = old.evicted, old.lastError, old.evictedAt
+			member.recoverySuccesses = old.recoverySuccesses
 		} else {
 			member.failureHistory = append([]int64(nil), initial.FailureHistory...)
 			member.evicted, member.lastError, member.evictedAt = initial.Evicted, initial.LastError, initial.EvictedAt
@@ -203,6 +264,16 @@ func ReconcileSilent(groupID int64, update RuntimeUpdate) []GroupStateEvent {
 			member.evictedAt = now
 			globalEvictedNodes.Store(member.nodeID, true)
 		}
+		if member.evicted && member.evictedAt.IsZero() {
+			// A restored-but-undated eviction would make the cooldown
+			// unmeasurable; anchor it so the policy stays well defined.
+			member.evictedAt = now
+		}
+		if member.evicted && member.recoverySuccesses > 0 {
+			// The policy or topology just changed, so the old streak no longer
+			// describes this generation of the member.
+			member.recoverySuccesses = 0
+		}
 		if pruned || newlyEvicted {
 			events = append(events, GroupStateEvent{GroupID: groupID, NodeID: member.nodeID,
 				FailureHistory: append([]int64(nil), member.failureHistory...), Evicted: member.evicted,
@@ -211,6 +282,9 @@ func ReconcileSilent(groupID int64, update RuntimeUpdate) []GroupStateEvent {
 		next[tag] = member
 	}
 	runtime.window, runtime.threshold, runtime.members = window, threshold, next
+	if recoveryPolicyProvided(update.Recovery) {
+		runtime.recovery = NormalizeRecoveryPolicy(update.Recovery)
+	}
 	preferredNodeID := currentNodeID
 	if preferredNodeID == 0 {
 		preferredNodeID = update.PreferredNodeID
@@ -245,14 +319,22 @@ func NotifyEvents(events []GroupStateEvent) {
 	}
 }
 
-func Register(groupID int64, failureWindow time.Duration, failureThreshold int, currentTag string, members map[string]GroupInitialState) func() {
+// Register installs a group runtime. The optional recovery policy defaults to
+// DefaultRecoveryPolicy; callers pass it explicitly to follow persisted group
+// settings.
+func Register(groupID int64, failureWindow time.Duration, failureThreshold int, currentTag string,
+	members map[string]GroupInitialState, recovery ...RecoveryPolicy) func() {
 	if groupID == 0 {
 		return func() {}
 	}
 	preferredTag := currentTag
+	policy := DefaultRecoveryPolicy()
+	if len(recovery) > 0 {
+		policy = NormalizeRecoveryPolicy(recovery[0])
+	}
 	runtime := &groupRuntime{
 		id: groupID, window: failureWindow, threshold: failureThreshold,
-		currentTag: currentTag, members: make(map[string]*groupMemberRuntime, len(members)),
+		recovery: policy, currentTag: currentTag, members: make(map[string]*groupMemberRuntime, len(members)),
 	}
 	if runtime.window <= 0 {
 		runtime.window = 5 * time.Minute
@@ -260,14 +342,22 @@ func Register(groupID int64, failureWindow time.Duration, failureThreshold int, 
 	if runtime.threshold <= 0 {
 		runtime.threshold = 3
 	}
+	now := time.Now()
 	for tag, initial := range members {
 		if initial.Evicted {
 			globalEvictedNodes.Store(initial.NodeID, true)
 		}
 		_, globallyEvicted := globalEvictedNodes.Load(initial.NodeID)
+		evicted := initial.Evicted || globallyEvicted
+		evictedAt := initial.EvictedAt
+		if evicted && evictedAt.IsZero() {
+			// Persisted state may carry Evicted without a timestamp; anchoring
+			// it keeps the recovery cooldown measurable across restarts.
+			evictedAt = now
+		}
 		runtime.members[tag] = &groupMemberRuntime{
 			nodeID: initial.NodeID, tag: tag, failureHistory: append([]int64(nil), initial.FailureHistory...),
-			evicted: initial.Evicted || globallyEvicted, lastError: initial.LastError, evictedAt: initial.EvictedAt,
+			evicted: evicted, lastError: initial.LastError, evictedAt: evictedAt,
 		}
 	}
 	if current := runtime.members[runtime.currentTag]; current == nil || current.evicted || len(current.failureHistory) > 0 {
@@ -376,6 +466,11 @@ func RecordFailure(groupID int64, tag string, cause error, at time.Time) bool {
 	runtime.mu.Lock()
 	member := runtime.members[tag]
 	if member == nil || member.evicted {
+		if member != nil {
+			// A fresh failure invalidates any recovery streak, including one
+			// observed while the member was still evicted.
+			member.recoverySuccesses = 0
+		}
 		runtime.mu.Unlock()
 		return member != nil && member.evicted
 	}
@@ -387,6 +482,7 @@ func RecordFailure(groupID int64, tag string, cause error, at time.Time) bool {
 		}
 	}
 	member.failureHistory = append(history, at.Unix())
+	member.recoverySuccesses = 0
 	if cause != nil {
 		member.lastError = cause.Error()
 	}
@@ -412,8 +508,14 @@ func RecordFailure(groupID int64, tag string, cause error, at time.Time) bool {
 	return event.Evicted
 }
 
-// RecordHealthSuccess clears a non-evicted member's consecutive failure
-// sequence. Permanently evicted members still require an explicit restore.
+// RecordHealthSuccess feeds one successful health probe into the group state.
+//
+// A healthy member simply clears its consecutive-failure streak. An evicted
+// member counts consecutive successes instead and is re-admitted once the
+// recovery policy is satisfied, which is what makes eviction recoverable
+// without operator intervention. Recovery progress is deliberately not
+// announced: the candidate topology has not changed yet, and the management API
+// reads the progress from the runtime snapshot.
 func RecordHealthSuccess(groupID int64, tag string) bool {
 	value, ok := groupRuntimeStore.Load(groupID)
 	if !ok {
@@ -422,16 +524,88 @@ func RecordHealthSuccess(groupID int64, tag string) bool {
 	runtime := value.(*groupRuntime)
 	runtime.mu.Lock()
 	member := runtime.members[tag]
-	if member == nil || member.evicted || len(member.failureHistory) == 0 {
+	if member == nil {
 		runtime.mu.Unlock()
-		return member != nil && !member.evicted
+		return false
+	}
+	if member.evicted {
+		if !runtime.recovery.Enabled {
+			if member.recoverySuccesses != 0 {
+				member.recoverySuccesses = 0
+			}
+			runtime.mu.Unlock()
+			return false
+		}
+		if time.Since(member.evictedAt) < runtime.recovery.Cooldown {
+			runtime.mu.Unlock()
+			return false
+		}
+		member.recoverySuccesses++
+		if member.recoverySuccesses < runtime.recovery.SuccessThreshold {
+			runtime.mu.Unlock()
+			return false
+		}
+		nodeID := member.nodeID
+		clearMemberEviction(member)
+		runtime.mu.Unlock()
+		globalEvictedNodes.Delete(nodeID)
+		notifyGroupState(GroupStateEvent{GroupID: groupID, NodeID: nodeID, StateChanged: true, Recovered: true})
+		recoverEvictedNodeEverywhere(nodeID, groupID)
+		return true
+	}
+	if len(member.failureHistory) == 0 {
+		member.recoverySuccesses = 0
+		runtime.mu.Unlock()
+		return true
 	}
 	member.failureHistory = nil
 	member.lastError = ""
+	member.recoverySuccesses = 0
 	event := GroupStateEvent{GroupID: groupID, NodeID: member.nodeID, StateChanged: true, Recovered: true}
 	runtime.mu.Unlock()
 	notifyGroupState(event)
 	return true
+}
+
+// clearMemberEviction returns a member to a clean, never-failed state. It must
+// be called with the owning runtime lock held.
+func clearMemberEviction(member *groupMemberRuntime) {
+	member.evicted = false
+	member.evictedAt = time.Time{}
+	member.failureHistory = nil
+	member.lastError = ""
+	member.recoverySuccesses = 0
+}
+
+// recoverEvictedNodeEverywhere clears the same NodeID's eviction in every other
+// group runtime. Eviction is propagated globally, so a recovery proved by one
+// group has to be global too; otherwise the node would stay banned in every
+// group whose own probe schedule happened to lag behind.
+func recoverEvictedNodeEverywhere(nodeID, originGroupID int64) {
+	if nodeID == 0 {
+		return
+	}
+	globalEvictedNodes.Delete(nodeID)
+	groupRuntimeStore.Range(func(_, value any) bool {
+		runtime := value.(*groupRuntime)
+		if runtime.id == originGroupID {
+			return true
+		}
+		runtime.mu.Lock()
+		recovered := false
+		for _, member := range runtime.members {
+			if member.nodeID != nodeID || !member.evicted {
+				continue
+			}
+			clearMemberEviction(member)
+			recovered = true
+		}
+		runtime.mu.Unlock()
+		if recovered {
+			notifyGroupState(GroupStateEvent{GroupID: runtime.id, NodeID: nodeID, StateChanged: true, Recovered: true})
+		}
+		return true
+	})
 }
 
 // RecordGroupHealthFailure feeds a failed background probe into every group
@@ -453,6 +627,8 @@ func RecordGroupHealthFailure(groupID int64, tag string, cause error, at time.Ti
 }
 
 // RestoreGroupMember clears a permanent eviction after an explicit user action.
+// It is the manual counterpart of the automatic recovery driven by
+// RecordHealthSuccess.
 func RestoreGroupMember(groupID, nodeID int64) error {
 	_, ok := groupRuntimeStore.Load(groupID)
 	if !ok {
@@ -463,21 +639,19 @@ func RestoreGroupMember(groupID, nodeID int64) error {
 	groupRuntimeStore.Range(func(_, value any) bool {
 		runtime := value.(*groupRuntime)
 		runtime.mu.Lock()
+		restored := false
 		for _, member := range runtime.members {
 			if member.nodeID != nodeID {
 				continue
 			}
 			found = true
-			member.evicted = false
-			member.evictedAt = time.Time{}
-			member.failureHistory = nil
-			member.lastError = ""
-			event := GroupStateEvent{GroupID: runtime.id, NodeID: nodeID, StateChanged: true, Recovered: true}
-			runtime.mu.Unlock()
-			notifyGroupState(event)
-			return true
+			clearMemberEviction(member)
+			restored = true
 		}
 		runtime.mu.Unlock()
+		if restored {
+			notifyGroupState(GroupStateEvent{GroupID: runtime.id, NodeID: nodeID, StateChanged: true, Recovered: true})
+		}
 		return true
 	})
 	if !found {
@@ -508,9 +682,17 @@ func GroupRuntimeSnapshots() map[int64]GroupRuntimeSnapshot {
 			} else if len(member.failureHistory) > 0 {
 				status = "SUSPECT"
 			}
-			snapshot.Members = append(snapshot.Members, GroupMemberSnapshot{NodeID: member.nodeID, Tag: member.tag,
+			snapshotMember := GroupMemberSnapshot{NodeID: member.nodeID, Tag: member.tag,
 				Status: status, FailureCount: len(member.failureHistory), FailureHistory: append([]int64(nil), member.failureHistory...),
-				LastError: member.lastError, EvictedAt: member.evictedAt})
+				LastError: member.lastError, EvictedAt: member.evictedAt}
+			if member.evicted && runtime.recovery.Enabled {
+				snapshotMember.RecoverySuccesses = member.recoverySuccesses
+				snapshotMember.RecoveryThreshold = runtime.recovery.SuccessThreshold
+				if cooldownEnd := member.evictedAt.Add(runtime.recovery.Cooldown); cooldownEnd.After(time.Now()) {
+					snapshotMember.RecoveryCooldownEnd = cooldownEnd
+				}
+			}
+			snapshot.Members = append(snapshot.Members, snapshotMember)
 		}
 		runtime.mu.Unlock()
 		for _, event := range expiredEvents {
@@ -571,6 +753,7 @@ func propagateEviction(nodeID int64, lastError string, evictedAt time.Time) {
 			member.evicted = true
 			member.evictedAt = evictedAt
 			member.lastError = lastError
+			member.recoverySuccesses = 0
 			currentChanged := false
 			if runtime.currentTag == member.tag {
 				runtime.currentTag = ""
