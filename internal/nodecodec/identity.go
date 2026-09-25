@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"net/netip"
 	"net/url"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -168,8 +168,10 @@ func normalizeQuery(protocol string, values url.Values) map[string][]string {
 		}
 	}
 	for key := range result {
-		sort.Strings(result[key])
-		result[key] = uniqueStrings(result[key])
+		// Canonical JSON needs a stable, duplicate-free ordering: sort each
+		// option list and collapse the runs that sorting creates.
+		slices.Sort(result[key])
+		result[key] = slices.Compact(result[key])
 	}
 
 	// Defaults and aliases must canonicalize to the same identity.
@@ -446,21 +448,8 @@ func splitAndSort(value string) []string {
 	for i := range parts {
 		parts[i] = strings.ToLower(strings.TrimSpace(parts[i]))
 	}
-	sort.Strings(parts)
-	return uniqueStrings(parts)
-}
-
-func uniqueStrings(values []string) []string {
-	if len(values) < 2 {
-		return values
-	}
-	result := values[:0]
-	for _, value := range values {
-		if len(result) == 0 || result[len(result)-1] != value {
-			result = append(result, value)
-		}
-	}
-	return result
+	slices.Sort(parts)
+	return slices.Compact(parts)
 }
 
 func setDefault(values map[string][]string, key, value string) {

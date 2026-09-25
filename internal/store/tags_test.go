@@ -66,14 +66,16 @@ func TestMigration13BackfillsExistingTags(t *testing.T) {
 	}
 
 	if err := Migrate(db); err != nil {
-		t.Fatalf("migrate to 13::%v", err)
+		t.Fatalf("migrate::%v", err)
 	}
 	version, err := CurrentVersion(db)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version != 13 {
-		t.Fatalf("schema version = %d, want 13", version)
+	// Assert the tagging migration landed rather than pinning the exact head
+	// version, so appending a later migration cannot fail this test.
+	if version < 13 {
+		t.Fatalf("schema version = %d, want >= 13", version)
 	}
 
 	names := map[string]int64{}

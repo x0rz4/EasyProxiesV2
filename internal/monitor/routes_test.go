@@ -46,8 +46,14 @@ func TestServeMuxMethodAndCanonicalPathSemantics(t *testing.T) {
 
 	redirect := httptest.NewRecorder()
 	handler.ServeHTTP(redirect, httptest.NewRequest(http.MethodGet, "/api//tags/./schema", nil))
-	if redirect.Code != http.StatusMovedPermanently || redirect.Header().Get("Location") != "/api/tags/schema" {
-		t.Fatalf("canonical redirect status=%d location=%q", redirect.Code, redirect.Header().Get("Location"))
+	// Go 1.26 changed ServeMux's canonical-path redirect from 301 to 307. What
+	// this test guards is the canonical Location, not which of the two redirect
+	// codes net/http happens to pick, so accept both.
+	if redirect.Code != http.StatusMovedPermanently && redirect.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("canonical redirect status=%d, want 301 or 307", redirect.Code)
+	}
+	if location := redirect.Header().Get("Location"); location != "/api/tags/schema" {
+		t.Fatalf("canonical redirect location=%q, want %q", location, "/api/tags/schema")
 	}
 
 	for _, path := range []string{"/api/not-registered", "/sub/not-registered/extra"} {
