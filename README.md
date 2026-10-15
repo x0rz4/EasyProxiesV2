@@ -33,7 +33,36 @@ EasyProxiesV2 是一个轻量级、高性能的代理池与订阅管理工具，
 
 ---
 
-## 🚀 最推荐：直接使用 Release 二进制（Linux / Windows）
+## 一键安装（Linux amd64 / arm64）
+
+下载脚本后选择 Docker 或二进制部署。Docker 模式需要事先安装 Docker；二进制自动启动需要 root 和 systemd。
+
+```bash
+curl -fL https://raw.githubusercontent.com/x0rz4/EasyProxiesV2/main/install.sh -o install.sh
+# Docker 部署（当前用户需有 Docker 权限，默认使用 host 网络）
+sudo bash install.sh --method docker
+# 或：Release 二进制 + systemd 服务
+sudo bash install.sh --method binary
+```
+
+默认解析最新 Release，并将下载文件、配置模板和镜像固定到同一个版本。数据和配置默认保存在 `/opt/easy-proxies`，新配置会生成随机管理密码，保存在 `config.yaml`。已有配置及数据在更新时保留。
+
+```bash
+# 指定版本与目录；重复执行可更新同一种部署方式
+sudo bash install.sh --method docker --version 2.1.0 --dir /opt/easy-proxies
+# 不安装系统服务，适合普通用户或没有 systemd 的环境
+bash install.sh --method binary --version 2.1.0 --dir "$HOME/easy-proxies" --no-start
+```
+
+二进制安装会验证 Release 提供的 SHA256。`--no-start` 在二进制模式只安装文件，在 Docker 模式只拉取镜像和准备配置。Docker 容器名为 `easy-proxies`，脚本只替换自身创建的容器。切换部署方式前，请先停止旧服务以免端口冲突；降级前备份数据。
+
+```bash
+# 二进制服务日志 / Docker 日志
+journalctl -u easy-proxies -f
+docker logs -f easy-proxies
+```
+
+## 🚀 Release 二进制（Linux amd64 / arm64）
 
 你不需要本地安装 Go 和 Node，直接下载发布产物即可使用。
 
@@ -42,7 +71,7 @@ EasyProxiesV2 是一个轻量级、高性能的代理池与订阅管理工具，
 从 GitHub Releases 下载这两个文件之一：
 
 - Linux: `easy-proxies-linux-amd64`
-- Windows: `easy-proxies-windows-amd64.exe`
+- Linux arm64: `easy-proxies-linux-arm64`
 
 并同时准备配置文件：
 
@@ -136,7 +165,7 @@ go build -tags "with_utls with_quic with_grpc with_wireguard with_gvisor" -o eas
 ```bash
 mkdir -p easy-proxies/data
 cd easy-proxies
-curl -L https://raw.githubusercontent.com/xiamuceer-j/EasyProxiesV2/main/config.example.yaml -o config.yaml
+curl -L https://raw.githubusercontent.com/x0rz4/EasyProxiesV2/main/config.example.yaml -o config.yaml
 ```
 
 编辑 `config.yaml`，至少确认订阅地址、需要启用的入口开关及管理密码。默认两类基础代理入口均关闭，管理面板仍监听 `0.0.0.0:9888`。
@@ -144,10 +173,12 @@ curl -L https://raw.githubusercontent.com/xiamuceer-j/EasyProxiesV2/main/config.
 ### 2) 拉取镜像
 
 ```bash
-docker pull mumujie/easy_proxies:latest
+docker pull ghcr.io/x0rz4/easyproxiesv2:latest
 ```
 
 生产环境建议将 `latest` 替换为明确的版本标签，避免升级时意外引入不兼容变更。
+镜像版本跟随 Release：`v2.1.0` 对应 `ghcr.io/x0rz4/easyproxiesv2:2.1.0`。稳定版本同时更新 `2.1`、`2` 和 `latest`；main 分支镜像使用 `main` / `sha-*` 标签，预发布版本使用自己的精确版本标签，均不覆盖稳定版本别名。
+使用 Compose 时可通过 `EASY_PROXIES_VERSION=2.1.0 docker compose up -d --no-build` 指定已发布镜像版本。
 
 ### 3) 启动容器
 
@@ -160,7 +191,7 @@ docker run -d \
   --network host \
   -v "$(pwd)/config.yaml:/etc/easy-proxies/config.yaml" \
   -v "$(pwd)/data:/etc/easy-proxies/data" \
-  mumujie/easy_proxies:latest
+  ghcr.io/x0rz4/easyproxiesv2:latest
 ```
 
 如果不能使用主机网络，可以显式映射所需端口：
@@ -174,7 +205,7 @@ docker run -d \
   -p 24000-24200:24000-24200 \
   -v "$(pwd)/config.yaml:/etc/easy-proxies/config.yaml" \
   -v "$(pwd)/data:/etc/easy-proxies/data" \
-  mumujie/easy_proxies:latest
+  ghcr.io/x0rz4/easyproxiesv2:latest
 ```
 
 仅当 `listener.enabled: true` 时需映射 `2323`；仅当 `multi_port.enabled: true` 时需映射每节点端口范围，并与 `config.yaml` 保持一致。
@@ -190,7 +221,7 @@ docker logs -f easy-proxies
 ### 5) 更新镜像
 
 ```bash
-docker pull mumujie/easy_proxies:latest
+docker pull ghcr.io/x0rz4/easyproxiesv2:latest
 docker rm -f easy-proxies
 ```
 

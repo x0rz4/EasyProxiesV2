@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: mumujie/easy_proxies:latest
+    image: ghcr.io/x0rz4/easyproxiesv2:${EASY_PROXIES_VERSION:-latest}
     container_name: easy-proxies
     restart: unless-stopped
     # 方式一：使用主机网络模式（推荐，支持端口自动重分配）

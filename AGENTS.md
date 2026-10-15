@@ -32,7 +32,8 @@ internal/monitor/assets/      前端构建产物，被 //go:embed assets/* 内�
 plane/*.md                    设计文档（重载、并发优化、打标系统等方案背景，可能落后于实现）
 config.example.yaml           配置模板（复制为 config.yaml 使用；config.yaml 不入库）
 Dockerfile / Dockerfile.ci    本地全量构建 / CI 只带产物的运行时镜像
-docker-compose.yml            mumujie/easy_proxies 镜像 + 数据卷
+docker-compose.yml            GHCR 镜像 + 数据卷（EASY_PROXIES_VERSION 可指定版本）
+install.sh                    Linux Docker / 二进制安装及更新入口
 .github/workflows/            打 tag 触发：多架构二进制 + Docker 镜像发布
 ```
 
@@ -170,6 +171,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 
 **CI 行为**：`build-and-release.yml` 在推送 `v*` tag 或手动运行时验证并构建 Linux amd64 / arm64 二进制，tag 构建会上传 Release 附件及 SHA256 校验文件。该工作流执行前端 lint / tsc / build、后端全量测试及关键包 race 检查。
 **镜像发布**：`docker-publish.yml` 在 main/master、版本 tag 推送及 PR 时构建多架构镜像，非 PR 运行使用 `GITHUB_TOKEN` 推送到 GHCR。不要在 Release 工作流中重复添加依赖 `DOCKERHUB_TOKEN` 的 Docker Hub 发布任务。
+镜像的精确版本标签必须匹配 `frontend/package.json` 与 Git Release tag；只有稳定版本 tag 构建更新 `latest`，分支及预发布版本不得覆盖稳定版别名。修改安装脚本时运行 `bash -n install.sh` 和 `python3 -m unittest discover -s tests -p 'test_install.py'`。
 
 ---
 
