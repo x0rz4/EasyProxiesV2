@@ -484,7 +484,7 @@ export default function GroupPoolsPanel() {
 
             <section aria-labelledby="member-editor-title">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-                <div><h4 id="member-editor-title" className="font-bold">节点成员管理</h4><p className="mt-1 text-xs leading-5 text-base-content/55">只能新增节点管理中状态可用的节点；地区规则与手动节点取并集</p></div>
+                <div><h4 id="member-editor-title" className="font-bold">节点成员管理</h4><p className="mt-1 text-xs leading-5 text-base-content/55">可添加已启用的节点，包括待检测或暂时不可用的节点；地区规则与手动节点取并集</p></div>
                 {selectedNodeOptions.length > 0 && <button type="button" className="btn btn-outline btn-sm gap-2" onClick={() => void probeSelectedNodes()} disabled={Boolean(batchProbeProgress)}>
                   {batchProbeProgress ? <span className="loading loading-spinner loading-xs" /> : <Activity className="h-4 w-4" />}
                   {batchProbeProgress ? `${batchProbeProgress.current}/${batchProbeProgress.total}` : '测试全部已选'}
@@ -506,13 +506,13 @@ export default function GroupPoolsPanel() {
                 </div>
 
                 <div className="rounded-2xl border border-base-300 bg-base-200/25 p-4">
-                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"><div><h5 className="text-sm font-bold">可添加节点</h5><p className="mt-0.5 text-xs text-base-content/50">仅显示节点管理状态为“可用”的节点</p></div><label className="input input-sm flex w-full items-center gap-2 sm:w-64"><Search className="h-3.5 w-3.5 text-base-content/40" /><input className="min-w-0 grow" value={nodeSearch} onChange={(e) => setNodeSearch(e.target.value)} placeholder="模糊搜索（支持多关键词）" aria-label="模糊搜索可添加节点名称、国家或地区" title="支持空格分隔的多关键词和轻微拼写错误" /></label></div>
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"><div><h5 className="text-sm font-bold">可添加节点</h5><p className="mt-0.5 text-xs text-base-content/50">显示已启用且尚未手动指定或排除的节点</p></div><label className="input input-sm flex w-full items-center gap-2 sm:w-64"><Search className="h-3.5 w-3.5 text-base-content/40" /><input className="min-w-0 grow" value={nodeSearch} onChange={(e) => setNodeSearch(e.target.value)} placeholder="模糊搜索（支持多关键词）" aria-label="模糊搜索可添加节点名称、国家或地区" title="支持空格分隔的多关键词和轻微拼写错误" /></label></div>
                   <div className="mt-3 max-h-72 space-y-2 overflow-y-auto pr-1">
                     {filteredNodes.map((node) => <NodeOptionRow key={node.id} node={node} latency={latencyOverrides[node.id] ?? node.latency_ms} probing={probingNodeIDs.has(node.id)}
                       action="add" onAction={() => { setDraftNodeCache((current) => ({ ...current, [node.id]: node })); setForm((current) => ({ ...current, explicit_node_ids: [...current.explicit_node_ids, node.id], excluded_node_ids: current.excluded_node_ids.filter((id) => id !== node.id) })); setPendingAutoExcludedIDs((current) => { const next = new Set(current); next.delete(node.id); return next }); setManualEvictionOverrideIDs((current) => new Set(current).add(node.id)) }}
                       onExclude={() => excludeDraftMember(node.id, node.name)}
                       onProbe={() => void probeOption(node)} />)}
-                    {filteredNodes.length === 0 && <EmptyMemberList message={nodeSearch.trim() ? '没有匹配的可用节点，请尝试缩短关键词或检查拼写' : '当前没有其他可用节点'} />}
+                    {filteredNodes.length === 0 && <EmptyMemberList message={nodeSearch.trim() ? '没有匹配的节点，请尝试缩短关键词或检查拼写' : '当前没有其他可添加节点'} />}
                   </div>
                 </div>
               </div>
