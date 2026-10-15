@@ -64,7 +64,9 @@ func (s *Server) loadNodeView(ctx context.Context, withFacts bool) (*nodeview.Vi
 			status := "pending"
 			if !node.Enabled {
 				status = "disabled"
-			} else if found && live.Blacklisted {
+			} else if !found {
+				status = "unloaded"
+			} else if live.Blacklisted {
 				status = "blacklisted"
 			} else if found && live.InitialCheckDone && live.Available {
 				status = "normal"
@@ -76,9 +78,12 @@ func (s *Server) loadNodeView(ctx context.Context, withFacts bool) (*nodeview.Vi
 				latency = live.LastLatencyMs
 			}
 			protocol, _, _ := strings.Cut(node.URI, ":")
+			if strings.EqualFold(protocol, "hy2") {
+				protocol = "hysteria2"
+			}
 			nodes = append(nodes, nodeview.Node{ID: node.ID, Name: node.Name, Region: node.Region, Country: node.Country, Tags: node.Tags,
 				Source: string(node.Source), Protocol: strings.ToLower(protocol), SubscriptionIDs: node.SubscriptionIDs, Status: status, LatencyMS: latency,
-				RuntimeTag: live.Tag, Healthy: node.Enabled && found && live.InitialCheckDone && live.Available && !live.Blacklisted && !live.Provisional, Enabled: node.Enabled})
+				Port: node.Port, RuntimeTag: live.Tag, Healthy: node.Enabled && found && live.InitialCheckDone && live.Available && !live.Blacklisted && !live.Provisional, Enabled: node.Enabled})
 		}
 		if withFacts && len(ids) > 0 {
 			facts, err = nodefacts.NewLoader(tx).Load(ctx, ids)

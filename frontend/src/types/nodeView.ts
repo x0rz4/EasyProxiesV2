@@ -38,7 +38,7 @@ export interface NodeViewItem {
 export interface NodeViewPage {
   offset: number
   limit: number
-  sort: 'id' | 'name' | 'region' | 'status' | 'latency_ms'
+  sort: 'id' | 'name' | 'region' | 'status' | 'latency_ms' | 'port' | 'source'
   descending: boolean
 }
 export interface NodeViewResult {
@@ -47,7 +47,7 @@ export interface NodeViewResult {
   page: NodeViewPage
   snapshot_revision: string
 }
-export interface NodeFacet { value: string; label: string; count: number; healthy: number }
+export interface NodeFacet { value: string; label: string; count: number; healthy: number; avg_latency_ms: number }
 export interface NodeFacets {
   regions: NodeFacet[]
   tags: NodeFacet[]

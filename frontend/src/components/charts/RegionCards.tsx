@@ -1,6 +1,7 @@
 import { regionFlag } from '../../utils/region'
 
 interface RegionStat {
+  label?: string
   region: string
   total: number
   healthy: number
@@ -56,7 +57,7 @@ export default function RegionCards({ regions, title }: RegionCardsProps) {
               {/* Header: Flag + Region */}
               <div className="flex items-center gap-2 mb-2">
                 <span className="text-lg">{regionFlag(r.region)}</span>
-                <span className="font-semibold text-sm uppercase">{r.region}</span>
+                <span className="font-semibold text-sm uppercase">{r.label || (r.region === 'unknown' ? '未检测' : r.region)}</span>
                 <span className="text-xs text-base-content/40 ml-auto">{r.total} 节点</span>
               </div>
               {/* Health bar */}

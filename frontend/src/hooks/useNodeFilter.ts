@@ -9,7 +9,7 @@ export function useNodeFacets() {
 
 export function useNodeFilter(initial: NodeFilterSpec = { version: 2 }, enabled = true) {
   const [spec, updateSpec] = useState(initial)
-  const [page, setPage] = useState<NodeViewPage>({ offset: 0, limit: 50, sort: 'id', descending: false })
+  const [page, setPage] = useState<NodeViewPage>({ offset: 0, limit: 50, sort: 'name', descending: false })
   const facets = useNodeFacets()
   const saved = useQuery({ queryKey: ['savedNodeFilters'], queryFn: listSavedNodeFilters })
   const query = useQuery({

@@ -57,3 +57,30 @@ func TestGroupAndViewUseSamePredicate(t *testing.T) {
 		}
 	}
 }
+
+func TestFacetsAverageAndManagementSorts(t *testing.T) {
+	v := New([]Node{
+		{ID: 1, Region: "hk", LatencyMS: 101, Port: 200, Source: "subscription"},
+		{ID: 2, Region: "hk", LatencyMS: 202, Port: 100, Source: "manual"},
+		{ID: 3, Region: "hk", LatencyMS: -1, Port: 100, Source: "manual"},
+		{ID: 4, LatencyMS: -1, Status: "unloaded"},
+	}, nil, nil, time.Time{})
+	facets := v.Facets()
+	for _, f := range facets.Regions {
+		if f.Value == "hk" && (f.Count != 3 || f.AvgLatencyMS != 152) {
+			t.Fatalf("bad average: %+v", f)
+		}
+		if f.Value == "unknown" && (f.Count != 1 || f.AvgLatencyMS != 0) {
+			t.Fatalf("bad unknown: %+v", f)
+		}
+	}
+	for _, key := range []string{"port", "source"} {
+		r, err := v.Query(Spec{Version: 2, ExcludedIDs: []int64{4}}, Page{Sort: key, Limit: 1, Offset: 1})
+		if err != nil || r.Total != 3 || len(r.Items) != 1 || r.Items[0].ID != 3 {
+			t.Fatalf("%s stable page: %+v %v", key, r, err)
+		}
+	}
+	if err := (Spec{Version: 2, Status: []string{"unloaded"}}).Validate(nil); err != nil {
+		t.Fatal(err)
+	}
+}

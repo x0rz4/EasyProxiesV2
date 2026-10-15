@@ -96,7 +96,8 @@ export default function TagEditorDrawer({ tag, mutexGroups, schema, saving, onCl
             </div>
             <Field label="说明"><textarea className={cn('textarea min-h-20 w-full', controlClass)} value={form.description || ''} onChange={(event) => setForm({ ...form, description: event.target.value })} placeholder="说明这个标签的用途与维护方式" /></Field>
             <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-primary/20 bg-primary/5 p-4"><input type="checkbox" className="toggle toggle-primary mt-0.5" checked={Boolean(form.auto_enabled)} onChange={(event) => setForm({ ...form, auto_enabled: event.target.checked })} /><span><strong className="block text-sm">启用自动打标</strong><span className="mt-0.5 block text-xs leading-5 text-base-content/50">关闭时保留规则但不自动分配；人工标签不受影响。</span></span></label>
-            <ConditionBuilder value={rule} schema={schema} onChange={(next) => setForm({ ...form, rule: next })} />
+            <label className="flex items-center gap-3 rounded-xl border border-base-300 p-3 text-sm"><input type="checkbox" className="checkbox checkbox-sm" checked={(rule.region_version ?? 2) === 2} onChange={event => setForm({ ...form, rule: { ...rule, region_version: event.target.checked ? 2 : 1 } })} />新版地区语义：未知不匹配地区条件，other 仅表示其他已知地区。切换后请检查右侧预览。</label>
+            <ConditionBuilder value={rule} schema={schema} onChange={(next) => setForm({ ...form, rule: { ...next, region_version: rule.region_version ?? 2 } })} />
           </div>
           <aside className="min-h-0 border-t border-base-300 bg-base-200/20 p-5 sm:p-6 xl:overflow-y-auto xl:border-l xl:border-t-0"><div className="mb-4 flex items-center gap-2"><Eye className="h-4 w-4 text-primary" /><div><h4 className="text-sm font-bold">规则预览</h4><p className="text-[10px] text-base-content/45">停止输入 400ms 后自动试跑</p></div></div><TagPreviewPanel preview={preview} loading={previewLoading} error={previewError} /></aside>
         </div>

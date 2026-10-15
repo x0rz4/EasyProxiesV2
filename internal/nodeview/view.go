@@ -3,6 +3,7 @@
 package nodeview
 
 import (
+	"cmp"
 	"crypto/sha256"
 	"fmt"
 	"slices"
@@ -74,7 +75,7 @@ func (s Spec) Validate(registry *nodefacts.Registry) error {
 		}
 	}
 	for _, status := range s.Status {
-		if !slices.Contains([]string{"normal", "pending", "unavailable", "blacklisted", "disabled"}, status) {
+		if !slices.Contains([]string{"normal", "pending", "unavailable", "blacklisted", "disabled", "unloaded"}, status) {
 			return fmt.Errorf("invalid status %q", status)
 		}
 	}
@@ -95,6 +96,7 @@ func (s Spec) Filter(names map[int64]string) nodeselect.Filter {
 }
 
 type Node struct {
+	Port            uint16   `json:"port"`
 	ID              int64    `json:"id"`
 	Name            string   `json:"name"`
 	Region          string   `json:"region"`
@@ -127,7 +129,7 @@ func (p *Page) Normalize() error {
 	if p.Offset < 0 || p.Limit < 1 || p.Limit > 500 {
 		return fmt.Errorf("offset must be nonnegative; limit must be 1..500")
 	}
-	if !slices.Contains([]string{"id", "name", "region", "status", "latency_ms"}, p.Sort) {
+	if !slices.Contains([]string{"id", "name", "region", "status", "latency_ms", "port", "source"}, p.Sort) {
 		return fmt.Errorf("invalid sort %q", p.Sort)
 	}
 	return nil
@@ -141,10 +143,13 @@ type Result struct {
 }
 
 type Facet struct {
-	Value   string `json:"value"`
-	Label   string `json:"label"`
-	Count   int    `json:"count"`
-	Healthy int    `json:"healthy"`
+	AvgLatencyMS int64 `json:"avg_latency_ms"`
+	latencySum   int64
+	latencyCount int64
+	Value        string `json:"value"`
+	Label        string `json:"label"`
+	Count        int    `json:"count"`
+	Healthy      int    `json:"healthy"`
 }
 
 type Facets struct {
@@ -234,6 +239,10 @@ func (v *View) Query(spec Spec, page Page) (Result, error) {
 		switch page.Sort {
 		case "name":
 			cmp = strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name))
+		case "source":
+			cmp = strings.Compare(a.Source, b.Source)
+		case "port":
+			cmp = comparePorts(a.Port, b.Port)
 		case "region":
 			cmp = strings.Compare(a.Region, b.Region)
 		case "status":
@@ -291,6 +300,10 @@ func (v *View) Facets() Facets {
 			key, label = "unknown", "未检测"
 		}
 		add(regions, key, label, node.Healthy)
+		if node.LatencyMS > 0 {
+			regions[key].latencySum += node.LatencyMS
+			regions[key].latencyCount++
+		}
 		for _, tag := range node.Tags {
 			if id := tagIDs[tag]; id > 0 {
 				add(tags, fmt.Sprint(id), tag, node.Healthy)
@@ -303,6 +316,9 @@ func (v *View) Facets() Facets {
 	list := func(m map[string]*Facet) []Facet {
 		result := make([]Facet, 0, len(m))
 		for _, item := range m {
+			if item.latencyCount > 0 {
+				item.AvgLatencyMS = (item.latencySum + item.latencyCount/2) / item.latencyCount
+			}
 			result = append(result, *item)
 		}
 		sort.Slice(result, func(i, j int) bool { return result[i].Value < result[j].Value })
@@ -363,3 +379,5 @@ func (v *View) allow(spec Spec, filter nodeselect.Filter, node Node) (bool, erro
 	}
 	return true, nil
 }
+
+func comparePorts(a, b uint16) int { return cmp.Compare(a, b) }

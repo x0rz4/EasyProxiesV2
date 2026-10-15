@@ -1,4 +1,4 @@
-import { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ConfigNodeConfig, ConfigNodePayload, NodeSnapshot } from '../types'
 import {
   fetchConfigNodes, createConfigNode, updateConfigNode, deleteConfigNode,
@@ -12,11 +12,12 @@ import { PageContent, PageHeader, PageLayout } from './ui/PageLayout'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { cn } from '../utils/cn'
-import { createFuzzySearcher, searchAllTokens } from '../utils/fuzzySearch'
+import { useNodeFilter } from '../hooks/useNodeFilter'
+import NodeFilterBar from './NodeFilterBar'
 import NodeTagPicker from './tags/NodeTagPicker'
 import {
   ArrowDown, ArrowUp, ArrowUpDown, Ban, Server, SlidersHorizontal, ChevronDown,
-  Download, Upload, RefreshCw, Plus, Search, Activity, FolderX, ShieldCheck,
+  Download, Upload, RefreshCw, Plus, Activity, FolderX, ShieldCheck,
   Check, Edit2, Trash2, FileUp, AlertTriangle
 } from 'lucide-react'
 
@@ -40,83 +41,15 @@ interface MergedNode extends ConfigNodeConfig {
 
 type ManageSortKey = 'name' | 'status' | 'latency' | 'region' | 'port' | 'source'
 type SortDir = 'asc' | 'desc'
-type StatusFilter = '' | 'normal' | 'unavailable' | 'blacklisted' | 'pending' | 'unloaded' | 'disabled'
 
 const activeProbeRefreshInterval = 1000
 const pendingProbeRefreshInterval = 5000
-
-function statusOrder(s: MergedNode['runtimeStatus']): number {
-  switch (s) {
-    case 'normal': return 0
-    case 'pending': return 1
-    case 'unavailable': return 2
-    case 'blacklisted': return 3
-    case 'unloaded': return 4
-    case 'disabled': return 5
-    default: return 6
-  }
-}
-
-function compareManageNodes(a: MergedNode, b: MergedNode, key: ManageSortKey, dir: SortDir): number {
-  let cmp = 0
-  switch (key) {
-    case 'name':
-      cmp = a.name.localeCompare(b.name)
-      break
-    case 'status':
-      cmp = statusOrder(a.runtimeStatus) - statusOrder(b.runtimeStatus)
-      break
-    case 'latency': {
-      const la = a.latency_ms < 0 ? Infinity : a.latency_ms
-      const lb = b.latency_ms < 0 ? Infinity : b.latency_ms
-      cmp = la - lb
-      break
-    }
-    case 'region':
-      cmp = (a.region || a.country || '').localeCompare(b.region || b.country || '')
-      break
-    case 'port':
-      cmp = (a.port || 0) - (b.port || 0)
-      break
-    case 'source':
-      cmp = (a.source || '').localeCompare(b.source || '')
-      break
-  }
-  return dir === 'asc' ? cmp : -cmp
-}
 
 function latencyColor(ms: number): string {
   if (ms < 0) return 'text-base-content/50'
   if (ms <= 100) return 'text-success'
   if (ms <= 300) return 'text-warning'
   return 'text-error'
-}
-
-// Extract a normalized proxy type ("ss", "vless", "hysteria2", ...) from a node URI.
-function nodeType(uri: string): string {
-  const idx = uri.indexOf('://')
-  if (idx === -1) return ''
-  const scheme = uri.slice(0, idx).toLowerCase()
-  // "hy2" is an alias for "hysteria2".
-  if (scheme === 'hy2') return 'hysteria2'
-  return scheme
-}
-
-function typeLabel(t: string): string {
-  switch (t) {
-    case 'ss': return 'Shadowsocks'
-    case 'ssr': return 'SSR'
-    case 'vmess': return 'VMess'
-    case 'vless': return 'VLESS'
-    case 'trojan': return 'Trojan'
-    case 'hysteria': return 'Hysteria'
-    case 'hysteria2': return 'Hysteria2'
-    case 'anytls': return 'AnyTLS'
-    case 'http': return 'HTTP'
-    case 'socks5': return 'SOCKS5'
-    case 'socks': return 'SOCKS'
-    default: return t ? t.toUpperCase() : '-'
-  }
 }
 
 // matchSnapshot resolves a config node to its runtime entry. Node ID is the
@@ -260,18 +193,10 @@ export default function ManagePanel() {
   const [batchDeleteConfirm, setBatchDeleteConfirm] = useState(false)
   const [batchProbeProgress, setBatchProbeProgress] = useState<{ current: number; total: number } | null>(null)
 
-  // Filters
-  const [filter, setFilter] = useState('')
-  const deferredFilter = useDeferredValue(filter)
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>('')
-  const [regionFilter, setRegionFilter] = useState('')
-  const [sourceFilter, setSourceFilter] = useState('')
-  const [typeFilter, setTypeFilter] = useState('')
-  const [subscriptionFilter, setSubscriptionFilter] = useState('all')
-
-  // Sort
-  const [sortKey, setSortKey] = useState<ManageSortKey>('name')
-  const [sortDir, setSortDir] = useState<SortDir>('asc')
+  const nodeFilter = useNodeFilter()
+  const sortKey: ManageSortKey = nodeFilter.page.sort === 'latency_ms' ? 'latency' : nodeFilter.page.sort === 'id' ? 'name' : nodeFilter.page.sort
+  const sortDir: SortDir = nodeFilter.page.descending ? 'desc' : 'asc'
+  const hasFilters = Object.keys(nodeFilter.spec).some(key => key !== 'version')
 
   // Import state
   const [importModalOpen, setImportModalOpen] = useState(false)
@@ -354,91 +279,26 @@ export default function ManagePanel() {
     })
   }, [configNodes, monitorData])
 
-  // ---- Filtering ----
-
-  const regions = useMemo(() => {
-    const set = new Set<string>()
-    for (const n of mergedNodes) {
-      if (n.region) set.add(n.region)
-    }
-    return Array.from(set).sort()
-  }, [mergedNodes])
-
-  const sources = useMemo(() => {
-    const set = new Set<string>()
-    for (const n of mergedNodes) {
-      if (n.source) set.add(n.source)
-    }
-    return Array.from(set).sort()
-  }, [mergedNodes])
-
-  const types = useMemo(() => {
-    const set = new Set<string>()
-    for (const n of mergedNodes) {
-      const t = nodeType(n.uri)
-      if (t) set.add(t)
-    }
-    // Fixed friendly order for common types, alphabetical for the rest.
-    const order = ['ss', 'ssr', 'vmess', 'vless', 'trojan', 'hysteria', 'hysteria2', 'anytls', 'http', 'socks5', 'socks']
-    const all = Array.from(set)
-    return all.sort((a, b) => {
-      const ia = order.indexOf(a)
-      const ib = order.indexOf(b)
-      if (ia !== -1 && ib !== -1) return ia - ib
-      if (ia !== -1) return -1
-      if (ib !== -1) return 1
-      return a.localeCompare(b)
-    })
-  }, [mergedNodes])
-
-  const filteredNodes = useMemo(() => {
-    return mergedNodes.filter(n => {
-      if (statusFilter && n.runtimeStatus !== statusFilter) return false
-      if (regionFilter && n.region !== regionFilter) return false
-      if (sourceFilter && n.source !== sourceFilter) return false
-      if (typeFilter && nodeType(n.uri) !== typeFilter) return false
-      if (subscriptionFilter === 'none' && n.source === 'subscription') return false
-      if (subscriptionFilter !== 'all' && subscriptionFilter !== 'none' &&
-          !n.subscription_ids.includes(Number(subscriptionFilter))) return false
-      return true
-    })
-  }, [mergedNodes, statusFilter, regionFilter, sourceFilter, typeFilter, subscriptionFilter])
-
-  const nodeSearcher = useMemo(() => createFuzzySearcher(filteredNodes, [
-    { name: 'name', weight: 0.45 },
-    { name: 'uri', weight: 0.30 },
-    { name: 'country', weight: 0.15 },
-    { name: 'region', weight: 0.10 },
-  ]), [filteredNodes])
-
+  // The backend owns matching and ordering; this map supplies action details.
   const sortedNodes = useMemo(() => {
-    const query = deferredFilter.trim()
-    if (query) {
-      return searchAllTokens(nodeSearcher, query)
-        .sort((a, b) => {
-          const scoreDifference = a.score - b.score
-          if (Math.abs(scoreDifference) > Number.EPSILON) return scoreDifference
-          return compareManageNodes(a.item, b.item, sortKey, sortDir) || a.refIndex - b.refIndex
-        })
-        .map((result) => result.item)
-    }
-    return [...filteredNodes].sort((a, b) => compareManageNodes(a, b, sortKey, sortDir))
-  }, [deferredFilter, filteredNodes, nodeSearcher, sortKey, sortDir])
-
+    const byID = new Map(mergedNodes.map(node => [node.id, node]))
+    return (nodeFilter.query.data?.items || []).flatMap(item => {
+      const node = byID.get(item.id)
+      return node ? [node] : []
+    })
+  }, [mergedNodes, nodeFilter.query.data])
+  // Selection survives pagination. Batch actions use every selected existing node.
   const visibleSelectedNames = useMemo(
-    () => sortedNodes.filter(node => selectedNodes.has(node.name)).map(node => node.name),
-    [selectedNodes, sortedNodes],
+    () => mergedNodes.filter(node => selectedNodes.has(node.name)).map(node => node.name),
+    [mergedNodes, selectedNodes],
   )
+  const pageSelectedCount = sortedNodes.filter(node => selectedNodes.has(node.name)).length
 
   // ---- Handlers ----
 
   const handleSort = (key: ManageSortKey) => {
-    if (sortKey === key) {
-      setSortDir(d => d === 'asc' ? 'desc' : 'asc')
-    } else {
-      setSortKey(key)
-      setSortDir('asc')
-    }
+    nodeFilter.setPage({ ...nodeFilter.page, sort: key === 'latency' ? 'latency_ms' : key,
+      descending: sortKey === key ? !nodeFilter.page.descending : false, offset: 0 })
   }
 
   const openCreateModal = () => {
@@ -488,6 +348,8 @@ export default function ManagePanel() {
       }
       setModalOpen(false)
       queryClient.invalidateQueries({ queryKey: ['configNodes'] })
+      void queryClient.invalidateQueries({ queryKey: ['nodeQuery'] })
+      void queryClient.invalidateQueries({ queryKey: ['nodeFacets'] })
     } catch (err) {
       setFormError(err instanceof Error ? err.message : '操作失败')
     } finally {
@@ -508,6 +370,8 @@ export default function ManagePanel() {
       }
       setDeleteTarget(null)
       queryClient.invalidateQueries({ queryKey: ['configNodes'] })
+      void queryClient.invalidateQueries({ queryKey: ['nodeQuery'] })
+      void queryClient.invalidateQueries({ queryKey: ['nodeFacets'] })
     } catch (err) {
       toast.error(err instanceof Error ? err.message : '删除失败')
     } finally {
@@ -522,6 +386,8 @@ export default function ManagePanel() {
       const res = await toggleConfigNode(node.name, newEnabled)
       toast.success(res.message || (newEnabled ? '节点已启用' : '节点已禁用'))
       queryClient.invalidateQueries({ queryKey: ['configNodes'] })
+      void queryClient.invalidateQueries({ queryKey: ['nodeQuery'] })
+      void queryClient.invalidateQueries({ queryKey: ['nodeFacets'] })
     } catch (err) {
       toast.error(err instanceof Error ? err.message : '操作失败')
     } finally {
@@ -563,10 +429,10 @@ export default function ManagePanel() {
   }
 
   const toggleSelectAll = () => {
-    if (visibleSelectedNames.length === sortedNodes.length) {
-      setSelectedNodes(new Set())
+    if (pageSelectedCount === sortedNodes.length) {
+      setSelectedNodes(current => { const next = new Set(current); for (const node of sortedNodes) next.delete(node.name); return next })
     } else {
-      setSelectedNodes(new Set(sortedNodes.map(n => n.name)))
+      setSelectedNodes(current => new Set([...current, ...sortedNodes.map(n => n.name)]))
     }
   }
 
@@ -578,6 +444,8 @@ export default function ManagePanel() {
       toast.success(res.message || '批量操作完成')
       setSelectedNodes(new Set())
       queryClient.invalidateQueries({ queryKey: ['configNodes'] })
+      void queryClient.invalidateQueries({ queryKey: ['nodeQuery'] })
+      void queryClient.invalidateQueries({ queryKey: ['nodeFacets'] })
     } catch (err) {
       toast.error(err instanceof Error ? err.message : '批量操作失败')
     } finally {
@@ -586,7 +454,7 @@ export default function ManagePanel() {
   }
 
   const handleBatchProbe = async () => {
-    const nodesToProbe = sortedNodes.filter(n => selectedNodes.has(n.name) && !n.disabled && n.tag)
+    const nodesToProbe = mergedNodes.filter(n => selectedNodes.has(n.name) && !n.disabled && n.tag)
     if (nodesToProbe.length === 0) {
       toast.error('所选节点中没有可探测的节点（已禁用或无运行时标识的节点将被跳过）')
       return
@@ -632,6 +500,8 @@ export default function ManagePanel() {
       toast.success(res.message || '批量删除完成')
       setSelectedNodes(new Set())
       queryClient.invalidateQueries({ queryKey: ['configNodes'] })
+      void queryClient.invalidateQueries({ queryKey: ['nodeQuery'] })
+      void queryClient.invalidateQueries({ queryKey: ['nodeFacets'] })
     } catch (err) {
       toast.error(err instanceof Error ? err.message : '批量删除失败')
     } finally {
@@ -672,6 +542,8 @@ export default function ManagePanel() {
         setNeedReload(true)
         toast.success(res.message)
         queryClient.invalidateQueries({ queryKey: ['configNodes'] })
+      void queryClient.invalidateQueries({ queryKey: ['nodeQuery'] })
+      void queryClient.invalidateQueries({ queryKey: ['nodeFacets'] })
       }
     } catch (err) {
       setImportError(err instanceof Error ? err.message : '导入失败')
@@ -703,6 +575,8 @@ export default function ManagePanel() {
       toast.success(res.message || '重载成功')
       setNeedReload(false)
       queryClient.invalidateQueries({ queryKey: ['configNodes'] })
+      void queryClient.invalidateQueries({ queryKey: ['nodeQuery'] })
+      void queryClient.invalidateQueries({ queryKey: ['nodeFacets'] })
       queryClient.invalidateQueries({ queryKey: ['nodes'] })
     } catch (err) {
       toast.error(err instanceof Error ? err.message : '重载失败')
@@ -791,62 +665,13 @@ export default function ManagePanel() {
         </div>
       )}
 
-      {/* Filters Area */}
-      <div className="panel-card p-4 lg:p-5">
-        <div className="flex flex-col lg:flex-row gap-4 items-center">
-          <div className="relative w-full lg:w-80 shrink-0">
-            <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-base-content/40">
-              <Search className="h-5 w-5" />
-            </div>
-            <input
-              type="text"
-              className="input input-md w-full pl-11 bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
-              placeholder="模糊搜索节点（支持多关键词）..."
-              value={filter}
-              onChange={(e) => setFilter(e.target.value)}
-              aria-label="模糊搜索节点名称、URI、国家或地区"
-              title="支持空格分隔的多关键词和轻微拼写错误"
-            />
-          </div>
-
-          <div className="flex flex-wrap sm:flex-nowrap gap-3 w-full lg:w-auto">
-            <select className="select select-md bg-base-200/50 focus:bg-base-100 flex-1 sm:w-40" value={subscriptionFilter} onChange={(e) => setSubscriptionFilter(e.target.value)}>
-              <option value="all">全部节点</option>
-              <option value="none">非订阅节点</option>
-              {subscriptions.filter(subscription => subscription.enabled).map(subscription => (
-                <option key={subscription.id} value={subscription.id}>{subscription.name}</option>
-              ))}
-            </select>
-            {types.length > 0 && (
-              <select className="select select-md bg-base-200/50 focus:bg-base-100 flex-1 sm:w-36" value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)}>
-                <option value="">全部类型</option>
-                {types.map(t => <option key={t} value={t}>{typeLabel(t)}</option>)}
-              </select>
-            )}
-            <select className="select select-md bg-base-200/50 focus:bg-base-100 flex-1 sm:w-36" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value as StatusFilter)}>
-              <option value="">全部状态</option>
-              <option value="normal">✅ 正常运行</option>
-              <option value="unavailable">❌ 不可用</option>
-              <option value="blacklisted">🔴 黑名单</option>
-              <option value="pending">⚠️ 待检查</option>
-              <option value="unloaded">⚠️ 未加载</option>
-              <option value="disabled">🚫 已禁用</option>
-            </select>
-            {regions.length > 0 && (
-              <select className="select select-md bg-base-200/50 focus:bg-base-100 flex-1 sm:w-32" value={regionFilter} onChange={(e) => setRegionFilter(e.target.value)}>
-                <option value="">全部地区</option>
-                {regions.map(r => <option key={r} value={r}>{regionFlag(r)} {r.toUpperCase()}</option>)}
-              </select>
-            )}
-            {sources.length > 1 && (
-              <select className="select select-md bg-base-200/50 focus:bg-base-100 flex-1 sm:w-32" value={sourceFilter} onChange={(e) => setSourceFilter(e.target.value)}>
-                <option value="">全部来源</option>
-                {sources.map(s => <option key={s} value={s}>{sourceLabel(s)}</option>)}
-              </select>
-            )}
-          </div>
-        </div>
-      </div>
+      <NodeFilterBar filter={nodeFilter} />
+      <label className="flex items-center gap-3 text-sm">订阅
+        <select className="select select-sm" value={nodeFilter.spec.unsubscribed ? 'none' : nodeFilter.spec.subscription_ids?.[0] || 'all'} onChange={event => {
+          const value = event.target.value
+          nodeFilter.setSpec({ ...nodeFilter.spec, unsubscribed: value === 'none', subscription_ids: value !== 'all' && value !== 'none' ? [Number(value)] : [] })
+        }}><option value="all">全部节点</option><option value="none">非订阅节点</option>{subscriptions.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
+      </label>
 
       {/* Batch action bar */}
       <div className={`overflow-hidden transition-all duration-300 ${visibleSelectedNames.length > 0 ? 'max-h-48 opacity-100 sm:max-h-24' : 'max-h-0 opacity-0'}`}>
@@ -854,7 +679,7 @@ export default function ManagePanel() {
           <div className="absolute left-0 top-0 bottom-0 w-1.5 bg-primary rounded-l-2xl"></div>
           <div className="flex items-center gap-4 flex-wrap">
             <span className="text-base font-medium text-base-content/80 flex items-center gap-2">
-              <span className="badge badge-primary badge-md font-bold">{visibleSelectedNames.length}</span> 项已选择
+              <span className="badge badge-primary badge-md font-bold">{visibleSelectedNames.length}</span> 项已选择（跨页）
             </span>
             <div className="flex gap-2 ml-auto flex-wrap">
               <button
@@ -919,10 +744,10 @@ export default function ManagePanel() {
                   <input
                     type="checkbox"
                     className="checkbox checkbox-xs"
-                    checked={sortedNodes.length > 0 && visibleSelectedNames.length === sortedNodes.length}
+                    checked={sortedNodes.length > 0 && pageSelectedCount === sortedNodes.length}
                     onChange={toggleSelectAll}
                     ref={(el) => {
-                      if (el) el.indeterminate = visibleSelectedNames.length > 0 && visibleSelectedNames.length < sortedNodes.length
+                      if (el) el.indeterminate = pageSelectedCount > 0 && pageSelectedCount < sortedNodes.length
                     }}
                   />
                 </th>
@@ -956,14 +781,14 @@ export default function ManagePanel() {
                         <FolderX className="h-8 w-8 text-base-content/40" />
                       </div>
                       <p className="text-base font-medium text-base-content">
-                        {filter || statusFilter || regionFilter || sourceFilter || typeFilter || subscriptionFilter !== 'all'
+                        {hasFilters
                           ? '未找到匹配的节点数据'
                           : '暂无配置节点'}
                       </p>
-                      {filter.trim() && (
+                      {nodeFilter.spec.text?.trim() && (
                         <p className="text-sm text-base-content/50 mt-1">请尝试缩短关键词或检查拼写</p>
                       )}
-                      {!(filter || statusFilter || regionFilter || sourceFilter || typeFilter || subscriptionFilter !== 'all') && (
+                      {!(hasFilters) && (
                         <p className="text-sm text-base-content/50 mt-1">请点击右上角「添加节点」或导入配置以开始</p>
                       )}
                     </div>
@@ -1077,9 +902,9 @@ export default function ManagePanel() {
       </div>
 
       {/* Summary */}
-      {filteredNodes.length !== mergedNodes.length && (
+      {(nodeFilter.query.data?.total || 0) !== mergedNodes.length && (
         <div className="text-center text-xs text-base-content/30">
-          筛选显示 {filteredNodes.length} / {mergedNodes.length} 个节点
+          筛选显示 {(nodeFilter.query.data?.total || 0)} / {mergedNodes.length} 个节点
         </div>
       )}
 

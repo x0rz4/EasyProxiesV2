@@ -316,6 +316,7 @@ export interface ConfigNodeConfig {
 // ---- Node tags ----
 
 export interface TagCondition {
+  region_version?: number
   match?: 'all' | 'any' | 'none'
   children?: TagCondition[]
   field?: string

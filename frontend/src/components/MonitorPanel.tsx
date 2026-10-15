@@ -1,3 +1,4 @@
+import { useNodeFacets } from '../hooks/useNodeFilter'
 import { useState, useEffect, useMemo, useRef } from 'react'
 import type { NodeSnapshot, ConfigNodeConfig, TrafficStreamEvent } from '../types'
 import { fetchNodes, fetchConfigNodes, streamTraffic } from '../api/client'
@@ -238,29 +239,10 @@ export default function MonitorPanel() {
   )
 
   // Region stats
-  const regionStats = useMemo(() => {
-    const map = new Map<string, { total: number; healthy: number; latencies: number[] }>()
-    for (const node of allNodes) {
-      const region = node.region || 'other'
-      const entry = map.get(region) || { total: 0, healthy: 0, latencies: [] }
-      entry.total++
-      if (node.initial_check_done && node.available && !node.blacklisted) {
-        entry.healthy++
-      }
-      if (node.last_latency_ms > 0) {
-        entry.latencies.push(node.last_latency_ms)
-      }
-      map.set(region, entry)
-    }
-    return Array.from(map.entries()).map(([region, stats]) => ({
-      region,
-      total: stats.total,
-      healthy: stats.healthy,
-      avgLatency: stats.latencies.length > 0
-        ? Math.round(stats.latencies.reduce((a, b) => a + b, 0) / stats.latencies.length)
-        : 0,
-    }))
-  }, [allNodes])
+  const regionFacets = useNodeFacets()
+  const regionStats = (regionFacets.data?.regions || []).map(item => ({
+    region: item.value, label: item.label, total: item.count, healthy: item.healthy, avgLatency: item.avg_latency_ms,
+  }))
 
   // ---- Render ----
 
@@ -482,6 +464,7 @@ export default function MonitorPanel() {
         </div>
       </div>
 
+      {regionFacets.error && <p role="alert" className="text-sm text-error">地区统计加载失败：{regionFacets.error.message}</p>}
       {/* Region Cards */}
       <div className={`${surfaceClass} p-5 lg:p-6`}>
         <RegionCards

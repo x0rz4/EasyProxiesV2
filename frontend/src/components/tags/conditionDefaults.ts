@@ -19,5 +19,5 @@ export function createLeafCondition(schema: TagSchema): TagCondition {
 }
 
 export function createDefaultCondition(schema: TagSchema): TagCondition {
-  return { match: 'all', children: [createLeafCondition(schema)] }
+  return { region_version: 2, match: 'all', children: [createLeafCondition(schema)] }
 }

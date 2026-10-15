@@ -44,6 +44,7 @@ export default function NodeFilterBar({ filter }: { filter: ReturnType<typeof us
     <div className="flex flex-wrap items-end gap-3">
       <label className="flex flex-col gap-1 text-xs">节点名称<input className="input" value={spec.text || ''} onChange={e => setSpec({ ...spec, text: e.target.value })} placeholder="搜索名称" /></label>
       <RegionSelect value={spec.regions || []} facets={facets.data?.regions} onChange={regions => setSpec({ ...spec, regions })} />
+      <RegionSelect label="排除地区" value={spec.exclude_regions || []} facets={facets.data?.regions} onChange={exclude_regions => setSpec({ ...spec, exclude_regions })} />
       <label className="flex items-center gap-2 text-xs"><input type="checkbox" className="checkbox checkbox-sm" checked={!!spec.include_unknown_region} onChange={e => setSpec({ ...spec, include_unknown_region: e.target.checked })} />包含未知地区</label>
       {(['statuses', 'sources', 'protocols', 'tags'] as const).map(key => {
         const field = { statuses: 'status', sources: 'sources', protocols: 'protocols', tags: 'tag_whitelist' }[key] as 'status' | 'sources' | 'protocols' | 'tag_whitelist'
@@ -56,6 +57,8 @@ export default function NodeFilterBar({ filter }: { filter: ReturnType<typeof us
           </select>
         </label>
       })}
+      <label className="flex flex-col gap-1 text-xs">最大延迟（ms）<input className="input w-32" type="number" min={0} value={spec.max_latency_ms ?? ''} onChange={event => setSpec({ ...spec, max_latency_ms: event.target.value === '' ? undefined : Number(event.target.value) })} /></label>
+      <label className="flex flex-col gap-1 text-xs">标签匹配<select className="select" value={spec.tag_match || 'any'} onChange={event => setSpec({ ...spec, tag_match: event.target.value as 'any' | 'all' })}><option value="any">任一标签</option><option value="all">全部标签</option></select></label>
       <button className="btn btn-sm" onClick={() => { setSpec({ version: 2 }); setSelected(0) }}>清除筛选</button>
     </div>
     <div className="flex flex-wrap items-center gap-2">
@@ -70,7 +73,7 @@ export default function NodeFilterBar({ filter }: { filter: ReturnType<typeof us
     </div>
     {(query.error || facets.error) && <p role="alert" className="text-sm text-error">{(query.error || facets.error)?.message}</p>}
     <div className="flex items-center gap-3 text-xs">
-      <span>{query.isFetching ? '查询中…' : `共 ${query.data?.total || 0} 个节点`} · 选择操作针对当前页</span>
+      <span>{query.isFetching ? '查询中…' : `共 ${query.data?.total || 0} 个节点`} · 全选作用于当前页；已选节点跨页保留</span>
       <button className="btn btn-xs" disabled={!page.offset || query.isFetching} onClick={() => setPage({ ...page, offset: Math.max(0, page.offset - page.limit) })}>上一页</button>
       <span>第 {Math.floor(page.offset / page.limit) + 1} 页</span>
       <button className="btn btn-xs" disabled={query.isFetching || !query.data || page.offset + page.limit >= query.data.total} onClick={() => setPage({ ...page, offset: page.offset + page.limit })}>下一页</button>
