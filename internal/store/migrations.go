@@ -413,6 +413,26 @@ ALTER TABLE group_pools ADD COLUMN recovery_success_threshold INTEGER NOT NULL D
 ALTER TABLE group_pools ADD COLUMN recovery_cooldown_seconds  INTEGER NOT NULL DEFAULT 300;
 `,
 		},
+		{
+			Version:     15,
+			Description: "persist landing location evidence and identity revisions",
+			Up: `
+CREATE TABLE node_locations (
+    node_id INTEGER PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL DEFAULT 1,
+    state_json TEXT NOT NULL DEFAULT '{}'
+);
+INSERT INTO node_locations(node_id) SELECT id FROM nodes;
+CREATE TRIGGER node_location_insert AFTER INSERT ON nodes BEGIN
+    INSERT INTO node_locations(node_id) VALUES(NEW.id);
+END;
+CREATE TRIGGER node_location_identity AFTER UPDATE OF identity_hash ON nodes
+WHEN OLD.identity_hash <> NEW.identity_hash BEGIN
+    UPDATE node_locations SET revision=revision+1, state_json='{}' WHERE node_id=NEW.id;
+    UPDATE nodes SET region='',country='' WHERE id=NEW.id;
+END;
+`,
+		},
 	}
 }
 

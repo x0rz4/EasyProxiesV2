@@ -13,6 +13,7 @@ import (
 
 	json "easy_proxies/internal/jsonx"
 	"easy_proxies/internal/nodecodec"
+	"easy_proxies/internal/nodeloc"
 
 	_ "modernc.org/sqlite"
 )
@@ -391,10 +392,10 @@ func (s *sqliteStore) UpdateNode(ctx context.Context, node *Node) error {
 	// slice cannot drop assignments. Use SetManualNodeTags to change tags.
 	result, err := s.writeConn().ExecContext(ctx,
 		`UPDATE nodes SET uri=?, name=?, source=?, port=?, username=?, password=?,
-		 region=?, country=?, enabled=?, identity_hash=?, canonical_json=?, updated_at=?
+		 enabled=?, identity_hash=?, canonical_json=?, updated_at=?
 		 WHERE id=?`,
 		node.URI, node.Name, node.Source, node.Port,
-		node.Username, node.Password, node.Region, node.Country,
+		node.Username, node.Password,
 		enabled, node.IdentityHash, node.CanonicalJSON, now, node.ID,
 	)
 	if err != nil {
@@ -414,12 +415,23 @@ func (s *sqliteStore) UpdateNode(ctx context.Context, node *Node) error {
 }
 
 func (s *sqliteStore) UpdateNodeLocation(ctx context.Context, nodeID int64, region, country string) error {
-	result, err := s.writeConn().ExecContext(ctx, `UPDATE nodes SET region=?,country=?,updated_at=? WHERE id=?`,
-		strings.ToLower(strings.TrimSpace(region)), strings.TrimSpace(country), formatTime(time.Now().UTC()), nodeID)
-	if err != nil {
-		return fmt.Errorf("update node %d landing location: %w", nodeID, err)
+	// Compatibility entry point for explicit administrative location writes.
+	// Detection paths must use ApplyLandingResult with a captured identity token.
+	if !nodeloc.ValidISO(nodeloc.Normalize(region)) {
+		return fmt.Errorf("invalid landing region %q", region)
 	}
-	return requireAffected(result, fmt.Sprintf("node %d not found", nodeID))
+	return s.runInTx(ctx, func(tx *sqliteStore) error {
+		state, err := tx.GetNodeLocation(ctx, nodeID)
+		if err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		_, err = tx.ApplyNodeLocation(ctx, nodeID, nodeloc.Observation{
+			Token: state.Token, ProbeID: fmt.Sprintf("manual:%d", now.UnixNano()), StartedAt: now, CheckedAt: now,
+			Source: nodeloc.SourceManual, Succeeded: true, ISO: region, Country: country,
+		})
+		return err
+	})
 }
 
 // clearNodeDetectionCache drops the cached facts of a node whose identity
@@ -472,7 +484,6 @@ func (s *sqliteStore) BulkUpsertNodes(ctx context.Context, nodes []Node) error {
 			 ON CONFLICT(identity_hash) WHERE identity_hash<>'' DO UPDATE SET
 			   name=excluded.name, source=excluded.source, port=excluded.port,
 			   username=excluded.username, password=excluded.password,
-			   region=excluded.region, country=excluded.country,
 			   updated_at=excluded.updated_at`)
 		if err != nil {
 			return fmt.Errorf("prepare bulk upsert: %w", err)
@@ -907,11 +918,8 @@ func (s *sqliteStore) reconcileSubscriptionLogicalNodes(ctx context.Context, sub
 				}
 			}
 			if _, err := s.writeConn().ExecContext(ctx, `UPDATE nodes SET uri=?,name=?,username=?,password=?,
-				region=CASE WHEN ?<>'' THEN ? ELSE region END,
-				country=CASE WHEN ?<>'' THEN ? ELSE country END,
 				identity_hash=?,canonical_json=?,updated_at=? WHERE id=?`,
 				input.URI, input.Name, input.Username, input.Password,
-				input.Region, input.Region, input.Country, input.Country,
 				input.IdentityHash, input.CanonicalJSON, formatTime(time.Now().UTC()), targetID); err != nil {
 				return fmt.Errorf("update logical subscription node %d: %w", targetID, err)
 			}
@@ -976,8 +984,6 @@ func (s *sqliteStore) upsertSubscriptionNodes(ctx context.Context, subscriptionI
 			name=excluded.name,
 			port=CASE WHEN nodes.port=0 THEN excluded.port ELSE nodes.port END,
 			username=excluded.username, password=excluded.password,
-			region=CASE WHEN excluded.region<>'' THEN excluded.region ELSE nodes.region END,
-			country=CASE WHEN excluded.country<>'' THEN excluded.country ELSE nodes.country END,
 			updated_at=excluded.updated_at`, node.URI, node.Name,
 			NodeSourceSubscription, node.Port, node.Username, node.Password, node.Region, node.Country,
 			boolToInt(node.Enabled), node.IdentityHash, node.CanonicalJSON, now, now)

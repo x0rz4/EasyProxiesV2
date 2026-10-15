@@ -6,6 +6,8 @@ package store
 import (
 	"context"
 	"time"
+
+	"easy_proxies/internal/nodeloc"
 )
 
 // Store defines all data storage operations.
@@ -34,9 +36,13 @@ type Store interface {
 
 	// UpdateNode updates an existing node by ID.
 	UpdateNode(ctx context.Context, node *Node) error
-	// UpdateNodeLocation stores the authoritative landing-IP classification
-	// without changing connection settings or administrator state.
+	// UpdateNodeLocation is an explicit manual override. Automated callers use
+	// ApplyNodeLocation with a token captured before the measurement.
 	UpdateNodeLocation(ctx context.Context, nodeID int64, region, country string) error
+	// GetNodeLocation captures identity and revision before a probe starts.
+	GetNodeLocation(ctx context.Context, nodeID int64) (nodeloc.State, error)
+	// ApplyNodeLocation commits accepted evidence and its legacy projection.
+	ApplyNodeLocation(ctx context.Context, nodeID int64, observation nodeloc.Observation) (nodeloc.Change, error)
 
 	// DeleteNode removes a node by ID (cascading to stats/timeline).
 	DeleteNode(ctx context.Context, id int64) error
@@ -358,10 +364,10 @@ type GroupPool struct {
 	TagWhitelist []int64 `json:"tag_whitelist"`
 	TagBlacklist []int64 `json:"tag_blacklist"`
 	// TagFilterMatch is "any" or "all" and applies to TagWhitelist.
-	TagFilterMatch       string           `json:"tag_filter_match"`
-	FailureWindowSeconds int              `json:"failure_window_seconds"`
-	FailureThreshold     int              `json:"failure_threshold"`
-	HealthCheckSeconds   int              `json:"health_check_seconds"`
+	TagFilterMatch       string `json:"tag_filter_match"`
+	FailureWindowSeconds int    `json:"failure_window_seconds"`
+	FailureThreshold     int    `json:"failure_threshold"`
+	HealthCheckSeconds   int    `json:"health_check_seconds"`
 	// Recovery* configure automatic re-admission of an evicted member: after
 	// RecoveryCooldownSeconds of quiet time, RecoverySuccessThreshold
 	// consecutive successful health probes restore it to the pool.

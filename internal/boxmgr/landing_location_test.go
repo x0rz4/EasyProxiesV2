@@ -80,7 +80,7 @@ type locationWriteFailureStore struct {
 	store.Store
 }
 
-func (s locationWriteFailureStore) UpdateNodeLocation(context.Context, int64, string, string) error {
+func (s locationWriteFailureStore) WithTx(context.Context, func(store.Store) error) error {
 	return errors.New("location write failed")
 }
 

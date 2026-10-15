@@ -2,6 +2,7 @@ package boxmgr
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -50,39 +51,43 @@ func (m *Manager) applyCachedLocations(ctx context.Context, cfg *config.Config, 
 		if node.ID == 0 {
 			continue
 		}
+		state, err := m.store.GetNodeLocation(ctx, node.ID)
+		if err != nil || state.Identity != node.NodeKey() {
+			continue
+		}
+		location := state.Current
 		result := results[node.ID]
-		// A failed or missing detection never erases a known location: group
-		// membership follows the region, so clearing it on a transient failure
-		// dropped the node out of its regional group until a later probe
-		// succeeded. Only a successful tunneled lookup naming a country can
-		// change it (see nodeloc.Resolve).
-		var observed nodeloc.Observation
-		if hasSuccessfulLandingIP(result) {
-			observed = nodeloc.Observation{
-				Succeeded: true,
-				ISO:       result.ExitCountryCode,
-				Country:   result.ExitCountry,
+		// Existing evidence is authoritative. Legacy cache may bootstrap only
+		// the original identity; it cannot contribute a second confirmation.
+		bootstrap := state.LastProbeID == "" && state.Revision == 1
+		reclassify := state.LastProbeID != "" && !state.LastSucceeded
+		if hasSuccessfulLandingIP(result) && (bootstrap || reclassify) {
+			copyResult := *result
+			if nodeloc.Normalize(copyResult.ExitCountryCode) == "" && classify != nil {
+				classified := classify(copyResult.ExitIP)
+				copyResult.ExitCountryCode, copyResult.ExitCountry = classified.ISOCode, classified.Country
 			}
-			if nodeloc.Normalize(observed.ISO) == "" && classify != nil {
-				if location := classify(result.ExitIP); location.ISOCode != "" {
-					observed.ISO, observed.Country = location.ISOCode, location.Country
-					result.ExitCountry = location.Country
-					result.ExitCountryCode = strings.ToUpper(location.ISOCode)
-					if err := m.store.UpsertNodeDetectionResult(ctx, result); err != nil {
-						m.logger.Warnf("cache landing country for node %d: %v", node.ID, err)
-					}
-				}
+			started := result.ExitIPCheckedAt
+			if started.IsZero() {
+				started = time.Unix(0, 1).UTC()
 			}
+			probeID := fmt.Sprintf("cache:%d:%d", node.ID, started.UnixNano())
+			if reclassify {
+				probeID, started = state.LastProbeID, state.LastStartedAt
+			}
+			if copyResult.ExitIPCheckedAt.Before(started) {
+				copyResult.ExitIPCheckedAt = started
+			}
+			change, err := store.ApplyLandingResult(ctx, m.store, nodeloc.Observation{
+				Token: state.Token, ProbeID: probeID, StartedAt: started, Source: nodeloc.SourceGeoIPExit,
+			}, &copyResult)
+			if err != nil {
+				m.logger.Warnf("apply cached landing location for node %d: %v", node.ID, err)
+				continue
+			}
+			location = change.Location
 		}
-		region, country, changed := nodeloc.Resolve(node.Region, node.Country, observed)
-		if !changed {
-			continue
-		}
-		if err := m.store.UpdateNodeLocation(ctx, node.ID, region, country); err != nil {
-			m.logger.Warnf("apply cached landing location for node %d: %v", node.ID, err)
-			continue
-		}
-		node.Region, node.Country = region, country
+		node.Region, node.Country = location.ISO, location.Country
 	}
 }
 
@@ -163,6 +168,11 @@ func (m *Manager) detectMissingNodeLocations(ctx context.Context, cfg *config.Co
 		go func() {
 			defer wg.Done()
 			for item := range jobs {
+				observation, err := store.BeginLandingProbe(ctx, m.store, item.id, cfg.Nodes[item.index].URI, "")
+				if err != nil {
+					m.logger.Warnf("begin landing probe for node %d: %v", item.id, err)
+					continue
+				}
 				result := &store.NodeDetectionResult{NodeID: item.id, LatencyStatus: "untested", SpeedStatus: "untested", ExitIPStatus: "failed", ExitIPCheckedAt: time.Now().UTC()}
 				dialer, dialErr := m.monitorMgr.DialerFor(item.tag)
 				if dialErr != nil {
@@ -190,22 +200,15 @@ func (m *Manager) detectMissingNodeLocations(ctx context.Context, cfg *config.Co
 						}
 					}
 				}
-				saved := true
-				if err := m.store.UpsertNodeDetectionResult(context.Background(), result); err != nil {
-					m.logger.Warnf("store landing IP result for node %d: %v", item.id, err)
-					saved = false
+				result.ExitIPCheckedAt = time.Now().UTC()
+				change, err := store.ApplyLandingResult(context.Background(), m.store, observation, result)
+				if err != nil {
+					m.logger.Warnf("apply landing result for node %d: %v", item.id, err)
+					continue
 				}
-				region := strings.ToLower(result.ExitCountryCode)
-				country := result.ExitCountry
-				if saved && result.ExitIPStatus == "success" && region != "" {
-					if err := m.store.UpdateNodeLocation(context.Background(), item.id, region, country); err != nil {
-						m.logger.Warnf("store landing location for node %d: %v", item.id, err)
-						region, country = "", ""
-					}
-				} else if !saved {
-					region, country = "", ""
+				if change.Applied {
+					done <- outcome{target: item, region: change.Location.ISO, country: change.Location.Country}
 				}
-				done <- outcome{target: item, region: region, country: country}
 			}
 		}()
 	}

@@ -11,10 +11,19 @@
 // The package has no dependencies so every write path can share the one rule.
 package nodeloc
 
-import "strings"
+import (
+	"strings"
+	"time"
+)
 
 // Observation is the outcome of one landing-IP detection for a node.
 type Observation struct {
+	Token
+	ProbeID   string    `json:"probe_id"`
+	StartedAt time.Time `json:"started_at"`
+	CheckedAt time.Time `json:"checked_at"`
+	IP        string    `json:"ip"`
+	Source    Source    `json:"source"`
 	// Succeeded is true only when the exit IP was obtained through the node's
 	// own tunnel. A lookup that did not go through the node says nothing about
 	// where the node lands.
@@ -27,23 +36,4 @@ type Observation struct {
 // Normalize returns the stored form of a region code: trimmed and lowercase.
 func Normalize(region string) string {
 	return strings.ToLower(strings.TrimSpace(region))
-}
-
-// Resolve returns the location the node should carry after obs, and whether it
-// differs from the current one. The current location is returned unchanged for
-// any observation that is not a success naming a country.
-func Resolve(currentRegion, currentCountry string, obs Observation) (region, country string, changed bool) {
-	region, country = currentRegion, currentCountry
-	if !obs.Succeeded {
-		return region, country, false
-	}
-	iso := Normalize(obs.ISO)
-	if iso == "" {
-		return region, country, false
-	}
-	name := strings.TrimSpace(obs.Country)
-	if currentRegion == iso && currentCountry == name {
-		return region, country, false
-	}
-	return iso, name, true
 }

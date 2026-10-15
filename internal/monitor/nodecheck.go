@@ -16,6 +16,7 @@ import (
 	"easy_proxies/internal/ipquality"
 	json "easy_proxies/internal/jsonx"
 	"easy_proxies/internal/nodedetect"
+	"easy_proxies/internal/nodeloc"
 	"easy_proxies/internal/store"
 	"easy_proxies/internal/unlock"
 )
@@ -382,20 +383,22 @@ func (m *nodeCheckManager) runQuality(task *nodeCheckTask) {
 	outcomes := make(map[int64][]string)
 	var outcomesMu sync.Mutex
 	var locationMu sync.Mutex
+	locationObservations := make(map[int64]nodeloc.Observation)
+	locationResults := make(map[int64]*store.NodeDetectionResult)
 	// relocatedNodeIDs, not just a boolean: a region change moves group
 	// membership, and the incremental path needs to know which nodes moved.
 	relocatedNodeIDs := make([]int64, 0)
-	markLocation := func(node Snapshot, region, country string) {
-		region = strings.ToLower(strings.TrimSpace(region))
-		country = strings.TrimSpace(country)
-		if region == "" {
+	markLocation := func(node Snapshot, observation nodeloc.Observation, result *store.NodeDetectionResult) {
+		change, err := store.ApplyLandingResult(context.Background(), m.server.store, observation, result)
+		if err != nil {
+			task.publish(nodeCheckEvent{Type: "task", Phase: "quality", NodeID: node.NodeID, Status: "warning", Error: "保存落地地区失败: " + err.Error()})
 			return
 		}
-		if err := m.server.store.UpdateNodeLocation(context.Background(), node.NodeID, region, country); err != nil {
+		if !change.Applied {
 			return
 		}
-		m.server.mgr.UpdateNodeLocation(node.NodeID, region, country)
-		if node.Region != region || node.Country != country {
+		m.server.mgr.UpdateNodeLocation(node.NodeID, change.Location.ISO, change.Location.Country)
+		if change.MembershipChanged {
 			locationMu.Lock()
 			relocatedNodeIDs = append(relocatedNodeIDs, node.NodeID)
 			locationMu.Unlock()
@@ -410,6 +413,14 @@ func (m *nodeCheckManager) runQuality(task *nodeCheckTask) {
 		if task.ctx.Err() != nil {
 			return
 		}
+		observation, beginErr := store.BeginLandingProbe(task.ctx, m.server.store, node.NodeID, node.URI, task.snapshot.ID+":landing")
+		if beginErr != nil {
+			task.publish(nodeCheckEvent{Type: "task", Phase: "quality", NodeID: node.NodeID, Status: "warning", Error: beginErr.Error()})
+			return
+		}
+		locationMu.Lock()
+		locationObservations[node.NodeID] = observation
+		locationMu.Unlock()
 		dial, err := m.server.mgr.DialerFor(node.Tag)
 		var ip string
 		if err == nil {
@@ -429,10 +440,9 @@ func (m *nodeCheckManager) runQuality(task *nodeCheckTask) {
 			task.landingIPs[node.NodeID] = ip
 			task.mu.Unlock()
 		}
-		if saveErr := m.server.store.UpsertNodeDetectionResult(context.Background(), result); saveErr == nil && result.ExitIPStatus == "success" {
-			markLocation(node, result.ExitCountryCode, result.ExitCountry)
-		}
-		m.server.enqueueRetag(node.NodeID)
+		locationMu.Lock()
+		locationResults[node.NodeID] = result
+		locationMu.Unlock()
 	})
 
 	if task.settings.IPPureEnabled {
@@ -480,14 +490,16 @@ func (m *nodeCheckManager) runQuality(task *nodeCheckTask) {
 			}
 			if ip != "" && quality.Status == ipquality.StatusSuccess && quality.CountryCode != "" && sameDetectedIP(ip, quality.IP) {
 				now := time.Now().UTC()
-				saveErr := m.server.store.UpsertNodeDetectionResult(context.Background(), &store.NodeDetectionResult{
+				locationMu.Lock()
+				observation := locationObservations[node.NodeID]
+				observation.Source = nodeloc.SourceExitProbe
+				locationObservations[node.NodeID] = observation
+				locationResults[node.NodeID] = &store.NodeDetectionResult{
 					NodeID: node.NodeID, TaskID: task.snapshot.ID, LatencyStatus: "untested", SpeedStatus: "untested",
 					ExitIP: ip, ExitIPFamily: detectIPFamily(ip), ExitCountry: quality.Country,
 					ExitCountryCode: strings.ToUpper(strings.TrimSpace(quality.CountryCode)), ExitIPStatus: "success", ExitIPCheckedAt: now,
-				})
-				if saveErr == nil {
-					markLocation(node, quality.CountryCode, quality.Country)
 				}
+				locationMu.Unlock()
 			}
 			m.saveQuality(task, node, quality)
 			recordOutcome(node.NodeID, quality.Status)
@@ -500,6 +512,12 @@ func (m *nodeCheckManager) runQuality(task *nodeCheckTask) {
 		}
 	}
 	for _, node := range task.nodes {
+		// Choose the best classifier before applying the one probe. Publishing
+		// both classifiers could briefly relocate a node and immediately undo it.
+		if result := locationResults[node.NodeID]; result != nil {
+			markLocation(node, locationObservations[node.NodeID], result)
+			m.server.enqueueRetag(node.NodeID)
+		}
 		statuses := outcomes[node.NodeID]
 		stageStatus := "failed"
 		if !task.settings.IPPureEnabled && !task.settings.IPAPIEnabled {
