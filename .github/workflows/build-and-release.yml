@@ -3,72 +3,117 @@ name: Build and Release
 on:
   push:
     tags:
-      - 'v*' # 仅当推送形如 v1.0.0 的 tag 时触发
-  workflow_dispatch: # 允许在 GitHub Actions 页面手动触发
+      - 'v*'
+  workflow_dispatch:
 
 permissions:
-  contents: write # 允许 GITHUB_TOKEN 创建/更新 Release
+  contents: write
 
 jobs:
-  build-binaries:
-    name: Build Go Binaries
+  validate:
+    name: Validate and build WebUI
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
-
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: 'npm'
+          cache: npm
           cache-dependency-path: frontend/package-lock.json
-
-      - name: Build Frontend
-        working-directory: ./frontend
+      - name: Validate and Build Frontend
+        working-directory: frontend
         run: |
           npm ci
+          npm run lint
           npm run build
-
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.27'
+          go-version-file: go.mod
           cache: true
+      - name: Test Backend
+        run: go test ./...
+      - name: Check Concurrent Runtime Paths
+        run: go test -race ./internal/group ./internal/outbound/pool ./internal/monitor ./internal/probe
+      - name: Upload WebUI
+        uses: actions/upload-artifact@v4
+        with:
+          name: webui
+          path: internal/monitor/assets/
+          if-no-files-found: error
+          retention-days: 3
 
+  build-binaries:
+    name: Build Linux ${{ matrix.arch }}
+    needs: validate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      - name: Download WebUI
+        uses: actions/download-artifact@v4
+        with:
+          name: webui
+          path: internal/monitor/assets
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
       - name: Build Linux Binary
         env:
           GOOS: linux
-          GOARCH: amd64
+          GOARCH: ${{ matrix.arch }}
           CGO_ENABLED: 0
         run: |
-          go build -trimpath -ldflags "-s -w" -tags "with_utls with_quic with_grpc with_wireguard with_gvisor" -o easy-proxies-linux-amd64 ./cmd/easy_proxies
-
-      - name: Build Windows Binary
-        env:
-          GOOS: windows
-          GOARCH: amd64
-          CGO_ENABLED: 0
-        run: |
-          go build -trimpath -ldflags "-s -w" -tags "with_utls with_quic with_grpc with_wireguard with_gvisor" -o easy-proxies-windows-amd64.exe ./cmd/easy_proxies
-
-      - name: Upload Artifacts
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w" -tags "with_utls with_quic with_grpc with_wireguard with_gvisor" -o "dist/easy-proxies-linux-${GOARCH}" ./cmd/easy_proxies
+          cd dist
+          sha256sum "easy-proxies-linux-${GOARCH}" > "easy-proxies-linux-${GOARCH}.sha256"
+      - name: Upload Binary
         uses: actions/upload-artifact@v4
         with:
-          name: binaries
-          path: |
-            easy-proxies-linux-amd64
-            easy-proxies-windows-amd64.exe
+          name: binaries-linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
 
+  release:
+    name: Publish Linux Release
+    needs: build-binaries
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-linux-*
+          merge-multiple: true
+          path: dist
+      - name: Verify Release Checksums
+        working-directory: dist
+        run: |
+          test -s easy-proxies-linux-amd64
+          test -s easy-proxies-linux-arm64
+          sha256sum -c easy-proxies-linux-amd64.sha256
+          sha256sum -c easy-proxies-linux-arm64.sha256
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v') # 只有打 tag 的时候才创建 Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            easy-proxies-linux-amd64
-            easy-proxies-windows-amd64.exe
+            dist/easy-proxies-linux-amd64
+            dist/easy-proxies-linux-amd64.sha256
+            dist/easy-proxies-linux-arm64
+            dist/easy-proxies-linux-arm64.sha256
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
 
   build-and-push-docker:
     name: Build and Push Docker Image
