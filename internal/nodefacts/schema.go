@@ -416,7 +416,7 @@ func registerBasicFields(registry *Registry) {
 	for _, field := range []Field{
 		{Name: FieldNodeName, Label: "节点名称", Group: GroupBasic, Kind: KindString, Source: "nodes.name"},
 		{Name: FieldNodeRegion, Label: "地区", Group: GroupBasic, Kind: KindEnum,
-			EnumKey: EnumRegion, Source: "nodes.region（空值归一为 other）"},
+			EnumKey: EnumRegion, Source: "nodes.region（空值为未知；旧版规则保留 other 兼容语义）"},
 		{Name: FieldNodeCountry, Label: "国家/地区名", Group: GroupBasic, Kind: KindString, Source: "nodes.country"},
 		{Name: FieldNodeProtocol, Label: "协议", Group: GroupBasic, Kind: KindEnum,
 			EnumKey: EnumProtocol, Source: "nodes.uri 的协议头"},

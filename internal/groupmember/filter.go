@@ -14,7 +14,7 @@ import (
 	"strings"
 
 	"easy_proxies/internal/config"
-	"easy_proxies/internal/geoip"
+	"easy_proxies/internal/noderegion"
 	"easy_proxies/internal/store"
 )
 
@@ -31,10 +31,13 @@ type Node struct {
 // Filter answers membership for one group pool. The zero value allows nothing;
 // build one with NewFilter.
 type Filter struct {
-	enabled  bool
-	regions  map[string]struct{}
-	explicit map[int64]struct{}
-	excluded map[int64]struct{}
+	enabled        bool
+	regions        []string
+	excludeRegions []string
+	regionVersion  int
+	includeUnknown bool
+	explicit       map[int64]struct{}
+	excluded       map[int64]struct{}
 	// whitelist and blacklist hold tag names resolved from the group's tag IDs.
 	// An ID with no known name resolves to a sentinel no node can carry, so a
 	// stale reference narrows the group instead of quietly widening it.
@@ -66,14 +69,14 @@ func NewFilter(groupCfg config.GroupPoolConfig, opts ...Option) Filter {
 		apply(&options)
 	}
 	filter := Filter{
-		enabled:  groupCfg.Enabled,
-		regions:  make(map[string]struct{}, len(groupCfg.Regions)),
-		explicit: make(map[int64]struct{}, len(groupCfg.ExplicitNodeIDs)),
-		excluded: make(map[int64]struct{}, len(groupCfg.ExcludedNodeIDs)),
-		matchAll: strings.EqualFold(strings.TrimSpace(groupCfg.TagFilterMatch), store.TagFilterMatchAll),
-	}
-	for _, region := range groupCfg.Regions {
-		filter.regions[NormalizeRegion(region)] = struct{}{}
+		enabled:        groupCfg.Enabled,
+		regions:        append([]string(nil), groupCfg.Regions...),
+		excludeRegions: append([]string(nil), groupCfg.ExcludeRegions...),
+		regionVersion:  groupCfg.RegionRuleVersion,
+		includeUnknown: groupCfg.IncludeUnknownRegion,
+		explicit:       make(map[int64]struct{}, len(groupCfg.ExplicitNodeIDs)),
+		excluded:       make(map[int64]struct{}, len(groupCfg.ExcludedNodeIDs)),
+		matchAll:       strings.EqualFold(strings.TrimSpace(groupCfg.TagFilterMatch), store.TagFilterMatchAll),
 	}
 	for _, nodeID := range groupCfg.ExplicitNodeIDs {
 		filter.explicit[nodeID] = struct{}{}
@@ -126,7 +129,10 @@ func (f Filter) Allow(node Node) bool {
 	if _, explicit := f.explicit[node.ID]; explicit {
 		return true
 	}
-	if _, regional := f.regions[NormalizeRegion(node.Region)]; !regional {
+	if !noderegion.Matches(node.Region, f.regions, f.includeUnknown, f.regionVersion) {
+		return false
+	}
+	if noderegion.Matches(node.Region, f.excludeRegions, false, f.regionVersion) {
 		return false
 	}
 	return f.tagsAllow(node.Tags)
@@ -185,9 +191,5 @@ func Nodes(cfg *config.Config, groupCfg config.GroupPoolConfig, opts ...Option) 
 // sides of the comparison have to agree that this means geoip.RegionOther —
 // which is the bucket the builder has always put such a node in.
 func NormalizeRegion(region string) string {
-	normalized := strings.ToLower(strings.TrimSpace(region))
-	if normalized == "" {
-		return geoip.RegionOther
-	}
-	return normalized
+	return noderegion.Legacy(region)
 }

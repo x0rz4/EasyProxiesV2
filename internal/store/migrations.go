@@ -433,6 +433,26 @@ WHEN OLD.identity_hash <> NEW.identity_hash BEGIN
 END;
 `,
 		},
+		{
+			Version:     16,
+			Description: "version region filters and separate unknown locations",
+			Up: `
+ALTER TABLE group_pools ADD COLUMN region_rule_version INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE group_pools ADD COLUMN include_unknown_region INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE group_pools ADD COLUMN exclude_regions_json TEXT NOT NULL DEFAULT '[]';
+UPDATE tags SET rule_json=json_set(rule_json,'$.region_version',1)
+WHERE CASE WHEN json_valid(rule_json) THEN json_type(rule_json)='object' ELSE 0 END;
+UPDATE nodes SET region='',country='' WHERE lower(trim(region)) IN ('other','unknown');
+UPDATE node_locations SET state_json=json_set(state_json,'$.current.iso','','$.current.country','','$.current.known',json('false'))
+WHERE json_extract(state_json,'$.current.iso') IN ('other','unknown');
+DROP TRIGGER node_location_identity;
+CREATE TRIGGER node_location_identity AFTER UPDATE OF identity_hash ON nodes
+WHEN OLD.identity_hash<>'' AND OLD.identity_hash <> NEW.identity_hash BEGIN
+    UPDATE node_locations SET revision=revision+1, state_json='{}' WHERE node_id=NEW.id;
+    UPDATE nodes SET region='',country='' WHERE id=NEW.id;
+END;
+`,
+		},
 	}
 }
 

@@ -270,9 +270,8 @@ func TestLoadEmptyAndSubsetSelections(t *testing.T) {
 	if len(loaded) != 3 || loaded[0].NodeID != 1 || loaded[1].NodeID != 2 || loaded[2].NodeID != 3 {
 		t.Fatalf("Load must sort by node ID, got %+v", loaded)
 	}
-	// An empty region normalizes to the bucket the group builder uses, so a rule
-	// can address unclassified nodes.
-	assertText(t, loaded[0], FieldNodeRegion, "other")
+	assertUnknown(t, loaded[0], FieldNodeRegion)
+	assertText(t, loaded[0], fieldNodeRegionLegacy, "other")
 
 	subset := mustLoad(t, source, []int64{2})
 	if len(subset) != 1 || subset[0].NodeID != 2 {

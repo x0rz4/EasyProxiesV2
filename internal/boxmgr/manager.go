@@ -636,6 +636,7 @@ func storeGroupFromConfig(groupCfg config.GroupPoolConfig) *store.GroupPool {
 	groupPool := &store.GroupPool{ID: groupCfg.ID, Name: groupCfg.Name, BindAddress: groupCfg.BindAddress,
 		BindPort: groupCfg.BindPort, Protocol: groupCfg.Protocol, Username: groupCfg.Username, Password: groupCfg.Password,
 		DispatchMode: groupCfg.DispatchMode, Regions: append([]string(nil), groupCfg.Regions...),
+		RegionRuleVersion: groupCfg.RegionRuleVersion, IncludeUnknownRegion: groupCfg.IncludeUnknownRegion, ExcludeRegions: append([]string(nil), groupCfg.ExcludeRegions...),
 		ExplicitNodeIDs: append([]int64(nil), groupCfg.ExplicitNodeIDs...), ExcludedNodeIDs: append([]int64(nil), groupCfg.ExcludedNodeIDs...),
 		TagWhitelist: append([]int64(nil), groupCfg.TagWhitelist...), TagBlacklist: append([]int64(nil), groupCfg.TagBlacklist...),
 		TagFilterMatch:       groupCfg.TagFilterMatch,
@@ -643,7 +644,7 @@ func storeGroupFromConfig(groupCfg config.GroupPoolConfig) *store.GroupPool {
 		HealthCheckSeconds: int(groupCfg.HealthCheckInterval / time.Second), CurrentActiveNodeID: groupCfg.CurrentActiveNodeID,
 		RecoveryEnabled: groupCfg.RecoveryEnabled, RecoverySuccessThreshold: groupCfg.RecoverySuccessThreshold,
 		RecoveryCooldownSeconds: int(groupCfg.RecoveryCooldown / time.Second),
-		Enabled: groupCfg.Enabled, SubscriptionEnabled: groupCfg.SubscriptionEnabled, SubscriptionToken: groupCfg.SubscriptionToken,
+		Enabled:                 groupCfg.Enabled, SubscriptionEnabled: groupCfg.SubscriptionEnabled, SubscriptionToken: groupCfg.SubscriptionToken,
 		SubscriptionMode: groupCfg.SubscriptionMode, ExternalHost: groupCfg.ExternalHost,
 		CreatedAt: groupCfg.CreatedAt, UpdatedAt: groupCfg.UpdatedAt}
 	for _, state := range groupCfg.NodeStates {
@@ -1313,7 +1314,7 @@ func (m *Manager) applyGroupRuntimeIncremental(cfg *config.Config, groupCfg conf
 		FailureWindow: groupCfg.FailureWindow, FailureThreshold: groupCfg.FailureThreshold,
 		HealthCheckInterval: groupCfg.HealthCheckInterval, PreferredNodeID: groupCfg.CurrentActiveNodeID,
 		RecoveryEnabled: groupCfg.RecoveryEnabled, RecoveryThreshold: groupCfg.RecoverySuccessThreshold,
-		RecoveryCooldown: groupCfg.RecoveryCooldown,
+		RecoveryCooldown:  groupCfg.RecoveryCooldown,
 		InitialGroupState: initial})
 	if err != nil {
 		m.cleanupCreatedMembers(instance, createdTags)
@@ -1613,6 +1614,7 @@ func groupRuntimeEqual(before, after *store.GroupPool) bool {
 		reflect.DeepEqual(before.ExplicitNodeIDs, after.ExplicitNodeIDs) && reflect.DeepEqual(before.ExcludedNodeIDs, after.ExcludedNodeIDs) &&
 		reflect.DeepEqual(before.TagWhitelist, after.TagWhitelist) && reflect.DeepEqual(before.TagBlacklist, after.TagBlacklist) &&
 		before.TagFilterMatch == after.TagFilterMatch &&
+		before.RegionRuleVersion == after.RegionRuleVersion && before.IncludeUnknownRegion == after.IncludeUnknownRegion && reflect.DeepEqual(before.ExcludeRegions, after.ExcludeRegions) &&
 		before.FailureWindowSeconds == after.FailureWindowSeconds && before.FailureThreshold == after.FailureThreshold &&
 		before.HealthCheckSeconds == after.HealthCheckSeconds && before.Enabled == after.Enabled &&
 		before.RecoveryEnabled == after.RecoveryEnabled && before.RecoverySuccessThreshold == after.RecoverySuccessThreshold &&
@@ -2276,11 +2278,12 @@ func GroupConfigsFromStore(groups []store.GroupPool) []config.GroupPoolConfig {
 		converted := config.GroupPoolConfig{ID: group.ID, Name: group.Name, BindAddress: group.BindAddress,
 			BindPort: group.BindPort, Protocol: group.Protocol, Username: group.Username, Password: group.Password,
 			DispatchMode: group.DispatchMode, Regions: append([]string(nil), group.Regions...),
-			ExplicitNodeIDs:  append([]int64(nil), group.ExplicitNodeIDs...),
-			ExcludedNodeIDs:  append([]int64(nil), group.ExcludedNodeIDs...),
-			TagWhitelist:     append([]int64(nil), group.TagWhitelist...),
-			TagBlacklist:     append([]int64(nil), group.TagBlacklist...),
-			TagFilterMatch:   group.TagFilterMatch,
+			ExplicitNodeIDs:   append([]int64(nil), group.ExplicitNodeIDs...),
+			ExcludedNodeIDs:   append([]int64(nil), group.ExcludedNodeIDs...),
+			TagWhitelist:      append([]int64(nil), group.TagWhitelist...),
+			TagBlacklist:      append([]int64(nil), group.TagBlacklist...),
+			TagFilterMatch:    group.TagFilterMatch,
+			RegionRuleVersion: group.RegionRuleVersion, IncludeUnknownRegion: group.IncludeUnknownRegion, ExcludeRegions: append([]string(nil), group.ExcludeRegions...),
 			FailureWindow:    time.Duration(group.FailureWindowSeconds) * time.Second,
 			FailureThreshold: group.FailureThreshold, HealthCheckInterval: time.Duration(group.HealthCheckSeconds) * time.Second,
 			RecoveryEnabled: group.RecoveryEnabled, RecoverySuccessThreshold: group.RecoverySuccessThreshold,

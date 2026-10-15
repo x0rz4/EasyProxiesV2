@@ -24,8 +24,9 @@ FROM node_locations l JOIN nodes n ON n.id=l.node_id WHERE n.id=?`, nodeID).Scan
 	}
 	state.Token = nodeloc.Token{Identity: identity, Revision: revision}
 	if state.Current.Source == "" {
-		iso := nodeloc.Normalize(region)
-		state.Current = nodeloc.Location{ISO: iso, Country: strings.TrimSpace(country), Known: nodeloc.ValidISO(iso), Source: nodeloc.SourceLegacy}
+		// Preserve legacy text until verified; v1 group rules compare that text.
+		iso := strings.ToLower(strings.TrimSpace(region))
+		state.Current = nodeloc.Location{ISO: iso, Country: strings.TrimSpace(country), Known: nodeloc.ValidISO(nodeloc.Normalize(iso)), Source: nodeloc.SourceLegacy}
 	}
 	return state, nil
 }

@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"easy_proxies/internal/geoip"
 	json "easy_proxies/internal/jsonx"
+	"easy_proxies/internal/noderegion"
 	"easy_proxies/internal/store"
 )
 
@@ -106,14 +106,11 @@ func (l *Loader) Load(ctx context.Context, nodeIDs []int64) ([]NodeFacts, error)
 	return out, nil
 }
 
-// NormalizeRegion lowercases a region code and maps the empty one to
-// geoip.RegionOther, matching how the group builder buckets unclassified nodes.
+const fieldNodeRegionLegacy = "_legacy.node.region"
+
+// NormalizeRegion returns a canonical country code, or empty for unknown.
 func NormalizeRegion(region string) string {
-	trimmed := strings.ToLower(strings.TrimSpace(region))
-	if trimmed == "" {
-		return geoip.RegionOther
-	}
-	return trimmed
+	return noderegion.Normalize(region)
 }
 
 func (l *Loader) manualTagNames(ctx context.Context, ids []int64) (map[int64][]string, error) {
@@ -180,7 +177,8 @@ func knownTextAt(value string, checkedAt time.Time) Fact[string] {
 // max_age_seconds can never expire them — they are not measurements.
 func applyNodeFields(facts NodeFacts, node store.Node) {
 	facts.Set(FieldNodeName, StringValue(Known(node.Name)))
-	facts.Set(FieldNodeRegion, EnumValue(Known(NormalizeRegion(node.Region))))
+	facts.Set(FieldNodeRegion, EnumValue(knownText(NormalizeRegion(node.Region))))
+	facts.Set(fieldNodeRegionLegacy, EnumValue(Known(noderegion.Legacy(node.Region))))
 	facts.Set(FieldNodeCountry, StringValue(knownText(node.Country)))
 	facts.Set(FieldNodeProtocol, EnumValue(knownText(uriProtocol(node.URI))))
 	facts.Set(FieldNodeSource, EnumValue(knownText(node.Source)))

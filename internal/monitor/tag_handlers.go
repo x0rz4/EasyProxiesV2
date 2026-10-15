@@ -637,6 +637,13 @@ func (s *Server) tagFromInput(ctx context.Context, input tagInput, existing *sto
 		tag.Priority = *input.Priority
 	}
 	if input.Rule != nil {
+		// Older clients do not send a region version when editing a rule.
+		// Keep the persisted interpretation until an explicit v2 migration.
+		if input.Rule.RegionVersion == 0 && existing != nil {
+			if previous, err := nodefacts.ParseRule([]byte(existing.RuleJSON)); err == nil {
+				input.Rule.RegionVersion = previous.RegionVersion
+			}
+		}
 		if s.tagSvc == nil {
 			return nil, false, errors.New("标签服务不可用")
 		}

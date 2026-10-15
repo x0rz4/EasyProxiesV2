@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"easy_proxies/internal/noderegion"
+
 	// stdjson is only used for its Number type, so a decoder configured with
 	// UseNumber still produces operands this package can read.
 	stdjson "encoding/json"
@@ -24,16 +26,65 @@ func Evaluate(condition Condition, facts NodeFacts, now time.Time) (bool, error)
 	if condition.IsEmpty() {
 		return false, nil
 	}
+	if condition.RegionVersion != 1 {
+		matched, known, err := evaluateTruth(condition, facts, now)
+		return matched && known, err
+	}
 	if condition.IsGroup() {
 		return evaluateGroup(condition, facts, now)
 	}
 	return evaluateLeaf(condition, facts, now)
 }
 
+// evaluateTruth preserves unknown through boolean composition. In particular,
+// none(unknown-region == hk) must not admit an unclassified node.
+func evaluateTruth(condition Condition, facts NodeFacts, now time.Time) (bool, bool, error) {
+	if !condition.IsGroup() {
+		value := facts.Value(condition.FieldName)
+		if condition.MaxAgeSeconds > 0 {
+			value = value.Aged(time.Duration(condition.MaxAgeSeconds)*time.Second, now)
+		}
+		if condition.Op != OpIsKnown && condition.Op != OpIsUnknown && !value.Known {
+			return false, false, nil
+		}
+		condition.RegionVersion = 2
+		matched, err := evaluateLeaf(condition, facts, now)
+		return matched, true, err
+	}
+	unknown := false
+	for _, child := range condition.Children {
+		matched, known, err := evaluateTruth(child, facts, now)
+		if err != nil {
+			return false, false, err
+		}
+		if !known {
+			unknown = true
+			continue
+		}
+		if condition.Match == MatchAll && !matched {
+			return false, true, nil
+		}
+		if condition.Match == MatchAny && matched {
+			return true, true, nil
+		}
+		if condition.Match == MatchNone && matched {
+			return false, true, nil
+		}
+	}
+	if condition.Match != MatchAll && condition.Match != MatchAny && condition.Match != MatchNone {
+		return false, false, fmt.Errorf("未知的组合方式 %q", condition.Match)
+	}
+	if unknown {
+		return false, false, nil
+	}
+	return condition.Match != MatchAny, true, nil
+}
+
 func evaluateGroup(condition Condition, facts NodeFacts, now time.Time) (bool, error) {
 	switch condition.Match {
 	case MatchAll:
 		for _, child := range condition.Children {
+			child.RegionVersion = condition.RegionVersion
 			matched, err := Evaluate(child, facts, now)
 			if err != nil {
 				return false, err
@@ -46,6 +97,7 @@ func evaluateGroup(condition Condition, facts NodeFacts, now time.Time) (bool, e
 	case MatchAny, MatchNone:
 		matchedAny := false
 		for _, child := range condition.Children {
+			child.RegionVersion = condition.RegionVersion
 			matched, err := Evaluate(child, facts, now)
 			if err != nil {
 				return false, err
@@ -66,6 +118,9 @@ func evaluateGroup(condition Condition, facts NodeFacts, now time.Time) (bool, e
 
 func evaluateLeaf(condition Condition, facts NodeFacts, now time.Time) (bool, error) {
 	value := facts.Value(condition.FieldName)
+	if condition.FieldName == FieldNodeRegion && condition.RegionVersion == 1 {
+		value = facts.Value(fieldNodeRegionLegacy)
+	}
 	if condition.MaxAgeSeconds > 0 {
 		value = value.Aged(time.Duration(condition.MaxAgeSeconds)*time.Second, now)
 	}
@@ -80,11 +135,41 @@ func evaluateLeaf(condition Condition, facts NodeFacts, now time.Time) (bool, er
 		// because the node was never measured.
 		return false, nil
 	}
-	matched, err := compare(value, condition)
+	var matched bool
+	var err error
+	if condition.FieldName == FieldNodeRegion && condition.RegionVersion != 1 {
+		matched, err = compareRegion(value, condition)
+	} else {
+		matched, err = compare(value, condition)
+	}
 	if err != nil {
 		return false, err
 	}
 	return condition.Negate != matched, nil
+}
+
+func compareRegion(value Value, condition Condition) (bool, error) {
+	match := func(operand any) bool {
+		text, ok := operand.(string)
+		return ok && noderegion.Matches(value.Str, []string{text}, false, 2)
+	}
+	switch condition.Op {
+	case OpEq:
+		return match(condition.Value), nil
+	case OpNe:
+		return !match(condition.Value), nil
+	case OpIn, OpNotIn:
+		found := false
+		for _, operand := range condition.Values {
+			if match(operand) {
+				found = true
+				break
+			}
+		}
+		return (condition.Op == OpIn) == found, nil
+	default:
+		return compare(value, condition)
+	}
 }
 
 func compare(value Value, condition Condition) (bool, error) {

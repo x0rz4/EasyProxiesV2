@@ -20,8 +20,11 @@ const (
 // Condition is one node of the rule AST. A node is either a group (Match set,
 // Children non-empty) or a leaf (Field + Op set); never both.
 type Condition struct {
-	Match    string      `json:"match,omitempty"`
-	Children []Condition `json:"children,omitempty"`
+	// RegionVersion=1 preserves pre-v16 region rules. New rules use v2 (zero
+	// means current); children inherit the root version.
+	RegionVersion int         `json:"region_version,omitempty"`
+	Match         string      `json:"match,omitempty"`
+	Children      []Condition `json:"children,omitempty"`
 
 	// FieldName is the registry key of the fact being compared. It is named
 	// FieldName rather than Field so it does not read as the Field type.
@@ -119,6 +122,9 @@ func collectFields(condition Condition, seen map[string]struct{}) {
 // only gate between operator input and the evaluator, so it verifies structure,
 // field existence, field/operator compatibility, value arity and value types.
 func (c Condition) Validate(registry *Registry, limits Limits) error {
+	if c.RegionVersion < 0 || c.RegionVersion > 2 {
+		return fmt.Errorf("不支持的地区规则版本: %d", c.RegionVersion)
+	}
 	if c.IsEmpty() {
 		return nil
 	}

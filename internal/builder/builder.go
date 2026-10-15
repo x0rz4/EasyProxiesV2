@@ -101,8 +101,8 @@ func BuildVersion(cfg *config.Config, runtimeTagVersion uint64) (option.Options,
 			meta.Country = node.Country
 			regionMembers[meta.Region] = append(regionMembers[meta.Region], tag)
 		} else {
-			meta.Region = geoip.RegionOther
-			meta.Country = "Unknown"
+			meta.Region = ""
+			meta.Country = ""
 			regionMembers[geoip.RegionOther] = append(regionMembers[geoip.RegionOther], tag)
 		}
 

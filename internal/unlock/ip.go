@@ -30,7 +30,9 @@ func probeExitIP(runtime Runtime, geo *geoip.Lookup) IPInfo {
 		if info.ISOCode == "" {
 			info.ISOCode = strings.ToUpper(region.ISOCode)
 		}
-		info.Region = region.Code
+		// A trace-provided country and its fallback must agree on one canonical
+		// exit code; an unclassifiable GeoIP result must not erase trace data.
+		info.Region = strings.ToLower(info.ISOCode)
 	} else if info.ISOCode != "" {
 		info.Region = strings.ToLower(info.ISOCode)
 	}

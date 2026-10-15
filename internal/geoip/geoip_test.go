@@ -196,9 +196,9 @@ func TestIsoCodeToRegionIsCountryCode(t *testing.T) {
 	if got := isoCodeToRegion("DE"); got != "de" {
 		t.Errorf("isoCodeToRegion(DE) = %q, want de", got)
 	}
-	// Unknown/empty falls back to "other".
-	if got := isoCodeToRegion(""); got != RegionOther {
-		t.Errorf("isoCodeToRegion(\"\") = %q, want %q", got, RegionOther)
+	// Unknown is separate from the known-country other query bucket.
+	if got := isoCodeToRegion(""); got != "" {
+		t.Errorf("isoCodeToRegion(\"\") = %q, want empty", got)
 	}
 }
 
@@ -207,12 +207,11 @@ func TestRegionNameShowsCountryCode(t *testing.T) {
 	if got := RegionName(RegionJP); got != "Japan" {
 		t.Errorf("RegionName(jp) = %q, want Japan", got)
 	}
-	// Any 2-letter code shows the uppercased code (not "Unknown").
-	if got := RegionName("sg"); got != "SG" {
-		t.Errorf("RegionName(sg) = %q, want SG", got)
+	if got := RegionName("sg"); got != "Singapore" {
+		t.Errorf("RegionName(sg) = %q, want Singapore", got)
 	}
-	if got := RegionName("de"); got != "DE" {
-		t.Errorf("RegionName(de) = %q, want DE", got)
+	if got := RegionName("de"); got != "Germany" {
+		t.Errorf("RegionName(de) = %q, want Germany", got)
 	}
 }
 

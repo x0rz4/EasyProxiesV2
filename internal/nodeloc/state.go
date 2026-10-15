@@ -1,6 +1,7 @@
 package nodeloc
 
 import (
+	"easy_proxies/internal/noderegion"
 	"net/netip"
 	"strings"
 	"time"
@@ -74,7 +75,7 @@ func sourcePriority(source Source) int {
 
 // ValidISO validates the lowercase ISO storage shape, excluding bucket names.
 func ValidISO(iso string) bool {
-	return len(iso) == 2 && iso[0] >= 'a' && iso[0] <= 'z' && iso[1] >= 'a' && iso[1] <= 'z'
+	return noderegion.Valid(iso)
 }
 
 // Decide is pure; the repository must read state and commit its result in one

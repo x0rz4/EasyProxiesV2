@@ -16,6 +16,8 @@ import (
 	"sync"
 	"time"
 
+	"easy_proxies/internal/noderegion"
+
 	"github.com/oschwald/geoip2-golang/v2"
 )
 
@@ -549,7 +551,7 @@ func regionInfoFromCountry(record *geoip2.Country) RegionInfo {
 }
 
 func unknownRegionInfo() RegionInfo {
-	return RegionInfo{Code: RegionOther, Country: "Unknown", ISOCode: ""}
+	return RegionInfo{}
 }
 
 // LookupURI extracts server from URI and returns region info
@@ -644,44 +646,17 @@ func extractSSRHost(uri string) string {
 // than collapsing most of the world into "other". An empty code (unknown /
 // unresolvable host) falls back to RegionOther.
 func isoCodeToRegion(isoCode string) string {
-	code := strings.ToLower(strings.TrimSpace(isoCode))
-	if code == "" {
-		return RegionOther
-	}
-	return code
+	return noderegion.Normalize(isoCode)
 }
 
-// AllRegions returns the well-known region codes. Region codes are not limited
-// to this set at runtime — any lowercased ISO country code may appear — but
-// these are the ones treated as first-class for routing and display.
+// AllRegions lists supported countries and the explicit other query bucket.
 func AllRegions() []string {
-	return []string{RegionJP, RegionKR, RegionUS, RegionHK, RegionTW, RegionOther}
+	return append(noderegion.Codes(), RegionOther)
 }
 
 // RegionName returns the display name for a region code.
 func RegionName(code string) string {
-	switch code {
-	case RegionJP:
-		return "Japan"
-	case RegionKR:
-		return "Korea"
-	case RegionUS:
-		return "USA"
-	case RegionHK:
-		return "Hong Kong"
-	case RegionTW:
-		return "Taiwan"
-	case RegionOther:
-		return "Other"
-	default:
-		// Region codes are lowercased ISO country codes; surface the code
-		// uppercased rather than a generic "Unknown".
-		upper := strings.ToUpper(code)
-		if len(upper) == 2 && isAlpha(upper) {
-			return upper
-		}
-		return "Unknown"
-	}
+	return noderegion.Name(code)
 }
 
 // RegionEmoji returns the flag emoji for a region code.
@@ -692,7 +667,7 @@ func RegionEmoji(code string) string {
 	if code == RegionOther {
 		return "🌍"
 	}
-	c := strings.ToLower(code)
+	c := noderegion.Normalize(code)
 	if len(c) != 2 || !isAlpha(c) {
 		return "❓"
 	}

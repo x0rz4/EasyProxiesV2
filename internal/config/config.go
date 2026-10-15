@@ -81,27 +81,30 @@ type PoolConfig struct {
 // GroupPoolConfig describes an independent listener backed by a dynamic subset
 // of the globally configured nodes. Definitions are persisted in SQLite.
 type GroupPoolConfig struct {
-	ID              int64    `yaml:"-" json:"id"`
-	Name            string   `yaml:"-" json:"name"`
-	BindAddress     string   `yaml:"-" json:"bind_address"`
-	BindPort        uint16   `yaml:"-" json:"bind_port"`
-	Protocol        string   `yaml:"-" json:"protocol"`
-	Username        string   `yaml:"-" json:"username,omitempty"`
-	Password        string   `yaml:"-" json:"password,omitempty"`
-	DispatchMode    string   `yaml:"-" json:"dispatch_mode"`
-	Regions         []string `yaml:"-" json:"regions"`
-	ExplicitNodeIDs []int64  `yaml:"-" json:"explicit_node_ids"`
-	ExcludedNodeIDs []int64  `yaml:"-" json:"excluded_node_ids"`
+	ID                   int64    `yaml:"-" json:"id"`
+	Name                 string   `yaml:"-" json:"name"`
+	BindAddress          string   `yaml:"-" json:"bind_address"`
+	BindPort             uint16   `yaml:"-" json:"bind_port"`
+	Protocol             string   `yaml:"-" json:"protocol"`
+	Username             string   `yaml:"-" json:"username,omitempty"`
+	Password             string   `yaml:"-" json:"password,omitempty"`
+	DispatchMode         string   `yaml:"-" json:"dispatch_mode"`
+	Regions              []string `yaml:"-" json:"regions"`
+	RegionRuleVersion    int      `yaml:"-" json:"region_rule_version"`
+	IncludeUnknownRegion bool     `yaml:"-" json:"include_unknown_region"`
+	ExcludeRegions       []string `yaml:"-" json:"exclude_regions"`
+	ExplicitNodeIDs      []int64  `yaml:"-" json:"explicit_node_ids"`
+	ExcludedNodeIDs      []int64  `yaml:"-" json:"excluded_node_ids"`
 	// TagWhitelist and TagBlacklist carry tag IDs, not names, so renaming a tag
 	// cannot silently change who is in the group. An empty whitelist means the
 	// group has no tag requirement.
 	TagWhitelist []int64 `yaml:"-" json:"tag_whitelist"`
 	TagBlacklist []int64 `yaml:"-" json:"tag_blacklist"`
 	// TagFilterMatch is "any" or "all" and applies to TagWhitelist only.
-	TagFilterMatch      string                 `yaml:"-" json:"tag_filter_match"`
-	FailureWindow       time.Duration          `yaml:"-" json:"-"`
-	FailureThreshold    int                    `yaml:"-" json:"failure_threshold"`
-	HealthCheckInterval time.Duration          `yaml:"-" json:"-"`
+	TagFilterMatch      string        `yaml:"-" json:"tag_filter_match"`
+	FailureWindow       time.Duration `yaml:"-" json:"-"`
+	FailureThreshold    int           `yaml:"-" json:"failure_threshold"`
+	HealthCheckInterval time.Duration `yaml:"-" json:"-"`
 	// Recovery* control automatic re-admission of an evicted member once its
 	// health probes succeed again.
 	RecoveryEnabled          bool                   `yaml:"-" json:"-"`
@@ -1949,6 +1952,7 @@ func (c *Config) Clone() *Config {
 		copy(cloned.Groups, c.Groups)
 		for idx := range cloned.Groups {
 			cloned.Groups[idx].Regions = append([]string(nil), c.Groups[idx].Regions...)
+			cloned.Groups[idx].ExcludeRegions = append([]string(nil), c.Groups[idx].ExcludeRegions...)
 			cloned.Groups[idx].ExplicitNodeIDs = append([]int64(nil), c.Groups[idx].ExplicitNodeIDs...)
 			cloned.Groups[idx].ExcludedNodeIDs = append([]int64(nil), c.Groups[idx].ExcludedNodeIDs...)
 			cloned.Groups[idx].TagWhitelist = append([]int64(nil), c.Groups[idx].TagWhitelist...)

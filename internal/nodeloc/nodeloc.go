@@ -12,7 +12,7 @@
 package nodeloc
 
 import (
-	"strings"
+	"easy_proxies/internal/noderegion"
 	"time"
 )
 
@@ -35,5 +35,5 @@ type Observation struct {
 
 // Normalize returns the stored form of a region code: trimmed and lowercase.
 func Normalize(region string) string {
-	return strings.ToLower(strings.TrimSpace(region))
+	return noderegion.Normalize(region)
 }

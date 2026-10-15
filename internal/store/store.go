@@ -348,17 +348,20 @@ type NodeFilter struct {
 
 // GroupPool is a persisted independently-addressable proxy pool definition.
 type GroupPool struct {
-	ID              int64    `json:"id"`
-	Name            string   `json:"name"`
-	BindAddress     string   `json:"bind_address"`
-	BindPort        uint16   `json:"bind_port"`
-	Protocol        string   `json:"protocol"`
-	Username        string   `json:"username,omitempty"`
-	Password        string   `json:"password,omitempty"`
-	DispatchMode    string   `json:"dispatch_mode"`
-	Regions         []string `json:"regions"`
-	ExplicitNodeIDs []int64  `json:"explicit_node_ids"`
-	ExcludedNodeIDs []int64  `json:"excluded_node_ids"`
+	ID                   int64    `json:"id"`
+	Name                 string   `json:"name"`
+	BindAddress          string   `json:"bind_address"`
+	BindPort             uint16   `json:"bind_port"`
+	Protocol             string   `json:"protocol"`
+	Username             string   `json:"username,omitempty"`
+	Password             string   `json:"password,omitempty"`
+	DispatchMode         string   `json:"dispatch_mode"`
+	Regions              []string `json:"regions"`
+	RegionRuleVersion    int      `json:"region_rule_version"`
+	IncludeUnknownRegion bool     `json:"include_unknown_region"`
+	ExcludeRegions       []string `json:"exclude_regions"`
+	ExplicitNodeIDs      []int64  `json:"explicit_node_ids"`
+	ExcludedNodeIDs      []int64  `json:"excluded_node_ids"`
 	// TagWhitelist and TagBlacklist hold tag IDs so renaming a tag cannot break
 	// a group. An empty whitelist means "no tag requirement".
 	TagWhitelist []int64 `json:"tag_whitelist"`

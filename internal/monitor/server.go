@@ -29,6 +29,7 @@ import (
 	json "easy_proxies/internal/jsonx"
 	"easy_proxies/internal/nodecodec"
 	"easy_proxies/internal/nodedetect"
+	"easy_proxies/internal/noderegion"
 	"easy_proxies/internal/nodetag"
 	"easy_proxies/internal/store"
 	"easy_proxies/internal/unlock"
@@ -2593,16 +2594,19 @@ func (s *Server) geoipEnabled() bool {
 }
 
 type groupPoolInput struct {
-	Name            string   `json:"name"`
-	BindAddress     string   `json:"bind_address"`
-	BindPort        uint16   `json:"bind_port"`
-	Protocol        string   `json:"protocol"`
-	Username        string   `json:"username"`
-	Password        string   `json:"password"`
-	DispatchMode    string   `json:"dispatch_mode"`
-	Regions         []string `json:"regions"`
-	ExplicitNodeIDs []int64  `json:"explicit_node_ids"`
-	ExcludedNodeIDs *[]int64 `json:"excluded_node_ids"`
+	Name                 string    `json:"name"`
+	BindAddress          string    `json:"bind_address"`
+	BindPort             uint16    `json:"bind_port"`
+	Protocol             string    `json:"protocol"`
+	Username             string    `json:"username"`
+	Password             string    `json:"password"`
+	DispatchMode         string    `json:"dispatch_mode"`
+	Regions              []string  `json:"regions"`
+	RegionRuleVersion    *int      `json:"region_rule_version"`
+	IncludeUnknownRegion *bool     `json:"include_unknown_region"`
+	ExcludeRegions       *[]string `json:"exclude_regions"`
+	ExplicitNodeIDs      []int64   `json:"explicit_node_ids"`
+	ExcludedNodeIDs      *[]int64  `json:"excluded_node_ids"`
 	// TagWhitelist and TagBlacklist are pointers so that omitting them from a
 	// partial update leaves the stored filter alone, matching ExcludedNodeIDs.
 	TagWhitelist         *[]int64 `json:"tag_whitelist"`
@@ -2613,11 +2617,11 @@ type groupPoolInput struct {
 	HealthCheckSeconds   int      `json:"health_check_seconds"`
 	// Automatic recovery of evicted members. Pointers keep a partial update
 	// from silently resetting stored values, matching Enabled.
-	RecoveryEnabled          *bool `json:"recovery_enabled"`
-	RecoverySuccessThreshold int   `json:"recovery_success_threshold"`
-	RecoveryCooldownSeconds  *int  `json:"recovery_cooldown_seconds"`
-	Enabled                  *bool `json:"enabled"`
-	SubscriptionEnabled      *bool `json:"subscription_enabled"`
+	RecoveryEnabled          *bool  `json:"recovery_enabled"`
+	RecoverySuccessThreshold int    `json:"recovery_success_threshold"`
+	RecoveryCooldownSeconds  *int   `json:"recovery_cooldown_seconds"`
+	Enabled                  *bool  `json:"enabled"`
+	SubscriptionEnabled      *bool  `json:"subscription_enabled"`
 	SubscriptionMode         string `json:"subscription_mode"`
 	ExternalHost             string `json:"external_host"`
 }
@@ -2992,7 +2996,7 @@ func (s *Server) writeGroupList(w http.ResponseWriter, r *http.Request) {
 					Region: mon.Region, Country: mon.Country, Status: status, FailureCount: member.FailureCount,
 					LastError: member.LastError, EvictedAt: member.EvictedAt, LatencyMs: mon.LastLatencyMs,
 					Available: mon.RoutingEligible, Provisional: mon.Provisional, HealthSource: mon.HealthSource,
-					IsActive: member.NodeID == runtimeState.CurrentNodeID,
+					IsActive:          member.NodeID == runtimeState.CurrentNodeID,
 					RecoverySuccesses: member.RecoverySuccesses, RecoveryThreshold: member.RecoveryThreshold,
 					RecoveryCooldownEnd: member.RecoveryCooldownEnd}
 				if item.Region == "" {
@@ -3218,12 +3222,52 @@ func (s *Server) groupFromInput(ctx context.Context, input groupPoolInput, exist
 		seenExcluded[nodeID] = struct{}{}
 		excludedNodeIDs = append(excludedNodeIDs, nodeID)
 	}
+	regionVersion := noderegion.CurrentVersion
+	if existing != nil {
+		regionVersion = existing.RegionRuleVersion
+	}
+	if input.RegionRuleVersion != nil {
+		regionVersion = *input.RegionRuleVersion
+	}
+	if regionVersion != 1 && regionVersion != noderegion.CurrentVersion {
+		return nil, nil, errors.New("不支持的地区规则版本")
+	}
+	includeUnknown := false
+	if existing != nil {
+		includeUnknown = existing.IncludeUnknownRegion
+	}
+	if input.IncludeUnknownRegion != nil {
+		includeUnknown = *input.IncludeUnknownRegion
+	}
+	excludeRegions := []string(nil)
+	if existing != nil {
+		excludeRegions = append(excludeRegions, existing.ExcludeRegions...)
+	}
+	if input.ExcludeRegions != nil {
+		excludeRegions = append([]string(nil), (*input.ExcludeRegions)...)
+	}
+	for i, value := range excludeRegions {
+		if strings.EqualFold(strings.TrimSpace(value), noderegion.Other) {
+			excludeRegions[i] = noderegion.Other
+			continue
+		}
+		excludeRegions[i] = noderegion.Normalize(value)
+		if excludeRegions[i] == "" {
+			return nil, nil, fmt.Errorf("无效的排除地区: %s", value)
+		}
+	}
 	regions := make([]string, 0, len(input.Regions))
 	seenRegions := make(map[string]struct{})
 	for _, value := range input.Regions {
 		region := strings.ToLower(strings.TrimSpace(value))
 		if region == "" {
 			continue
+		}
+		if regionVersion >= noderegion.CurrentVersion && region != noderegion.Other {
+			region = noderegion.Normalize(region)
+			if region == "" {
+				return nil, nil, fmt.Errorf("无效的地区: %s", value)
+			}
 		}
 		if _, ok := seenRegions[region]; !ok {
 			seenRegions[region] = struct{}{}
@@ -3262,6 +3306,7 @@ func (s *Server) groupFromInput(ctx context.Context, input groupPoolInput, exist
 	group := &store.GroupPool{Name: input.Name, BindAddress: input.BindAddress, BindPort: input.BindPort,
 		Protocol: protocol, Username: input.Username, Password: input.Password, DispatchMode: input.DispatchMode,
 		Regions: regions, ExplicitNodeIDs: keptNodeIDs, ExcludedNodeIDs: excludedNodeIDs, FailureWindowSeconds: input.FailureWindowSeconds,
+		RegionRuleVersion: regionVersion, IncludeUnknownRegion: includeUnknown, ExcludeRegions: excludeRegions,
 		TagWhitelist: tagWhitelist, TagBlacklist: tagBlacklist, TagFilterMatch: tagFilterMatch,
 		FailureThreshold: input.FailureThreshold, HealthCheckSeconds: input.HealthCheckSeconds, Enabled: enabled,
 		RecoveryEnabled: recoveryEnabled, RecoverySuccessThreshold: recoveryThreshold, RecoveryCooldownSeconds: recoveryCooldown,
