@@ -1,4 +1,4 @@
-import { useDeferredValue, useMemo, useState } from 'react'
+import { useDeferredValue, useEffect, useMemo, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Activity, CheckCircle2, ChevronDown, CircleAlert, Copy, KeyRound, Layers3, Link2, Network, Pencil,
@@ -8,15 +8,18 @@ import { toast } from 'sonner'
 import type { GroupMember, GroupNodeOption, GroupPool, GroupPoolPayload, GroupMemberStatus, Tag } from '../types'
 import {
   activateGroupMember, createGroupPool, deleteGroupPool, fetchTags, listGroupPools, probeNode, removeGroupMember,
-  resetGroupSubscriptionToken, restoreGroupMember, updateGroupPool,
+  resetGroupSubscriptionToken, restoreGroupMember, updateGroupPool, previewGroup,
 } from '../api/client'
 import { cn } from '../utils/cn'
 import { createFuzzySearcher, searchAllTokens } from '../utils/fuzzySearch'
 import { controlClass, PageContent, PageHeader, PageLayout, surfaceClass } from './ui/PageLayout'
+import { RegionSelect } from './NodeFilterBar'
+import { useNodeFacets } from '../hooks/useNodeFilter'
 import TagBadge from './tags/TagBadge'
 import TagMultiSelect from './tags/TagMultiSelect'
 
 const emptyPayload = (): GroupPoolPayload => ({
+  region_rule_version: 2, include_unknown_region: false, exclude_regions: [],
   name: '', bind_address: '0.0.0.0', bind_port: 0, protocol: 'mixed', username: '', password: '',
   dispatch_mode: 'fixed', regions: [], explicit_node_ids: [], failure_window_seconds: 300,
   excluded_node_ids: [],
@@ -88,6 +91,7 @@ async function copyTextWithFallback(value: string): Promise<boolean> {
 
 function payloadFromGroup(group: GroupPool): GroupPoolPayload {
   return {
+    region_rule_version: group.region_rule_version || 1, include_unknown_region: group.include_unknown_region || false, exclude_regions: group.exclude_regions || [],
     name: group.name, bind_address: group.bind_address, bind_port: group.bind_port,
     protocol: group.protocol, username: group.username || '', password: group.password || '',
     dispatch_mode: group.dispatch_mode, regions: group.regions || [],
@@ -116,7 +120,14 @@ export default function GroupPoolsPanel() {
   const [editorOpen, setEditorOpen] = useState(false)
   const [editing, setEditing] = useState<GroupPool | null>(null)
   const [form, setForm] = useState<GroupPoolPayload>(emptyPayload)
-  const [regionsText, setRegionsText] = useState('')
+  const regionFacets = useNodeFacets()
+  const previewForm = useDeferredValue(form)
+  const preview = useQuery({
+    queryKey: ['groupPreview', editing?.id, previewForm],
+    queryFn: ({ signal }) => previewGroup(editing?.id, previewForm, signal),
+    enabled: editorOpen,
+    refetchInterval: 10_000,
+  })
   const [nodeSearch, setNodeSearch] = useState('')
   const deferredNodeSearch = useDeferredValue(nodeSearch)
   const [deleteTarget, setDeleteTarget] = useState<GroupPool | null>(null)
@@ -171,18 +182,18 @@ export default function GroupPoolsPanel() {
   }, [nodes, editing?.members, form.excluded_node_ids, pendingAutoExcludedIDs])
 
   const openCreate = () => {
-    setEditing(null); setForm(emptyPayload()); setRegionsText(''); setNodeSearch(''); setRemovedDraftNodes([]); setPendingAutoExcludedIDs(new Set()); setManualEvictionOverrideIDs(new Set()); setDraftNodeCache({}); setEditorOpen(true)
+    setEditing(null); setForm(emptyPayload()); setNodeSearch(''); setRemovedDraftNodes([]); setPendingAutoExcludedIDs(new Set()); setManualEvictionOverrideIDs(new Set()); setDraftNodeCache({}); setEditorOpen(true)
   }
   const openEdit = (group: GroupPool) => {
     const nodeByID = new Map(nodes.map((node) => [node.id, node]))
-    const evictedIDs = group.members.filter((member) => member.status === 'EVICTED').map((member) => member.node_id)
+    const evictedIDs = (group.recovery_enabled ? [] : group.members).filter((member) => member.status === 'EVICTED').map((member) => member.node_id)
     const evictedSet = new Set(evictedIDs)
     const excludedIDs = [...new Set([...(group.excluded_node_ids || []), ...evictedIDs])]
-    const keptIDs = group.explicit_node_ids.filter((id) => nodeByID.get(id)?.selectable && !evictedSet.has(id))
-    const removedNames = group.explicit_node_ids.filter((id) => !nodeByID.get(id)?.selectable).map((id) =>
+    const keptIDs = group.explicit_node_ids.filter((id) => nodeByID.has(id) && !evictedSet.has(id))
+    const removedNames = group.explicit_node_ids.filter((id) => !nodeByID.has(id)).map((id) =>
       nodeByID.get(id)?.name || group.members.find((member) => member.node_id === id)?.name || `节点 #${id}`)
     const cache = Object.fromEntries(keptIDs.map((id) => [id, nodeByID.get(id)]).filter((entry): entry is [number, GroupNodeOption] => Boolean(entry[1])))
-    setEditing(group); setForm({ ...payloadFromGroup(group), explicit_node_ids: keptIDs, excluded_node_ids: excludedIDs }); setRegionsText((group.regions || []).join(', '));
+    setEditing(group); setForm({ ...payloadFromGroup(group), explicit_node_ids: keptIDs, excluded_node_ids: excludedIDs });
     setNodeSearch(''); setRemovedDraftNodes(removedNames); setPendingAutoExcludedIDs(new Set(evictedIDs.filter((id) => !group.excluded_node_ids.includes(id)))); setManualEvictionOverrideIDs(new Set()); setDraftNodeCache(cache); setEditorOpen(true)
   }
   const closeEditor = () => { setEditorOpen(false); setEditing(null); setRemovedDraftNodes([]); setPendingAutoExcludedIDs(new Set()); setManualEvictionOverrideIDs(new Set()); setBatchProbeProgress(null) }
@@ -210,20 +221,18 @@ export default function GroupPoolsPanel() {
       const excludedNodeIDs = [...new Set([...form.excluded_node_ids, ...latestEvictedIDs])]
       const excludedSet = new Set(excludedNodeIDs)
       const latestNodes = latestSnapshot?.nodes || nodes
-      const selectableIDs = new Set(latestNodes.filter((node) => node.selectable).map((node) => node.id))
+      const selectableIDs = new Set(latestNodes.map((node) => node.id))
       const keptNodeIDs = form.explicit_node_ids.filter((id) => selectableIDs.has(id) && !excludedSet.has(id))
       const locallyRemoved = form.explicit_node_ids.length - keptNodeIDs.length
       const payload = {
         ...form,
-        name,
-        regions: regionsText.split(/[,，\s]+/).map((value) => value.trim().toLowerCase()).filter(Boolean),
-        explicit_node_ids: keptNodeIDs,
+        name,        explicit_node_ids: keptNodeIDs,
         excluded_node_ids: excludedNodeIDs,
       }
       const result = editing ? await updateGroupPool(editing.id, payload) : await createGroupPool(payload)
       const removedCount = locallyRemoved + (result.removed_unavailable_node_ids?.length || 0)
       toast.success(editing ? '分组池已更新' : '分组池已创建并加载', removedCount > 0
-        ? { description: `${removedCount} 个不可用手动节点未被保存` } : undefined)
+        ? { description: `${removedCount} 个已删除或明确排除的手动节点未被保存` } : undefined)
       closeEditor(); await refresh()
     } catch (error) {
       toast.error(error instanceof Error ? error.message : '保存分组池失败')
@@ -249,10 +258,7 @@ export default function GroupPoolsPanel() {
   const removeManualNode = (node: GroupNodeOption) => {
     setForm((current) => ({ ...current, explicit_node_ids: current.explicit_node_ids.filter((id) => id !== node.id) }))
     setManualEvictionOverrideIDs((current) => { const next = new Set(current); next.delete(node.id); return next })
-    const regions = new Set(regionsText.split(/[,，\s]+/).map((value) => value.trim().toLowerCase()).filter(Boolean))
-    if (node.region && regions.has(node.region.toLowerCase())) {
-      toast.info('已取消手动指定', { description: `${node.name} 仍匹配地区规则，会继续自动入池` })
-    }
+    toast.info('已取消手动指定', { description: '是否继续自动入池请查看下方规则预览' })
   }
 
   const excludeDraftMember = (nodeId: number, name?: string) => {
@@ -277,17 +283,7 @@ export default function GroupPoolsPanel() {
       if (!quiet) toast.success(`${node.name} 延迟 ${result.latency_ms} ms`)
       return true
     } catch (error) {
-      const removed = form.explicit_node_ids.includes(node.id)
-      setForm((current) => {
-        if (!current.explicit_node_ids.includes(node.id)) return current
-        return { ...current, explicit_node_ids: current.explicit_node_ids.filter((id) => id !== node.id) }
-      })
-      if (removed) {
-        setRemovedDraftNodes((current) => current.includes(node.name) ? current : [...current, node.name])
-        setManualEvictionOverrideIDs((current) => { const next = new Set(current); next.delete(node.id); return next })
-      }
-      if (!quiet) toast.error(error instanceof Error ? error.message : '延迟测试失败', removed
-        ? { description: `${node.name} 已从当前编辑草稿移除` } : undefined)
+      if (!quiet) toast.error(error instanceof Error ? error.message : '延迟测试失败', { description: '保留手动成员选择，等待后续探测恢复' })
       return false
     } finally {
       setProbingNodeIDs((current) => { const next = new Set(current); next.delete(node.id); return next })
@@ -420,7 +416,18 @@ export default function GroupPoolsPanel() {
               </div>
             </section>
 
-            <Field label="地区自动入池" hint="ISO 地区码，用逗号或空格分隔，例如 hk, jp, us"><input className={cn('input w-full font-mono', controlClass)} value={regionsText} onChange={(e) => setRegionsText(e.target.value)} placeholder="hk, jp" /></Field>
+            <div className="flex flex-wrap gap-4">
+              <RegionSelect label="地区自动入池" value={form.regions} facets={regionFacets.data?.regions} onChange={regions => setForm({ ...form, regions })} />
+              <RegionSelect label="排除地区" value={form.exclude_regions} facets={regionFacets.data?.regions} onChange={exclude_regions => setForm({ ...form, exclude_regions })} />
+              <label className="flex items-center gap-2 text-sm"><input className="checkbox checkbox-sm" type="checkbox" checked={form.include_unknown_region} onChange={e => setForm({ ...form, include_unknown_region: e.target.checked })} />包含未知地区</label>
+              <label className="flex items-center gap-2 text-sm"><input className="checkbox checkbox-sm" type="checkbox" checked={form.region_rule_version === 2} onChange={e => setForm({ ...form, region_rule_version: e.target.checked ? 2 : 1 })} />使用新版地区规则（other 仅含已知地区）</label>
+            </div>
+            <div className="rounded-xl border border-base-300 p-3 text-sm" aria-live="polite">
+              {preview.error ? <span className="text-error">预览失败：{preview.error.message}</span> : preview.isFetching ? '正在更新成员预览…' : preview.data && <>
+                匹配 {preview.data.matched_ids.length} 个节点；相对已保存规则新增 {preview.data.rule_added_ids.length}、移除 {preview.data.rule_removed_ids.length}。
+                <details className="mt-2"><summary>查看每个节点的判定</summary><ul className="max-h-56 overflow-auto">{preview.data.candidates.map(node => <li key={node.id}>{node.name}：{node.decision.allowed ? '入池' : '不入池'} · {node.decision.reason}</li>)}</ul></details>
+              </>}
+            </div>
 
             <section className="rounded-2xl border border-base-300 bg-base-200/25 p-4 sm:p-5" aria-labelledby="tag-filter-title">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
@@ -489,8 +496,7 @@ export default function GroupPoolsPanel() {
               {editing && <div className="mt-4 rounded-2xl border border-base-300 bg-base-200/15 p-4">
                 <div><h5 className="text-sm font-bold">当前运行成员</h5><p className="mt-0.5 text-xs text-base-content/50">来自已保存的地区与手动规则；可点击“排除”将其从当前分组排除</p></div>
                 <div className="mt-3 grid max-h-80 gap-2 overflow-y-auto pr-1 md:grid-cols-2">
-                  {editing.members.filter(member => !form.excluded_node_ids.includes(member.node_id)).map((member) => <RuntimeMemberRow key={member.node_id} member={member} manual={form.explicit_node_ids.includes(member.node_id)}
-                    regional={Boolean(member.region && regionsText.split(/[,，\s]+/).some((region) => region.toLowerCase() === member.region?.toLowerCase()))}
+                  {editing.members.filter(member => !form.excluded_node_ids.includes(member.node_id)).map((member) => <RuntimeMemberRow key={member.node_id} member={member} manual={form.explicit_node_ids.includes(member.node_id)}                    regional={preview.data?.candidates.some(node => node.id === member.node_id && node.decision.allowed && node.decision.reason === 'rules_matched') || false}
                     latency={latencyOverrides[member.node_id] ?? member.latency_ms} probing={probingNodeIDs.has(member.node_id)} onProbe={() => void probeOption({ id: member.node_id, name: member.name || member.tag, tag: member.tag })}
                     onExclude={() => excludeDraftMember(member.node_id, member.name || member.tag)}
                     onActivate={() => { void run(`activate-${editing.id}-${member.node_id}`, () => activateGroupMember(editing.id, member.node_id), '当前出口已立即切换').then(() => { setEditing((current) => current ? { ...current, members: current.members.map(m => ({ ...m, is_active: m.node_id === member.node_id })) } : null) }) }} isActivateBusy={busy === `activate-${editing.id}-${member.node_id}` || (editing.runtime_status !== 'ready' && editing.runtime_status !== 'degraded')} />)}
@@ -579,9 +585,15 @@ function LatencyValue({ value }: { value: number }) {
 // Nothing is rendered when the group has automatic recovery turned off, so the
 // badge never implies a recovery that will not happen.
 function RecoveryBadge({ member }: { member: GroupMember }) {
-  if (member.status !== 'EVICTED' || !member.recovery_threshold) return null
   const cooldownEnd = member.recovery_cooldown_end ? Date.parse(member.recovery_cooldown_end) : 0
-  if (cooldownEnd && cooldownEnd > Date.now()) {
+  const [now, setNow] = useState(Date.now)
+  useEffect(() => {
+    if (!cooldownEnd) return
+    const timer = window.setTimeout(() => setNow(Date.now()), Math.min(2147483647, Math.max(0, cooldownEnd - Date.now()) + 1))
+    return () => window.clearTimeout(timer)
+  }, [cooldownEnd])
+  if (member.status !== 'EVICTED' || !member.recovery_threshold) return null
+  if (cooldownEnd && cooldownEnd > now) {
     return <span className="badge badge-ghost badge-xs" title={`冷却至 ${new Date(cooldownEnd).toLocaleTimeString()}`}>冷却中 · 待恢复</span>
   }
   return <span className="badge badge-warning badge-outline badge-xs">恢复中 {member.recovery_successes || 0}/{member.recovery_threshold}</span>
@@ -622,7 +634,7 @@ function RuntimeMemberRow({ member, manual, regional, latency, probing, onProbe,
 }) {
   const style = statusStyle[member.status]
   return <div className="flex min-w-0 items-center gap-2 rounded-xl border border-base-200 bg-base-100/70 px-3 py-2.5">
-    <div className="min-w-0 flex-1"><div className="flex min-w-0 items-center gap-2"><span className="truncate text-sm font-medium">{member.name || member.tag}</span>{member.region && <span className="shrink-0 text-[10px] font-bold uppercase text-base-content/45">{member.region}</span>}</div><div className="mt-1 flex flex-wrap items-center gap-1.5"><span className={cn('badge badge-xs', style.badge)}>{style.label}</span><RecoveryBadge member={member} />{member.provisional && <span className="badge badge-warning badge-outline badge-xs">临时可用 · 待复检</span>}{(member.health_source === 'persisted' || member.health_source === 'previous_generation') && <span className="badge badge-ghost badge-xs">历史延迟</span>}{manual && <span className="badge badge-outline badge-xs">手动</span>}{regional && <span className="badge badge-ghost badge-xs">地区</span>}{member.is_active && <span className="badge badge-success badge-outline badge-xs">当前出口</span>}<LatencyValue value={latency} /></div></div>
+    <div className="min-w-0 flex-1"><div className="flex min-w-0 items-center gap-2"><span className="truncate text-sm font-medium">{member.name || member.tag}</span>{member.region && <span className="shrink-0 text-[10px] font-bold uppercase text-base-content/45">{member.region}</span>}</div><div className="mt-1 flex flex-wrap items-center gap-1.5"><span className={cn('badge badge-xs', style.badge)}>{style.label}</span><RecoveryBadge member={member} />{member.provisional && <span className="badge badge-warning badge-outline badge-xs">临时可用 · 待复检</span>}{(member.health_source === 'persisted' || member.health_source === 'previous_generation') && <span className="badge badge-ghost badge-xs">历史延迟</span>}{manual && <span className="badge badge-outline badge-xs">手动</span>}{regional && <span className="badge badge-ghost badge-xs">规则匹配</span>}{member.is_active && <span className="badge badge-success badge-outline badge-xs">当前出口</span>}<LatencyValue value={latency} /></div></div>
     {onActivate && member.status === 'ALIVE' && !member.is_active && (
       <button type="button" className="btn btn-ghost btn-xs btn-square text-primary" onClick={onActivate} disabled={isActivateBusy} title="强制设为当前出口" aria-label={`将 ${member.name || member.tag} 设为当前出口`}>
         <Crosshair className="h-3.5 w-3.5" />

@@ -98,6 +98,9 @@ export interface GroupMember {
 }
 
 export interface GroupPool {
+  region_rule_version: number
+  include_unknown_region: boolean
+  exclude_regions: string[]
   id: number
   name: string
   bind_address: string
@@ -142,6 +145,9 @@ export interface GroupPoolsResponse {
 }
 
 export interface GroupPoolPayload {
+  region_rule_version: number
+  include_unknown_region: boolean
+  exclude_regions: string[]
   name: string
   bind_address: string
   bind_port: number
@@ -898,3 +904,4 @@ export interface TrafficStreamEvent {
   sampled_at: string
   nodes: TrafficStreamNode[]
 }
+export type { NodeFilterSpec, NodeViewItem, NodeViewPage, NodeViewResult, NodeFacet, NodeFacets, SavedNodeFilter, GroupPreview } from './nodeView'

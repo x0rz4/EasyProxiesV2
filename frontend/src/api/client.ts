@@ -804,3 +804,27 @@ export async function importNodes(content: string): Promise<ImportNodesResult> {
     body: JSON.stringify({ content }),
   })
 }
+import type { GroupPreview, NodeFacets, NodeFilterSpec, NodeViewPage, NodeViewResult, SavedNodeFilter } from '../types/nodeView'
+
+export function queryNodeView(spec: NodeFilterSpec, page: NodeViewPage, signal?: AbortSignal) {
+  return request<NodeViewResult>('/api/nodes/query', { method: 'POST', body: JSON.stringify({ spec, page }), signal })
+}
+export function fetchNodeFacets(signal?: AbortSignal) {
+  return request<NodeFacets>('/api/nodes/facets', { signal })
+}
+export function listSavedNodeFilters() {
+  return request<{ filters: SavedNodeFilter[] }>('/api/node-filters')
+}
+export function saveNodeFilter(name: string, spec: NodeFilterSpec, previous?: SavedNodeFilter) {
+  return request<SavedNodeFilter>(previous ? `/api/node-filters/${previous.id}` : '/api/node-filters', {
+    method: previous ? 'PUT' : 'POST', body: JSON.stringify({ name, spec, revision: previous?.revision || 0 }),
+  })
+}
+export function deleteNodeFilter(id: number) {
+  return request<{ success: boolean }>(`/api/node-filters/${id}`, { method: 'DELETE' })
+}
+export function previewGroup(id: number | undefined, payload: GroupPoolPayload, signal?: AbortSignal) {
+  return request<GroupPreview>(id ? `/api/groups/${id}/preview` : '/api/groups/preview', {
+    method: 'POST', body: JSON.stringify(payload), signal,
+  })
+}
