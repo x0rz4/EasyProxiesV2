@@ -78,6 +78,7 @@ export interface GroupNodeOption {
 export type GroupMemberStatus = 'ALIVE' | 'SUSPECT' | 'EVICTED'
 
 export interface GroupMember {
+  standby: boolean
   node_id: number
   tag: string
   name: string
@@ -113,6 +114,7 @@ export interface GroupHealEvent {
 }
 
 export interface GroupPool extends GroupHealPolicy {
+  standby_count: number
   region_rule_version: number
   include_unknown_region: boolean
   exclude_regions: string[]

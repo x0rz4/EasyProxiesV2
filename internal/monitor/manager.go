@@ -244,6 +244,7 @@ type Snapshot struct {
 	RoutingEligible   bool            `json:"routing_eligible"`
 	HealthSource      string          `json:"health_source"`
 	HealthUpdatedAt   time.Time       `json:"health_updated_at,omitempty"`
+	HealthCheckedAt   time.Time       `json:"health_checked_at,omitempty"`
 	TotalUpload       int64           `json:"total_upload"`
 	TotalDownload     int64           `json:"total_download"`
 	UploadSpeed       int64           `json:"upload_speed"`   // bytes/sec
@@ -1290,6 +1291,7 @@ func (e *entry) snapshot() Snapshot {
 		InitialCheckDone:  e.initialCheckDone,
 		HealthSource:      e.healthSource,
 		HealthUpdatedAt:   e.healthUpdatedAt,
+		HealthCheckedAt:   e.lastHealthCheck,
 		TotalUpload:       e.totalUpload.Load(),
 		TotalDownload:     e.totalDownload.Load(),
 		UploadSpeed:       e.uploadSpeed,

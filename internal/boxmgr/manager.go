@@ -600,9 +600,12 @@ func groupAppliedFingerprint(cfg *config.Config, groupCfg config.GroupPoolConfig
 		Preferred      int64
 		SkipCertVerify bool
 		Members        []config.NodeConfig
+		Healing        group.HealPolicy
+		Recovery       group.RecoveryPolicy
 	}{groupCfg.Enabled, groupCfg.BindAddress, groupCfg.BindPort, groupCfg.Protocol, groupCfg.Username, groupCfg.Password,
 		groupCfg.DispatchMode, groupCfg.FailureWindow, groupCfg.FailureThreshold, groupCfg.HealthCheckInterval,
-		groupCfg.CurrentActiveNodeID, cfg != nil && cfg.SkipCertVerify, groupMemberRuntimeShape(cfg, groupCfg)}
+		groupCfg.CurrentActiveNodeID, cfg != nil && cfg.SkipCertVerify, groupMemberRuntimeShape(cfg, groupCfg), groupCfg.HealPolicy,
+		group.RecoveryPolicy{Enabled: groupCfg.RecoveryEnabled, SuccessThreshold: groupCfg.RecoverySuccessThreshold, Cooldown: groupCfg.RecoveryCooldown}}
 	encoded, _ := yaml.Marshal(shape)
 	return string(encoded)
 }
@@ -1203,7 +1206,7 @@ func cancelGroupRetirements(slot *groupRuntimeSlot) {
 	slot.mu.Unlock()
 }
 
-func (m *Manager) applyGroupRuntimeIncremental(cfg *config.Config, groupCfg config.GroupPoolConfig, slot *groupRuntimeSlot, instance *box.Box, fingerprint string) (resultErr error) {
+func (m *Manager) applyGroupRuntimeIncremental(cfg *config.Config, groupCfg config.GroupPoolConfig, slot *groupRuntimeSlot, instance *box.Box, fingerprint string, selection ...[]int64) (resultErr error) {
 	poolTag := fmt.Sprintf("group-pool-%d", groupCfg.ID)
 	poolOutbound, found := instance.Outbound().Outbound(poolTag)
 	if !found {
@@ -1311,7 +1314,15 @@ func (m *Manager) applyGroupRuntimeIncremental(cfg *config.Config, groupCfg conf
 			FailureHistory: append([]int64(nil), state.FailureHistory...), Evicted: state.Evicted,
 			LastError: state.LastError, EvictedAt: state.EvictedAt}
 	}
-	prepared, err := runtimePool.PrepareUpdate(pool.RuntimeUpdate{Members: specs, Mode: groupCfg.DispatchMode,
+	capacityTarget := 0
+	if groupCfg.Execute {
+		capacityTarget = groupCfg.TargetSize
+	}
+	var activeNodeIDs []int64
+	if len(selection) > 0 {
+		activeNodeIDs = append([]int64{}, selection[0]...)
+	}
+	prepared, err := runtimePool.PrepareUpdate(pool.RuntimeUpdate{CapacityTarget: capacityTarget, ActiveNodeIDs: activeNodeIDs, Members: specs, Mode: groupCfg.DispatchMode,
 		FailureWindow: groupCfg.FailureWindow, FailureThreshold: groupCfg.FailureThreshold,
 		HealthCheckInterval: groupCfg.HealthCheckInterval, PreferredNodeID: groupCfg.CurrentActiveNodeID,
 		RecoveryEnabled: groupCfg.RecoveryEnabled, RecoveryThreshold: groupCfg.RecoverySuccessThreshold,

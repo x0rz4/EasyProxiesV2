@@ -97,3 +97,37 @@ func TestPlanHealingRejectsInvalidInputs(t *testing.T) {
 		t.Fatal("accepted duplicate candidate")
 	}
 }
+
+func TestCapacitySelectionPreservesSlotsAndExplicitEmpty(t *testing.T) {
+	for _, tc := range []struct{ previous, want []int64 }{
+		{nil, []int64{1, 2}}, {[]int64{}, []int64{}}, {[]int64{3, 99}, []int64{3}},
+	} {
+		if got := CapacitySelection([]int64{3, 1, 2}, tc.previous, 2); !reflect.DeepEqual(got, tc.want) {
+			t.Fatalf("selection=%v want=%v", got, tc.want)
+		}
+	}
+}
+
+func TestStandbyRecoveryPreservesStreakAcrossCapacityChange(t *testing.T) {
+	Reset()
+	defer Reset()
+	policy := recoverablePolicy(2)
+	states := map[string]GroupInitialState{"a": {NodeID: 1}, "b": {NodeID: 2, Standby: true}}
+	Register(993, time.Minute, 1, "a", states, policy)
+	RecordFailure(993, "a", nil, time.Now())
+	RecordHealthSuccess(993, "a")
+	states["a"] = GroupInitialState{NodeID: 1, Standby: true}
+	states["b"] = GroupInitialState{NodeID: 2}
+	NotifyEvents(ReconcileSilent(993, RuntimeUpdate{FailureWindow: time.Minute, FailureThreshold: 1, Members: states, Recovery: policy}))
+	if !RecordHealthSuccess(993, "a") {
+		t.Fatal("capacity update reset recovery progress")
+	}
+	if MemberAvailable(993, "a") {
+		t.Fatal("recovery admitted standby to traffic")
+	}
+	for _, n := range GroupRuntimeSnapshots()[993].Members {
+		if n.NodeID == 1 && (n.Status != "ALIVE" || !n.Standby) {
+			t.Fatalf("standby failed to recover: %+v", n)
+		}
+	}
+}

@@ -207,3 +207,27 @@ func uniquePositiveIDs(ids []int64) []int64 {
 	slices.Sort(out)
 	return slices.Compact(out)
 }
+
+// CapacitySelection selects traffic slots within an already-filtered candidate
+// set. Nil previous initializes deterministically; an explicit empty selection
+// stays empty. Existing slots never admit a new node merely because one left.
+func CapacitySelection(candidates, previous []int64, target int) []int64 {
+	ids := uniquePositiveIDs(candidates)
+	if target <= 0 {
+		return ids
+	}
+	if previous == nil {
+		return ids[:min(target, len(ids))]
+	}
+	allowed := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		allowed[id] = true
+	}
+	selected := make([]int64, 0, min(target, len(previous)))
+	for _, id := range uniquePositiveIDs(previous) {
+		if allowed[id] && len(selected) < target {
+			selected = append(selected, id)
+		}
+	}
+	return selected
+}

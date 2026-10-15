@@ -9,6 +9,7 @@ import (
 
 // GroupInitialState restores the persisted state for one member.
 type GroupInitialState struct {
+	Standby        bool
 	NodeID         int64
 	FailureHistory []int64
 	Evicted        bool
@@ -33,6 +34,7 @@ type GroupStateEvent struct {
 
 // GroupMemberSnapshot is the runtime view consumed by the management API.
 type GroupMemberSnapshot struct {
+	Standby        bool      `json:"standby"`
 	NodeID         int64     `json:"node_id"`
 	Tag            string    `json:"tag"`
 	Status         string    `json:"status"`
@@ -105,6 +107,7 @@ type GroupRuntimeSnapshot struct {
 }
 
 type groupMemberRuntime struct {
+	standby        bool
 	nodeID         int64
 	tag            string
 	failureHistory []int64
@@ -245,7 +248,7 @@ func ReconcileSilent(groupID int64, update RuntimeUpdate) []GroupStateEvent {
 	events := make([]GroupStateEvent, 0)
 	now := time.Now()
 	for tag, initial := range update.Members {
-		member := &groupMemberRuntime{nodeID: initial.NodeID, tag: tag}
+		member := &groupMemberRuntime{nodeID: initial.NodeID, tag: tag, standby: initial.Standby}
 		if old := oldByNodeID[initial.NodeID]; old != nil {
 			member.failureHistory = append([]int64(nil), old.failureHistory...)
 			member.evicted, member.lastError, member.evictedAt = old.evicted, old.lastError, old.evictedAt
@@ -269,7 +272,9 @@ func ReconcileSilent(groupID int64, update RuntimeUpdate) []GroupStateEvent {
 			// unmeasurable; anchor it so the policy stays well defined.
 			member.evictedAt = now
 		}
-		if member.evicted && member.recoverySuccesses > 0 {
+		old := oldByNodeID[initial.NodeID]
+		policyChanged := recoveryPolicyProvided(update.Recovery) && NormalizeRecoveryPolicy(update.Recovery) != runtime.recovery
+		if member.evicted && member.recoverySuccesses > 0 && (policyChanged || old != nil && old.tag != tag) {
 			// The policy or topology just changed, so the old streak no longer
 			// describes this generation of the member.
 			member.recoverySuccesses = 0
@@ -291,7 +296,7 @@ func ReconcileSilent(groupID int64, update RuntimeUpdate) []GroupStateEvent {
 	}
 	runtime.currentTag = ""
 	for tag, member := range next {
-		if member.nodeID == preferredNodeID && !member.evicted && len(member.failureHistory) == 0 {
+		if member.nodeID == preferredNodeID && !member.standby && !member.evicted && len(member.failureHistory) == 0 {
 			runtime.currentTag = tag
 			break
 		}
@@ -356,11 +361,12 @@ func Register(groupID int64, failureWindow time.Duration, failureThreshold int, 
 			evictedAt = now
 		}
 		runtime.members[tag] = &groupMemberRuntime{
-			nodeID: initial.NodeID, tag: tag, failureHistory: append([]int64(nil), initial.FailureHistory...),
+			standby: initial.Standby,
+			nodeID:  initial.NodeID, tag: tag, failureHistory: append([]int64(nil), initial.FailureHistory...),
 			evicted: evicted, lastError: initial.LastError, evictedAt: evictedAt,
 		}
 	}
-	if current := runtime.members[runtime.currentTag]; current == nil || current.evicted || len(current.failureHistory) > 0 {
+	if current := runtime.members[runtime.currentTag]; current == nil || current.standby || current.evicted || len(current.failureHistory) > 0 {
 		runtime.currentTag = ""
 	}
 	groupRuntimeStore.Store(groupID, runtime)
@@ -391,7 +397,7 @@ func MemberAvailable(groupID int64, tag string) bool {
 	if member != nil && !member.evicted {
 		pruneFailures(member, runtime.window, time.Now())
 	}
-	return member != nil && !member.evicted && len(member.failureHistory) == 0
+	return member != nil && !member.standby && !member.evicted && len(member.failureHistory) == 0
 }
 
 // MemberNotEvicted is the optimistic-startup gate. Pending members may ignore
@@ -406,7 +412,7 @@ func MemberNotEvicted(groupID int64, tag string) bool {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
 	member := runtime.members[tag]
-	return member != nil && !member.evicted
+	return member != nil && !member.standby && !member.evicted
 }
 
 func CurrentTag(groupID int64) string {
@@ -416,7 +422,7 @@ func CurrentTag(groupID int64) string {
 	}
 	runtime := value.(*groupRuntime)
 	runtime.mu.Lock()
-	if member := runtime.members[runtime.currentTag]; member != nil && !member.evicted {
+	if member := runtime.members[runtime.currentTag]; member != nil && !member.standby && !member.evicted {
 		pruneFailures(member, runtime.window, time.Now())
 		if len(member.failureHistory) == 0 {
 			tag := runtime.currentTag
@@ -441,6 +447,10 @@ func SetCurrentTag(groupID int64, tag string) {
 	}
 	runtime := value.(*groupRuntime)
 	runtime.mu.Lock()
+	if member := runtime.members[tag]; tag != "" && (member == nil || member.standby || member.evicted) {
+		runtime.mu.Unlock()
+		return
+	}
 	if runtime.currentTag == tag {
 		runtime.mu.Unlock()
 		return
@@ -683,7 +693,8 @@ func GroupRuntimeSnapshots() map[int64]GroupRuntimeSnapshot {
 				status = "SUSPECT"
 			}
 			snapshotMember := GroupMemberSnapshot{NodeID: member.nodeID, Tag: member.tag,
-				Status: status, FailureCount: len(member.failureHistory), FailureHistory: append([]int64(nil), member.failureHistory...),
+				Standby: member.standby,
+				Status:  status, FailureCount: len(member.failureHistory), FailureHistory: append([]int64(nil), member.failureHistory...),
 				LastError: member.lastError, EvictedAt: member.evictedAt}
 			if member.evicted && runtime.recovery.Enabled {
 				snapshotMember.RecoverySuccesses = member.recoverySuccesses

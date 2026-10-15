@@ -294,6 +294,9 @@ func BuildVersion(cfg *config.Config, runtimeTagVersion uint64) (option.Options,
 			GroupID: group.ID, PreferredMember: preferredTag, InitialGroupState: stateByTag,
 			RecoveryEnabled: group.RecoveryEnabled, RecoverySuccessThreshold: group.RecoverySuccessThreshold,
 			RecoveryCooldown: group.RecoveryCooldown}
+		if group.Execute {
+			groupOptions.CapacityTarget = group.TargetSize
+		}
 		outbounds = append(outbounds, option.Outbound{Type: poolout.Type, Tag: groupOutboundTag, Options: &groupOptions})
 
 		addr, err := parseAddr(group.BindAddress)

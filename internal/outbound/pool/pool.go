@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -44,6 +45,8 @@ const (
 
 // Options controls pool outbound behaviour.
 type Options struct {
+	CapacityTarget      int
+	ActiveNodeIDs       []int64
 	Mode                string
 	Members             []string
 	FailureThreshold    int
@@ -206,6 +209,8 @@ type RuntimePool interface {
 // RuntimeUpdate is a complete immutable group pool configuration. Zero policy
 // values are normalized to the same defaults used at cold start.
 type RuntimeUpdate struct {
+	CapacityTarget      int
+	ActiveNodeIDs       []int64 // nil preserves current slots; empty means none
 	Members             []RuntimeMemberSpec
 	Mode                string
 	FailureWindow       time.Duration
@@ -419,6 +424,7 @@ func normalizeOptions(options Options) Options {
 			initialState[tag] = group.GroupInitialState{NodeID: options.Metadata[tag].NodeID}
 		}
 		options.InitialGroupState = initialState
+		options.ActiveNodeIDs = applyCapacitySelection(options.CapacityTarget, options.ActiveNodeIDs, initialState)
 	}
 	return options
 }
@@ -744,6 +750,10 @@ func (p *poolOutbound) ReconcileMembers(specs []RuntimeMemberSpec) (uint64, []Re
 }
 
 func (p *poolOutbound) reconcileMembersLocked(specs []RuntimeMemberSpec) (uint64, []RetiredMember, error) {
+	return p.reconcileMembersWithPolicyLocked(specs, nil)
+}
+
+func (p *poolOutbound) reconcileMembersWithPolicyLocked(specs []RuntimeMemberSpec, applyPolicy func()) (uint64, []RetiredMember, error) {
 	if p.closed.Load() {
 		return 0, nil, net.ErrClosed
 	}
@@ -764,6 +774,10 @@ func (p *poolOutbound) reconcileMembersLocked(specs []RuntimeMemberSpec) (uint64
 			return 0, nil, E.New("pool member not found: ", spec.Tag)
 		}
 		resolved[spec.Tag] = detour
+	}
+	// Resolution is the last fallible step. Change policy/state only after it.
+	if applyPolicy != nil {
+		applyPolicy()
 	}
 	next := make([]*MemberRef, 0, len(specs))
 	for _, spec := range specs {
@@ -858,6 +872,8 @@ func (p *poolOutbound) PrepareUpdate(update RuntimeUpdate) (PreparedUpdate, erro
 		return nil, errors.New("pool update requires at least one member")
 	}
 	copyUpdate := RuntimeUpdate{
+		CapacityTarget:      update.CapacityTarget,
+		ActiveNodeIDs:       slices.Clone(update.ActiveNodeIDs),
 		Members:             make([]RuntimeMemberSpec, len(update.Members)),
 		Mode:                normalizeOptions(Options{Mode: update.Mode}).Mode,
 		FailureWindow:       update.FailureWindow,
@@ -889,10 +905,20 @@ func (p *poolOutbound) PrepareUpdate(update RuntimeUpdate) (PreparedUpdate, erro
 			return nil, E.New("pool member has no supported network: ", spec.Tag)
 		}
 	}
-	for tag, state := range update.InitialGroupState {
+	for _, spec := range copyUpdate.Members {
+		state := update.InitialGroupState[spec.Tag]
+		state.NodeID = spec.Meta.NodeID
 		state.FailureHistory = append([]int64(nil), state.FailureHistory...)
-		copyUpdate.InitialGroupState[tag] = state
+		copyUpdate.InitialGroupState[spec.Tag] = state
 	}
+	if copyUpdate.ActiveNodeIDs == nil && copyUpdate.CapacityTarget > 0 {
+		p.mu.Lock()
+		if p.options.CapacityTarget > 0 {
+			copyUpdate.ActiveNodeIDs = slices.Clone(p.options.ActiveNodeIDs)
+		}
+		p.mu.Unlock()
+	}
+	copyUpdate.ActiveNodeIDs = applyCapacitySelection(copyUpdate.CapacityTarget, copyUpdate.ActiveNodeIDs, copyUpdate.InitialGroupState)
 	return &preparedPoolUpdate{pool: p, update: copyUpdate}, nil
 }
 
@@ -911,25 +937,27 @@ func (u *preparedPoolUpdate) Commit() (uint64, []RetiredMember, error) {
 		p.mu.Unlock()
 		return 0, nil, net.ErrClosed
 	}
-	oldMode := p.mode
-	p.mode = u.update.Mode
-	p.options.Mode = u.update.Mode
-	p.options.FailureWindow = u.update.FailureWindow
-	p.options.FailureThreshold = u.update.FailureThreshold
-	p.options.HealthCheckInterval = u.update.HealthCheckInterval
-	p.options.RecoveryEnabled = u.update.RecoveryEnabled
-	p.options.RecoverySuccessThreshold = u.update.RecoveryThreshold
-	p.options.RecoveryCooldown = u.update.RecoveryCooldown
-	p.failureThreshold.Store(int64(u.update.FailureThreshold))
-	p.failureWindowNanos.Store(int64(u.update.FailureWindow))
-	events := group.ReconcileSilent(p.options.GroupID, group.RuntimeUpdate{
-		FailureWindow: u.update.FailureWindow, FailureThreshold: u.update.FailureThreshold,
-		PreferredNodeID: u.update.PreferredNodeID, Members: u.update.InitialGroupState,
-		Recovery: p.recoveryPolicy(),
+	var events []group.GroupStateEvent
+	version, retired, err := p.reconcileMembersWithPolicyLocked(u.update.Members, func() {
+		p.mode = u.update.Mode
+		p.options.Mode = u.update.Mode
+		p.options.FailureWindow = u.update.FailureWindow
+		p.options.FailureThreshold = u.update.FailureThreshold
+		p.options.HealthCheckInterval = u.update.HealthCheckInterval
+		p.options.RecoveryEnabled = u.update.RecoveryEnabled
+		p.options.RecoverySuccessThreshold = u.update.RecoveryThreshold
+		p.options.RecoveryCooldown = u.update.RecoveryCooldown
+		p.options.CapacityTarget = u.update.CapacityTarget
+		p.options.ActiveNodeIDs = slices.Clone(u.update.ActiveNodeIDs)
+		p.failureThreshold.Store(int64(u.update.FailureThreshold))
+		p.failureWindowNanos.Store(int64(u.update.FailureWindow))
+		events = group.ReconcileSilent(p.options.GroupID, group.RuntimeUpdate{
+			FailureWindow: u.update.FailureWindow, FailureThreshold: u.update.FailureThreshold,
+			PreferredNodeID: u.update.PreferredNodeID, Members: u.update.InitialGroupState,
+			Recovery: p.recoveryPolicy(),
+		})
 	})
-	version, retired, err := p.reconcileMembersLocked(u.update.Members)
 	if err != nil {
-		p.mode, p.options.Mode = oldMode, oldMode
 		p.mu.Unlock()
 		return 0, nil, err
 	}
@@ -1970,4 +1998,23 @@ func (p *poolOutbound) decActive(member *memberState) {
 	if member.shared != nil {
 		member.shared.decActive()
 	}
+}
+
+// applyCapacitySelection changes routing eligibility, not topology: every
+// candidate keeps its outbound, health schedule and recovery state.
+func applyCapacitySelection(target int, previous []int64, states map[string]group.GroupInitialState) []int64 {
+	ids := make([]int64, 0, len(states))
+	for _, state := range states {
+		ids = append(ids, state.NodeID)
+	}
+	selected := group.CapacitySelection(ids, previous, target)
+	active := make(map[int64]bool, len(selected))
+	for _, id := range selected {
+		active[id] = true
+	}
+	for tag, state := range states {
+		state.Standby = target > 0 && !active[state.NodeID]
+		states[tag] = state
+	}
+	return selected
 }

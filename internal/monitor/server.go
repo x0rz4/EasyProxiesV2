@@ -2655,6 +2655,7 @@ type groupPoolInput struct {
 }
 
 type groupMemberResponse struct {
+	Standby      bool      `json:"standby"`
 	NodeID       int64     `json:"node_id"`
 	Tag          string    `json:"tag"`
 	Name         string    `json:"name"`
@@ -2694,6 +2695,7 @@ type groupNodeOptionResponse struct {
 
 type groupPoolResponse struct {
 	store.GroupPool
+	StandbyCount     int                   `json:"standby_count"`
 	RuntimeStatus    string                `json:"runtime_status"`
 	RuntimeError     string                `json:"runtime_error,omitempty"`
 	CurrentActiveTag string                `json:"current_active_tag,omitempty"`
@@ -3021,7 +3023,8 @@ func (s *Server) writeGroupList(w http.ResponseWriter, r *http.Request) {
 					status = "SUSPECT"
 				}
 				item := groupMemberResponse{NodeID: member.NodeID, Tag: member.Tag, Name: node.Name,
-					Region: mon.Region, Country: mon.Country, Status: status, FailureCount: member.FailureCount,
+					Standby: member.Standby,
+					Region:  mon.Region, Country: mon.Country, Status: status, FailureCount: member.FailureCount,
 					LastError: member.LastError, EvictedAt: member.EvictedAt, LatencyMs: mon.LastLatencyMs,
 					Available: mon.RoutingEligible, Provisional: mon.Provisional, HealthSource: mon.HealthSource,
 					IsActive:          member.NodeID == runtimeState.CurrentNodeID,
@@ -3034,9 +3037,12 @@ func (s *Server) writeGroupList(w http.ResponseWriter, r *http.Request) {
 					item.Country = node.Country
 				}
 				response.Members = append(response.Members, item)
+				if member.Standby {
+					response.StandbyCount++
+				}
 				if status == "EVICTED" {
 					response.EvictedCount++
-				} else if status == "ALIVE" {
+				} else if status == "ALIVE" && !member.Standby {
 					response.AliveCount++
 				}
 			}
