@@ -3176,9 +3176,13 @@ func (s *Server) groupFromInput(ctx context.Context, input groupPoolInput, exist
 	} else if err := s.validateGroupPort(ctx, input.BindAddress, input.BindPort, existing); err != nil {
 		return nil, nil, err
 	}
-	selectableNodeIDs, err := s.selectableGroupNodeIDs(ctx)
+	managedNodes, err := s.store.ListManagedNodes(ctx, nil)
 	if err != nil {
 		return nil, nil, err
+	}
+	knownNodeIDs := make(map[int64]struct{}, len(managedNodes))
+	for _, node := range managedNodes {
+		knownNodeIDs[node.ID] = struct{}{}
 	}
 	keptNodeIDs := make([]int64, 0, len(input.ExplicitNodeIDs))
 	removedNodeIDs := make([]int64, 0)
@@ -3191,7 +3195,7 @@ func (s *Server) groupFromInput(ctx context.Context, input groupPoolInput, exist
 			continue
 		}
 		seenNodeIDs[nodeID] = struct{}{}
-		if _, ok := selectableNodeIDs[nodeID]; !ok {
+		if _, ok := knownNodeIDs[nodeID]; !ok {
 			removedNodeIDs = append(removedNodeIDs, nodeID)
 			continue
 		}
@@ -3203,17 +3207,10 @@ func (s *Server) groupFromInput(ctx context.Context, input groupPoolInput, exist
 	} else if existing != nil {
 		excludedInput = existing.ExcludedNodeIDs
 	}
-	keptSet := make(map[int64]struct{}, len(keptNodeIDs))
-	for _, nodeID := range keptNodeIDs {
-		keptSet[nodeID] = struct{}{}
-	}
 	excludedNodeIDs := make([]int64, 0, len(excludedInput))
 	seenExcluded := make(map[int64]struct{}, len(excludedInput))
 	for _, nodeID := range excludedInput {
 		if nodeID <= 0 {
-			continue
-		}
-		if _, manuallyAdded := keptSet[nodeID]; manuallyAdded {
 			continue
 		}
 		if _, duplicate := seenExcluded[nodeID]; duplicate {
@@ -3506,6 +3503,7 @@ func cloneGroupPool(groupPool *store.GroupPool) *store.GroupPool {
 	}
 	cloned := *groupPool
 	cloned.Regions = append([]string(nil), groupPool.Regions...)
+	cloned.ExcludeRegions = append([]string(nil), groupPool.ExcludeRegions...)
 	cloned.ExplicitNodeIDs = append([]int64(nil), groupPool.ExplicitNodeIDs...)
 	cloned.ExcludedNodeIDs = append([]int64(nil), groupPool.ExcludedNodeIDs...)
 	cloned.TagWhitelist = append([]int64(nil), groupPool.TagWhitelist...)

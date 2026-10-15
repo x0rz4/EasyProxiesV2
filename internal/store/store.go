@@ -12,6 +12,10 @@ import (
 
 // Store defines all data storage operations.
 type Store interface {
+	ListSavedFilters(ctx context.Context) ([]SavedFilter, error)
+	GetSavedFilter(ctx context.Context, id int64) (*SavedFilter, error)
+	SaveFilter(ctx context.Context, filter *SavedFilter) error
+	DeleteSavedFilter(ctx context.Context, id int64) error
 	// --- Node operations ---
 
 	// ListNodes returns nodes matching the given filter.
@@ -235,6 +239,16 @@ type Store interface {
 	// WithTx executes fn within a transaction. If fn returns an error,
 	// the transaction is rolled back; otherwise it is committed.
 	WithTx(ctx context.Context, fn func(tx Store) error) error
+}
+
+// SavedFilter stores a versioned query specification. Groups copy its content;
+// changing a saved filter never silently changes a running pool.
+type SavedFilter struct {
+	ID        int64     `json:"id"`
+	Name      string    `json:"name"`
+	SpecJSON  string    `json:"-"`
+	Revision  int64     `json:"revision"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // --- Data models ---

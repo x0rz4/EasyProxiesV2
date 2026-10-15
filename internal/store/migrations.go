@@ -453,6 +453,17 @@ WHEN OLD.identity_hash<>'' AND OLD.identity_hash <> NEW.identity_hash BEGIN
 END;
 `,
 		},
+		{
+			Version:     17,
+			Description: "add versioned saved node filters",
+			Up: `CREATE TABLE saved_filters (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+name TEXT NOT NULL DEFAULT '' UNIQUE,
+spec_json TEXT NOT NULL DEFAULT '{}',
+revision INTEGER NOT NULL DEFAULT 1,
+updated_at TEXT NOT NULL DEFAULT ''
+);`,
+		},
 	}
 }
 
