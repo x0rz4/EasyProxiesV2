@@ -59,6 +59,18 @@ func TestNodeQueryAndDraftPreviewShareRegionRules(t *testing.T) {
 	if strings.Contains(preview.Body.String(), "very-secret") {
 		t.Fatal("preview exposed credentials")
 	}
+	bulk := httptest.NewRecorder()
+	s.routes().ServeHTTP(bulk, httptest.NewRequest(http.MethodPost, "/api/nodes/query-ids", strings.NewReader(`{"spec":{"version":2,"regions":["other"]}}`)))
+	var targets struct {
+		IDs      []int64 `json:"ids"`
+		Revision string  `json:"snapshot_revision"`
+	}
+	if err := json.Unmarshal(bulk.Body.Bytes(), &targets); err != nil || bulk.Code != 200 || len(targets.IDs) != 1 || targets.IDs[0] != result.Items[0].ID || targets.Revision == "" {
+		t.Fatalf("bulk query disagrees: %d %s %v", bulk.Code, bulk.Body.String(), err)
+	}
+	if strings.Contains(bulk.Body.String(), "very-secret") {
+		t.Fatal("bulk query exposed credentials")
+	}
 	bad := httptest.NewRecorder()
 	s.routes().ServeHTTP(bad, httptest.NewRequest(http.MethodPost, "/api/nodes/query", strings.NewReader(`{"spec":{},"page":{"limit":501}}`)))
 	if bad.Code != 400 {

@@ -809,8 +809,8 @@ import type { GroupPreview, NodeFacets, NodeFilterSpec, NodeViewPage, NodeViewRe
 export function queryNodeView(spec: NodeFilterSpec, page: NodeViewPage, signal?: AbortSignal) {
   return request<NodeViewResult>('/api/nodes/query', { method: 'POST', body: JSON.stringify({ spec, page }), signal })
 }
-export function fetchNodeFacets(signal?: AbortSignal) {
-  return request<NodeFacets>('/api/nodes/facets', { signal })
+export function fetchNodeFacets(signal?: AbortSignal, runtimeOnly = false) {
+  return request<NodeFacets>(`/api/nodes/facets${runtimeOnly ? '?runtime_only=true' : ''}`, { signal })
 }
 export function listSavedNodeFilters() {
   return request<{ filters: SavedNodeFilter[] }>('/api/node-filters')
@@ -827,4 +827,8 @@ export function previewGroup(id: number | undefined, payload: GroupPoolPayload, 
   return request<GroupPreview>(id ? `/api/groups/${id}/preview` : '/api/groups/preview', {
     method: 'POST', body: JSON.stringify(payload), signal,
   })
+}
+
+export function queryNodeIDs(spec: NodeFilterSpec) {
+  return request<{ ids: number[]; snapshot_revision: string }>('/api/nodes/query-ids', { method: 'POST', body: JSON.stringify({ spec }) })
 }

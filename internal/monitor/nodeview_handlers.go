@@ -133,9 +133,18 @@ func (s *Server) handleNodeQuery(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, 400, err.Error())
 		return
 	}
-	view, err := s.loadNodeView(r.Context(), input.Spec.Condition != nil)
+	view, err := s.loadNodeView(r.Context(), input.Spec.Condition != nil || input.Spec.Diagnostic != "" || input.Page.Sort == "speed_bps" || input.Page.Sort == "fraud_score" || input.Page.Sort == "diagnostic_latency")
 	if err != nil {
 		writeAPIError(w, 500, err.Error())
+		return
+	}
+	if r.URL.Path == "/api/nodes/query-ids" {
+		ids, err := view.IDs(input.Spec)
+		if err != nil {
+			writeAPIError(w, 400, err.Error())
+			return
+		}
+		writeJSON(w, map[string]any{"ids": ids, "snapshot_revision": view.Revision()})
 		return
 	}
 	result, err := view.Query(input.Spec, input.Page)
@@ -147,9 +156,13 @@ func (s *Server) handleNodeQuery(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleNodeFacets(w http.ResponseWriter, r *http.Request) {
-	view, err := s.loadNodeView(r.Context(), false)
+	view, err := s.loadNodeView(r.Context(), true)
 	if err != nil {
 		writeAPIError(w, 500, err.Error())
+		return
+	}
+	if r.URL.Query().Get("runtime_only") == "true" {
+		writeJSON(w, view.RuntimeFacets())
 		return
 	}
 	writeJSON(w, view.Facets())

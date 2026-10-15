@@ -7,6 +7,7 @@ import type { NodeFacet } from '../types'
 export function RegionSelect({ value, onChange, facets = [], label = '地区' }: {
   value: string[]; onChange: (value: string[]) => void; facets?: NodeFacet[]; label?: string
 }) {
+  const [custom, setCustom] = useState('')
   const options = new Map(facets.filter(item => item.value !== 'unknown').map(item => [item.value, item.label]))
   for (const code of ['hk', 'tw', 'jp', 'kr', 'us', 'gb', 'cn', 'sg', ...value]) {
     if (!options.has(code)) options.set(code, code.toUpperCase())
@@ -17,6 +18,13 @@ export function RegionSelect({ value, onChange, facets = [], label = '地区' }:
       onChange={event => onChange(Array.from(event.target.selectedOptions, item => item.value))}>
       {[...options].map(([code, name]) => <option key={code} value={code}>{name}</option>)}
     </select>
+    <input className="input input-xs w-40" aria-label={`添加${label}`} placeholder="地区码或中文名，回车添加" value={custom} onChange={event => setCustom(event.target.value)} onKeyDown={event => {
+      if (event.key === 'Enter') {
+        event.preventDefault()
+        if (custom.trim()) onChange([...new Set([...value, custom.trim()])])
+        setCustom('')
+      }
+    }} />
   </label>
 }
 
@@ -59,6 +67,7 @@ export default function NodeFilterBar({ filter }: { filter: ReturnType<typeof us
       })}
       <label className="flex flex-col gap-1 text-xs">最大延迟（ms）<input className="input w-32" type="number" min={0} value={spec.max_latency_ms ?? ''} onChange={event => setSpec({ ...spec, max_latency_ms: event.target.value === '' ? undefined : Number(event.target.value) })} /></label>
       <label className="flex flex-col gap-1 text-xs">标签匹配<select className="select" value={spec.tag_match || 'any'} onChange={event => setSpec({ ...spec, tag_match: event.target.value as 'any' | 'all' })}><option value="any">任一标签</option><option value="all">全部标签</option></select></label>
+      <label className="flex flex-col gap-1 text-xs">诊断筛选<select className="select" value={spec.diagnostic || ''} onChange={event => setSpec({ ...spec, diagnostic: event.target.value })}><option value="">全部诊断结果</option>{facets.data?.diagnostics.map(item => <option key={item.value} value={item.value}>{item.label} ({item.count})</option>)}</select></label>
       <button className="btn btn-sm" onClick={() => { setSpec({ version: 2 }); setSelected(0) }}>清除筛选</button>
     </div>
     <div className="flex flex-wrap items-center gap-2">

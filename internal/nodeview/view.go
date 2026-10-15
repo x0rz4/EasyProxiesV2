@@ -18,6 +18,7 @@ import (
 )
 
 type Spec struct {
+	Diagnostic           string               `json:"diagnostic,omitempty"`
 	Version              int                  `json:"version"`
 	Text                 string               `json:"text,omitempty"`
 	Regions              []string             `json:"regions,omitempty"`
@@ -39,6 +40,9 @@ type Spec struct {
 }
 
 func (s Spec) Validate(registry *nodefacts.Registry) error {
+	if _, err := DiagnosticCondition(s.Diagnostic); err != nil {
+		return err
+	}
 	if s.Version != 0 && s.Version != 1 && s.Version != 2 {
 		return fmt.Errorf("unsupported filter version %d", s.Version)
 	}
@@ -129,7 +133,7 @@ func (p *Page) Normalize() error {
 	if p.Offset < 0 || p.Limit < 1 || p.Limit > 500 {
 		return fmt.Errorf("offset must be nonnegative; limit must be 1..500")
 	}
-	if !slices.Contains([]string{"id", "name", "region", "status", "latency_ms", "port", "source"}, p.Sort) {
+	if !slices.Contains([]string{"id", "name", "region", "status", "latency_ms", "port", "source", "speed_bps", "fraud_score", "diagnostic_latency"}, p.Sort) {
 		return fmt.Errorf("invalid sort %q", p.Sort)
 	}
 	return nil
@@ -153,6 +157,7 @@ type Facet struct {
 }
 
 type Facets struct {
+	Diagnostics      []Facet `json:"diagnostics"`
 	Regions          []Facet `json:"regions"`
 	Tags             []Facet `json:"tags"`
 	Statuses         []Facet `json:"statuses"`
@@ -239,6 +244,17 @@ func (v *View) Query(spec Spec, page Page) (Result, error) {
 		switch page.Sort {
 		case "name":
 			cmp = strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name))
+		case "speed_bps", "fraud_score", "diagnostic_latency":
+			field := map[string]string{"speed_bps": nodefacts.FieldSpeedBps, "fraud_score": nodefacts.FieldIPQMaxFraudScore, "diagnostic_latency": nodefacts.FieldLatencyMs}[page.Sort]
+			av, bv := v.facts[a.ID].Value(field), v.facts[b.ID].Value(field)
+			if av.Known != bv.Known {
+				return av.Known
+			}
+			if av.Num < bv.Num {
+				cmp = -1
+			} else if av.Num > bv.Num {
+				cmp = 1
+			}
 		case "source":
 			cmp = strings.Compare(a.Source, b.Source)
 		case "port":
@@ -276,7 +292,10 @@ func (v *View) Query(spec Spec, page Page) (Result, error) {
 }
 
 // Facets counts the entire visible snapshot, not just the current page.
-func (v *View) Facets() Facets {
+func (v *View) Facets() Facets        { return v.facets(false) }
+func (v *View) RuntimeFacets() Facets { return v.facets(true) }
+func (v *View) facets(runtimeOnly bool) Facets {
+	total := 0
 	regions, tags, statuses, sources, protocols := map[string]*Facet{}, map[string]*Facet{}, map[string]*Facet{}, map[string]*Facet{}, map[string]*Facet{}
 	add := func(target map[string]*Facet, value, label string, healthy bool) {
 		item := target[value]
@@ -294,6 +313,10 @@ func (v *View) Facets() Facets {
 		tagIDs[name] = id
 	}
 	for _, node := range v.nodes {
+		if runtimeOnly && node.RuntimeTag == "" {
+			continue
+		}
+		total++
 		region := noderegion.Normalize(node.Region)
 		key, label := region, noderegion.Name(region)
 		if region == "" {
@@ -324,7 +347,22 @@ func (v *View) Facets() Facets {
 		sort.Slice(result, func(i, j int) bool { return result[i].Value < result[j].Value })
 		return result
 	}
-	return Facets{Regions: list(regions), Tags: list(tags), Statuses: list(statuses), Sources: list(sources), Protocols: list(protocols), Total: len(v.nodes), SnapshotRevision: v.revision}
+	diagnostics := []Facet{}
+	for _, name := range []string{"untested", "failed", "unlocked", "mixed", "locked", "residential", "broadcast", "proxy", "quality_success", "quality_failed", "speed_fast", "speed_failed", "fraud_high"} {
+		condition, _ := DiagnosticCondition(name)
+		labels := map[string]string{"untested": "未检测", "failed": "解锁失败", "unlocked": "完整解锁", "mixed": "混合解锁", "locked": "受限 / 部分", "residential": "住宅 IP", "broadcast": "广播 IP", "proxy": "代理 / 托管", "quality_success": "质量已测", "quality_failed": "质量失败", "speed_fast": "速度 ≥5 MB/s", "speed_failed": "测速失败", "fraud_high": "风险分 ≥71"}
+		item := Facet{Value: name, Label: labels[name]}
+		for _, node := range v.nodes {
+			if runtimeOnly && node.RuntimeTag == "" {
+				continue
+			}
+			if allowed, _ := nodefacts.Evaluate(*condition, v.facts[node.ID], v.now); allowed {
+				item.Count++
+			}
+		}
+		diagnostics = append(diagnostics, item)
+	}
+	return Facets{Diagnostics: diagnostics, Regions: list(regions), Tags: list(tags), Statuses: list(statuses), Sources: list(sources), Protocols: list(protocols), Total: total, SnapshotRevision: v.revision}
 }
 
 // Allow applies the same constraints as Query to one node from this snapshot.
@@ -368,6 +406,14 @@ func (v *View) allow(spec Spec, filter nodeselect.Filter, node Node) (bool, erro
 			return false, nil
 		}
 	}
+	if preset, err := DiagnosticCondition(spec.Diagnostic); err != nil {
+		return false, err
+	} else if preset != nil {
+		ok, err := nodefacts.Evaluate(*preset, v.facts[node.ID], v.now)
+		if err != nil || !ok {
+			return false, err
+		}
+	}
 	if spec.Condition != nil {
 		ok, err := nodefacts.Evaluate(*spec.Condition, v.facts[node.ID], v.now)
 		if err != nil {
@@ -381,3 +427,20 @@ func (v *View) allow(spec Spec, filter nodeselect.Filter, node Node) (bool, erro
 }
 
 func comparePorts(a, b uint16) int { return cmp.Compare(a, b) }
+
+// IDs selects bulk-operation targets from this single snapshot without paging
+// over a changing runtime or sorting/materializing full node responses.
+func (v *View) IDs(spec Spec) ([]int64, error) {
+	ids := []int64{}
+	filter := spec.Filter(v.names)
+	for _, node := range v.nodes {
+		allowed, err := v.allow(spec, filter, node)
+		if err != nil {
+			return nil, err
+		}
+		if allowed {
+			ids = append(ids, node.ID)
+		}
+	}
+	return ids, nil
+}

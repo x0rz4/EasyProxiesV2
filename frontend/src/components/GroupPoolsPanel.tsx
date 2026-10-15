@@ -142,7 +142,7 @@ export default function GroupPoolsPanel() {
   const [batchProbeProgress, setBatchProbeProgress] = useState<{ current: number; total: number } | null>(null)
 
   const eligibleNodes = useMemo(
-    () => nodes.filter((node) => node.selectable && !form.explicit_node_ids.includes(node.id) && !form.excluded_node_ids.includes(node.id)),
+    () => nodes.filter((node) => node.enabled && !form.explicit_node_ids.includes(node.id) && !form.excluded_node_ids.includes(node.id)),
     [nodes, form.explicit_node_ids, form.excluded_node_ids],
   )
   const nodeSearcher = useMemo(() => createFuzzySearcher(eligibleNodes, [
@@ -316,7 +316,7 @@ export default function GroupPoolsPanel() {
     await queryClient.invalidateQueries({ queryKey: ['groupPools'] })
     await queryClient.invalidateQueries({ queryKey: ['nodes'] })
     toast.success(`批量测试完成：${succeeded} 成功，${failed} 失败`, failed > 0
-      ? { description: '失败节点已从当前编辑草稿移除' } : undefined)
+      ? { description: '失败节点保留在编辑草稿中，等待后续探测恢复' } : undefined)
   }
 
   const activeGroups = groups.filter((group) => group.runtime_status === 'ready' || group.runtime_status === 'degraded').length

@@ -100,6 +100,7 @@ func (l *Loader) Load(ctx context.Context, nodeIDs []int64) ([]NodeFacts, error)
 		applyDetectionFields(facts, detections[node.ID], stats[node.ID])
 		applyUnlockFields(facts, unlocks[node.ID])
 		applyIPQualityFields(facts, qualities[node.ID])
+		applyDiagnosticFields(facts, detections[node.ID], unlocks[node.ID], qualities[node.ID])
 		out = append(out, facts)
 	}
 	sort.Slice(out, func(first, second int) bool { return out[first].NodeID < out[second].NodeID })
@@ -388,14 +389,14 @@ func (r flagReduction) fact(value bool) Fact[bool] {
 // their columns hold whatever the failed attempt left behind.
 func applyIPQualityFields(facts NodeFacts, rows []store.NodeIPQualityResult) {
 	reductions := map[string]*flagReduction{
-		"is_residential": {}, "proxy": {}, "hosting": {},
+		"is_residential": {}, "proxy": {}, "hosting": {}, "is_broadcast": {},
 	}
 	// The max reduction takes the highest score but the oldest timestamp: the
 	// combined fact is only as fresh as its stalest contributor.
 	maxFraudKnown, maxFraudValue := false, int64(0)
 	var maxFraudCheckedAt time.Time
 	for _, row := range rows {
-		if row.Status != detectionStatusSuccess {
+		if row.Status != detectionStatusSuccess && row.Status != "partial" {
 			continue
 		}
 		provider := strings.ToLower(strings.TrimSpace(row.Provider))

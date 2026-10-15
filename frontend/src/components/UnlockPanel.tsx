@@ -1,4 +1,4 @@
-import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type {
   ConfigNodeConfig,
   NodeSnapshot,
@@ -10,15 +10,17 @@ import type {
   NodeCheckEvent,
   Subscription,
 } from '../types'
-import { cancelNodeCheckTask, createNodeCheckTask, fetchConfigNodes, fetchNodeCheckResults, fetchNodeCheckSettings, fetchNodeCheckTasks, fetchNodes, fetchUnlockResults, listSubscriptions, streamNodeCheckTask, unlockNode, updateNodeCheckSettings } from '../api/client'
-import { createFuzzySearcher, searchAllTokens } from '../utils/fuzzySearch'
+import { queryNodeIDs, cancelNodeCheckTask, createNodeCheckTask, fetchConfigNodes, fetchNodeCheckResults, fetchNodeCheckSettings, fetchNodeCheckTasks, fetchNodes, fetchUnlockResults, listSubscriptions, streamNodeCheckTask, unlockNode, updateNodeCheckSettings } from '../api/client'
+import { useQueryClient } from '@tanstack/react-query'
+import { useNodeFilter } from '../hooks/useNodeFilter'
+import NodeFilterBar from './NodeFilterBar'
 import { regionFlag } from '../utils/region'
 import { displayLatency, unlockNetworkInfo } from '../utils/unlockDisplay'
 import { PageContent, PageHeader, PageLayout, surfaceClass } from './ui/PageLayout'
 import UnlockDrawer from './UnlockDrawer'
 import {
   ShieldCheck, X, Play, RefreshCw, ArrowUpDown, ArrowUp, ArrowDown,
-  Search, Sparkles, AlertTriangle, CheckCircle2, XCircle, RotateCcw,
+  Sparkles, AlertTriangle, CheckCircle2, XCircle, RotateCcw,
   Globe2,
   Gauge, Settings2, Wifi, Database, Save,
 } from 'lucide-react'
@@ -27,21 +29,6 @@ import { cn } from '../utils/cn'
 
 type StatusFilterType = '' | 'unlocked' | 'residential' | 'broadcast' | 'proxy' | 'quality_success' | 'quality_failed' | 'speed_fast' | 'speed_failed' | 'fraud_high' | 'locked' | 'mixed' | 'failed' | 'untested'
 type DiagnosticSortKey = 'name' | 'latency' | 'speed' | 'fraud'
-
-interface UnlockSearchRecord {
-  node: NodeSnapshot
-  config?: ConfigNodeConfig
-  name: string
-  runtimeTag: string
-  uri: string
-  tagNames: string[]
-  exitIp: string
-  landingCountry: string
-  configuredRegion: string
-  qualityText: string
-  source: string
-  port: string
-}
 
 function sourceLabel(source?: string) {
   switch (source) {
@@ -86,6 +73,9 @@ function normalizeUnlockResults(raw: Record<string, UnlockResult>): Record<numbe
 }
 
 export default function UnlockPanel() {
+  const queryClient = useQueryClient()
+  const nodeFilter = useNodeFilter({ version: 2 }, true, true)
+  const [preparingTask, setPreparingTask] = useState(false)
   const [nodes, setNodes] = useState<NodeSnapshot[]>([])
   const [configNodes, setConfigNodes] = useState<ConfigNodeConfig[]>([])
   const [subscriptions, setSubscriptions] = useState<Subscription[]>([])
@@ -118,24 +108,13 @@ export default function UnlockPanel() {
   const [batchProgress, setBatchProgress] = useState({ current: 0, total: 0 })
   const batchAbortRef = useRef<AbortController | null>(null)
 
-  // Filter / search
-  const [filter, setFilter] = useState('')
-  const deferredFilter = useDeferredValue(filter)
-  const [statusFilter, setStatusFilter] = useState<StatusFilterType>('')
-  const [countryFilter, setCountryFilter] = useState('')
-
-  // Sorting
-  const [sortKey, setSortKey] = useState<DiagnosticSortKey | null>(null)
-  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc')
-
-  const handleSort = (key: DiagnosticSortKey) => {
-    if (sortKey === key) {
-      setSortDir(sortDir === 'asc' ? 'desc' : 'asc')
-    } else {
-      setSortKey(key)
-      setSortDir('asc')
-    }
-  }
+  const statusFilter = (nodeFilter.spec.diagnostic || '') as StatusFilterType
+  const setStatusFilter = (diagnostic: StatusFilterType) => nodeFilter.setSpec({ ...nodeFilter.spec, diagnostic })
+  const sortNames = { name: 'name', latency: 'diagnostic_latency', speed: 'speed_bps', fraud: 'fraud_score' } as const
+  const sortKey = (Object.keys(sortNames) as DiagnosticSortKey[]).find(key => sortNames[key] === nodeFilter.page.sort)
+  const sortDir = nodeFilter.page.descending ? 'desc' : 'asc'
+  const handleSort = (key: DiagnosticSortKey) => nodeFilter.setPage({ ...nodeFilter.page,
+    sort: sortNames[key], descending: sortKey === key ? !nodeFilter.page.descending : false, offset: 0 })
 
   // ---- Node list ----
   // The runtime node list is refetched whenever detection data is refreshed, so
@@ -148,11 +127,13 @@ export default function UnlockPanel() {
       listSubscriptions().catch(() => null),
     ])
     // unlock-checked; the dialer is registered per member tag.
-    const usable = (res.nodes || []).filter((n) => n.tag && n.initial_check_done && n.available && !n.blacklisted)
-    setNodes(usable)
+    const usable = (res.nodes || []).filter((n) => n.tag)
+    setNodes([...new Map(usable.map(node => [node.node_id, node])).values()])
+    void queryClient.invalidateQueries({ queryKey: ['nodeQuery'] })
+    void queryClient.invalidateQueries({ queryKey: ['nodeFacets'] })
     setConfigNodes(configRes?.nodes || [])
     setSubscriptions(subscriptionRes?.subscriptions || [])
-  }, [])
+  }, [queryClient])
 
   const loadNodes = useCallback(async () => {
     try {
@@ -299,9 +280,16 @@ export default function UnlockPanel() {
   }, [connectTask])
 
   // Quick unlock uses the same task scheduler as comprehensive diagnostics.
-  const runBatch = useCallback(() => {
-    void launchTask(nodes.map((node) => node.node_id), { latency: false, speed: false, quality: false, unlock: true })
-  }, [launchTask, nodes])
+  const runFilteredTask = async (stages: NodeCheckStages, settings?: NodeCheckSettings) => {
+    if (preparingTask) return
+    setPreparingTask(true)
+    try {
+      const result = await queryNodeIDs(nodeFilter.querySpec)
+      await launchTask(result.ids, stages, settings)
+    } catch (error) { toast.error(error instanceof Error ? error.message : '获取筛选节点失败') }
+    finally { setPreparingTask(false) }
+  }
+  const runBatch = () => void runFilteredTask({ latency: false, speed: false, quality: false, unlock: true })
 
   const stopBatch = useCallback(() => {
     if (activeTask) void cancelNodeCheckTask(activeTask.id)
@@ -314,74 +302,14 @@ export default function UnlockPanel() {
     setActiveTask((current) => current ? { ...current, status: 'cancelled' } : current)
   }, [activeTask])
 
-  // ---- Summary metrics ----
-  const summary = useMemo(() => {
-    let unlocked = 0
-    let locked = 0
-    let mixed = 0
-    let failed = 0
-    let pureIp = 0
-    let testedCount = 0
-    let qualityTested = 0
-
-    for (const node of nodes) {
-      const r = results[node.node_id]
-      const err = errors[node.node_id]
-      const quality = diagnostics[node.node_id]?.quality || []
-      if (quality.some((item) => item.status === 'success' || item.status === 'partial')) qualityTested++
-      if (quality.some((item) => item.is_residential === true)) pureIp++
-      if (!r && !err) continue
-
-      testedCount++
-      if (err || r?.error) {
-        failed++
-        continue
-      }
-      if (!r) continue
-
-      const statuses = r.services?.map((s) => s.status) || []
-      const isAllUnlocked = statuses.length > 0 && statuses.every((s) => s === 'unlocked')
-      const hasUnlocked = statuses.some((s) => s === 'unlocked')
-      const hasLocked = statuses.some((s) => s === 'locked' || s === 'partial' || s === 'originals_only')
-
-      if (isAllUnlocked) {
-        unlocked++
-      } else if (hasUnlocked && hasLocked) {
-        mixed++
-      } else if (hasLocked) {
-        locked++
-      } else {
-        failed++
-      }
-    }
-
-    const untested = Math.max(0, nodes.length - testedCount)
-    return {
-      total: nodes.length,
-      tested: testedCount,
-      untested,
-      unlocked,
-      pureIp,
-      qualityTested,
-      locked,
-      mixed,
-      failed,
-    }
-  }, [nodes, results, errors, diagnostics])
-
-  // ---- Countries breakdown ----
-  const countries = useMemo(() => {
-    const counts = new Map<string, number>()
-    for (const n of nodes) {
-      const code = unlockNetworkInfo(diagnostics[n.node_id], results[n.node_id]).countryCode
-      if (code) {
-        counts.set(code.toUpperCase(), (counts.get(code.toUpperCase()) || 0) + 1)
-      }
-    }
-    return Array.from(counts.entries())
-      .sort((a, b) => b[1] - a[1])
-      .map(([code, count]) => ({ code, count }))
-  }, [nodes, diagnostics, results])
+  // Diagnostic counts come from the same fact predicates as the query.
+  const diagnosticCount = (name: string) => nodeFilter.facets.data?.diagnostics.find(item => item.value === name)?.count || 0
+  const summary = {
+    total: nodeFilter.facets.data?.total || 0, tested: Math.max(0, (nodeFilter.facets.data?.total || 0) - diagnosticCount('untested')),
+    untested: diagnosticCount('untested'), unlocked: diagnosticCount('unlocked'),
+    pureIp: diagnosticCount('residential'), qualityTested: diagnosticCount('quality_success'),
+    locked: diagnosticCount('locked'), mixed: diagnosticCount('mixed'), failed: diagnosticCount('failed'),
+  }
 
   // ---- Filtered and sorted data ----
   const nodeConfigByID = useMemo(() => {
@@ -399,139 +327,13 @@ export default function UnlockPanel() {
     [subscriptions],
   )
 
-  const filterableNodes = useMemo(() => {
-    return nodes.filter((n) => {
-      if (countryFilter) {
-        const c = unlockNetworkInfo(diagnostics[n.node_id], results[n.node_id]).countryCode
-        if (c !== countryFilter.toUpperCase()) return false
-      }
-
-      if (statusFilter) {
-        const r = results[n.node_id]
-        const err = errors[n.node_id]
-        if (statusFilter === 'untested') {
-          return !r && !err
-        }
-        if (statusFilter === 'failed') {
-          return Boolean(err || r?.error)
-        }
-        if (statusFilter === 'residential') {
-          return diagnostics[n.node_id]?.quality.some((item) => item.is_residential === true) || false
-        }
-        if (statusFilter === 'broadcast') {
-          return diagnostics[n.node_id]?.quality.some((item) => item.is_broadcast === true) || false
-        }
-        if (statusFilter === 'proxy') {
-          return diagnostics[n.node_id]?.quality.some((item) => item.proxy === true || item.hosting === true) || false
-        }
-        if (statusFilter === 'quality_success') {
-          return diagnostics[n.node_id]?.quality.some((item) => item.status === 'success' || item.status === 'partial') || false
-        }
-        if (statusFilter === 'quality_failed') {
-          return diagnostics[n.node_id]?.quality.some((item) => item.status === 'failed') || false
-        }
-        if (statusFilter === 'speed_fast') {
-          return (diagnostics[n.node_id]?.detection?.average_bytes_per_second || 0) >= 5 * 1024 * 1024
-        }
-        if (statusFilter === 'speed_failed') {
-          return diagnostics[n.node_id]?.detection?.speed_status === 'failed'
-        }
-        if (statusFilter === 'fraud_high') {
-          return diagnostics[n.node_id]?.quality.some((item) => item.fraud_score != null && item.fraud_score >= 71) || false
-        }
-        if (!r || r.error || err) return false
-        const statuses = r.services?.map((s) => s.status) || []
-        if (statusFilter === 'unlocked') {
-          return statuses.length > 0 && statuses.every((s) => s === 'unlocked')
-        }
-        if (statusFilter === 'locked') {
-          const hasLocked = statuses.some((s) => s === 'locked' || s === 'partial' || s === 'originals_only')
-          const hasUnlocked = statuses.some((s) => s === 'unlocked')
-          return hasLocked || hasUnlocked
-        }
-        if (statusFilter === 'mixed') {
-          const hasUnlocked = statuses.some((s) => s === 'unlocked')
-          const hasLocked = statuses.some((s) => s === 'locked' || s === 'partial' || s === 'originals_only')
-          return hasUnlocked && hasLocked
-        }
-      }
-      return true
-    })
-  }, [nodes, statusFilter, countryFilter, results, errors, diagnostics])
-
-  const searchRecords = useMemo<UnlockSearchRecord[]>(() => filterableNodes.map((node) => {
-    const config = nodeConfigByID.get(node.node_id)
-    const result = results[node.node_id]
-    const diagnostic = diagnostics[node.node_id]
-    const network = unlockNetworkInfo(diagnostic, result)
-    const source = nodeSourceLabel(config, subscriptionNamesByID)
-    return {
-      node,
-      config,
-      name: node.name,
-      runtimeTag: node.tag,
-      uri: config?.uri || node.uri,
-      tagNames: config?.tags || [],
-      exitIp: `${diagnostic?.detection?.exit_ip || ''} ${result?.ip?.ip || ''}`,
-      landingCountry: `${network.country} ${network.countryCode}`,
-      configuredRegion: `${config?.country || ''} ${config?.region || ''} ${node.country || ''} ${node.region || ''}`,
-      qualityText: `${network.asn} ${network.organization} ${diagnostic?.quality.map((item) => `${item.ip || ''} ${item.asn || ''} ${item.org || ''} ${item.isp || ''}`).join(' ') || ''}`,
-      source: `${config?.source || ''} ${source}`,
-      port: String(config?.port || node.port || ''),
-    }
-  }), [diagnostics, filterableNodes, nodeConfigByID, results, subscriptionNamesByID])
-
-  const nodeSearcher = useMemo(() => createFuzzySearcher(searchRecords, [
-    { name: 'name', weight: 0.24 },
-    { name: 'runtimeTag', weight: 0.10 },
-    { name: 'uri', weight: 0.10 },
-    { name: 'tagNames', weight: 0.12 },
-    { name: 'exitIp', weight: 0.12 },
-    { name: 'landingCountry', weight: 0.10 },
-    { name: 'configuredRegion', weight: 0.06 },
-    { name: 'qualityText', weight: 0.08 },
-    { name: 'source', weight: 0.04 },
-    { name: 'port', weight: 0.04 },
-  ]), [searchRecords])
-
   const sortedNodes = useMemo(() => {
-    const compareNodes = (a: NodeSnapshot, b: NodeSnapshot) => {
-      if (!sortKey) return 0
-      let cmp = 0
-      if (sortKey === 'name') {
-        cmp = a.name.localeCompare(b.name)
-      } else if (sortKey === 'latency') {
-        const valA = displayLatency(a, diagnostics[a.node_id]).value
-        const valB = displayLatency(b, diagnostics[b.node_id]).value
-        if (valA == null || valB == null) {
-          if (valA == null && valB == null) return 0
-          return valA == null ? 1 : -1
-        }
-        cmp = valA - valB
-      } else if (sortKey === 'speed') {
-        const valA = diagnostics[a.node_id]?.detection?.average_bytes_per_second ?? -1
-        const valB = diagnostics[b.node_id]?.detection?.average_bytes_per_second ?? -1
-        cmp = valA - valB
-      } else if (sortKey === 'fraud') {
-        const valA = diagnostics[a.node_id]?.quality.find((item) => item.provider === 'ippure')?.fraud_score ?? Infinity
-        const valB = diagnostics[b.node_id]?.quality.find((item) => item.provider === 'ippure')?.fraud_score ?? Infinity
-        cmp = valA - valB
-      }
-      return sortDir === 'asc' ? cmp : -cmp
-    }
-
-    const query = deferredFilter.trim()
-    if (query) {
-      return searchAllTokens(nodeSearcher, query)
-        .sort((a, b) => {
-          const scoreDifference = a.score - b.score
-          if (Math.abs(scoreDifference) > Number.EPSILON) return scoreDifference
-          return compareNodes(a.item.node, b.item.node) || a.refIndex - b.refIndex
-        })
-        .map((result) => result.item.node)
-    }
-    return sortKey ? [...filterableNodes].sort(compareNodes) : filterableNodes
-  }, [deferredFilter, diagnostics, filterableNodes, nodeSearcher, sortDir, sortKey])
+    const byID = new Map(nodes.map(node => [node.node_id, node]))
+    return (nodeFilter.query.data?.items || []).flatMap(item => {
+      const node = byID.get(item.id)
+      return node ? [node] : []
+    })
+  }, [nodes, nodeFilter.query.data])
 
   const progressPct =
     batchProgress.total > 0
@@ -543,12 +345,8 @@ export default function UnlockPanel() {
     setDrawerOpen(true)
   }
 
-  const isFilterActive = Boolean(filter || countryFilter || statusFilter)
-  const resetFilters = () => {
-    setFilter('')
-    setCountryFilter('')
-    setStatusFilter('')
-  }
+  const isFilterActive = Object.keys(nodeFilter.spec).some(key => key !== 'version')
+  const resetFilters = () => nodeFilter.setSpec({ version: 2 })
   const allFilteredSelected = sortedNodes.length > 0 && sortedNodes.every((node) => selectedIds.has(node.node_id))
   const toggleAllFiltered = () => setSelectedIds((current) => {
     const next = new Set(current)
@@ -556,7 +354,7 @@ export default function UnlockPanel() {
     else sortedNodes.forEach((node) => next.add(node.node_id))
     return next
   })
-  const taskTargets = checkScope === 'selected' ? nodes.filter((node) => selectedIds.has(node.node_id)) : sortedNodes
+  const selectedTargets = nodes.filter(node => selectedIds.has(node.node_id))
 
   return (
     <PageLayout className="lg:h-[calc(100vh-4rem)] lg:min-h-0 lg:overflow-hidden">
@@ -576,7 +374,7 @@ export default function UnlockPanel() {
                 <button className="btn btn-primary btn-sm gap-2 shadow-sm lg:btn-md" onClick={() => setCheckDialogOpen(true)} disabled={loading || nodes.length === 0}>
                   <Gauge className="h-4 w-4" />综合检测
                 </button>
-                <button className="btn btn-ghost btn-sm gap-2 border border-base-300 lg:btn-md" onClick={runBatch} disabled={loading || nodes.length === 0}>
+                <button className="btn btn-ghost btn-sm gap-2 border border-base-300 lg:btn-md" onClick={runBatch} disabled={preparingTask || loading || nodes.length === 0}>
                   <Play className="h-4 w-4" />快速解锁
                 </button>
               </>
@@ -585,7 +383,7 @@ export default function UnlockPanel() {
               className="btn btn-ghost btn-sm gap-2 border border-base-300 shadow-sm lg:btn-md"
               onClick={() => void loadNodes()}
               disabled={loading}
-              title="重新加载可用节点列表"
+              title="重新加载运行节点列表"
             >
               <RefreshCw className={cn('h-4 w-4', loading && 'animate-spin')} />
               <span className="hidden sm:inline">刷新节点</span>
@@ -652,7 +450,7 @@ export default function UnlockPanel() {
             value={nodes.length > 0 ? `${summary.tested} / ${summary.total}` : '0'}
             hint={
               nodes.length === 0
-                ? '暂无可用节点'
+                ? '暂无运行节点'
                 : summary.untested === 0
                   ? '覆盖率 100% · 全部已完成'
                   : `覆盖率 ${Math.round((summary.tested / summary.total) * 100)}% · 待检测 ${summary.untested}`
@@ -693,7 +491,7 @@ export default function UnlockPanel() {
           />
           <SummaryCard
             label="受限 / 部分"
-            value={summary.locked + summary.mixed}
+            value={summary.locked}
             hint="仅自制剧或部分流媒体"
             icon={<AlertTriangle className="h-5 w-5" />}
             toneBg="bg-warning/10"
@@ -716,51 +514,7 @@ export default function UnlockPanel() {
         {/* ---- Redesigned Search & Filter Toolbar ---- */}
         <section className={cn(surfaceClass, 'mb-5 shrink-0 p-4 sm:p-5')}>
           <div className="flex flex-col gap-4">
-            {/* Row 1: Search input + Country selector */}
-            <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
-              {/* Search Bar */}
-              <div className="relative min-w-0 flex-1">
-                <div className="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3.5 text-base-content/40">
-                  <Search className="h-4 w-4" />
-                </div>
-                <input
-                  type="text"
-                  className="input input-md w-full rounded-xl border border-base-300/70 bg-base-200/40 pl-10 pr-9 text-sm transition-colors focus:border-primary/50 focus:bg-base-100 focus:outline-none"
-                  placeholder="模糊搜索名称、标签、来源、出口 IP…（空格分隔多关键词）"
-                  value={filter}
-                  onChange={(e) => setFilter(e.target.value)}
-                  aria-label="模糊搜索节点，支持空格分隔的多关键词"
-                  title="支持空格分隔的多关键词和轻微拼写错误"
-                />
-                {filter && (
-                  <button
-                    type="button"
-                    className="absolute inset-y-0 right-0 flex items-center pr-3 text-base-content/40 hover:text-base-content"
-                    onClick={() => setFilter('')}
-                    aria-label="清空搜索"
-                  >
-                    <X className="h-4 w-4" />
-                  </button>
-                )}
-              </div>
-
-              {/* Country Selector */}
-              <div className="sm:w-60">
-                <select
-                  className="select select-md w-full rounded-xl border border-base-300/70 bg-base-200/40 text-sm font-medium focus:border-primary/50 focus:bg-base-100"
-                  value={countryFilter}
-                  onChange={(e) => setCountryFilter(e.target.value)}
-                  aria-label="筛选落地国家和地区"
-                >
-                  <option value="">🌐 全部落地国家 / 地区 ({nodes.length})</option>
-                  {countries.map(({ code, count }) => (
-                    <option key={code} value={code}>
-                      {regionFlag(code)} {code} ({count} 个节点)
-                    </option>
-                  ))}
-                </select>
-              </div>
-            </div>
+            <NodeFilterBar filter={nodeFilter} />
 
             {/* Row 2: Status Filter Chips & Result Counter */}
             <div className="flex flex-wrap items-center justify-between gap-3 border-t border-base-200 pt-3.5">
@@ -783,49 +537,49 @@ export default function UnlockPanel() {
                   active={statusFilter === 'broadcast'}
                   onClick={() => setStatusFilter(statusFilter === 'broadcast' ? '' : 'broadcast')}
                   label="广播 IP"
-                  count={nodes.filter((node) => diagnostics[node.node_id]?.quality.some((item) => item.is_broadcast === true)).length}
+                  count={diagnosticCount('broadcast')}
                   tone="warning"
                 />
                 <FilterChip
                   active={statusFilter === 'proxy'}
                   onClick={() => setStatusFilter(statusFilter === 'proxy' ? '' : 'proxy')}
                   label="代理 / 托管"
-                  count={nodes.filter((node) => diagnostics[node.node_id]?.quality.some((item) => item.proxy === true || item.hosting === true)).length}
+                  count={diagnosticCount('proxy')}
                   tone="warning"
                 />
                 <FilterChip
                   active={statusFilter === 'quality_success'}
                   onClick={() => setStatusFilter(statusFilter === 'quality_success' ? '' : 'quality_success')}
                   label="质量已测"
-                  count={nodes.filter((node) => diagnostics[node.node_id]?.quality.some((item) => item.status === 'success' || item.status === 'partial')).length}
+                  count={diagnosticCount('quality_success')}
                   tone="success"
                 />
                 <FilterChip
                   active={statusFilter === 'quality_failed'}
                   onClick={() => setStatusFilter(statusFilter === 'quality_failed' ? '' : 'quality_failed')}
                   label="质量失败"
-                  count={nodes.filter((node) => diagnostics[node.node_id]?.quality.some((item) => item.status === 'failed')).length}
+                  count={diagnosticCount('quality_failed')}
                   tone="error"
                 />
                 <FilterChip
                   active={statusFilter === 'speed_fast'}
                   onClick={() => setStatusFilter(statusFilter === 'speed_fast' ? '' : 'speed_fast')}
                   label="≥5 MB/s"
-                  count={nodes.filter((node) => (diagnostics[node.node_id]?.detection?.average_bytes_per_second || 0) >= 5 * 1024 * 1024).length}
+                  count={diagnosticCount('speed_fast')}
                   tone="success"
                 />
                 <FilterChip
                   active={statusFilter === 'speed_failed'}
                   onClick={() => setStatusFilter(statusFilter === 'speed_failed' ? '' : 'speed_failed')}
                   label="测速失败"
-                  count={nodes.filter((node) => diagnostics[node.node_id]?.detection?.speed_status === 'failed').length}
+                  count={diagnosticCount('speed_failed')}
                   tone="error"
                 />
                 <FilterChip
                   active={statusFilter === 'fraud_high'}
                   onClick={() => setStatusFilter(statusFilter === 'fraud_high' ? '' : 'fraud_high')}
                   label="欺诈分 ≥71"
-                  count={nodes.filter((node) => diagnostics[node.node_id]?.quality.some((item) => item.fraud_score != null && item.fraud_score >= 71)).length}
+                  count={diagnosticCount('fraud_high')}
                   tone="error"
                 />
                 <FilterChip
@@ -839,7 +593,7 @@ export default function UnlockPanel() {
                   active={statusFilter === 'locked'}
                   onClick={() => setStatusFilter(statusFilter === 'locked' ? '' : 'locked')}
                   label="受限 / 部分"
-                  count={summary.locked + summary.mixed}
+                  count={summary.locked}
                   tone="warning"
                 />
                 <FilterChip
@@ -863,7 +617,7 @@ export default function UnlockPanel() {
               {/* Status information & Reset */}
               <div className="flex items-center gap-3 text-xs text-base-content/55">
                 <span>
-                  显示 <strong className="font-bold text-base-content">{sortedNodes.length}</strong> / {nodes.length} 个节点
+                  当前页 <strong className="font-bold text-base-content">{sortedNodes.length}</strong> / {nodeFilter.query.data?.total || 0} 个匹配节点
                 </span>
                 {isFilterActive && (
                   <button
@@ -910,7 +664,7 @@ export default function UnlockPanel() {
                   </th>
                   <th className="w-52">出口 IP / 运营商</th>
                   <th className="w-44 cursor-pointer select-none transition-colors hover:bg-base-200/60" onClick={() => handleSort('fraud')}>
-                    <div className="flex items-center gap-1.5"><span>IP 质量</span><SortIcon active={sortKey === 'fraud'} dir={sortDir} /></div>
+                    <div className="flex items-center gap-1.5"><span>IP 质量（最高风险）</span><SortIcon active={sortKey === 'fraud'} dir={sortDir} /></div>
                   </th>
                   <th className="min-w-[240px]">解锁状态</th>
                   <th className="w-24 text-right pr-4">操作</th>
@@ -931,9 +685,9 @@ export default function UnlockPanel() {
                       <div className="flex flex-col items-center justify-center gap-2">
                         <Globe2 className="h-8 w-8 text-base-content/30" />
                         <p className="font-medium text-base-content/70">
-                          {nodes.length === 0 ? '暂无可用节点' : '没有找到匹配的节点'}
+                          {nodes.length === 0 ? '暂无运行节点' : '没有找到匹配的节点'}
                         </p>
-                        {nodes.length > 0 && filter.trim() && (
+                        {nodes.length > 0 && nodeFilter.spec.text?.trim() && (
                           <p className="text-xs text-base-content/45">请尝试缩短关键词或检查拼写</p>
                         )}
                         {isFilterActive && (
@@ -990,9 +744,9 @@ export default function UnlockPanel() {
           settings={checkSettings}
           stages={checkStages}
           scope={checkScope}
-          selectedCount={selectedIds.size}
-          filteredCount={sortedNodes.length}
-          targetCount={taskTargets.length}
+          selectedCount={selectedTargets.length}
+          filteredCount={nodeFilter.query.data?.total || 0}
+          targetCount={checkScope === 'selected' ? selectedTargets.length : nodeFilter.query.data?.total || 0}
           onStagesChange={setCheckStages}
           onScopeChange={setCheckScope}
           onSettingsChange={setCheckSettings}
@@ -1001,7 +755,7 @@ export default function UnlockPanel() {
             catch (error) { toast.error(error instanceof Error ? error.message : '保存设置失败') }
           }}
           onClose={() => setCheckDialogOpen(false)}
-          onStart={() => void launchTask(taskTargets.map((node) => node.node_id), checkStages, checkSettings)}
+          onStart={() => { if (!preparingTask) void (checkScope === 'selected' ? launchTask(selectedTargets.map(node => node.node_id), checkStages, checkSettings) : runFilteredTask(checkStages, checkSettings)) }}
         />
       )}
     </PageLayout>

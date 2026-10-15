@@ -1,6 +1,7 @@
 import type { TagCondition } from './index'
 
 export interface NodeFilterSpec {
+  diagnostic?: string
   version: number
   text?: string
   regions?: string[]
@@ -38,7 +39,7 @@ export interface NodeViewItem {
 export interface NodeViewPage {
   offset: number
   limit: number
-  sort: 'id' | 'name' | 'region' | 'status' | 'latency_ms' | 'port' | 'source'
+  sort: 'id' | 'name' | 'region' | 'status' | 'latency_ms' | 'port' | 'source' | 'speed_bps' | 'fraud_score' | 'diagnostic_latency'
   descending: boolean
 }
 export interface NodeViewResult {
@@ -49,6 +50,7 @@ export interface NodeViewResult {
 }
 export interface NodeFacet { value: string; label: string; count: number; healthy: number; avg_latency_ms: number }
 export interface NodeFacets {
+  diagnostics: NodeFacet[]
   regions: NodeFacet[]
   tags: NodeFacet[]
   statuses: NodeFacet[]

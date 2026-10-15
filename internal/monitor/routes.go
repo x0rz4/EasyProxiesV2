@@ -49,6 +49,7 @@ func (s *Server) routes() http.Handler {
 
 	authenticated("GET /api/nodes", s.handleNodes)
 	authenticated("POST /api/nodes/query", s.handleNodeQuery)
+	authenticated("POST /api/nodes/query-ids", s.handleNodeQuery)
 	authenticated("GET /api/nodes/facets", s.handleNodeFacets)
 	authenticated("POST /api/groups/preview", s.handleGroupPreview)
 	authenticated("POST /api/groups/{groupID}/preview", s.handleGroupPreview)

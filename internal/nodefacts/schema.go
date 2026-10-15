@@ -364,6 +364,7 @@ func WithIPQualityProviders(providers []ProviderInfo) RegistryOption {
 		})
 		for _, flag := range []struct{ attribute, label string }{
 			{"is_residential", "住宅 IP"},
+			{"is_broadcast", "广播 IP"},
 			{"proxy", "代理"},
 			{"hosting", "机房"},
 		} {
@@ -406,6 +407,7 @@ func DefaultRegistry(options ...RegistryOption) *Registry {
 	registerPerformanceFields(registry)
 	registerIPFields(registry)
 	registerUnlockFields(registry)
+	registerDiagnosticFields(registry)
 	for _, option := range options {
 		option(registry)
 	}

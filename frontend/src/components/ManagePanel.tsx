@@ -194,7 +194,7 @@ export default function ManagePanel() {
   const [batchProbeProgress, setBatchProbeProgress] = useState<{ current: number; total: number } | null>(null)
 
   const nodeFilter = useNodeFilter()
-  const sortKey: ManageSortKey = nodeFilter.page.sort === 'latency_ms' ? 'latency' : nodeFilter.page.sort === 'id' ? 'name' : nodeFilter.page.sort
+  const sortKey: ManageSortKey = nodeFilter.page.sort === 'latency_ms' ? 'latency' : (['name', 'status', 'region', 'port', 'source'] as string[]).includes(nodeFilter.page.sort) ? nodeFilter.page.sort as ManageSortKey : 'name'
   const sortDir: SortDir = nodeFilter.page.descending ? 'desc' : 'asc'
   const hasFilters = Object.keys(nodeFilter.spec).some(key => key !== 'version')
 
