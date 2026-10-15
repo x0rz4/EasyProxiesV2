@@ -224,7 +224,7 @@ func TestCommitSnapshotReconcilesUniqueLogicalNodeInPlace(t *testing.T) {
 	if err := db.UpdateNode(ctx, oldNode); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.UpsertNodeStats(ctx, &NodeStats{NodeID: oldNode.ID, SuccessCount: 8, LastLatencyMs: 66}); err != nil {
+	if err := db.UpsertNodeStats(ctx, &NodeStats{NodeID: oldNode.ID, SuccessCount: 8, LastLatencyMs: 66, TotalDownloadBytes: 123}); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.UpsertNodeDetectionResult(ctx, &NodeDetectionResult{NodeID: oldNode.ID, LatencyStatus: "untested", SpeedStatus: "untested", ExitIPStatus: "success", ExitIP: "1.1.1.1"}); err != nil {
@@ -257,8 +257,8 @@ func TestCommitSnapshotReconcilesUniqueLogicalNodeInPlace(t *testing.T) {
 		t.Fatalf("stale logical node was retained: %+v", stale)
 	}
 	stats, _ := db.GetNodeStats(ctx, oldNode.ID)
-	if stats == nil || stats.SuccessCount != 8 || stats.LastLatencyMs != 66 {
-		t.Fatalf("logical replacement lost stats: %+v", stats)
+	if stats == nil || stats.SuccessCount != 0 || stats.LastLatencyMs != -1 || stats.InitialCheckDone || stats.TotalDownloadBytes != 123 {
+		t.Fatalf("logical identity replacement must reset health and preserve traffic: %+v", stats)
 	}
 	storedGroup, _ := db.GetGroupPool(ctx, group.ID)
 	if storedGroup == nil || storedGroup.CurrentActiveNodeID != oldNode.ID || len(storedGroup.ExplicitNodeIDs) != 1 || storedGroup.ExplicitNodeIDs[0] != oldNode.ID {

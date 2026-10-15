@@ -233,7 +233,7 @@ func TestRegionEmojiFromAnyCountryCode(t *testing.T) {
 	if got := RegionEmoji(""); got != "❓" {
 		t.Errorf("RegionEmoji(\"\") = %q, want ❓", got)
 	}
-	if got := RegionEmoji("usa"); got != "❓" {
-		t.Errorf("RegionEmoji(usa) = %q, want ❓", got)
+	if got := RegionEmoji("usa"); got != "🇺🇸" {
+		t.Errorf("RegionEmoji(usa alias) = %q, want 🇺🇸", got)
 	}
 }

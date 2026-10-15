@@ -185,7 +185,7 @@ func TestEvaluateGroups(t *testing.T) {
 		// A group of unknown-only leaves must not become true through "none".
 		{"none over unknown leaves", Condition{Match: MatchNone, Children: []Condition{
 			leaf(FieldSpeedBps, OpGt, 0),
-		}}, true},
+		}}, false},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {

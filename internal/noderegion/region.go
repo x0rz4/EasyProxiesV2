@@ -23,11 +23,17 @@ func init() {
 			continue
 		}
 		name := display.English.Regions().Name(r)
+		if strings.TrimSpace(name) == "" {
+			continue
+		}
 		names[code] = name
 		aliases[code] = code
 		aliases[strings.ToLower(name)] = code
-		aliases[display.SimplifiedChinese.Regions().Name(r)] = code
-		aliases[display.TraditionalChinese.Regions().Name(r)] = code
+		for _, localized := range []string{display.SimplifiedChinese.Regions().Name(r), display.TraditionalChinese.Regions().Name(r)} {
+			if localized != "" {
+				aliases[localized] = code
+			}
+		}
 	}
 	for alias, code := range map[string]string{"uk": "gb", "usa": "us", "中国": "cn", "中國": "cn", "香港": "hk", "台湾": "tw", "台灣": "tw", "澳门": "mo", "澳門": "mo", "韩国": "kr", "韓國": "kr", "英国": "gb", "英國": "gb"} {
 		aliases[alias] = code
@@ -36,6 +42,9 @@ func init() {
 
 func Normalize(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return ""
+	}
 	runes := []rune(value)
 	if len(runes) == 2 && runes[0] >= 0x1f1e6 && runes[0] <= 0x1f1ff && runes[1] >= 0x1f1e6 && runes[1] <= 0x1f1ff {
 		value = string([]rune{'a' + runes[0] - 0x1f1e6, 'a' + runes[1] - 0x1f1e6})

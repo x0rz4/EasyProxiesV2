@@ -55,7 +55,7 @@ func TestValidateGroupPortIgnoresDisabledBaseEntries(t *testing.T) {
 	}
 }
 
-func TestGroupNodeOptionsUseManagedAvailableNodes(t *testing.T) {
+func TestGroupNodeOptionsIncludePendingAndUnavailableManagedNodes(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(filepath.Join(t.TempDir(), "groups-options.db"))
 	if err != nil {
@@ -89,7 +89,7 @@ func TestGroupNodeOptionsUseManagedAvailableNodes(t *testing.T) {
 	for _, snapshot := range mgr.Snapshot() {
 		monitorByTag[snapshot.Tag] = snapshot
 	}
-	options, err := server.groupNodeOptions(ctx, []store.GroupPool{{ExplicitNodeIDs: []int64{unavailable.ID}, ExcludedNodeIDs: []int64{pending.ID}}}, monitorByTag)
+	options, err := server.groupNodeOptions(ctx, nil, monitorByTag)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,10 +100,10 @@ func TestGroupNodeOptionsUseManagedAvailableNodes(t *testing.T) {
 	if option, ok := byID[available.ID]; !ok || !option.Selectable || option.Status != "normal" || option.LatencyMs != 86 {
 		t.Fatalf("available option = %+v, present=%v", option, ok)
 	}
-	if option, ok := byID[unavailable.ID]; !ok || option.Selectable || option.Status != "unavailable" {
+	if option, ok := byID[unavailable.ID]; !ok || !option.Selectable || option.Status != "unavailable" {
 		t.Fatalf("referenced unavailable option = %+v, present=%v", option, ok)
 	}
-	if option, ok := byID[pending.ID]; !ok || option.Selectable || option.Status != "pending" {
+	if option, ok := byID[pending.ID]; !ok || !option.Selectable || option.Status != "pending" {
 		t.Fatalf("excluded pending option = %+v, present=%v", option, ok)
 	}
 	for _, node := range []*store.Node{disabled, hiddenSubscription} {
@@ -113,7 +113,7 @@ func TestGroupNodeOptionsUseManagedAvailableNodes(t *testing.T) {
 	}
 }
 
-func TestGroupFromInputDropsUnavailableExplicitNodes(t *testing.T) {
+func TestGroupFromInputKeepsTemporarilyUnavailableExplicitNodes(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(filepath.Join(t.TempDir(), "groups-filter.db"))
 	if err != nil {
@@ -137,10 +137,10 @@ func TestGroupFromInputDropsUnavailableExplicitNodes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(groupPool.ExplicitNodeIDs) != 1 || groupPool.ExplicitNodeIDs[0] != available.ID {
+	if len(groupPool.ExplicitNodeIDs) != 2 || groupPool.ExplicitNodeIDs[0] != available.ID || groupPool.ExplicitNodeIDs[1] != unavailable.ID {
 		t.Fatalf("kept explicit nodes = %v", groupPool.ExplicitNodeIDs)
 	}
-	if len(removed) != 1 || removed[0] != unavailable.ID {
+	if len(removed) != 0 {
 		t.Fatalf("removed nodes = %v", removed)
 	}
 	if len(groupPool.Regions) != 1 || groupPool.Regions[0] != "hk" {
@@ -159,7 +159,7 @@ func TestGroupFromInputDropsUnavailableExplicitNodes(t *testing.T) {
 	}
 }
 
-func TestUpdateGroupAPIReportsRemovedUnavailableNodes(t *testing.T) {
+func TestUpdateGroupAPIKeepsTemporarilyUnavailableNodes(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(filepath.Join(t.TempDir(), "groups-update-api.db"))
 	if err != nil {
@@ -201,11 +201,11 @@ func TestUpdateGroupAPIReportsRemovedUnavailableNodes(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
 	}
-	if len(payload.Removed) != 1 || payload.Removed[0] != unavailable.ID {
+	if len(payload.Removed) != 0 {
 		t.Fatalf("removed node IDs = %v", payload.Removed)
 	}
 	updated, err := db.GetGroupPool(ctx, groupPool.ID)
-	if err != nil || len(updated.ExplicitNodeIDs) != 1 || updated.ExplicitNodeIDs[0] != available.ID {
+	if err != nil || len(updated.ExplicitNodeIDs) != 2 || updated.ExplicitNodeIDs[0] != available.ID || updated.ExplicitNodeIDs[1] != unavailable.ID {
 		t.Fatalf("stored group = %+v err=%v", updated, err)
 	}
 }

@@ -3100,7 +3100,9 @@ func (s *Server) groupNodeOptions(ctx context.Context, groups []store.GroupPool,
 		} else if found && snapshot.InitialCheckDone {
 			status = "unavailable"
 		}
-		selectable := managed.Enabled && found && snapshot.RoutingEligible
+		// Configuration membership survives temporary health failures. Runtime
+		// availability controls routing, not whether a managed node can be chosen.
+		selectable := managed.Enabled
 		if _, isReferenced := referenced[managed.ID]; !selectable && !isReferenced {
 			continue
 		}
@@ -3256,6 +3258,9 @@ func (s *Server) groupFromInput(ctx context.Context, input groupPoolInput, exist
 	regionVersion := noderegion.CurrentVersion
 	if existing != nil {
 		regionVersion = existing.RegionRuleVersion
+		if regionVersion == 0 {
+			regionVersion = 1
+		}
 	}
 	if input.RegionRuleVersion != nil {
 		regionVersion = *input.RegionRuleVersion
