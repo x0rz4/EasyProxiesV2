@@ -154,6 +154,8 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	// Facts change while the process is down (a node was edited, a rule was
 	// imported), so the first run reconciles everything.
 	retagQueue.EnqueueAll()
+	stopProbeProjections := startProbeProjections(ctx, dataStore, boxMgr.ProjectProbeOutcome, retagQueue.Enqueue)
+	defer stopProbeProjections()
 
 	// ── 6. Create and start SubscriptionManager ──
 	// Always created so it can dynamically respond to config changes
@@ -190,6 +192,8 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	// ── 9. Graceful shutdown ──
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
+
+	stopProbeProjections()
 
 	// Flush stats one final time before shutdown
 	flushStatsToStore(context.Background(), boxMgr, dataStore)

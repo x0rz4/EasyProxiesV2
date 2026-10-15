@@ -2,12 +2,41 @@ package monitor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"easy_proxies/internal/probe"
 	"easy_proxies/internal/store"
 )
+
+func (s *Server) beginMeasuredResult(ctx context.Context, snap *Snapshot, kind probe.Kind, origin probe.Origin) (probe.Result, error) {
+	if s == nil || s.store == nil || snap == nil {
+		return probe.Result{}, fmt.Errorf("检测存储或节点不可用")
+	}
+	return probe.New(s.store).Begin(ctx, snap.NodeID, snap.URI, origin, kind)
+}
+
+func (s *Server) applyMeasuredResult(event probe.Result) error {
+	if event.Kind == probe.Health {
+		return fmt.Errorf("手动检测不能提交健康状态")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	event.Observation.CheckedAt = time.Now().UTC()
+	applier := probe.New(s.store)
+	out, err := applier.Apply(ctx, event)
+	if err != nil {
+		return err
+	}
+	if !out.Applied {
+		return fmt.Errorf("检测结果未应用: %s", out.Reason)
+	}
+	s.enqueueRetag(event.NodeID)
+	return applier.Acknowledge(ctx, out)
+}
+
+func measurementError(resultErr, persistErr error) error { return errors.Join(resultErr, persistErr) }
 
 // applyDiagnosticResult is the synchronous commit boundary for manual stages.
 // No call here can publish health events. Failed persistence is visible to the
@@ -35,55 +64,4 @@ func (m *nodeCheckManager) applyDiagnosticResult(task *nodeCheckTask, node Snaps
 		task.publish(nodeCheckEvent{Type: "task", Phase: string(kind), NodeID: node.NodeID, Status: "warning", Error: "确认结果同步失败: " + err.Error()})
 	}
 	return true
-}
-
-func (s *Server) reconcileProbeProjection(ctx context.Context, out probe.Outcome) error {
-	if out.Event.Kind == probe.Health {
-		return fmt.Errorf("health projection consumer not bound")
-	}
-	if out.Event.Kind == probe.Landing {
-		state, err := s.store.GetNodeLocation(ctx, out.Event.NodeID)
-		if err != nil {
-			return err
-		}
-		if state.Token != out.Event.Observation.Token {
-			return nil
-		}
-		if s.mgr == nil {
-			return fmt.Errorf("monitor not initialized")
-		}
-		s.mgr.UpdateNodeLocation(out.Event.NodeID, state.Current.ISO, state.Current.Country)
-		membership, ok := s.nodeMgr.(GroupMembershipManager)
-		if !ok {
-			return fmt.Errorf("membership manager not initialized")
-		}
-		if err := membership.ApplyGroupMembershipChanges(ctx, []int64{out.Event.NodeID}); err != nil {
-			return err
-		}
-	}
-	s.enqueueRetag(out.Event.NodeID)
-	return nil
-}
-
-func (s *Server) runProbeProjections(ctx context.Context) {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-s.done:
-			return
-		case <-ticker.C:
-		}
-		if s.store == nil {
-			continue
-		}
-		attempt, cancel := context.WithTimeout(ctx, 15*time.Second)
-		err := probe.New(s.store).Reconcile(attempt, s.reconcileProbeProjection)
-		cancel()
-		if err != nil && s.logger != nil {
-			s.logger.Printf("[probe] pending projection retry: %v", err)
-		}
-	}
 }

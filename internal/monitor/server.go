@@ -31,6 +31,7 @@ import (
 	"easy_proxies/internal/nodedetect"
 	"easy_proxies/internal/noderegion"
 	"easy_proxies/internal/nodetag"
+	"easy_proxies/internal/probe"
 	"easy_proxies/internal/store"
 	"easy_proxies/internal/unlock"
 
@@ -375,6 +376,9 @@ func (s *Server) closeGeoipLookup() {
 func (s *Server) SetStore(st store.Store) {
 	if s != nil {
 		s.store = st
+		if s.mgr != nil {
+			s.mgr.SetProbeStore(st)
+		}
 		if s.nodeChecks == nil {
 			s.nodeChecks = newNodeCheckManager(s)
 		}
@@ -1035,7 +1039,6 @@ func (s *Server) Start(ctx context.Context) {
 	if s == nil || s.srv == nil {
 		return
 	}
-	go s.runProbeProjections(ctx)
 	s.logger.Printf("Starting monitor server on %s", s.cfg.Listen)
 	go func() {
 		if err := s.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -1265,39 +1268,41 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request, action
 			options = nodedetect.SpeedOptions{URL: settings.SpeedURL, Duration: settings.SpeedDuration, RequestTimeout: settings.SpeedRequestTimeout, MaxBytes: settings.MaxDownloadBytes, PeakSampleInterval: settings.PeakSampleInterval}
 		}
 		s.cfgMu.RUnlock()
-		runner := &SpeedtestRunner{Options: options}
-		result, runErr := runner.Run(r.Context(), dialer, func(mbps float64, isDone bool) {
-			if isDone {
-				fmt.Fprintf(w, "event: done\ndata: {\"mbps\": %.2f}\n\n", mbps)
-			} else {
-				fmt.Fprintf(w, "event: progress\ndata: {\"mbps\": %.2f}\n\n", mbps)
-			}
-			flusher.Flush()
-		})
-		if runErr != nil {
-			if s.store != nil {
-				if snapshot := s.mgr.SnapshotForTag(tag); snapshot != nil && snapshot.NodeID > 0 {
-					now := time.Now().UTC()
-					failed := &store.NodeDetectionResult{NodeID: snapshot.NodeID, TaskID: "legacy-speedtest", LatencyStatus: "untested", SpeedStatus: "failed", BytesDownloaded: result.BytesDownloaded, SpeedDurationMs: result.DurationMs, SpeedError: runErr.Error(), SpeedCheckedAt: now, ExitIPStatus: "untested"}
-					if result.BytesDownloaded > 0 {
-						average, peak := result.AverageBytesPerSecond, result.PeakBytesPerSecond
-						failed.AverageBytesPerSecond, failed.PeakBytesPerSecond = &average, &peak
-					}
-					_ = s.store.UpsertNodeDetectionResult(context.Background(), failed)
-				}
-			}
-			payload, _ := json.Marshal(map[string]string{"error": runErr.Error()})
+		event, beginErr := s.beginMeasuredResult(r.Context(), s.mgr.SnapshotForTag(tag), probe.Speed, probe.ManualDiagnostic)
+		if beginErr != nil {
+			payload, _ := json.Marshal(map[string]string{"error": beginErr.Error()})
 			fmt.Fprintf(w, "event: error\ndata: %s\n\n", payload)
 			flusher.Flush()
 			return
 		}
-		if s.store != nil {
-			if snapshot := s.mgr.SnapshotForTag(tag); snapshot != nil && snapshot.NodeID > 0 {
-				now := time.Now().UTC()
-				average, peak := result.AverageBytesPerSecond, result.PeakBytesPerSecond
-				_ = s.store.UpsertNodeDetectionResult(context.Background(), &store.NodeDetectionResult{NodeID: snapshot.NodeID, TaskID: "legacy-speedtest", LatencyStatus: "untested", SpeedStatus: "success", AverageBytesPerSecond: &average, PeakBytesPerSecond: &peak, BytesDownloaded: result.BytesDownloaded, SpeedDurationMs: result.DurationMs, SpeedCheckedAt: now, ExitIPStatus: "untested"})
+		runner := &SpeedtestRunner{Options: options}
+		result, runErr := runner.Run(r.Context(), dialer, func(mbps float64, isDone bool) {
+			if isDone {
+				return
 			}
+			fmt.Fprintf(w, "event: progress\ndata: {\"mbps\": %.2f}\n\n", mbps)
+			flusher.Flush()
+		})
+		now := time.Now().UTC()
+		stored := &store.NodeDetectionResult{NodeID: event.NodeID, TaskID: "legacy-speedtest", LatencyStatus: "untested", SpeedStatus: "success", BytesDownloaded: result.BytesDownloaded, SpeedDurationMs: result.DurationMs, SpeedCheckedAt: now, ExitIPStatus: "untested"}
+		if runErr != nil {
+			stored.SpeedStatus = "failed"
+			stored.SpeedError = runErr.Error()
 		}
+		if result.BytesDownloaded > 0 {
+			stored.AverageBytesPerSecond = &result.AverageBytesPerSecond
+			stored.PeakBytesPerSecond = &result.PeakBytesPerSecond
+		}
+		event.Detection = stored
+		if err := measurementError(runErr, s.applyMeasuredResult(event)); err != nil {
+			payload, _ := json.Marshal(map[string]string{"error": err.Error()})
+			fmt.Fprintf(w, "event: error\ndata: %s\n\n", payload)
+			flusher.Flush()
+			return
+		}
+		fmt.Fprintf(w, "event: done\ndata: {\"mbps\": %.2f}\n\n", float64(result.AverageBytesPerSecond)*8/1_000_000)
+		flusher.Flush()
+
 	case "unlock":
 		// Unlock checks issue several HTTP requests through the node, so allow
 		// more time than a single latency probe.
@@ -1313,12 +1318,26 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request, action
 		if snap != nil && snap.Name != "" {
 			name = snap.Name
 		}
-		result, err := unlock.Check(ctx, unlock.DialFunc(dialer), tag, name, s.geoipLookupForCheck(), 25*time.Second)
-		if err != nil {
-			writeJSON(w, map[string]any{"error": err.Error()})
+		event, beginErr := s.beginMeasuredResult(ctx, snap, probe.Unlock, probe.UnlockCheck)
+		if beginErr != nil {
+			writeAPIError(w, http.StatusConflict, beginErr.Error())
 			return
 		}
-		s.persistUnlockResult(snap, result)
+		result, err := unlock.Check(ctx, unlock.DialFunc(dialer), tag, name, s.geoipLookupForCheck(), 25*time.Second)
+		if result == nil {
+			result = &unlock.Result{Tag: tag, Name: name}
+		}
+		if err != nil {
+			result.Error = err.Error()
+		}
+		if persistErr := s.persistUnlockResult(event, result); persistErr != nil {
+			writeAPIError(w, http.StatusInternalServerError, persistErr.Error())
+			return
+		}
+		if err != nil {
+			writeAPIError(w, http.StatusBadGateway, err.Error())
+			return
+		}
 		writeJSON(w, result)
 	default:
 		w.WriteHeader(http.StatusNotFound)
@@ -1428,11 +1447,20 @@ func (s *Server) handleUnlockAll(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return unlockBatchResult{err: err.Error()}
 		}
-		res, err := unlock.Check(checkCtx, unlock.DialFunc(dialer), snap.Tag, snap.Name, s.geoipLookupForCheck(), 25*time.Second)
-		if err != nil {
-			return unlockBatchResult{err: err.Error()}
+		event, beginErr := s.beginMeasuredResult(checkCtx, &snap, probe.Unlock, probe.UnlockCheck)
+		if beginErr != nil {
+			return unlockBatchResult{err: beginErr.Error()}
 		}
-		s.persistUnlockResult(&snap, res)
+		res, err := unlock.Check(checkCtx, unlock.DialFunc(dialer), snap.Tag, snap.Name, s.geoipLookupForCheck(), 25*time.Second)
+		if res == nil {
+			res = &unlock.Result{Tag: snap.Tag, Name: snap.Name}
+		}
+		if err != nil {
+			res.Error = err.Error()
+		}
+		if combined := measurementError(err, s.persistUnlockResult(event, res)); combined != nil {
+			return unlockBatchResult{err: combined.Error()}
+		}
 		return unlockBatchResult{result: res}
 	})
 
@@ -1629,18 +1657,13 @@ func writeJSON(w http.ResponseWriter, payload any) {
 	_ = enc.Encode(payload)
 }
 
-// persistUnlockResult stores an unlock.Result to the store keyed by the node ID
-// resolved from the snapshot's URI (falling back to its Name). It is best-effort:
-// the DB write never fails the check response or the SSE stream; persistence
-// errors are only logged. It is safe to call with a nil store or nil snapshot.
-func (s *Server) persistUnlockResult(snap *Snapshot, result *unlock.Result) {
-	if s == nil || s.store == nil || result == nil || snap == nil {
-		return
+// persistUnlockResult applies a report using the identity captured before dialing.
+// Service regions remain unlock facts; they are not exit-location observations.
+func (s *Server) persistUnlockResult(event probe.Result, result *unlock.Result) error {
+	if s == nil || s.store == nil || result == nil {
+		return fmt.Errorf("解锁结果或存储不可用")
 	}
-	nodeID, ok := s.nodeIDForSnapshot(*snap)
-	if !ok || nodeID == 0 {
-		return
-	}
+	nodeID := event.NodeID
 
 	// Serialize the full result once and store it verbatim so the WebUI can
 	// reconstruct per-service detail/region exactly as reported.
@@ -1683,18 +1706,8 @@ func (s *Server) persistUnlockResult(snap *Snapshot, result *unlock.Result) {
 		})
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := s.store.UpsertUnlockResult(ctx, stored); err != nil {
-		s.logger.Printf("[unlock] failed to persist result for node %d (%s): %v", nodeID, snap.Tag, err)
-	}
-
-	// The unlock facts this result carries — IP purity, risk level, per-service
-	// status — are what the 原生IP / 高风险 / <服务>解锁 tags are computed from.
-	// Writing those names here is what used to delete every hand-placed tag on the
-	// node, so the result is only persisted and the tagging service is asked to
-	// recompute from it.
-	s.enqueueRetag(nodeID)
+	event.Unlock = stored
+	return s.applyMeasuredResult(event)
 }
 
 // nodeIDForSnapshot resolves a monitor Snapshot to its store node ID by URI,

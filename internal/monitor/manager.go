@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"easy_proxies/internal/probe"
 	M "github.com/sagernet/sing/common/metadata"
 )
 
@@ -300,6 +301,9 @@ type EntryHandle struct {
 }
 
 type entry struct {
+	healthReceiptID  string
+	healthReceiptAt  time.Time
+	healthApplyMu    sync.Mutex
 	info             NodeInfo
 	failure          int
 	success          int64
@@ -333,14 +337,16 @@ type entry struct {
 
 // Manager aggregates all node states for the UI/API.
 type Manager struct {
-	cfg         Config
-	probeTarget ProbeTarget
-	probeReady  bool
-	targetMu    sync.RWMutex
-	registry    *nodeRegistry
-	ctx         context.Context
-	cancel      context.CancelFunc
-	logger      Logger
+	resultApplier atomic.Pointer[probe.Applier]
+	probeEpoch    time.Time
+	cfg           Config
+	probeTarget   ProbeTarget
+	probeReady    bool
+	targetMu      sync.RWMutex
+	registry      *nodeRegistry
+	ctx           context.Context
+	cancel        context.CancelFunc
+	logger        Logger
 
 	// periodic health check control
 	healthMu                  sync.Mutex
@@ -383,6 +389,7 @@ type Logger interface {
 func NewManager(cfg Config) (*Manager, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Manager{
+		probeEpoch:       time.Now().UTC(),
 		cfg:              cfg,
 		ctx:              ctx,
 		cancel:           cancel,
@@ -1115,6 +1122,10 @@ func (m *Manager) Probe(ctx context.Context, tag string) (time.Duration, error) 
 	probeCtx, cancel := context.WithTimeout(ctx, policy.RoutineTimeout)
 	defer cancel()
 	probeCtx = withProbePhaseTimeouts(probeCtx, policy.DialTimeout, policy.ResponseTimeout)
+	ticket, beginErr := m.beginHealthResult(ctx, e)
+	if beginErr != nil {
+		return 0, beginErr
+	}
 	var latency time.Duration
 	for attempt := 0; attempt <= policy.RoutineRetries; attempt++ {
 		latency, err = probe(probeCtx)
@@ -1123,7 +1134,9 @@ func (m *Manager) Probe(ctx context.Context, tag string) (time.Duration, error) 
 		}
 	}
 	if entryRuntimeTag(e) == tag {
-		m.applyHealthResult(e, latency, err, time.Now())
+		if commitErr := m.commitHealthResult(e, ticket, latency, err, time.Now()); commitErr != nil {
+			return 0, commitErr
+		}
 	}
 	if err != nil {
 		return 0, err
@@ -1149,7 +1162,7 @@ func (m *Manager) endTagProbe(tag string) {
 	m.probeScheduler.endTagProbe(tag)
 }
 
-func (m *Manager) applyHealthResult(e *entry, latency time.Duration, probeErr error, checkedAt time.Time) {
+func (m *Manager) projectHealthResult(e *entry, latency time.Duration, probeErr error, checkedAt time.Time) {
 	if checkedAt.IsZero() {
 		checkedAt = time.Now()
 	}
@@ -1198,8 +1211,11 @@ func (m *Manager) MarkAvailableWithoutProbe(tag string) error {
 	if alreadyAvailable {
 		return nil
 	}
-	m.applyHealthResult(e, 0, nil, time.Now())
-	return nil
+	ticket, err := m.beginHealthResult(context.Background(), e)
+	if err != nil {
+		return err
+	}
+	return m.commitHealthResult(e, ticket, 0, nil, time.Now())
 }
 
 // Release clears blacklist state for the given node.

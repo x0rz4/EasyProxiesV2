@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"easy_proxies/internal/probe"
 	"easy_proxies/internal/store"
 	"easy_proxies/internal/unlock"
 )
@@ -56,7 +57,7 @@ func TestPersistUnlockResultKeepsManualTagsAndEnqueues(t *testing.T) {
 
 	queue := &fakeRetagQueue{}
 	server := &Server{store: dataStore, logger: log.New(io.Discard, "", 0), retag: queue}
-	snap := Snapshot{NodeInfo: NodeInfo{NodeID: node.ID, Tag: "hk-01", Name: "hk-01"}}
+	snap := Snapshot{NodeInfo: NodeInfo{NodeID: node.ID, URI: node.URI, Tag: "hk-01", Name: "hk-01"}}
 	result := &unlock.Result{
 		Tag: "hk-01", Name: "hk-01",
 		IP: unlock.IPInfo{IP: "203.0.113.7", Pure: true, RiskLevel: "High"},
@@ -64,7 +65,13 @@ func TestPersistUnlockResultKeepsManualTagsAndEnqueues(t *testing.T) {
 			{Name: "netflix", DisplayName: "Netflix", Status: unlock.StatusUnlocked, Region: "HK"},
 		},
 	}
-	server.persistUnlockResult(&snap, result)
+	event, err := server.beginMeasuredResult(ctx, &snap, probe.Unlock, probe.UnlockCheck)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.persistUnlockResult(event, result); err != nil {
+		t.Fatal(err)
+	}
 
 	// The facts are persisted — the tags are derived from these, not written here.
 	stored, err := dataStore.GetUnlockResult(ctx, node.ID)
@@ -100,7 +107,13 @@ func TestPersistUnlockResultKeepsManualTagsAndEnqueues(t *testing.T) {
 
 	// A server with no queue wired must still persist the result.
 	quiet := &Server{store: dataStore, logger: log.New(io.Discard, "", 0)}
-	quiet.persistUnlockResult(&snap, result)
+	next, err := quiet.beginMeasuredResult(ctx, &snap, probe.Unlock, probe.UnlockCheck)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := quiet.persistUnlockResult(next, result); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // TestNodeMutationsRequestAFullRecompute covers the other trigger class: node

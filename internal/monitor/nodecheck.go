@@ -586,11 +586,20 @@ func (m *nodeCheckManager) runUnlock(task *nodeCheckTask) {
 			result, err = unlock.Check(task.ctx, unlock.DialFunc(dial), node.Tag, node.Name, m.server.geoipLookupForCheck(), 25*time.Second)
 		}
 		status, errText := "success", ""
-		if err != nil {
-			status, errText = "failed", err.Error()
-		} else {
-			m.server.persistUnlockResult(&node, result)
+		if result == nil {
+			result = &unlock.Result{Tag: node.Tag, Name: node.Name}
 		}
+		if err != nil {
+			result.Error = err.Error()
+		}
+		observation := task.observations[node.NodeID]
+		observation.ProbeID += ":unlock"
+		event := probe.Result{NodeID: node.NodeID, Kind: probe.Unlock, Origin: probe.ManualDiagnostic, Observation: observation}
+		combined := measurementError(err, m.server.persistUnlockResult(event, result))
+		if combined != nil {
+			status, errText = "failed", combined.Error()
+		}
+
 		task.updateStage("unlock", status)
 		task.publish(nodeCheckEvent{Type: "result", Phase: "unlock", NodeID: node.NodeID, Tag: node.Tag, Name: node.Name, Status: status, Error: errText})
 		m.persist(task)

@@ -249,6 +249,14 @@ func (a *Applier) Reconcile(ctx context.Context, consume func(context.Context, O
 		if err := ctx.Err(); err != nil {
 			return errors.Join(append(failures, err)...)
 		}
+		latest, err := a.db.GetProbeReceipt(ctx, receipt.NodeID, receipt.Stream)
+		if err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		if latest == nil || latest.EventID != receipt.EventID {
+			continue
+		}
 		var out Outcome
 		if err := json.Unmarshal([]byte(receipt.ResultJSON), &out); err != nil {
 			failures = append(failures, err)

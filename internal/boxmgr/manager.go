@@ -1774,6 +1774,7 @@ func (m *Manager) ensureMonitor(ctx context.Context) error {
 		return fmt.Errorf("init monitor manager: %w", err)
 	}
 	monitorMgr.SetLogger(monitorLoggerAdapter{logger: m.logger})
+	monitorMgr.SetProbeStore(m.store)
 	m.monitorMgr = monitorMgr
 
 	var serverToStart *monitor.Server

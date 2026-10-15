@@ -715,6 +715,12 @@ func (s *probeScheduler) probeInitialAttempt(ctx context.Context, item probeWork
 		result.Err = errStaleProbeGeneration
 		return result
 	}
+	ticket, beginErr := s.manager.beginHealthResult(ctx, item.entry)
+	if beginErr != nil {
+		result.Err = beginErr
+		return result
+	}
+
 	if item.probe == nil {
 		result.Err = errors.New("probe function not configured")
 	} else {
@@ -722,7 +728,9 @@ func (s *probeScheduler) probeInitialAttempt(ctx context.Context, item probeWork
 		result.Latency, result.Err = s.runProbeAttempt(probeCtx, item, policy.StartupTimeout)
 	}
 	if ctx.Err() == nil && entryRuntimeTag(item.entry) == item.tag && (result.Err == nil || commitFailure || item.probe == nil) {
-		s.manager.applyHealthResult(item.entry, result.Latency, result.Err, time.Now())
+		if err := s.manager.commitHealthResult(item.entry, ticket, result.Latency, result.Err, time.Now()); err != nil {
+			result.Err = errors.Join(result.Err, err)
+		}
 	}
 	return result
 }
@@ -733,6 +741,12 @@ func (s *probeScheduler) probeRoutineItem(ctx context.Context, item probeWorkIte
 		result.Err = errStaleProbeGeneration
 		return result
 	}
+	ticket, beginErr := s.manager.beginHealthResult(ctx, item.entry)
+	if beginErr != nil {
+		result.Err = beginErr
+		return result
+	}
+
 	if item.probe == nil {
 		result.Err = errors.New("probe function not configured")
 		return result
@@ -748,7 +762,9 @@ func (s *probeScheduler) probeRoutineItem(ctx context.Context, item probeWorkIte
 		}
 	}
 	if ctx.Err() == nil && entryRuntimeTag(item.entry) == result.Tag {
-		s.manager.applyHealthResult(item.entry, result.Latency, result.Err, time.Now())
+		if err := s.manager.commitHealthResult(item.entry, ticket, result.Latency, result.Err, time.Now()); err != nil {
+			result.Err = errors.Join(result.Err, err)
+		}
 	}
 	return result
 }
