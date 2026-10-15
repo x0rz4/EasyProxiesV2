@@ -1987,6 +1987,7 @@ func (m *Manager) CreateNode(ctx context.Context, node config.NodeConfig) (confi
 			}
 			return config.NodeConfig{}, fmt.Errorf("save to store: %w", err)
 		}
+		normalized.ID = storeNode.ID
 	}
 
 	m.cfg.Nodes = append(m.cfg.Nodes, normalized)

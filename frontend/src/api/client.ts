@@ -786,6 +786,8 @@ export async function exportProxies(): Promise<string> {
 // ---- Import API ----
 
 export interface ImportNodesResult {
+  reloaded?: boolean
+  reload_error?: string
   message: string
   imported: number
   parsed: number

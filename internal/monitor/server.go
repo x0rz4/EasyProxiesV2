@@ -1996,6 +1996,16 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		"duplicates_skipped": duplicatesSkipped,
 		"invalid":            len(errs),
 	}
+	if imported > 0 {
+		s.enqueueRetagAll()
+		// Publish the imported nodes once; the existing scheduler performs their
+		// initial probes after the runtime snapshot becomes visible.
+		reloadError := s.reloadAfterGroupMutation(r.Context())
+		result["reloaded"] = reloadError == ""
+		if reloadError != "" {
+			result["reload_error"] = reloadError
+		}
+	}
 	if len(duplicateGroups) > 0 {
 		result["duplicate_groups"] = duplicateGroups
 	}

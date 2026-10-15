@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"easy_proxies/internal/nodecodec"
 	"sync"
 	"time"
 )
@@ -166,6 +167,12 @@ func (r *nodeRegistry) migrate(nodeID int64, info NodeInfo) *entry {
 		item = &entry{timeline: make([]TimelineEvent, 0, maxTimelineSize), healthSource: "none", onTimeline: r.manager.publishDebugLog}
 	}
 	item.mu.Lock()
+	identityChanged := false
+	if item.info.URI != "" && item.info.URI != info.URI {
+		previous, previousErr := nodecodec.ParseURI(item.info.URI)
+		current, currentErr := nodecodec.ParseURI(info.URI)
+		identityChanged = previousErr != nil || currentErr != nil || previous.Hash != current.Hash
+	}
 	item.info = info
 	item.reloadGen = r.reload
 	item.onTimeline = r.manager.publishDebugLog
@@ -178,6 +185,14 @@ func (r *nodeRegistry) migrate(nodeID int64, info NodeInfo) *entry {
 		if item.healthSource != "none" {
 			item.healthSource = "previous_generation"
 		}
+	}
+	if identityChanged {
+		item.failure, item.success = 0, 0
+		item.blacklist, item.available, item.initialCheckDone = false, false, false
+		item.until, item.lastFail, item.lastOK = time.Time{}, time.Time{}, time.Time{}
+		item.lastHealthCheck, item.healthUpdatedAt = time.Time{}, time.Time{}
+		item.lastError, item.healthSource = "", "none"
+		item.lastProbe = 0
 	}
 	item.mu.Unlock()
 	r.byTag[info.Tag] = item

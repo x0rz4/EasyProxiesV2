@@ -371,6 +371,12 @@ func (s *sqliteStore) materializeManualNodeTags(ctx context.Context, nodeID int6
 }
 
 func (s *sqliteStore) UpdateNode(ctx context.Context, node *Node) error {
+	return s.runInTx(ctx, func(tx *sqliteStore) error {
+		return tx.updateNode(ctx, node)
+	})
+}
+
+func (s *sqliteStore) updateNode(ctx context.Context, node *Node) error {
 	var previousIdentity string
 	if err := s.writeConn().QueryRowContext(ctx, "SELECT identity_hash FROM nodes WHERE id=?", node.ID).Scan(&previousIdentity); err != nil {
 		if err == sql.ErrNoRows {
@@ -439,6 +445,15 @@ func (s *sqliteStore) UpdateNodeLocation(ctx context.Context, nodeID int64, regi
 // auto tag must never outlive its evidence. Manual assignments stay, and the
 // caller is expected to enqueue the node for a recompute.
 func (s *sqliteStore) clearNodeDetectionCache(ctx context.Context, nodeID int64) error {
+	// Availability evidence belongs to the connection identity, while lifetime
+	// traffic remains attached to the managed node's stable ID.
+	if _, err := s.writeConn().ExecContext(ctx, `UPDATE node_stats SET
+		failure_count=0, success_count=0, blacklisted=0, blacklisted_until='',
+		last_error='', last_failure_at='', last_success_at='', last_latency_ms=-1,
+		available=0, initial_check_done=0, updated_at=? WHERE node_id=?`,
+		time.Now().UTC().Format(time.RFC3339), nodeID); err != nil {
+		return fmt.Errorf("reset node %d identity health: %w", nodeID, err)
+	}
 	for _, table := range []string{"node_detection_results", "node_ip_quality_results", "node_unlock_results"} {
 		if _, err := s.writeConn().ExecContext(ctx, "DELETE FROM "+table+" WHERE node_id=?", nodeID); err != nil {
 			return fmt.Errorf("clear node %d cached detection from %s: %w", nodeID, table, err)

@@ -539,11 +539,12 @@ export default function ManagePanel() {
       const res = await importNodes(importContent)
       setImportResult(res)
       if (res.imported > 0) {
-        setNeedReload(true)
+        setNeedReload(!res.reloaded)
+        if (res.reload_error) toast.error(`节点已保存，加载失败：${res.reload_error}`)
         toast.success(res.message)
         queryClient.invalidateQueries({ queryKey: ['configNodes'] })
-      void queryClient.invalidateQueries({ queryKey: ['nodeQuery'] })
-      void queryClient.invalidateQueries({ queryKey: ['nodeFacets'] })
+        void queryClient.invalidateQueries({ queryKey: ['nodeQuery'] })
+        void queryClient.invalidateQueries({ queryKey: ['nodeFacets'] })
       }
     } catch (err) {
       setImportError(err instanceof Error ? err.message : '导入失败')

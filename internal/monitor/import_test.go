@@ -50,6 +50,9 @@ func TestImportHTTPProxyGeneratesUniqueNames(t *testing.T) {
 	if payload.Imported != 2 || len(payload.Errors) != 0 {
 		t.Fatalf("payload=%+v", payload)
 	}
+	if manager.reloads.Load() != 1 {
+		t.Fatalf("batch import reloads=%d, want one", manager.reloads.Load())
+	}
 	if len(manager.created) != 2 || manager.created[0].Name != "imported-2" || manager.created[1].Name != "imported-3" {
 		t.Fatalf("created nodes=%+v", manager.created)
 	}

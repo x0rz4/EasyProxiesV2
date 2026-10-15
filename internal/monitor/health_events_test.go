@@ -196,3 +196,19 @@ func TestOldGroupScheduleCleanupDoesNotDeleteNewGeneration(t *testing.T) {
 		t.Fatal("active generation cleanup did not remove its schedule")
 	}
 }
+
+func TestMigrateChangedIdentityDropsHealthButKeepsTraffic(t *testing.T) {
+	mgr, err := NewManager(Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	handle := mgr.Register(NodeInfo{NodeID: 7, Tag: "node@v1", URI: "http://old.example:80"})
+	handle.RecordSuccessWithLatency(23 * time.Millisecond)
+	handle.AddTraffic(100, 200)
+	mgr.MigrateRuntimeTag(7, NodeInfo{NodeID: 7, Tag: "node@v2", URI: "http://new.example:80"})
+	snap := mgr.SnapshotForTag("node@v2")
+	if snap == nil || snap.SuccessCount != 0 || snap.Available || snap.InitialCheckDone || snap.HealthSource != "none" || snap.TotalUpload != 100 || snap.TotalDownload != 200 {
+		t.Fatalf("replacement inherited health or lost traffic: %+v", snap)
+	}
+}

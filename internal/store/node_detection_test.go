@@ -135,6 +135,9 @@ func TestNodeConnectionIdentityChangeClearsDetectionCache(t *testing.T) {
 	}
 
 	// A display-only rename preserves the cache.
+	if err := db.UpsertNodeStats(ctx, &NodeStats{NodeID: node.ID, SuccessCount: 9, Available: true, InitialCheckDone: true, LastLatencyMs: 12, TotalDownloadBytes: 123}); err != nil {
+		t.Fatal(err)
+	}
 	node.Name = "renamed"
 	if err := db.UpdateNode(ctx, node); err != nil {
 		t.Fatal(err)
@@ -142,6 +145,10 @@ func TestNodeConnectionIdentityChangeClearsDetectionCache(t *testing.T) {
 	results, err := db.ListNodeDetectionResults(ctx)
 	if err != nil || results[node.ID] == nil {
 		t.Fatalf("rename unexpectedly cleared landing cache: results=%v err=%v", results, err)
+	}
+	stats, err := db.GetNodeStats(ctx, node.ID)
+	if err != nil || stats == nil || !stats.Available || stats.SuccessCount != 9 {
+		t.Fatalf("rename cleared health: %+v, %v", stats, err)
 	}
 
 	// Authentication is part of the semantic identity, so changing it must
@@ -163,6 +170,10 @@ func TestNodeConnectionIdentityChangeClearsDetectionCache(t *testing.T) {
 	}
 	if len(quality[node.ID]) != 0 {
 		t.Fatalf("connection identity change retained stale quality cache: %+v", quality[node.ID])
+	}
+	stats, err = db.GetNodeStats(ctx, node.ID)
+	if err != nil || stats == nil || stats.Available || stats.InitialCheckDone || stats.LastLatencyMs != -1 || stats.SuccessCount != 0 || stats.TotalDownloadBytes != 123 {
+		t.Fatalf("replacement must be pending and retain traffic only: %+v, %v", stats, err)
 	}
 }
 
@@ -238,5 +249,39 @@ func TestUpdateNodeLocationOnlyChangesLandingMetadata(t *testing.T) {
 	}
 	if len(nodes) != 1 || nodes[0].Region != "hk" || nodes[0].Country != "Hong Kong" || nodes[0].Enabled || nodes[0].URI != node.URI || len(nodes[0].Tags) != 1 || nodes[0].Tags[0] != "kept" {
 		t.Fatalf("specialized landing update changed unrelated fields: %+v", nodes)
+	}
+}
+
+func TestIdentityUpdateRollsBackWhenEvidenceResetFails(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "identity-rollback.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	node := &Node{URI: "http://old.example:80", Name: "old", Source: NodeSourceManual, Enabled: true}
+	if err := db.CreateNode(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+	before, err := db.GetNodeLocation(ctx, node.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A storage failure after the nodes UPDATE must also roll back its triggers.
+	sqlStore := db.(*sqliteStore)
+	if _, err := sqlStore.writeConn().ExecContext(ctx, `CREATE TRIGGER fail_health_reset BEFORE UPDATE ON node_stats BEGIN SELECT RAISE(ABORT, 'injected failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	node.URI = "http://new.example:80"
+	if err := db.UpdateNode(ctx, node); err == nil {
+		t.Fatal("expected reset failure")
+	}
+	persisted, err := db.GetNode(ctx, node.ID)
+	if err != nil || persisted == nil || persisted.URI != "http://old.example:80" {
+		t.Fatalf("partial identity write: %+v %v", persisted, err)
+	}
+	after, err := db.GetNodeLocation(ctx, node.ID)
+	if err != nil || after.Token != before.Token {
+		t.Fatalf("partial revision write: %+v %v", after, err)
 	}
 }
