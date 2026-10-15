@@ -10,6 +10,7 @@ import (
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/geoip"
 	"easy_proxies/internal/nodedetect"
+	"easy_proxies/internal/nodeloc"
 	"easy_proxies/internal/store"
 )
 
@@ -23,17 +24,26 @@ func (m *Manager) applyCachedNodeLocations(ctx context.Context, cfg *config.Conf
 	if m.store == nil || cfg == nil {
 		return
 	}
-	results, err := m.store.ListNodeDetectionResults(ctx)
-	if err != nil {
-		m.logger.Warnf("load cached landing IP results: %v", err)
-		return
-	}
-
 	lookup := m.openLandingGeoIP(cfg)
 	if lookup == nil {
 		m.logger.Warnf("GeoIP database unavailable; preserving cached node locations and pausing classification")
 	} else {
 		defer lookup.Close()
+	}
+	var classify func(string) geoip.RegionInfo
+	if lookup != nil {
+		classify = lookup.LookupIP
+	}
+	m.applyCachedLocations(ctx, cfg, classify)
+}
+
+// applyCachedLocations accepts a local classifier so cached observations can
+// be reconciled without network access. The caller holds landingMu.
+func (m *Manager) applyCachedLocations(ctx context.Context, cfg *config.Config, classify func(string) geoip.RegionInfo) {
+	results, err := m.store.ListNodeDetectionResults(ctx)
+	if err != nil {
+		m.logger.Warnf("load cached landing IP results: %v", err)
+		return
 	}
 	for index := range cfg.Nodes {
 		node := &cfg.Nodes[index]
@@ -41,16 +51,22 @@ func (m *Manager) applyCachedNodeLocations(ctx context.Context, cfg *config.Conf
 			continue
 		}
 		result := results[node.ID]
-		region, country := "", ""
+		// A failed or missing detection never erases a known location: group
+		// membership follows the region, so clearing it on a transient failure
+		// dropped the node out of its regional group until a later probe
+		// succeeded. Only a successful tunneled lookup naming a country can
+		// change it (see nodeloc.Resolve).
+		var observed nodeloc.Observation
 		if hasSuccessfulLandingIP(result) {
-			region = strings.ToLower(strings.TrimSpace(result.ExitCountryCode))
-			country = strings.TrimSpace(result.ExitCountry)
-			if region == "" && lookup != nil {
-				location := lookup.LookupIP(result.ExitIP)
-				if location.ISOCode != "" {
-					region = strings.ToLower(location.ISOCode)
-					country = location.Country
-					result.ExitCountry = country
+			observed = nodeloc.Observation{
+				Succeeded: true,
+				ISO:       result.ExitCountryCode,
+				Country:   result.ExitCountry,
+			}
+			if nodeloc.Normalize(observed.ISO) == "" && classify != nil {
+				if location := classify(result.ExitIP); location.ISOCode != "" {
+					observed.ISO, observed.Country = location.ISOCode, location.Country
+					result.ExitCountry = location.Country
 					result.ExitCountryCode = strings.ToUpper(location.ISOCode)
 					if err := m.store.UpsertNodeDetectionResult(ctx, result); err != nil {
 						m.logger.Warnf("cache landing country for node %d: %v", node.ID, err)
@@ -58,20 +74,15 @@ func (m *Manager) applyCachedNodeLocations(ctx context.Context, cfg *config.Conf
 				}
 			}
 		}
-		if lookup == nil && region == "" {
-			// Do not erase persisted metadata while the authoritative classifier
-			// is unavailable. A later successful database download triggers a
-			// controlled reload that reconciles this node.
+		region, country, changed := nodeloc.Resolve(node.Region, node.Country, observed)
+		if !changed {
 			continue
 		}
-		// Rows without a successful tunneled lookup are intentionally unknown.
-		// This clears legacy URI-host-derived classifications.
-		if node.Region != region || node.Country != country {
-			node.Region, node.Country = region, country
-			if err := m.store.UpdateNodeLocation(ctx, node.ID, region, country); err != nil {
-				m.logger.Warnf("apply cached landing location for node %d: %v", node.ID, err)
-			}
+		if err := m.store.UpdateNodeLocation(ctx, node.ID, region, country); err != nil {
+			m.logger.Warnf("apply cached landing location for node %d: %v", node.ID, err)
+			continue
 		}
+		node.Region, node.Country = region, country
 	}
 }
 

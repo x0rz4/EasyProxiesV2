@@ -2,6 +2,7 @@ package boxmgr
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -11,9 +12,99 @@ import (
 	"time"
 
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/geoip"
+	"easy_proxies/internal/groupmember"
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/store"
 )
+
+func TestCachedLocationPreservesRegionalMembershipWithClassifier(t *testing.T) {
+	for _, status := range []string{"missing", "failed", "success-unclassified", "success"} {
+		t.Run(status, func(t *testing.T) {
+			ctx := context.Background()
+			db, err := store.Open(filepath.Join(t.TempDir(), "location.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			node := &store.Node{URI: "http://127.0.0.1:8080", Enabled: true, Source: store.NodeSourceManual, Region: "hk", Country: "Hong Kong"}
+			if err := db.CreateNode(ctx, node); err != nil {
+				t.Fatal(err)
+			}
+			if status != "missing" {
+				result := &store.NodeDetectionResult{NodeID: node.ID, ExitIPStatus: "success", ExitIP: "203.0.113.1"}
+				if status == "failed" {
+					result.ExitIPStatus = "failed"
+					result.ExitCountryCode = "JP" // stale data must not be promoted
+				}
+				if err := db.UpsertNodeDetectionResult(ctx, result); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cfg := &config.Config{Nodes: []config.NodeConfig{{ID: node.ID, URI: node.URI, Region: node.Region, Country: node.Country}}}
+			manager := New(cfg, monitor.Config{}, WithStore(db))
+			lookups := 0
+			classify := func(string) geoip.RegionInfo {
+				lookups++
+				if status == "success" {
+					return geoip.RegionInfo{ISOCode: "JP", Country: "Japan"}
+				}
+				return geoip.RegionInfo{Code: geoip.RegionOther}
+			}
+			manager.applyCachedLocations(ctx, cfg, classify)
+			// A reload replay must produce the same location and membership.
+			manager.applyCachedLocations(ctx, cfg, classify)
+			wantRegion, wantCountry := "hk", "Hong Kong"
+			if status == "success" {
+				wantRegion, wantCountry = "jp", "Japan"
+			}
+			persisted, err := db.GetNode(ctx, node.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if persisted.Region != wantRegion || persisted.Country != wantCountry || cfg.Nodes[0].Region != wantRegion || cfg.Nodes[0].Country != wantCountry {
+				t.Fatalf("location mismatch: persisted=%+v config=%+v", persisted, cfg.Nodes[0])
+			}
+			members := groupmember.Nodes(cfg, config.GroupPoolConfig{Enabled: true, Regions: []string{wantRegion}})
+			if len(members) != 1 || members[0].ID != node.ID {
+				t.Fatalf("regional membership lost: %+v", members)
+			}
+			if (status == "missing" || status == "failed") && lookups != 0 {
+				t.Fatalf("classified an unsuccessful observation %d times", lookups)
+			}
+		})
+	}
+}
+
+type locationWriteFailureStore struct {
+	store.Store
+}
+
+func (s locationWriteFailureStore) UpdateNodeLocation(context.Context, int64, string, string) error {
+	return errors.New("location write failed")
+}
+
+func TestCachedLocationWriteFailurePreservesConfig(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "location.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	node := &store.Node{URI: "http://127.0.0.1:8080", Enabled: true, Source: store.NodeSourceManual, Region: "hk", Country: "Hong Kong"}
+	if err := db.CreateNode(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertNodeDetectionResult(ctx, &store.NodeDetectionResult{NodeID: node.ID, ExitIPStatus: "success", ExitIP: "203.0.113.1", ExitCountryCode: "JP", ExitCountry: "Japan"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{Nodes: []config.NodeConfig{{ID: node.ID, URI: node.URI, Region: node.Region, Country: node.Country}}}
+	manager := New(cfg, monitor.Config{}, WithStore(locationWriteFailureStore{db}))
+	manager.applyCachedLocations(ctx, cfg, nil)
+	if cfg.Nodes[0].Region != "hk" || cfg.Nodes[0].Country != "Hong Kong" {
+		t.Fatalf("uncommitted location leaked into config: %+v", cfg.Nodes[0])
+	}
+}
 
 func TestApplyCachedNodeLocationsUsesClassifiedCacheAndPreservesLocationWithoutDatabase(t *testing.T) {
 	ctx := context.Background()
