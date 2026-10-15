@@ -171,6 +171,8 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	if server := boxMgr.MonitorServer(); server != nil {
 		server.SetSubscriptionRefresher(subMgr)
 	}
+	stopGroupHealer := startGroupHealer(ctx, &healingBackend{Manager: boxMgr, db: dataStore, subscriptions: subMgr})
+	defer stopGroupHealer()
 
 	// ── 7. Start periodic stats flush ──
 	statsCtx, statsCancel := context.WithCancel(ctx)
@@ -193,6 +195,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
 
+	stopGroupHealer()
 	stopProbeProjections()
 
 	// Flush stats one final time before shutdown

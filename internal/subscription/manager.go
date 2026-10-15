@@ -15,6 +15,7 @@ import (
 
 	"easy_proxies/internal/boxmgr"
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/group"
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/store"
 )
@@ -303,7 +304,18 @@ func validateSubscription(sub *store.Subscription) error {
 }
 
 func (m *Manager) RefreshOne(ctx context.Context, id int64) error {
+	return m.refreshOne(ctx, id, false)
+}
+
+func (m *Manager) RefreshForHealing(ctx context.Context, id int64) error {
+	return m.refreshOne(ctx, id, true)
+}
+
+func (m *Manager) refreshOne(ctx context.Context, id int64, healing bool) error {
 	if !m.refreshMu.TryLock() {
+		if healing {
+			return &group.DeferredHealing{Reason: "subscription refresh already running", Until: time.Now().Add(time.Minute)}
+		}
 		return errors.New("刷新正在进行")
 	}
 	defer m.refreshMu.Unlock()
@@ -314,6 +326,19 @@ func (m *Manager) RefreshOne(ctx context.Context, id int64) error {
 	sub, err := m.Get(ctx, id)
 	if err != nil {
 		return err
+	}
+	if healing {
+		now := time.Now()
+		if !sub.Enabled {
+			return &group.DeferredHealing{Reason: "subscription disabled", Until: now.Add(5 * time.Minute)}
+		}
+		if next := sub.LastAttempt.Add(5 * time.Minute); now.Before(next) {
+			return &group.DeferredHealing{Reason: "subscription refresh cooldown", Until: next}
+		}
+		// Record before network I/O so process shutdown cannot erase the cooldown.
+		if err := m.store.MarkSubscriptionAttempt(ctx, id, now); err != nil {
+			return err
+		}
 	}
 	err = m.refreshSubscription(ctx, sub)
 	reconcileErr := m.reconcileRuntime(ctx)

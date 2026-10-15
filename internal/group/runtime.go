@@ -672,6 +672,16 @@ func RestoreGroupMember(groupID, nodeID int64) error {
 
 // GroupRuntimeSnapshots returns all live group states.
 func GroupRuntimeSnapshots() map[int64]GroupRuntimeSnapshot {
+	return groupRuntimeSnapshots(true)
+}
+
+// GroupRuntimeSnapshotsReadonly never prunes state or emits events. Dry-run
+// planning must remain an observation even when a failure window has expired.
+func GroupRuntimeSnapshotsReadonly() map[int64]GroupRuntimeSnapshot {
+	return groupRuntimeSnapshots(false)
+}
+
+func groupRuntimeSnapshots(prune bool) map[int64]GroupRuntimeSnapshot {
 	result := make(map[int64]GroupRuntimeSnapshot)
 	groupRuntimeStore.Range(func(key, value any) bool {
 		runtime := value.(*groupRuntime)
@@ -682,7 +692,7 @@ func GroupRuntimeSnapshots() map[int64]GroupRuntimeSnapshot {
 			snapshot.CurrentNodeID = current.nodeID
 		}
 		for _, member := range runtime.members {
-			if !member.evicted && pruneFailures(member, runtime.window, time.Now()) {
+			if prune && !member.evicted && pruneFailures(member, runtime.window, time.Now()) {
 				expiredEvents = append(expiredEvents, GroupStateEvent{GroupID: runtime.id, NodeID: member.nodeID,
 					FailureHistory: append([]int64(nil), member.failureHistory...), LastError: member.lastError, StateChanged: true})
 			}

@@ -65,6 +65,7 @@ export default function NodeFilterBar({ filter }: { filter: ReturnType<typeof us
           </select>
         </label>
       })}
+      <label className="flex flex-col gap-1 text-xs">排除标签<select multiple className="select h-28" value={(spec.tag_blacklist || []).map(String)} onChange={event => setSpec({ ...spec, tag_blacklist: Array.from(event.target.selectedOptions, item => Number(item.value)) })}>{facets.data?.tags.map(item => <option key={item.value} value={item.value}>{item.label} ({item.count})</option>)}</select></label>
       <label className="flex flex-col gap-1 text-xs">最大延迟（ms）<input className="input w-32" type="number" min={0} value={spec.max_latency_ms ?? ''} onChange={event => setSpec({ ...spec, max_latency_ms: event.target.value === '' ? undefined : Number(event.target.value) })} /></label>
       <label className="flex flex-col gap-1 text-xs">标签匹配<select className="select" value={spec.tag_match || 'any'} onChange={event => setSpec({ ...spec, tag_match: event.target.value as 'any' | 'all' })}><option value="any">任一标签</option><option value="all">全部标签</option></select></label>
       <label className="flex flex-col gap-1 text-xs">诊断筛选<select className="select" value={spec.diagnostic || ''} onChange={event => setSpec({ ...spec, diagnostic: event.target.value })}><option value="">全部诊断结果</option>{facets.data?.diagnostics.map(item => <option key={item.value} value={item.value}>{item.label} ({item.count})</option>)}</select></label>

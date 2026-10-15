@@ -647,6 +647,14 @@ func (s *sqliteStore) UpdateSubscription(ctx context.Context, subscription *Subs
 	return requireAffected(result, fmt.Sprintf("subscription %d not found", subscription.ID))
 }
 
+func (s *sqliteStore) MarkSubscriptionAttempt(ctx context.Context, id int64, at time.Time) error {
+	result, err := s.writeConn().ExecContext(ctx, "UPDATE subscriptions SET last_attempt=?, updated_at=? WHERE id=? AND enabled=1", formatTime(at), formatTime(at), id)
+	if err != nil {
+		return err
+	}
+	return requireAffected(result, "subscription missing or disabled")
+}
+
 func (s *sqliteStore) DeleteSubscription(ctx context.Context, id int64) error {
 	return s.runInTx(ctx, func(tx *sqliteStore) error {
 		var exists int

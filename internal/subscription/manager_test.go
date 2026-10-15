@@ -436,3 +436,50 @@ func assertRuntimePortListening(t *testing.T, port uint16) {
 	}
 	_ = connection.Close()
 }
+
+func TestHealingRefreshHonorsPersistedCooldownAndBusyGate(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "healing-refresh.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	mgr := New(&config.Config{}, nil, WithStore(db), WithHTTPClient(server.Client()))
+	defer mgr.Stop()
+	sub, err := mgr.Create(ctx, store.Subscription{Name: "healer", URL: server.URL, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.RefreshForHealing(ctx, sub.ID); err == nil {
+		t.Fatal("expected upstream failure")
+	}
+	first := requests.Load()
+	if first == 0 {
+		t.Fatal("missing first request")
+	}
+	persisted, err := db.GetSubscription(ctx, sub.ID)
+	if err != nil || persisted.LastAttempt.IsZero() {
+		t.Fatalf("attempt not persisted: %+v %v", persisted, err)
+	}
+	// A new manager must still honor the database cooldown.
+	restarted := New(&config.Config{}, nil, WithStore(db), WithHTTPClient(server.Client()))
+	defer restarted.Stop()
+	if _, ok := restarted.RefreshForHealing(ctx, sub.ID).(*group.DeferredHealing); !ok {
+		t.Fatal("restart ignored cooldown")
+	}
+	if requests.Load() != first {
+		t.Fatal("cooldown sent network request")
+	}
+	restarted.refreshMu.Lock()
+	_, busy := restarted.RefreshForHealing(ctx, sub.ID).(*group.DeferredHealing)
+	restarted.refreshMu.Unlock()
+	if !busy || requests.Load() != first {
+		t.Fatal("busy gate failed")
+	}
+}

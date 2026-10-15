@@ -75,6 +75,7 @@ type Store interface {
 	GetSubscriptionByURL(ctx context.Context, url string) (*Subscription, error)
 	CreateSubscription(ctx context.Context, subscription *Subscription) error
 	UpdateSubscription(ctx context.Context, subscription *Subscription) error
+	MarkSubscriptionAttempt(ctx context.Context, id int64, at time.Time) error
 	DeleteSubscription(ctx context.Context, id int64) error
 	// AdoptOrphanSubscriptionNodes converts historical subscription nodes with
 	// no remaining subscription membership into ordinary manual nodes.

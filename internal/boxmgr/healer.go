@@ -19,27 +19,32 @@ func (m *Manager) HealingInputs(ctx context.Context, now time.Time) ([]group.Hea
 	if cfg == nil || mon == nil {
 		return nil, nil
 	}
-	subscriptions := map[int64][]int64{}
+	var subscriptionIDs []int64
 	if db != nil {
-		nodes, err := db.ListManagedNodes(ctx, nil)
+		subscriptions, err := db.ListSubscriptions(ctx)
 		if err != nil {
 			return nil, err
 		}
-		for _, node := range nodes {
-			subscriptions[node.ID] = node.SubscriptionIDs
+		for _, sub := range subscriptions {
+			if sub.Enabled {
+				subscriptionIDs = append(subscriptionIDs, sub.ID)
+			}
 		}
 	}
 	health := map[int64]monitor.Snapshot{}
 	for _, snapshot := range mon.Snapshot() {
 		health[snapshot.NodeID] = snapshot
 	}
-	runtimes := group.GroupRuntimeSnapshots()
+	runtimes := group.GroupRuntimeSnapshotsReadonly()
 	inputs := []group.HealInput{}
 	for _, g := range cfg.Groups {
 		if !g.Enabled || g.TargetSize <= 0 {
 			continue
 		}
 		in := group.HealInput{GroupID: g.ID, Policy: g.HealPolicy.Clone(), Now: now, MaxHealthAge: max(time.Minute, 2*g.HealthCheckInterval)}
+		// Groups do not constrain subscription sources. Refresh can discover new
+		// matching nodes even when the current candidate set is empty.
+		in.SubscriptionIDs = slices.Clone(subscriptionIDs)
 		members := map[int64]group.GroupMemberSnapshot{}
 		for _, member := range runtimes[g.ID].Members {
 			members[member.NodeID] = member
@@ -55,7 +60,6 @@ func (m *Manager) HealingInputs(ctx context.Context, now time.Time) ([]group.Hea
 				Status: status, Available: h.Available && !h.Blacklisted, InitialCheckDone: h.InitialCheckDone,
 				Provisional: h.Provisional, HealthCheckedAt: h.HealthCheckedAt,
 				RecoveryEnabled: g.RecoveryEnabled, RecoveryCooldownEnd: member.RecoveryCooldownEnd})
-			in.SubscriptionIDs = append(in.SubscriptionIDs, subscriptions[node.ID]...)
 		}
 		inputs = append(inputs, in)
 	}
@@ -115,6 +119,13 @@ func (m *Manager) ProbeHealingCandidate(ctx context.Context, groupID, nodeID int
 	for _, in := range inputs {
 		if in.GroupID != groupID || !in.Policy.Execute || !slices.Contains(in.Policy.Refill, group.ProbeQuarantined) {
 			continue
+		}
+		plan, err := group.PlanHealing(in)
+		if err != nil {
+			return err
+		}
+		if plan.Healthy >= in.Policy.MinHealthy {
+			return &group.DeferredHealing{Reason: "healthy capacity already satisfied"}
 		}
 		for _, n := range in.Candidates {
 			if n.NodeID == nodeID && n.Status == "EVICTED" && n.RecoveryEnabled && !in.Now.Before(n.RecoveryCooldownEnd) {

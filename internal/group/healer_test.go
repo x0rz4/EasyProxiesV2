@@ -131,3 +131,19 @@ func TestStandbyRecoveryPreservesStreakAcrossCapacityChange(t *testing.T) {
 		}
 	}
 }
+
+func TestHealingSnapshotReadDoesNotPruneOrEmitEvents(t *testing.T) {
+	Reset()
+	defer Reset()
+	Register(994, time.Minute, 3, "", map[string]GroupInitialState{"a": {NodeID: 1}})
+	value, _ := groupRuntimeStore.Load(int64(994))
+	runtime := value.(*groupRuntime)
+	runtime.mu.Lock()
+	runtime.members["a"].failureHistory = []int64{time.Now().Add(-2 * time.Minute).UnixNano()}
+	runtime.mu.Unlock()
+	before := GroupRuntimeSnapshotsReadonly()[994].Members[0]
+	after := GroupRuntimeSnapshotsReadonly()[994].Members[0]
+	if before.FailureCount != 1 || after.FailureCount != 1 {
+		t.Fatalf("read pruned state: before=%+v after=%+v", before, after)
+	}
+}
