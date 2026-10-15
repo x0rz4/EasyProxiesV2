@@ -634,7 +634,8 @@ func groupRuntimeNodesForConfig(cfg *config.Config, groupCfg config.GroupPoolCon
 
 func storeGroupFromConfig(groupCfg config.GroupPoolConfig) *store.GroupPool {
 	groupPool := &store.GroupPool{ID: groupCfg.ID, Name: groupCfg.Name, BindAddress: groupCfg.BindAddress,
-		BindPort: groupCfg.BindPort, Protocol: groupCfg.Protocol, Username: groupCfg.Username, Password: groupCfg.Password,
+		HealPolicy: groupCfg.HealPolicy.Clone(),
+		BindPort:   groupCfg.BindPort, Protocol: groupCfg.Protocol, Username: groupCfg.Username, Password: groupCfg.Password,
 		DispatchMode: groupCfg.DispatchMode, Regions: append([]string(nil), groupCfg.Regions...),
 		RegionRuleVersion: groupCfg.RegionRuleVersion, IncludeUnknownRegion: groupCfg.IncludeUnknownRegion, ExcludeRegions: append([]string(nil), groupCfg.ExcludeRegions...),
 		ExplicitNodeIDs: append([]int64(nil), groupCfg.ExplicitNodeIDs...), ExcludedNodeIDs: append([]int64(nil), groupCfg.ExcludedNodeIDs...),
@@ -1608,7 +1609,7 @@ func groupRuntimeEqual(before, after *store.GroupPool) bool {
 	if before == nil || after == nil {
 		return before == after
 	}
-	return before.ID == after.ID && before.BindAddress == after.BindAddress && before.BindPort == after.BindPort &&
+	return reflect.DeepEqual(before.HealPolicy, after.HealPolicy) && before.ID == after.ID && before.BindAddress == after.BindAddress && before.BindPort == after.BindPort &&
 		before.Protocol == after.Protocol && before.Username == after.Username && before.Password == after.Password &&
 		before.DispatchMode == after.DispatchMode && reflect.DeepEqual(before.Regions, after.Regions) &&
 		reflect.DeepEqual(before.ExplicitNodeIDs, after.ExplicitNodeIDs) && reflect.DeepEqual(before.ExcludedNodeIDs, after.ExcludedNodeIDs) &&
@@ -2278,7 +2279,8 @@ func GroupConfigsFromStore(groups []store.GroupPool) []config.GroupPoolConfig {
 	result := make([]config.GroupPoolConfig, 0, len(groups))
 	for _, group := range groups {
 		converted := config.GroupPoolConfig{ID: group.ID, Name: group.Name, BindAddress: group.BindAddress,
-			BindPort: group.BindPort, Protocol: group.Protocol, Username: group.Username, Password: group.Password,
+			HealPolicy: group.HealPolicy.Clone(),
+			BindPort:   group.BindPort, Protocol: group.Protocol, Username: group.Username, Password: group.Password,
 			DispatchMode: group.DispatchMode, Regions: append([]string(nil), group.Regions...),
 			ExplicitNodeIDs:   append([]int64(nil), group.ExplicitNodeIDs...),
 			ExcludedNodeIDs:   append([]int64(nil), group.ExcludedNodeIDs...),

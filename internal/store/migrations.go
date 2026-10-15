@@ -483,6 +483,22 @@ WHEN OLD.identity_hash<>'' AND OLD.identity_hash<>NEW.identity_hash BEGIN
  DELETE FROM node_probe_receipts WHERE node_id=NEW.id;
 END;`,
 		},
+		{
+			Version:     19,
+			Description: "add opt-in group capacity policy and healing audit",
+			Up: `ALTER TABLE group_pools ADD COLUMN heal_policy_json TEXT NOT NULL DEFAULT '{}';
+CREATE TABLE group_heal_events (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+group_id INTEGER NOT NULL REFERENCES group_pools(id) ON DELETE CASCADE,
+event_key TEXT NOT NULL DEFAULT '',
+action TEXT NOT NULL DEFAULT '',
+status TEXT NOT NULL DEFAULT '',
+detail_json TEXT NOT NULL DEFAULT '{}',
+created_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX idx_group_heal_events_group ON group_heal_events(group_id,id);
+CREATE INDEX idx_group_heal_events_key ON group_heal_events(group_id,event_key,created_at);`,
+		},
 	}
 }
 

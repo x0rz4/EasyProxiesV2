@@ -1827,7 +1827,7 @@ dispatch_mode, regions_json, explicit_node_ids_json, excluded_node_ids_json,
 tag_whitelist_json, tag_blacklist_json, tag_filter_match, failure_window_seconds,
 failure_threshold, health_check_seconds, recovery_enabled, recovery_success_threshold,
 recovery_cooldown_seconds, current_active_node_id, enabled,
-subscription_enabled, subscription_token, subscription_mode, external_host, created_at, updated_at, region_rule_version, include_unknown_region, exclude_regions_json`
+subscription_enabled, subscription_token, subscription_mode, external_host, created_at, updated_at, region_rule_version, include_unknown_region, exclude_regions_json, heal_policy_json`
 
 func (s *sqliteStore) ListGroupPools(ctx context.Context) ([]GroupPool, error) {
 	rows, err := s.readConn().QueryContext(ctx, "SELECT "+groupPoolColumns+" FROM group_pools ORDER BY id")
@@ -1871,6 +1871,13 @@ func (s *sqliteStore) GetGroupPool(ctx context.Context, id int64) (*GroupPool, e
 }
 
 func (s *sqliteStore) CreateGroupPool(ctx context.Context, g *GroupPool) error {
+	if err := g.HealPolicy.Validate(); err != nil {
+		return err
+	}
+	healPolicy, err := json.Marshal(g.HealPolicy)
+	if err != nil {
+		return err
+	}
 	if g.RegionRuleVersion == 0 {
 		g.RegionRuleVersion = 2
 	}
@@ -1885,14 +1892,14 @@ func (s *sqliteStore) CreateGroupPool(ctx context.Context, g *GroupPool) error {
  failure_window_seconds, failure_threshold, health_check_seconds,
  recovery_enabled, recovery_success_threshold, recovery_cooldown_seconds,
  current_active_node_id, enabled, subscription_enabled, subscription_token, subscription_mode,
- external_host, created_at, updated_at, region_rule_version, include_unknown_region, exclude_regions_json)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+ external_host, created_at, updated_at, region_rule_version, include_unknown_region, exclude_regions_json, heal_policy_json)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		g.Name, g.BindAddress, g.BindPort, g.Protocol, g.Username, g.Password, g.DispatchMode,
 		string(regions), string(nodeIDs), string(excludedNodeIDs), tagWhitelist, tagBlacklist, tagFilterMatch,
 		g.FailureWindowSeconds, g.FailureThreshold,
 		g.HealthCheckSeconds, boolToInt(g.RecoveryEnabled), g.RecoverySuccessThreshold, g.RecoveryCooldownSeconds,
 		g.CurrentActiveNodeID, boolToInt(g.Enabled), boolToInt(g.SubscriptionEnabled),
-		g.SubscriptionToken, g.SubscriptionMode, g.ExternalHost, formatTime(time.Now()), formatTime(time.Now()), g.RegionRuleVersion, boolToInt(g.IncludeUnknownRegion), string(excludeRegions))
+		g.SubscriptionToken, g.SubscriptionMode, g.ExternalHost, formatTime(time.Now()), formatTime(time.Now()), g.RegionRuleVersion, boolToInt(g.IncludeUnknownRegion), string(excludeRegions), string(healPolicy))
 	if err != nil {
 		return fmt.Errorf("create group pool: %w", err)
 	}
@@ -1901,6 +1908,13 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 
 }
 
 func (s *sqliteStore) UpdateGroupPool(ctx context.Context, g *GroupPool) error {
+	if err := g.HealPolicy.Validate(); err != nil {
+		return err
+	}
+	healPolicy, err := json.Marshal(g.HealPolicy)
+	if err != nil {
+		return err
+	}
 	regions, _ := json.Marshal(g.Regions)
 	excludeRegions, _ := json.Marshal(g.ExcludeRegions)
 	nodeIDs, _ := json.Marshal(g.ExplicitNodeIDs)
@@ -1912,13 +1926,13 @@ regions_json=?, explicit_node_ids_json=?, excluded_node_ids_json=?,
 tag_whitelist_json=?, tag_blacklist_json=?, tag_filter_match=?, failure_window_seconds=?, failure_threshold=?,
 health_check_seconds=?, recovery_enabled=?, recovery_success_threshold=?, recovery_cooldown_seconds=?,
 current_active_node_id=?, enabled=?, subscription_enabled=?, subscription_token=?,
-subscription_mode=?, external_host=?, updated_at=?, region_rule_version=?, include_unknown_region=?, exclude_regions_json=? WHERE id=?`,
+subscription_mode=?, external_host=?, updated_at=?, region_rule_version=?, include_unknown_region=?, exclude_regions_json=?, heal_policy_json=? WHERE id=?`,
 		g.Name, g.BindAddress, g.BindPort, g.Protocol, g.Username, g.Password, g.DispatchMode,
 		string(regions), string(nodeIDs), string(excludedNodeIDs), tagWhitelist, tagBlacklist, tagFilterMatch,
 		g.FailureWindowSeconds, g.FailureThreshold,
 		g.HealthCheckSeconds, boolToInt(g.RecoveryEnabled), g.RecoverySuccessThreshold, g.RecoveryCooldownSeconds,
 		g.CurrentActiveNodeID, boolToInt(g.Enabled), boolToInt(g.SubscriptionEnabled),
-		g.SubscriptionToken, g.SubscriptionMode, g.ExternalHost, formatTime(time.Now()), g.RegionRuleVersion, boolToInt(g.IncludeUnknownRegion), string(excludeRegions), g.ID)
+		g.SubscriptionToken, g.SubscriptionMode, g.ExternalHost, formatTime(time.Now()), g.RegionRuleVersion, boolToInt(g.IncludeUnknownRegion), string(excludeRegions), string(healPolicy), g.ID)
 	if err != nil {
 		return fmt.Errorf("update group pool: %w", err)
 	}
@@ -2019,16 +2033,19 @@ last_error, evicted_at, updated_at FROM group_node_states WHERE group_id = ?`, g
 
 func scanGroupPool(row scanner) (GroupPool, error) {
 	var g GroupPool
-	var regions, nodeIDs, excludedNodeIDs, tagWhitelist, tagBlacklist, createdAt, updatedAt, excludeRegions string
+	var regions, nodeIDs, excludedNodeIDs, tagWhitelist, tagBlacklist, createdAt, updatedAt, excludeRegions, healPolicy string
 	var enabled, subscriptionEnabled, recoveryEnabled, includeUnknown int
 	err := row.Scan(&g.ID, &g.Name, &g.BindAddress, &g.BindPort, &g.Protocol, &g.Username, &g.Password,
 		&g.DispatchMode, &regions, &nodeIDs, &excludedNodeIDs, &tagWhitelist, &tagBlacklist, &g.TagFilterMatch,
 		&g.FailureWindowSeconds, &g.FailureThreshold,
 		&g.HealthCheckSeconds, &recoveryEnabled, &g.RecoverySuccessThreshold, &g.RecoveryCooldownSeconds,
 		&g.CurrentActiveNodeID, &enabled, &subscriptionEnabled,
-		&g.SubscriptionToken, &g.SubscriptionMode, &g.ExternalHost, &createdAt, &updatedAt, &g.RegionRuleVersion, &includeUnknown, &excludeRegions)
+		&g.SubscriptionToken, &g.SubscriptionMode, &g.ExternalHost, &createdAt, &updatedAt, &g.RegionRuleVersion, &includeUnknown, &excludeRegions, &healPolicy)
 	if err != nil {
 		return g, err
+	}
+	if err := json.Unmarshal([]byte(healPolicy), &g.HealPolicy); err != nil {
+		return g, fmt.Errorf("decode group capacity policy: %w", err)
 	}
 	_ = json.Unmarshal([]byte(regions), &g.Regions)
 	_ = json.Unmarshal([]byte(excludeRegions), &g.ExcludeRegions)

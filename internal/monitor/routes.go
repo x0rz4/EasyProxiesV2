@@ -95,6 +95,7 @@ func (s *Server) routes() http.Handler {
 
 	authenticated("POST /api/reload", s.handleReload)
 	authenticated("GET /api/groups", bindRouteAction("list", s.handleGroups))
+	authenticated("GET /api/groups/{groupID}/healing-events", s.handleGroupHealEvents)
 	authenticated("POST /api/groups", bindRouteAction("create", s.handleGroups))
 	authenticated("PUT /api/groups/{groupID}", bindRouteAction("update", s.handleGroupItem))
 	authenticated("DELETE /api/groups/{groupID}", bindRouteAction("delete", s.handleGroupItem))

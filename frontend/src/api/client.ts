@@ -1,4 +1,5 @@
 import type {
+  GroupHealEvent,
   AuthResponse,
   NodesResponse,
   DebugResponse,
@@ -833,4 +834,8 @@ export function previewGroup(id: number | undefined, payload: GroupPoolPayload, 
 
 export function queryNodeIDs(spec: NodeFilterSpec) {
   return request<{ ids: number[]; snapshot_revision: string }>('/api/nodes/query-ids', { method: 'POST', body: JSON.stringify({ spec }) })
+}
+
+export async function fetchGroupHealEvents(groupID: number, signal?: AbortSignal): Promise<{ events: GroupHealEvent[] }> {
+  return request(`/api/groups/${groupID}/healing-events?limit=50`, { signal })
 }

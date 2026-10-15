@@ -7,11 +7,14 @@ import (
 	"context"
 	"time"
 
+	"easy_proxies/internal/group"
 	"easy_proxies/internal/nodeloc"
 )
 
 // Store defines all data storage operations.
 type Store interface {
+	AppendGroupHealEvent(ctx context.Context, event GroupHealEvent, repeatAfter time.Duration) (bool, error)
+	ListGroupHealEvents(ctx context.Context, groupID int64, limit int) ([]GroupHealEvent, error)
 	GetProbeReceipt(ctx context.Context, nodeID int64, stream string) (*ProbeReceipt, error)
 	PutProbeReceipt(ctx context.Context, receipt ProbeReceipt) error
 	ListPendingProbeReceipts(ctx context.Context, limit int) ([]ProbeReceipt, error)
@@ -366,6 +369,7 @@ type NodeFilter struct {
 
 // GroupPool is a persisted independently-addressable proxy pool definition.
 type GroupPool struct {
+	group.HealPolicy
 	ID                   int64    `json:"id"`
 	Name                 string   `json:"name"`
 	BindAddress          string   `json:"bind_address"`

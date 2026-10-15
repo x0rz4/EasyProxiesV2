@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"easy_proxies/internal/group"
 	json "easy_proxies/internal/jsonx"
 	"easy_proxies/internal/nodecodec"
 
@@ -81,6 +82,7 @@ type PoolConfig struct {
 // GroupPoolConfig describes an independent listener backed by a dynamic subset
 // of the globally configured nodes. Definitions are persisted in SQLite.
 type GroupPoolConfig struct {
+	group.HealPolicy     `yaml:"-"`
 	ID                   int64    `yaml:"-" json:"id"`
 	Name                 string   `yaml:"-" json:"name"`
 	BindAddress          string   `yaml:"-" json:"bind_address"`
@@ -1951,6 +1953,7 @@ func (c *Config) Clone() *Config {
 		cloned.Groups = make([]GroupPoolConfig, len(c.Groups))
 		copy(cloned.Groups, c.Groups)
 		for idx := range cloned.Groups {
+			cloned.Groups[idx].HealPolicy = c.Groups[idx].HealPolicy.Clone()
 			cloned.Groups[idx].Regions = append([]string(nil), c.Groups[idx].Regions...)
 			cloned.Groups[idx].ExcludeRegions = append([]string(nil), c.Groups[idx].ExcludeRegions...)
 			cloned.Groups[idx].ExplicitNodeIDs = append([]int64(nil), c.Groups[idx].ExplicitNodeIDs...)

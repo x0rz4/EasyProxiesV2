@@ -2618,6 +2618,10 @@ func (s *Server) geoipEnabled() bool {
 }
 
 type groupPoolInput struct {
+	MinHealthy           *int      `json:"min_healthy"`
+	TargetSize           *int      `json:"target_size"`
+	HealingEnabled       *bool     `json:"healing_enabled"`
+	Refill               *[]string `json:"refill"`
 	Name                 string    `json:"name"`
 	BindAddress          string    `json:"bind_address"`
 	BindPort             uint16    `json:"bind_port"`
@@ -3324,8 +3328,28 @@ func (s *Server) groupFromInput(ctx context.Context, input groupPoolInput, exist
 			return nil, nil, fmt.Errorf("生成订阅 Token: %w", err)
 		}
 	}
+	healPolicy := group.HealPolicy{Refill: []string{group.PromoteStandby, group.ProbeQuarantined, group.RefreshSubscription}}
+	if existing != nil {
+		healPolicy = existing.HealPolicy.Clone()
+	}
+	if input.MinHealthy != nil {
+		healPolicy.MinHealthy = *input.MinHealthy
+	}
+	if input.TargetSize != nil {
+		healPolicy.TargetSize = *input.TargetSize
+	}
+	if input.HealingEnabled != nil {
+		healPolicy.Execute = *input.HealingEnabled
+	}
+	if input.Refill != nil {
+		healPolicy.Refill = append([]string(nil), (*input.Refill)...)
+	}
+	if err := healPolicy.Validate(); err != nil {
+		return nil, nil, err
+	}
 	group := &store.GroupPool{Name: input.Name, BindAddress: input.BindAddress, BindPort: input.BindPort,
-		Protocol: protocol, Username: input.Username, Password: input.Password, DispatchMode: input.DispatchMode,
+		HealPolicy: healPolicy,
+		Protocol:   protocol, Username: input.Username, Password: input.Password, DispatchMode: input.DispatchMode,
 		Regions: regions, ExplicitNodeIDs: keptNodeIDs, ExcludedNodeIDs: excludedNodeIDs, FailureWindowSeconds: input.FailureWindowSeconds,
 		RegionRuleVersion: regionVersion, IncludeUnknownRegion: includeUnknown, ExcludeRegions: excludeRegions,
 		TagWhitelist: tagWhitelist, TagBlacklist: tagBlacklist, TagFilterMatch: tagFilterMatch,
@@ -3526,6 +3550,7 @@ func cloneGroupPool(groupPool *store.GroupPool) *store.GroupPool {
 		return nil
 	}
 	cloned := *groupPool
+	cloned.HealPolicy = groupPool.HealPolicy.Clone()
 	cloned.Regions = append([]string(nil), groupPool.Regions...)
 	cloned.ExcludeRegions = append([]string(nil), groupPool.ExcludeRegions...)
 	cloned.ExplicitNodeIDs = append([]int64(nil), groupPool.ExplicitNodeIDs...)

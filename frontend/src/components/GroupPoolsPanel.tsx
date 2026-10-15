@@ -17,8 +17,11 @@ import { RegionSelect } from './NodeFilterBar'
 import { useNodeFacets } from '../hooks/useNodeFilter'
 import TagBadge from './tags/TagBadge'
 import TagMultiSelect from './tags/TagMultiSelect'
+import GroupHealLog from './GroupHealLog'
 
 const emptyPayload = (): GroupPoolPayload => ({
+  min_healthy: 0, target_size: 0, healing_enabled: false,
+  refill: ['promote_standby', 'probe_quarantined', 'refresh_subscription'],
   region_rule_version: 2, include_unknown_region: false, exclude_regions: [],
   name: '', bind_address: '0.0.0.0', bind_port: 0, protocol: 'mixed', username: '', password: '',
   dispatch_mode: 'fixed', regions: [], explicit_node_ids: [], failure_window_seconds: 300,
@@ -91,6 +94,8 @@ async function copyTextWithFallback(value: string): Promise<boolean> {
 
 function payloadFromGroup(group: GroupPool): GroupPoolPayload {
   return {
+    min_healthy: group.min_healthy ?? 0, target_size: group.target_size ?? 0,
+    healing_enabled: group.healing_enabled ?? false, refill: group.refill ?? [],
     region_rule_version: group.region_rule_version || 1, include_unknown_region: group.include_unknown_region || false, exclude_regions: group.exclude_regions || [],
     name: group.name, bind_address: group.bind_address, bind_port: group.bind_port,
     protocol: group.protocol, username: group.username || '', password: group.password || '',
@@ -416,6 +421,25 @@ export default function GroupPoolsPanel() {
               </div>
             </section>
 
+            <section className="rounded-2xl border border-base-300 p-4 space-y-3" aria-labelledby="capacity-title">
+              <h4 id="capacity-title" className="font-bold">池容量自愈</h4>
+              <p className="text-xs text-base-content/60">容量为 0 时关闭。默认 dry-run 仅记录计划；补位始终遵守当前地区、标签和排除规则。</p>
+              <div className="grid gap-4 sm:grid-cols-2">
+                <Field label="最低健康数"><input className={cn('input w-full', controlClass)} type="number" min={0} max={form.target_size} value={form.min_healthy} onChange={e => setForm({ ...form, min_healthy: Number(e.target.value) })} /></Field>
+                <Field label="目标容量"><input className={cn('input w-full', controlClass)} type="number" min={0} max={100000} value={form.target_size} onChange={e => setForm({ ...form, target_size: Number(e.target.value) })} /></Field>
+              </div>
+              <div className="flex flex-wrap gap-4">
+                {([
+                  ['promote_standby', '提升健康备用节点'], ['probe_quarantined', '冷却后复检剔除节点'], ['refresh_subscription', '受控刷新订阅'],
+                ] as const).map(([action, label]) => <label key={action} className="flex items-center gap-2 text-sm"><input type="checkbox" className="checkbox checkbox-sm" checked={form.refill.includes(action)} onChange={e => {
+                  const selected = new Set(form.refill)
+                  if (e.target.checked) selected.add(action); else selected.delete(action)
+                  setForm({ ...form, refill: (['promote_standby', 'probe_quarantined', 'refresh_subscription'] as const).filter(value => selected.has(value)) })
+                }} />{label}</label>)}
+              </div>
+              <label className="flex items-center gap-2 text-sm"><input type="checkbox" className="toggle toggle-sm" checked={form.healing_enabled} onChange={e => setForm({ ...form, healing_enabled: e.target.checked })} />{form.healing_enabled ? '执行自愈动作' : 'dry-run：仅记录拟执行动作'}</label>
+            </section>
+
             <div className="flex flex-wrap gap-4">
               <RegionSelect label="地区自动入池" value={form.regions} facets={regionFacets.data?.regions} onChange={regions => setForm({ ...form, regions })} />
               <RegionSelect label="排除地区" value={form.exclude_regions} facets={regionFacets.data?.regions} onChange={exclude_regions => setForm({ ...form, exclude_regions })} />
@@ -677,6 +701,7 @@ function GroupCard({ group, nodeOptions, tags, busy, expanded, onToggleExpanded,
     <div className="border-b border-base-200 p-5">
       <div className="flex items-start gap-3"><div className={cn('flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl', runtimeReady ? 'bg-primary/10 text-primary' : 'bg-base-200 text-base-content/40')}><Layers3 className="h-5 w-5" /></div><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><h3 className="truncate text-lg font-bold">{group.name}</h3><span className={cn('badge badge-sm', runtimeStyle.badge)}>{runtimeStyle.label}</span><span className="badge badge-outline badge-sm">{dispatchModeLabel[group.dispatch_mode]}</span></div><div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-base-content/55"><code className="font-semibold text-primary">{group.bind_address}:{group.bind_port}</code><span className="uppercase">{group.protocol}</span><span>{group.failure_window_seconds / 60} 分钟 / {group.failure_threshold} 次踢出</span><span className={cn('badge badge-xs', group.recovery_enabled ? 'badge-success badge-outline' : 'badge-ghost')}>{group.recovery_enabled ? `自动恢复 ${group.recovery_success_threshold}×` : '仅手动恢复'}</span></div>{group.runtime_error && <p className="mt-1 truncate text-xs text-error" title={group.runtime_error}>{group.runtime_error}</p>}</div><div className="dropdown dropdown-end"><button tabIndex={0} className="btn btn-ghost btn-sm btn-square" aria-label="分组操作" disabled={runtimeUpdating}><Pencil className="h-4 w-4" /></button><ul tabIndex={0} className="dropdown-content z-20 mt-1 w-36 rounded-box border border-base-300 bg-base-100 p-1.5 shadow-xl"><li><button className="flex w-full cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-sm hover:bg-base-200" onClick={onEdit} disabled={runtimeUpdating}><Pencil className="h-4 w-4" />编辑</button></li><li><button className="flex w-full cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-sm hover:bg-base-200" onClick={onToggle} disabled={runtimeUpdating}><Power className="h-4 w-4" />{group.enabled ? '停用' : '启用'}</button></li><li><button className="flex w-full cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-sm text-error hover:bg-error/10" onClick={onDelete} disabled={runtimeUpdating}><Trash2 className="h-4 w-4" />删除</button></li></ul></div></div>
       <div className="mt-4 grid grid-cols-4 gap-2"><MiniMetric label="成员" value={group.member_count} /><MiniMetric label="健康" value={group.alive_count} tone="text-success" /><MiniMetric label="踢出" value={group.evicted_count} tone={group.evicted_count ? 'text-error' : ''} /><MiniMetric label="排除" value={excludedNodes.length} tone={excludedNodes.length ? 'text-error' : ''} /></div>
+      <GroupHealLog group={group} />
       {(group.regions?.length > 0 || group.explicit_node_ids?.length > 0) && <div className="mt-4 flex flex-wrap gap-1.5">{group.regions?.map((region) => <span key={region} className="badge badge-primary badge-outline badge-sm uppercase">{region}</span>)}{group.explicit_node_ids?.length > 0 && <span className="badge badge-ghost badge-sm">手动 {group.explicit_node_ids.length} 个</span>}</div>}
       {(group.tag_whitelist?.length > 0 || group.tag_blacklist?.length > 0) && (
         <div className="mt-3 space-y-2 rounded-xl border border-base-200 bg-base-200/25 px-3 py-2.5">

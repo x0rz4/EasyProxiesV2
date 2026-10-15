@@ -97,7 +97,22 @@ export interface GroupMember {
   is_active: boolean
 }
 
-export interface GroupPool {
+export interface GroupHealPolicy {
+  min_healthy: number
+  target_size: number
+  healing_enabled: boolean
+  refill: Array<'promote_standby' | 'probe_quarantined' | 'refresh_subscription'>
+}
+
+export interface GroupHealEvent {
+  id: number
+  group_id: number
+  status: 'dry_run' | 'planned' | 'succeeded' | 'failed' | 'deferred' | 'alert'
+  action: { kind: string; node_ids?: number[]; removed_ids?: number[]; subscription_ids?: number[]; reason: string }
+  created_at: string
+}
+
+export interface GroupPool extends GroupHealPolicy {
   region_rule_version: number
   include_unknown_region: boolean
   exclude_regions: string[]
@@ -144,7 +159,7 @@ export interface GroupPoolsResponse {
   port_range: { start: number; end: number }
 }
 
-export interface GroupPoolPayload {
+export interface GroupPoolPayload extends GroupHealPolicy {
   region_rule_version: number
   include_unknown_region: boolean
   exclude_regions: string[]
