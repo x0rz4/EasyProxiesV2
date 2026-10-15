@@ -2,6 +2,8 @@
 
 状态：对 `71d8745` 的静态盘点，**不是“生产无旁路”的验收结论**。目标与约束见 [当前 spec](specs/proxy-pool/spec.md)，整改任务见 [阶段 1 任务](changes/scale-proxy-pool/tasks.md)。
 
+P1 首批新增调用者分类及代码收敛见 [健康边界报告](changes/scale-proxy-pool/p1-health-boundaries.md)：已删除无调用者的 MarkAvailable，修正持久化无目标路径和单节点取消/超时；以下 A1 等条目保留为原始发现，其余入口与规模问题仍需继续验收。
+
 ## 权威链与允许写入者
 
 | 事实/状态 | 允许入口及顺序 | 禁止旁路 / 待核查边界 |

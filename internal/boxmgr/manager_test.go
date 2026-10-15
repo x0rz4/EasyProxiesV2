@@ -17,6 +17,24 @@ import (
 	"easy_proxies/internal/store"
 )
 
+func TestInitialHealthWaitWithoutTargetFailsImmediately(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		runtime, err := monitor.NewManager(monitor.Config{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer runtime.Stop()
+		manager := &Manager{monitorMgr: runtime, minAvailableNodes: 1}
+		started := time.Now()
+		if err := manager.waitForHealthCheck(time.Minute); err == nil {
+			t.Fatal("unconfigured measurement was reported as a healthy startup")
+		}
+		if !time.Now().Equal(started) {
+			t.Fatal("startup waited for measurements that cannot be scheduled")
+		}
+	})
+}
+
 func TestEnsureMonitorBindsStoreBeforeListen(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "monitor-startup.db"))
 	if err != nil {

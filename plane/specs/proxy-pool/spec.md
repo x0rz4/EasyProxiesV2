@@ -2,6 +2,8 @@
 
 基线：提交 `71d8745`（安装与发布功能版本 `2.1.0`）。本次为静态代码核对；已有测试仅表示存在证据入口，不表示已重新执行或通过基础设施规模验收。阶段性增强见 [变更提案](../../changes/scale-proxy-pool/proposal.md)。
 
+增量：`2.1.1` 的首批健康入口硬化与实际测试证据见 [P1 健康边界](../../changes/scale-proxy-pool/p1-health-boundaries.md)，不等同于 M1 或规模认证。
+
 ## 能力与事实源
 
 | 层 | 权威能力及代码入口 | 当前边界 |
@@ -30,6 +32,8 @@
 生产装配 MUST 使用 `HealthProbe + Health → Applier → receipt → ProjectHealthOutcome → runtime entry → HealthResultEvent`；事务失败不得发布测量成功。运行时投影重试 MUST 幂等，历史收据不能在进程重启后重复推进恢复。无 Store 的内存模式是兼容/测试路径，不是生产双写许可。
 
 `HealthResultEvent` 当前携带 Tag、NodeID、Success、Latency、Error、CheckedAt 与 SnapshotOnly；SnapshotOnly 只要求重新读取当前快照，MUST NOT 作为一次新的健康成功/失败推进恢复或故障窗口。
+
+持久化运行态无探测目标时不得用兼容方法制造成功收据，仍按 optimistic/strict 决定待测节点临时选路。单节点探测的调用方取消不得形成健康事实；探测自身预算超时不得接受 callback 的迟到成功。
 
 ### Scenario: 收据提交成功但投影失败
 

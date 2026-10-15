@@ -55,7 +55,10 @@ func TestHealingPromotesStandbyWithoutRestartingBoxes(t *testing.T) {
 		if snapshot == nil {
 			t.Fatal("missing monitor registration")
 		}
-		if err := mgr.monitorMgr.MarkAvailableWithoutProbe(snapshot.Tag); err != nil {
+		mgr.monitorMgr.HandleForTag(snapshot.Tag).SetProbe(func(context.Context) (time.Duration, error) {
+			return time.Millisecond, nil
+		})
+		if _, err := mgr.monitorMgr.Probe(ctx, snapshot.Tag); err != nil {
 			t.Fatal(err)
 		}
 	}

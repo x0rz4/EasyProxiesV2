@@ -1105,6 +1105,9 @@ func (m *Manager) TrafficSummary(includeNodes bool) TrafficSummary {
 
 // Probe triggers a manual health check.
 func (m *Manager) Probe(ctx context.Context, tag string) (time.Duration, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	e, err := m.entry(tag)
 	if err != nil {
 		return 0, err
@@ -1133,6 +1136,16 @@ func (m *Manager) Probe(ctx context.Context, tag string) (time.Duration, error) 
 		if err == nil || probeCtx.Err() != nil {
 			break
 		}
+	}
+	// Cancellation belongs to the caller, not the node's health. The callback
+	// may ignore cancellation and even return success; neither is new evidence.
+	if callerErr := ctx.Err(); callerErr != nil {
+		return 0, callerErr
+	}
+	// An internal probe deadline is a measured failure, even if a callback
+	// returns a late success after its budget expired.
+	if timeoutErr := probeCtx.Err(); timeoutErr != nil {
+		err = timeoutErr
 	}
 	if entryRuntimeTag(e) == tag {
 		if commitErr := m.commitHealthResult(e, ticket, latency, err, time.Now()); commitErr != nil {
@@ -1199,8 +1212,9 @@ func (m *Manager) projectHealthResult(e *entry, latency time.Duration, probeErr 
 	m.publishHealthResult(event)
 }
 
-// MarkAvailableWithoutProbe keeps the existing compatibility behavior used
-// when no probe target is configured while still notifying group schedulers.
+// MarkAvailableWithoutProbe preserves the no-target behavior for in-memory
+// embedders only. Persistent runtimes must not manufacture health receipts:
+// unmeasured nodes remain pending under their normal startup routing policy.
 func (m *Manager) MarkAvailableWithoutProbe(tag string) error {
 	e, err := m.entry(tag)
 	if err != nil {
@@ -1211,6 +1225,9 @@ func (m *Manager) MarkAvailableWithoutProbe(tag string) error {
 	e.mu.RUnlock()
 	if alreadyAvailable {
 		return nil
+	}
+	if m.resultApplier.Load() != nil {
+		return errors.New("persistent health requires a completed probe")
 	}
 	ticket, err := m.beginHealthResult(context.Background(), e)
 	if err != nil {
@@ -1500,7 +1517,8 @@ func (h *EntryHandle) RecordSuccess(destination string) {
 	h.ref.recordSuccess(destination)
 }
 
-// RecordSuccessWithLatency updates the last success timestamp and latency.
+// RecordSuccessWithLatency seeds health for in-memory compatibility fixtures.
+// Production measurements must go through the health result applier and projection.
 func (h *EntryHandle) RecordSuccessWithLatency(latency time.Duration) {
 	if h == nil || h.ref == nil {
 		return
@@ -1565,23 +1583,14 @@ func (h *EntryHandle) SetDialer(fn DialerFunc) {
 	h.ref.setDialer(fn)
 }
 
-// MarkInitialCheckDone marks the initial health check as completed.
+// MarkInitialCheckDone seeds initial health for compatibility fixtures.
+// Production measurements must go through the health result projection.
 func (h *EntryHandle) MarkInitialCheckDone(available bool) {
 	if h == nil || h.ref == nil {
 		return
 	}
 	h.ref.mu.Lock()
 	h.ref.initialCheckDone = true
-	h.ref.available = available
-	h.ref.mu.Unlock()
-}
-
-// MarkAvailable updates the availability status.
-func (h *EntryHandle) MarkAvailable(available bool) {
-	if h == nil || h.ref == nil {
-		return
-	}
-	h.ref.mu.Lock()
 	h.ref.available = available
 	h.ref.mu.Unlock()
 }

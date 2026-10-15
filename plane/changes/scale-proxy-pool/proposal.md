@@ -1,6 +1,6 @@
 # 大型代理池基础设施：变更提案
 
-状态：**Proposed**。已有主路径按代码基线锁定，实施任务尚未验收。入口：[文档索引](../../README.md)；当前约束：[spec](../../specs/proxy-pool/spec.md)。
+状态：**In progress**。已启动 [P1 首批健康边界硬化](p1-health-boundaries.md)，里程碑尚未验收。入口：[文档索引](../../README.md)；当前约束：[spec](../../specs/proxy-pool/spec.md)。
 
 ## Why
 
@@ -26,7 +26,7 @@ ADDED 项仅为未来规格增量，定义见 [设计](design.md#拟新增规格
 - 不重写 Runtime、PlanHealing、Healer、Applier 或现有探测执行器。
 - 不为“分层”立即迁移到 `httpapi/controlplane`，也不把 L0–L5 机械映射为六个新包。
 - 不引入分布式共享 SQLite、多实例同时管理同一池、租户隔离或新的消息总线。
-- 不在本批文档任务改变 API、数据库、默认执行开关或发布版本。
+- 本提案本身不要求破坏性 API/数据库变更或修改默认执行开关；每批代码实现单独声明兼容和版本影响。
 
 ## 规模假设与承诺边界
 

@@ -1,6 +1,6 @@
 # 回归、规模与运营验收
 
-本文件是执行计划，**本批未运行后端测试、race 或压测**。已有用例来自静态核对，新增场景仍待实现；历史记录见 [nodeview-validation](../../nodeview-validation.md)，不能直接当作本次结果。
+本文件是完整验收计划，**M1 全矩阵和规模压测尚未完成**。P1 首批回归的实际执行结果另记于 [健康边界验证记录](p1-health-boundaries.md)；其余已有用例仍只是证据入口。历史记录见 [nodeview-validation](../../nodeview-validation.md)，不能直接当作本次结果。
 
 ## 1. 测试矩阵与证据入口
 

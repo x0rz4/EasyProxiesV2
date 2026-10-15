@@ -1749,6 +1749,9 @@ func (m *Manager) waitForHealthCheck(timeout time.Duration) error {
 			m.logger.Infof("health check passed: %d/%d nodes available", available, total)
 			return nil
 		}
+		if _, ready := m.monitorMgr.TargetForProbe(); !ready {
+			return errors.New("health check unavailable: no probe target configured")
+		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("timeout: %d/%d nodes available (need >= %d)", available, total, m.minAvailableNodes)
 		}
