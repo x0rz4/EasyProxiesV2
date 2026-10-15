@@ -1035,6 +1035,7 @@ func (s *Server) Start(ctx context.Context) {
 	if s == nil || s.srv == nil {
 		return
 	}
+	go s.runProbeProjections(ctx)
 	s.logger.Printf("Starting monitor server on %s", s.cfg.Listen)
 	go func() {
 		if err := s.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

@@ -464,6 +464,25 @@ revision INTEGER NOT NULL DEFAULT 1,
 updated_at TEXT NOT NULL DEFAULT ''
 );`,
 		},
+		{
+			Version:     18,
+			Description: "persist ordered probe receipts and pending projections",
+			Up: `CREATE TABLE node_probe_receipts (
+node_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+stream TEXT NOT NULL DEFAULT '',
+event_id TEXT NOT NULL DEFAULT '',
+revision INTEGER NOT NULL DEFAULT 0,
+started_at TEXT NOT NULL DEFAULT '',
+result_json TEXT NOT NULL DEFAULT '{}',
+pending INTEGER NOT NULL DEFAULT 1,
+PRIMARY KEY(node_id,stream)
+);
+CREATE INDEX idx_probe_receipts_pending ON node_probe_receipts(pending,started_at);
+CREATE TRIGGER clear_probe_receipts_on_identity_change AFTER UPDATE OF identity_hash ON nodes
+WHEN OLD.identity_hash<>'' AND OLD.identity_hash<>NEW.identity_hash BEGIN
+ DELETE FROM node_probe_receipts WHERE node_id=NEW.id;
+END;`,
+		},
 	}
 }
 

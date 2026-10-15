@@ -12,6 +12,10 @@ import (
 
 // Store defines all data storage operations.
 type Store interface {
+	GetProbeReceipt(ctx context.Context, nodeID int64, stream string) (*ProbeReceipt, error)
+	PutProbeReceipt(ctx context.Context, receipt ProbeReceipt) error
+	ListPendingProbeReceipts(ctx context.Context, limit int) ([]ProbeReceipt, error)
+	AcknowledgeProbeReceipt(ctx context.Context, nodeID int64, stream, eventID string) error
 	ListSavedFilters(ctx context.Context) ([]SavedFilter, error)
 	GetSavedFilter(ctx context.Context, id int64) (*SavedFilter, error)
 	SaveFilter(ctx context.Context, filter *SavedFilter) error

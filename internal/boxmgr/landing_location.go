@@ -12,6 +12,7 @@ import (
 	"easy_proxies/internal/geoip"
 	"easy_proxies/internal/nodedetect"
 	"easy_proxies/internal/nodeloc"
+	"easy_proxies/internal/probe"
 	"easy_proxies/internal/store"
 )
 
@@ -78,9 +79,9 @@ func (m *Manager) applyCachedLocations(ctx context.Context, cfg *config.Config, 
 			if copyResult.ExitIPCheckedAt.Before(started) {
 				copyResult.ExitIPCheckedAt = started
 			}
-			change, err := store.ApplyLandingResult(ctx, m.store, nodeloc.Observation{
+			change, err := probe.ApplyLanding(ctx, m.store, nodeloc.Observation{
 				Token: state.Token, ProbeID: probeID, StartedAt: started, Source: nodeloc.SourceGeoIPExit,
-			}, &copyResult)
+			}, &copyResult, probe.StartupExit)
 			if err != nil {
 				m.logger.Warnf("apply cached landing location for node %d: %v", node.ID, err)
 				continue
@@ -201,7 +202,7 @@ func (m *Manager) detectMissingNodeLocations(ctx context.Context, cfg *config.Co
 					}
 				}
 				result.ExitIPCheckedAt = time.Now().UTC()
-				change, err := store.ApplyLandingResult(context.Background(), m.store, observation, result)
+				change, err := probe.ApplyLanding(context.Background(), m.store, observation, result, probe.StartupExit)
 				if err != nil {
 					m.logger.Warnf("apply landing result for node %d: %v", item.id, err)
 					continue

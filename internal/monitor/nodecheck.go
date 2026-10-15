@@ -17,6 +17,7 @@ import (
 	json "easy_proxies/internal/jsonx"
 	"easy_proxies/internal/nodedetect"
 	"easy_proxies/internal/nodeloc"
+	"easy_proxies/internal/probe"
 	"easy_proxies/internal/store"
 	"easy_proxies/internal/unlock"
 )
@@ -78,16 +79,17 @@ type nodeCheckEvent struct {
 }
 
 type nodeCheckTask struct {
-	mu         sync.Mutex
-	snapshot   nodeCheckTaskSnapshot
-	settings   config.NodeCheckConfig
-	nodes      []Snapshot
-	ctx        context.Context
-	cancel     context.CancelFunc
-	sequence   int64
-	subs       map[chan nodeCheckEvent]struct{}
-	latencyOK  map[int64]bool
-	landingIPs map[int64]string
+	observations map[int64]nodeloc.Observation
+	mu           sync.Mutex
+	snapshot     nodeCheckTaskSnapshot
+	settings     config.NodeCheckConfig
+	nodes        []Snapshot
+	ctx          context.Context
+	cancel       context.CancelFunc
+	sequence     int64
+	subs         map[chan nodeCheckEvent]struct{}
+	latencyOK    map[int64]bool
+	landingIPs   map[int64]string
 }
 
 // nodeIDs returns the store IDs of the task's nodes. task.nodes is fixed at
@@ -173,6 +175,9 @@ type nodeCheckCreateRequest struct {
 }
 
 func (m *nodeCheckManager) create(request nodeCheckCreateRequest) (*nodeCheckTask, error) {
+	if m.server.store == nil {
+		return nil, errors.New("数据存储不可用")
+	}
 	if !request.Stages.Latency && !request.Stages.Speed && !request.Stages.Quality && !request.Stages.Unlock {
 		return nil, errors.New("至少选择一个检测项目")
 	}
@@ -223,6 +228,16 @@ func (m *nodeCheckManager) create(request nodeCheckCreateRequest) (*nodeCheckTas
 		subs: make(map[chan nodeCheckEvent]struct{}), latencyOK: make(map[int64]bool), landingIPs: make(map[int64]string),
 		snapshot: nodeCheckTaskSnapshot{ID: newNodeCheckID(), Status: nodeCheckTaskPending, Stages: request.Stages, Settings: nodeCheckPublicSettings(settings), Stats: stats, TotalNodes: len(nodes), CreatedAt: now},
 	}
+	task.observations = make(map[int64]nodeloc.Observation, len(nodes))
+	for _, node := range nodes {
+		observation, err := store.BeginLandingProbe(ctx, m.server.store, node.NodeID, node.URI, task.snapshot.ID)
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		task.observations[node.NodeID] = observation
+	}
+
 	m.mu.Lock()
 	if m.active != nil {
 		active := m.active.copySnapshot()
@@ -318,8 +333,13 @@ func (m *nodeCheckManager) runLatency(task *nodeCheckTask) {
 			task.latencyOK[node.NodeID] = true
 			task.mu.Unlock()
 		}
-		_ = m.server.store.UpsertNodeDetectionResult(context.Background(), result)
-		m.server.enqueueRetag(node.NodeID)
+		if !m.applyDiagnosticResult(task, node, probe.Latency, result, nil) {
+			status = "failed"
+			errText = "检测结果未能保存"
+			task.mu.Lock()
+			delete(task.latencyOK, node.NodeID)
+			task.mu.Unlock()
+		}
 		task.updateStage("latency", status)
 		event := nodeCheckEvent{Type: "result", Phase: "latency", NodeID: node.NodeID, Tag: node.Tag, Name: node.Name, Status: status, Error: errText, LatencyMs: result.LatencyMs}
 		task.publish(event)
@@ -339,7 +359,7 @@ func (m *nodeCheckManager) runSpeed(task *nodeCheckTask) {
 			task.mu.Unlock()
 			if !passed {
 				now := time.Now().UTC()
-				_ = m.server.store.UpsertNodeDetectionResult(context.Background(), &store.NodeDetectionResult{NodeID: node.NodeID, TaskID: task.snapshot.ID, LatencyStatus: "untested", SpeedStatus: "skipped", SpeedError: "latency test failed", SpeedCheckedAt: now, ExitIPStatus: "untested"})
+				m.applyDiagnosticResult(task, node, probe.Speed, &store.NodeDetectionResult{NodeID: node.NodeID, TaskID: task.snapshot.ID, LatencyStatus: "untested", SpeedStatus: "skipped", SpeedError: "latency test failed", SpeedCheckedAt: now, ExitIPStatus: "untested"}, nil)
 				task.updateStage("speed", "skipped")
 				task.publish(nodeCheckEvent{Type: "result", Phase: "speed", NodeID: node.NodeID, Tag: node.Tag, Name: node.Name, Status: "skipped", Error: "latency test failed"})
 				continue
@@ -371,8 +391,10 @@ func (m *nodeCheckManager) runSpeed(task *nodeCheckTask) {
 		if err != nil {
 			status, errText, result.SpeedStatus, result.SpeedError = "failed", err.Error(), "failed", err.Error()
 		}
-		_ = m.server.store.UpsertNodeDetectionResult(context.Background(), result)
-		m.server.enqueueRetag(node.NodeID)
+		if !m.applyDiagnosticResult(task, node, probe.Speed, result, nil) {
+			status = "failed"
+			errText = "检测结果未能保存"
+		}
 		task.updateStage("speed", status)
 		task.publish(nodeCheckEvent{Type: "result", Phase: "speed", NodeID: node.NodeID, Tag: node.Tag, Name: node.Name, Status: status, Error: errText, Speed: &speed, DownloadedBytes: speed.BytesDownloaded})
 		m.persist(task)
@@ -389,7 +411,7 @@ func (m *nodeCheckManager) runQuality(task *nodeCheckTask) {
 	// membership, and the incremental path needs to know which nodes moved.
 	relocatedNodeIDs := make([]int64, 0)
 	markLocation := func(node Snapshot, observation nodeloc.Observation, result *store.NodeDetectionResult) {
-		change, err := store.ApplyLandingResult(context.Background(), m.server.store, observation, result)
+		change, err := probe.ApplyLanding(context.Background(), m.server.store, observation, result, probe.ManualDiagnostic)
 		if err != nil {
 			task.publish(nodeCheckEvent{Type: "task", Phase: "quality", NodeID: node.NodeID, Status: "warning", Error: "保存落地地区失败: " + err.Error()})
 			return
@@ -547,8 +569,9 @@ func (m *nodeCheckManager) runQuality(task *nodeCheckTask) {
 // to hear about a new ipq.* fact.
 func (m *nodeCheckManager) saveQuality(task *nodeCheckTask, node Snapshot, quality ipquality.Result) {
 	result := store.NodeIPQualityResult{NodeID: node.NodeID, TaskID: task.snapshot.ID, Provider: quality.Provider, Status: quality.Status, IP: quality.IP, Family: quality.Family, Country: quality.Country, CountryCode: quality.CountryCode, ASN: quality.ASN, Org: quality.Org, ISP: quality.ISP, IsBroadcast: quality.IsBroadcast, IsResidential: quality.IsResidential, FraudScore: quality.FraudScore, Proxy: quality.Proxy, Hosting: quality.Hosting, Mobile: quality.Mobile, Reason: quality.Reason, CheckedAt: quality.CheckedAt}
-	_ = m.server.store.UpsertNodeIPQualityResult(context.Background(), &result)
-	m.server.enqueueRetag(node.NodeID)
+	if !m.applyDiagnosticResult(task, node, probe.Quality, nil, &result) {
+		return
+	}
 	task.publish(nodeCheckEvent{Type: "result", Phase: "quality", NodeID: node.NodeID, Tag: node.Tag, Name: node.Name, Status: quality.Status, Error: quality.Reason, Quality: &result})
 }
 
