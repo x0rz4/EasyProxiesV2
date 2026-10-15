@@ -168,8 +168,8 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 
 产物名 `easy-proxies-linux-*` / `easy-proxies-windows-*.exe` 已被 gitignore。交叉编译需为 linux 目标全量重编依赖（约 8 分钟/架构），不要在前台等。
 
-**CI 行为**：`.github/workflows/` 仅在推送 `v*` tag 时构建（linux-amd64 / windows-amd64 二进制 + linux/amd64+arm64 镜像）。
-**CI 不跑 `go test`，也不跑前端 `lint` / `tsc`** —— 提交前必须在本地自行执行。
+**CI 行为**：`build-and-release.yml` 在推送 `v*` tag 或手动运行时验证并构建 Linux amd64 / arm64 二进制，tag 构建会上传 Release 附件及 SHA256 校验文件。该工作流执行前端 lint / tsc / build、后端全量测试及关键包 race 检查。
+**镜像发布**：`docker-publish.yml` 在 main/master、版本 tag 推送及 PR 时构建多架构镜像，非 PR 运行使用 `GITHUB_TOKEN` 推送到 GHCR。不要在 Release 工作流中重复添加依赖 `DOCKERHUB_TOKEN` 的 Docker Hub 发布任务。
 
 ---
 
