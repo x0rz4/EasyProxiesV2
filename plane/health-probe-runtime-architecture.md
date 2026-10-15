@@ -2,6 +2,14 @@
 
 本文描述健康探测重构后的代码边界与并发不变量。实现以 `internal/monitor` 为准。
 
+## 当前事实链与规模边界
+
+本篇保留调度器专题设计；持久化结果的权威契约见 [HEALTH-001 / DIAGNOSTIC-001](specs/proxy-pool/spec.md)，基础设施演进见 [分层设计](changes/scale-proxy-pool/design.md)。生产测活在联网前捕获身份，经 `probe.Applier` 提交事实与收据，再由 `ProjectHealthOutcome` 更新 entry 并发布 `HealthResultEvent`；投影可重试且必须幂等。无 Store 的内存路径用于兼容与测试，不代替生产链。
+
+HealthEventHub 当前采用每订阅**无界 FIFO**以避免慢回调阻塞 worker，尚未满足大型池的内存有界目标。不能为了限内存直接丢弃/合并中间失败或成功事件，否则会改变失败窗口与恢复 streak；阶段 2 需要先测量积压再设计保序的背压或恢复方案。
+
+当前自动 batch 并发按节点数计算并限制在 32–128（再受实际节点数约束），共节点测活间隔取基础与适用组配置中的最短值。这不等于已经证明所有 standalone、诊断和自愈入口共享同一个全局并发限制，相关盘点及压测见 [P2.1–P2.5](changes/scale-proxy-pool/tasks.md)。
+
 ## 组件边界
 
 ```text

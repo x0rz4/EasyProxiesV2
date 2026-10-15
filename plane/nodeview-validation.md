@@ -1,5 +1,7 @@
 # 节点视图与分组自愈验收
 
+> 本文保留该批次当时的本地验证结果与环境限制；“未推送”“Docker 未改动”不描述当前仓库状态。新的基础设施验收方法见 [validation](changes/scale-proxy-pool/validation.md)，当前分层与契约见 [spec](specs/proxy-pool/spec.md)。历史测试通过不等于规模压测通过。
+
 日期：2026-10-15。阶段 0–6 已实现并分批提交到本地 Git，未推送远端。
 
 ## 交付范围

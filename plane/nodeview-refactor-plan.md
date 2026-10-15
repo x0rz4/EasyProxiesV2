@@ -1,5 +1,7 @@
 # 地区、节点查询与分组自愈：评审及实施计划
 
+> 历史实施记录：下文“未推送”“Docker 不改”等描述属于该批次当时的范围与状态，不是当前操作限制。后续基础设施计划与现状核对以 [plane 索引](README.md) 和 [当前契约](specs/proxy-pool/spec.md) 为入口；不要将本历史报告视为规模验收。
+
 评审日期：2026-10-15。本文保留评审与分批实施历史；最终验收见 [nodeview-validation.md](nodeview-validation.md)。
 
 最终状态（2026-10-15）：阶段 0–6 与 Linux amd64/arm64 发布 CI 已完成，已分批本地提交。后端全量测试、前端 lint/build 与两架构生产构建通过；本机缺少 C 编译器，race 留待已配置的 Ubuntu CI 执行。未推送 GitHub，Docker 未改动。

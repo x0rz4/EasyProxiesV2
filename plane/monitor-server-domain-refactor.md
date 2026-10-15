@@ -1,5 +1,7 @@
 # `monitor/server.go` 完整领域分层改造方案
 
+> 状态：独立设计提案。文中 `internal/httpapi` / `internal/controlplane` 为目标结构，不代表当前已存在。大型代理池路线采用责任分层，先硬化现有边界，再按证据决定是否迁移包；参见 [分层设计](changes/scale-proxy-pool/design.md)。
+
 ## 1. 背景
 
 `internal/monitor/server.go` 当前约 3,300 行，集中承载 26 条 HTTP 路由以及认证、设置、节点管理、探测、解锁检测、订阅、分组、GeoIP、SSE、JSON 编解码和数据库访问。代码可以运行，但 HTTP 协议、业务编排、运行时控制与持久化耦合，导致后续增加缓存、限流或读写连接分离时难以限定改动范围。

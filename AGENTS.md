@@ -29,7 +29,7 @@ cmd/easy_proxies/main.go      入口：加载 config → app.Run
 internal/                     全部后端包（见 §3）
 frontend/src/                 React 源码（components/ api/ types/ utils/）
 internal/monitor/assets/      前端构建产物，被 //go:embed assets/* 内嵌（gitignore，禁止手改）
-plane/*.md                    设计文档（重载、并发优化、打标系统等方案背景，可能落后于实现）
+plane/README.md               文档入口：当前规格 specs/、变更计划 changes/、专题与历史记录
 config.example.yaml           配置模板（复制为 config.yaml 使用；config.yaml 不入库）
 Dockerfile / Dockerfile.ci    本地全量构建 / CI 只带产物的运行时镜像
 docker-compose.yml            GHCR 镜像 + 数据卷（EASY_PROXIES_VERSION 可指定版本）
@@ -191,6 +191,8 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 ---
 
 ## 7. Testing Guidelines
+
+基础设施变更先参考 [plane/README.md](plane/README.md)、[当前契约](plane/specs/proxy-pool/spec.md) 与 [写路径评审清单](plane/write-path-audit.md)。新增实现需关联 Requirement/任务 ID，区分已实现、待实现与未验证；历史方案中的“未推送”等描述不是当前操作约束。L0–L5 是责任分层，不要求创建同名包。
 
 - 使用标准 `testing` 包；用例名 `TestBehavior`；解析器与配置变体优先表驱动；fixture 必须确定性（注入固定 `time.Now()`，避免 sleep）。
 - 回归测试就近放在改动包内（`internal/**/xxx_test.go`）。

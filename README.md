@@ -237,6 +237,8 @@ docker compose up -d --build
 
 ## 📁 目录结构简述
 
+架构与大型代理池实施计划入口：[plane/README.md](plane/README.md)。其中分开维护当前行为规格、OpenSpec 风格变更提案/设计/任务/验收，以及运维手册和历史记录。
+
 - `cmd/easy_proxies/`: Go 程序入口
 - `frontend/`: 前端源码
 - `internal/`: 后端核心模块
