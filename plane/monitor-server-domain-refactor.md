@@ -14,7 +14,7 @@
 | --- | --- |
 | `server.go` | **510 行**（PR1 前 4,261 行），只剩 embed、外部类型、`NewServer`、`SetX`、`Start`/`Shutdown` |
 | 包内非测试代码 | 11,324 行 / 31 个文件 |
-| 包内测试 | 28 个文件 / 5,430 行 / 133 个 `TestXxx`（另有 17 处 `t.Run` 子用例） |
+| 包内测试 | 29 个文件 / 5,716 行 / 139 个 `TestXxx`（另有 18 处 `t.Run` 子用例），已含 Phase 0 契约 |
 | 路由注册 | 100 条（`routes.go`，一行一路由） |
 | 契约用例覆盖 | 103 条（`routes_contract_test.go`，含错方法/未知路径） |
 | import 的 internal 包 | 18 个 |
@@ -140,11 +140,13 @@ boxmgr 删除 `monitorServer` 字段、`MonitorServer()` 和对 Server Setter �
 
 Server 结构、全部 handler、DTO、`assets` 及 11 处构建路径引用（Dockerfile、`vite.config.ts`、2 个 workflow、README、AGENTS、.gitignore），HTTP 生命周期从 `boxmgr.MonitorServer()` 移到 `app.Run`。PR1 拉直后的路由表可原样复用。
 
-### Phase 0：冻结契约（PR1 已提前完成一部分）
+### Phase 0：冻结契约（进行中）
 
 - ✅ 为全部路由补充表驱动契约测试（`routes_contract_test.go`，103 条）。
-- 为代表性 settings、nodes、groups、subscriptions、geoip JSON 建立响应断言（部分由既有用例覆盖）。
-- 固定四类 SSE 的初始、进度、完成、错误和取消行为。
+- ✅ GeoIP JSON 形状（`handlers_contract_test.go`）：`enabled` + `database` 全字段，含"文件不存在"与"文件存在"两条分支、400 早退（未配置路径时**必须不发网络请求**）。
+- ✅ 两类此前无形状断言的 SSE 初始帧：`/api/nodes/traffic/stream`（`type/node_count/total_*/node*_speed/sampled_at/nodes`）、`/api/node-check/tasks/{id}/events`（`type:"task"` + task 快照，终态任务立即返回；未知任务 404）。
+- ✅ 既有覆盖（无需新增）：`/api/nodes/probe-all`、`/api/nodes/unlock-all` 的 start→progress→complete 序列（`operations_test.go`）；`/api/debug/stream` 的初始帧（`server_timeout_test.go`）；auth/settings/nodes/groups/subscriptions 的响应断言分散在各 `*_test.go`。
+- ⬜ 取消语义：SSE 客户端断开后生产协程退出（`test -race` 下验证，本地无 gcc 留给 CI）。
 
 ### Phase 1：模型与 ports
 
@@ -279,3 +281,27 @@ go build -tags "with_utls with_quic with_grpc with_wireguard with_gvisor" \
 **未覆盖**：`go test -race` 本地跑不了（需要 `CGO_ENABLED=1`，本机无 gcc），留给 CI。手动冒烟（登录 → 设置 → 标签 → 分组 → 节点探测 SSE）未做。
 
 **已知遗留**：`server_groups.go` 1,067 行，略超原计划的 ~1,010 上限；分组域本就更重，容忍，PR2/PR3 迁 Groups 时一并消化。
+
+## 12. Phase 0 契约补全记录
+
+**范围**：只加测试，不改产品代码。补齐 §7 Phase 0 里 PR2 尚未满足的前置条件——文档自己把"迁移前建立契约测试"列为搬迁前置，且 §10 明确警告过"JSON 漂移"。
+
+**新增** `handlers_contract_test.go`（286 行，6 个用例 + 2 个 helper）：
+
+| 用例 | 钉住的契约 |
+| --- | --- |
+| `TestGeoipStatusKeepsResponseShape` | `/api/geoip/status` 的 `enabled` + `database` 全字段；文件不存在时 `exists=false`、`size_bytes=0`、`modified_at=""`（不得凭空造值） |
+| `TestGeoipStatusReportsExistingFile` | 文件存在时 `exists=true` + 真实 size + RFC3339 UTC（`Z` 结尾）mtime |
+| `TestGeoipMutationRejectsMissingPathBeforeTouchingTheNetwork` | download/update 在路径未配置时**先答 400**，文案 `GeoIP 数据库路径未配置`；顺序错了会变慢而不是变错 |
+| `TestTrafficStreamKeepsInitialEventShape` | `/api/nodes/traffic/stream` 初始帧的 8 个键与 `type:"traffic"`、`node_count` |
+| `TestNodeCheckTaskEventsKeepsInitialEventShape` | `/api/node-check/tasks/{id}/events` 初始帧 `type:"task"` + 快照字段；终态任务发完即返回 |
+| `TestNodeCheckTaskEventsUnknownTaskIsNotFound` | 未知任务 404，而不是开一条永不产事件的流 |
+
+**确定性做法**（遵循 §7 测试准则"注入固定状态、避免 sleep"）：
+
+- traffic stream 与 node-check events 都靠"已取消的 context / 已终态的任务"让 handler 在首帧后立即返回，因此 recorder 里恰好一帧，无 sleep、无 ticker 等待。
+- GeoIP fixture 用 `os.WriteFile` 造真实文件与缺失文件，`DatabaseStatus` 用 `os.Stat` 判断，不需要 mmdb 内容。
+
+**踩到的坑（值得记录）**：首版 fixture 走 `config.LoadForReload` + `geoip.database_path: ""`，以为能构造"未配置"场景。实际 `applyDefaults` 会给空路径填 `GeoLite2-Country.mmdb`，于是该用例**真的发起了下载**，跑了 124 秒并返回 500。改成直接构造 `&config.Config{}` 并把 `GeoIP.DatabasePath` 设为空，用例从 124s 降到 0.00s。教训：涉及网络路径的"早退"断言，必须确认 fixture 真的落在那条分支上——慢，就是没落上。
+
+**版本**：`2.1.6 → 2.1.7`。
