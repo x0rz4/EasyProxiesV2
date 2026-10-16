@@ -69,6 +69,7 @@ func (s *Server) routes() http.Handler {
 	authenticated("PUT /api/nodes/config/{name}", bindRouteAction("update", s.handleConfigNodeItem))
 	authenticated("PATCH /api/nodes/config/{name}", bindRouteAction("toggle", s.handleConfigNodeItem))
 	authenticated("DELETE /api/nodes/config/{name}", bindRouteAction("delete", s.handleConfigNodeItem))
+	authenticated("GET /api/nodes/maintenance", s.handleNodeMaintenance)
 	authenticated("POST /api/nodes/probe-all", s.handleProbeAll)
 	authenticated("POST /api/nodes/unlock-all", s.handleUnlockAll)
 	authenticated("GET /api/nodes/unlock-meta", s.handleUnlockMeta)

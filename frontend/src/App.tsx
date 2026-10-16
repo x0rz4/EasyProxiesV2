@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import { 
   Activity, Cloud, Server, ShieldCheck, TerminalSquare, Settings, 
-  Menu, Hexagon, Palette, ChevronDown, Check, LogOut, Layers3, Tags, Wrench
+  Menu, Hexagon, Palette, ChevronDown, Check, LogOut, Layers3, Tags, Wrench, HeartPulse
 } from 'lucide-react'
 import MonitorPanel from './components/MonitorPanel'
 import ManagePanel from './components/ManagePanel'
@@ -13,11 +13,12 @@ import LoginPage from './components/LoginPage'
 import GroupPoolsPanel from './components/GroupPoolsPanel'
 import OperationsPanel from './components/OperationsPanel'
 import TagsPanel from './components/TagsPanel'
+import NodeMaintenancePanel from './components/NodeMaintenancePanel'
 import { checkAuth, getToken, logout } from './api/client'
 import packageJson from '../package.json'
 
 type AuthState = 'loading' | 'need_login' | 'authenticated'
-type TabId = 'monitor' | 'groups' | 'manage' | 'tags' | 'subscriptions' | 'unlock' | 'operations' | 'debug' | 'settings'
+type TabId = 'monitor' | 'groups' | 'manage' | 'maintenance' | 'tags' | 'subscriptions' | 'unlock' | 'operations' | 'debug' | 'settings'
 
 const ALL_THEMES = [
   'light', 'dark', 'cupcake', 'bumblebee', 'emerald', 'corporate',
@@ -46,6 +47,12 @@ const MENU_ITEMS: { id: TabId; label: string; icon: React.ReactNode; desc: strin
     label: '节点管理',
     desc: '操作与配置',
     icon: <Server className="h-5 w-5" />,
+  },
+  {
+    id: 'maintenance',
+    label: '节点维护',
+    desc: '离线节点清理',
+    icon: <HeartPulse className="h-5 w-5" />,
   },
   {
     id: 'tags',
@@ -85,7 +92,7 @@ const MENU_ITEMS: { id: TabId; label: string; icon: React.ReactNode; desc: strin
   },
 ]
 
-const VALID_TABS: TabId[] = ['monitor', 'groups', 'manage', 'tags', 'subscriptions', 'unlock', 'operations', 'debug', 'settings']
+const VALID_TABS: TabId[] = ['monitor', 'groups', 'manage', 'maintenance', 'tags', 'subscriptions', 'unlock', 'operations', 'debug', 'settings']
 const THEME_STORAGE_KEY = 'ep-theme'
 
 const APP_VERSION = `v${packageJson.version}`
@@ -195,6 +202,7 @@ function App() {
     switch (activeTab) {
       case 'monitor': return <MonitorPanel />
       case 'manage': return <ManagePanel />
+    case 'maintenance': return <NodeMaintenancePanel />
       case 'tags': return <TagsPanel />
       case 'groups': return <GroupPoolsPanel />
       case 'subscriptions': return <SubscriptionsPanel />

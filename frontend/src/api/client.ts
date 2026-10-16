@@ -8,6 +8,7 @@ import type {
   SubscriptionRefreshSettings,
   APIKey,
   APIKeysResponse,
+  NodeMaintenanceResponse,
   ConfigNodesResponse,
   ConfigNodePayload,
   ConfigNodeMutationResponse,
@@ -763,6 +764,13 @@ export async function createAPIKey(name: string): Promise<APIKey> {
 
 export async function deleteAPIKey(id: number): Promise<{ ok: boolean; message: string }> {
   return request(`/api/api-keys/${id}`, { method: 'DELETE' })
+}
+
+// ---- Node maintenance API ----
+
+/** Lists every managed node with its online/offline state and offline streak. */
+export async function fetchNodeMaintenance(): Promise<NodeMaintenanceResponse> {
+  return request<NodeMaintenanceResponse>('/api/nodes/maintenance')
 }
 
 export async function refreshSubscription(): Promise<SubscriptionRefreshResponse> {

@@ -2134,25 +2134,33 @@ func (m *Manager) DeleteNode(ctx context.Context, name string) error {
 		return errConfigUnavailable
 	}
 
+	// The active config only carries enabled nodes (disabling a node removes its
+	// entry), so it must not decide whether a node exists. The Store is the
+	// source of truth here, mirroring SetNodeEnabled.
 	idx := m.nodeIndexLocked(name)
-	if idx == -1 {
+	if m.store == nil && idx == -1 {
 		return monitor.ErrNodeNotFound
 	}
 
-	// Delete from Store if available
 	if m.store != nil {
 		existing, err := m.store.GetNodeByName(ctx, name)
 		if err != nil {
 			return fmt.Errorf("lookup in store: %w", err)
 		}
-		if existing != nil {
-			if err := m.store.DeleteNode(ctx, existing.ID); err != nil {
-				return fmt.Errorf("delete from store: %w", err)
+		if existing == nil {
+			// Nodes that only live in the in-memory config (never persisted)
+			// are still removable; anything unknown is a real 404.
+			if idx == -1 {
+				return monitor.ErrNodeNotFound
 			}
+		} else if err := m.store.DeleteNode(ctx, existing.ID); err != nil {
+			return fmt.Errorf("delete from store: %w", err)
 		}
 	}
 
-	m.cfg.Nodes = append(m.cfg.Nodes[:idx], m.cfg.Nodes[idx+1:]...)
+	if idx != -1 {
+		m.cfg.Nodes = append(m.cfg.Nodes[:idx], m.cfg.Nodes[idx+1:]...)
+	}
 	return nil
 }
 

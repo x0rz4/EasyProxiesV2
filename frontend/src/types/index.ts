@@ -294,6 +294,49 @@ export interface APIKeysResponse {
   api_keys: APIKey[]
 }
 
+// ---- Node maintenance types ----
+
+export type NodeMaintenanceStatus = 'online' | 'offline' | 'pending' | 'disabled'
+
+/** A node as seen by the maintenance page: persisted config + runtime health. */
+export interface MaintenanceNode {
+  id: number
+  name: string
+  uri: string
+  source: string
+  region?: string
+  country?: string
+  tags?: string[]
+  enabled: boolean
+  status: NodeMaintenanceStatus
+  available: boolean
+  initial_check_done: boolean
+  blacklisted: boolean
+  /** When the current offline streak began. Absent unless status is offline. */
+  offline_since?: string
+  /** Days the node has been continuously offline (0 for every other status). */
+  offline_days: number
+  last_success_at?: string
+  last_failure_at?: string
+  last_error?: string
+  success_count: number
+  failure_count: number
+}
+
+export interface NodeMaintenanceSummary {
+  total: number
+  online: number
+  offline: number
+  pending: number
+  disabled: number
+}
+
+export interface NodeMaintenanceResponse {
+  generated_at: string
+  nodes: MaintenanceNode[]
+  summary: NodeMaintenanceSummary
+}
+
 export interface SettingsUpdateResponse {
   message: string
   saved: boolean
