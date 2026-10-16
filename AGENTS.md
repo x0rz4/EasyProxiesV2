@@ -39,7 +39,7 @@ install.sh                    Linux Docker / 二进制安装及更新入口
 
 ---
 
-## 3. Module Map（`internal/`，26 个包）
+## 3. Module Map（`internal/`，27 个包）
 
 ### 装配与基础
 
@@ -50,6 +50,7 @@ install.sh                    Linux Docker / 二进制安装及更新入口
 | `store` | 唯一的持久化层（`Store` 接口 86 个方法）：nodes / subscriptions / stats / sessions / unlock / detection / group pools / tags | `Open()` 内部跑 `Migrate`；`migrations.go`、`sqlite.go`、`sqlite_tags.go`、`node_identity.go`、`migrate_legacy.go` |
 | `jsonx` | JSON 编解码统一出口（Sonic + `MarshalCanonical`） | `Marshal` / `Unmarshal` / `MarshalCanonical` |
 | `noderesult` | 检测结果负载的**唯一**定义（叶子包，不 import 本项目任何包）：`Quality`（ipquality）/ `Service`+`IPInfo`+`Unlock`（unlock）。`store` 嵌入这些类型加元数据字段，`unlock`/`ipquality` 用 `type` 别名指回来，因此检测结果落库/出 API 不需要逐字段转换 | `noderesult.Quality` / `Unlock` / `Service` / `IPInfo` |
+| `netx` | 经节点 outbound 拨号的 HTTP 客户端/transport 的**唯一**构造点（叶子包，不 import 本项目任何包）。各消费方的差异（超时、TLS 校验、连接复用、重定向）变成显式 `Options`，而不是在每处重拼 `http.Transport` | `NewClient(dial, Options)` / `NewTransport(dial, Options)`、`CloseIdleConnections` |
 
 ### 数据面（代理运行）
 
@@ -97,6 +98,7 @@ main → app → boxmgr ──→ builder ──→ config/store/groupmember/run
 app → nodetag ←(事实)→ nodefacts        monitor 是 unlock/ipquality 与 nodefacts 的桥接层
 subscription → boxmgr（经 interface）
 store / unlock / ipquality → noderesult（叶子，检测结果类型的唯一来源）
+nodedetect / unlock / ipquality / geoip → netx（叶子，拨号 http.Client 的唯一构造点）
 ```
 
 ---
@@ -243,3 +245,4 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 8. `ResetSharedStateStore` / `ResetAllRuntimeState` 只用于进程启动重试、关闭与测试，**热重载期间调用会清掉无关分组的状态**。
 9. 新增解锁检测器：加一个 `checker_*.go`，实现 `Checker` 接口并在 `init()` 里 `RegisterChecker`，取一个未占用的 `Order()`。provider 字段、内置标签模板、schema 枚举会自动派生；重复 key 或别名冲突会在启动时 panic。
 10. **`golang.org/x/net` 必须钉在 `v0.50.0`（`x/crypto` ≤ `v0.48.0`）**：sing-box v1.13.x 用 `//go:linkname` 直接抓 `x/net/http2.(*Transport).connPool` 这个**私有字段**，而该字段自 x/net `v0.51.0` 起已改名 `connPoolOrDef` → 一旦升级 x/net，链接器就会报 `relocation target ... not defined`。后果随 Go 版本放大：`go test` 下 `subscription` / `boxmgr` / `app` 三个包必然 `[build failed]`；Go ≥ 1.27 时**连生产构建都失败**（1.26 只是靠链接期 DCE 侥幸通过，不要依赖）。由于 `modernc.org/sqlite` 与 `geoip2-golang` 会反向要求更高的 x/net，这两个版本也要跟着钉住（当前 `v1.52.0` / `v2.2.0`）。调整这几个依赖后务必跑一次 `go build ./cmd/easy_proxies` 验证链接。
+11. **经节点拨号的 HTTP 客户端一律走 `netx`，且 `DialFunc` 不允许为 nil**：`netx` 造的是**裸** `http.Transport`（这是刻意的：每个消费者只要它声明的那几个字段）。因此 `nil` 拨号不等于"用标准库默认值"——那样会静默丢掉 `http.DefaultTransport` 的 HTTP/2、代理环境变量与共享空闲连接池。主机本地（不经节点）的请求，例如 `IPAPIClient` 的批量查询，应直接用 `&http.Client{Timeout: ...}`，不要经过 `netx`。新增消费者时把差异写成显式 `Options`，不要在调用处重拼 transport。

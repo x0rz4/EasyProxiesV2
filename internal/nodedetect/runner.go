@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"easy_proxies/internal/netx"
 )
 
 const (
@@ -43,14 +45,13 @@ type SpeedResult struct {
 	DurationMs            int64 `json:"duration_ms"`
 }
 
-func newClient(dial DialFunc, timeout time.Duration) (*http.Client, *http.Transport) {
-	transport := &http.Transport{
-		DialContext:         dial,
-		DisableKeepAlives:   false,
-		ForceAttemptHTTP2:   false,
+func newClient(dial DialFunc, timeout time.Duration) *http.Client {
+	// One idle connection per host: latency and speed runs reuse the same
+	// target within a measurement, but never fan out to several hosts.
+	return netx.NewClient(netx.DialFunc(dial), netx.Options{
+		Timeout:             timeout,
 		MaxIdleConnsPerHost: 1,
-	}
-	return &http.Client{Transport: transport, Timeout: timeout}, transport
+	})
 }
 
 func MeasureLatency(ctx context.Context, dial DialFunc, target string, timeout time.Duration, includeHandshake bool) (time.Duration, error) {
@@ -60,8 +61,8 @@ func MeasureLatency(ctx context.Context, dial DialFunc, target string, timeout t
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
-	client, transport := newClient(dial, timeout)
-	defer transport.CloseIdleConnections()
+	client := newClient(dial, timeout)
+	defer netx.CloseIdleConnections(client)
 	if !includeHandshake {
 		if _, err := timedRequest(ctx, client, target); err != nil {
 			return 0, fmt.Errorf("latency warm-up: %s", sanitizedError(err, target))
@@ -110,8 +111,8 @@ func MeasureSpeed(ctx context.Context, dial DialFunc, options SpeedOptions, prog
 	if options.PeakSampleInterval <= 0 {
 		options.PeakSampleInterval = 100 * time.Millisecond
 	}
-	client, transport := newClient(dial, options.RequestTimeout+options.Duration)
-	defer transport.CloseIdleConnections()
+	client := newClient(dial, options.RequestTimeout+options.Duration)
+	defer netx.CloseIdleConnections(client)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, options.URL, nil)
 	if err != nil {
 		return SpeedResult{}, err
@@ -214,8 +215,8 @@ func makeSpeedResult(total int64, start time.Time, peak, sampleBytes int64, samp
 }
 
 func DiscoverExitIP(ctx context.Context, dial DialFunc, target string, timeout time.Duration) (string, error) {
-	client, transport := newClient(dial, timeout)
-	defer transport.CloseIdleConnections()
+	client := newClient(dial, timeout)
+	defer netx.CloseIdleConnections(client)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return "", err

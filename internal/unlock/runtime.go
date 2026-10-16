@@ -3,12 +3,12 @@ package unlock
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"io"
-	"net"
 	"net/http"
 	"strings"
 	"time"
+
+	"easy_proxies/internal/netx"
 )
 
 const defaultProbeBodyLimit int64 = 32 * 1024
@@ -34,35 +34,24 @@ func newRuntime(ctx context.Context, dialer DialFunc, timeout time.Duration) Run
 	if timeout <= 0 {
 		timeout = 20 * time.Second
 	}
-	transport := &http.Transport{
-		DialContext: func(dialCtx context.Context, network, address string) (net.Conn, error) {
-			bounded, cancel := context.WithTimeout(dialCtx, timeout)
-			defer cancel()
-			return dialer(bounded, network, address)
-		},
-		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true}, // #nosec G402 -- probe targets can have region-specific certificate chains.
+	// Detectors probe many unrelated hosts per node, so connections are not
+	// reused; each phase gets the same deadline as the whole check, and
+	// certificates are not verified because exits present region-specific
+	// chains that would otherwise read as a broken node.
+	client := netx.NewClient(netx.DialFunc(dialer), netx.Options{
+		Timeout:               timeout,
+		DialTimeout:           timeout,
 		TLSHandshakeTimeout:   timeout,
 		ResponseHeaderTimeout: timeout,
-		ForceAttemptHTTP2:     false,
+		InsecureSkipVerify:    true,
 		DisableKeepAlives:     true,
-	}
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   timeout,
-		CheckRedirect: func(_ *http.Request, via []*http.Request) error {
-			if len(via) >= 5 {
-				return http.ErrUseLastResponse
-			}
-			return nil
-		},
-	}
+		MaxRedirects:          5,
+	})
 	return Runtime{Context: ctx, Client: client, Timeout: timeout}
 }
 
 func (runtime Runtime) close() {
-	if transport, ok := runtime.Client.Transport.(*http.Transport); ok {
-		transport.CloseIdleConnections()
-	}
+	netx.CloseIdleConnections(runtime.Client)
 }
 
 func fetchProbe(runtime Runtime, target string, headers map[string]string) (*probeResponse, error) {

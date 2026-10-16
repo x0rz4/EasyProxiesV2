@@ -15,6 +15,7 @@ import (
 	"time"
 
 	json "easy_proxies/internal/jsonx"
+	"easy_proxies/internal/netx"
 	"easy_proxies/internal/nodedetect"
 	"easy_proxies/internal/noderesult"
 )
@@ -52,9 +53,9 @@ func (p IPPureProvider) Check(ctx context.Context, dial nodedetect.DialFunc) Res
 	if p.Timeout <= 0 {
 		p.Timeout = 5 * time.Second
 	}
-	transport := &http.Transport{DialContext: dial, ForceAttemptHTTP2: false, DisableKeepAlives: true}
-	client := &http.Client{Transport: transport, Timeout: p.Timeout}
-	defer transport.CloseIdleConnections()
+	// One-shot query per check: no connection reuse.
+	client := netx.NewClient(netx.DialFunc(dial), netx.Options{Timeout: p.Timeout, DisableKeepAlives: true})
+	defer netx.CloseIdleConnections(client)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.URL, nil)
 	if err != nil {
 		result.Reason = err.Error()
@@ -168,6 +169,10 @@ func (c *IPAPIClient) checkChunk(ctx context.Context, ips []string) map[string]R
 	req.Header.Set("User-Agent", "EasyProxies/NodeCheck")
 	client := c.Client
 	if client == nil {
+		// This batch lookup runs from the host itself rather than through a
+		// node outbound, so it deliberately keeps the stdlib default transport
+		// (HTTP/2, proxy-from-environment, shared idle pool) instead of the
+		// bare probe transport netx builds.
 		client = &http.Client{Timeout: 10 * time.Second}
 	}
 	resp, err := client.Do(req)

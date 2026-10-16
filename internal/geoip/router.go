@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"easy_proxies/internal/netx"
 )
 
 // RouterConfig holds configuration for the GeoIP router
@@ -247,10 +249,10 @@ func (r *Router) handleHTTP(w http.ResponseWriter, req *http.Request, dialer Poo
 	outReq.Header.Del("Proxy-Connection")
 	outReq.Header.Del("Proxy-Authorization")
 
-	// Create transport with custom dialer
-	transport := &http.Transport{
-		DialContext: dialer.DialContext,
-	}
+	// A proxy hop forwards whatever the client sends, so this transport keeps
+	// the proxy's own connection semantics: keep-alives on, no per-request
+	// deadlines beyond the request context, TLS untouched.
+	transport := netx.NewTransport(netx.DialFunc(dialer.DialContext), netx.Options{})
 
 	resp, err := transport.RoundTrip(outReq)
 	if err != nil {
