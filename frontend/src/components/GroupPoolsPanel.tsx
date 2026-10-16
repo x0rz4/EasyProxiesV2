@@ -440,11 +440,11 @@ export default function GroupPoolsPanel() {
               <label className="flex items-center gap-2 text-sm"><input type="checkbox" className="toggle toggle-sm" checked={form.healing_enabled} onChange={e => setForm({ ...form, healing_enabled: e.target.checked })} />{form.healing_enabled ? '执行自愈动作' : 'dry-run：仅记录拟执行动作'}</label>
             </section>
 
-            <div className="flex flex-wrap gap-4">
+            <div className="flex flex-wrap items-start gap-4">
               <RegionSelect label="地区自动入池" value={form.regions} facets={regionFacets.data?.regions} onChange={regions => setForm({ ...form, regions })} />
               <RegionSelect label="排除地区" value={form.exclude_regions} facets={regionFacets.data?.regions} onChange={exclude_regions => setForm({ ...form, exclude_regions })} />
-              <label className="flex items-center gap-2 text-sm"><input className="checkbox checkbox-sm" type="checkbox" checked={form.include_unknown_region} onChange={e => setForm({ ...form, include_unknown_region: e.target.checked })} />包含未知地区</label>
-              <label className="flex items-center gap-2 text-sm"><input className="checkbox checkbox-sm" type="checkbox" checked={form.region_rule_version === 2} onChange={e => setForm({ ...form, region_rule_version: e.target.checked ? 2 : 1 })} />使用新版地区规则（other 仅含已知地区）</label>
+              <label className="flex items-center gap-2 self-end text-sm"><input className="checkbox checkbox-sm" type="checkbox" checked={form.include_unknown_region} onChange={e => setForm({ ...form, include_unknown_region: e.target.checked })} />包含未知地区</label>
+              <label className="flex items-center gap-2 self-end text-sm"><input className="checkbox checkbox-sm" type="checkbox" checked={form.region_rule_version === 2} onChange={e => setForm({ ...form, region_rule_version: e.target.checked ? 2 : 1 })} />使用新版地区规则（other 仅含已知地区）</label>
             </div>
             <div className="rounded-xl border border-base-300 p-3 text-sm" aria-live="polite">
               {preview.error ? <span className="text-error">预览失败：{preview.error.message}</span> : preview.isFetching ? '正在更新成员预览…' : preview.data && <>
