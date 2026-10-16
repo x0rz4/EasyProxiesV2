@@ -110,9 +110,11 @@ func Decide(state State, obs Observation) (State, Change) {
 		}
 		state.Evidence = state.BeforeProbe
 	} else {
-		if obs.StartedAt.Equal(state.LastStartedAt) {
-			return reject("ambiguous_order")
-		}
+		// A different ProbeID with an equal StartedAt used to be rejected as
+		// ambiguous, but wall-clock granularity (≈1 ms on Windows) makes
+		// back-to-back probes share one timestamp. The later transaction is
+		// causally newer, so it wins; strictly older observations were
+		// already rejected above.
 		state.BeforeProbe = state.Evidence
 	}
 	state.LastProbeID, state.LastStartedAt = obs.ProbeID, obs.StartedAt

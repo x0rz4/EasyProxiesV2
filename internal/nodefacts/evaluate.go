@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"easy_proxies/internal/noderegion"
@@ -13,6 +14,29 @@ import (
 	// UseNumber still produces operands this package can read.
 	stdjson "encoding/json"
 )
+
+// regexCache caches compiled regular expressions by pattern. Patterns are
+// validated when a rule is saved, but Evaluate is called once per node per
+// recompute pass; without the cache a single regex rule recompiled its
+// pattern for every node on every pass, which dominated the actual matching
+// cost by an order of magnitude. The cache is bounded by the number of
+// distinct stored patterns (rules are edited through the control plane), so
+// no eviction is needed.
+var regexCache sync.Map // map[string]*regexp.Regexp
+
+func compileCachedRegex(pattern string) (*regexp.Regexp, error) {
+	if cached, ok := regexCache.Load(pattern); ok {
+		if expression, ok := cached.(*regexp.Regexp); ok {
+			return expression, nil
+		}
+	}
+	expression, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, err
+	}
+	regexCache.Store(pattern, expression)
+	return expression, nil
+}
 
 // Evaluate reports whether a node's facts satisfy the condition. It is a pure
 // function of (condition, facts, now): no I/O, no caching, no ordering effects,
@@ -314,7 +338,7 @@ func compareString(actual string, condition Condition) (bool, error) {
 	case OpNotContains:
 		return !containsFoldText(actual, wanted), nil
 	case OpRegex:
-		expression, err := regexp.Compile(wanted)
+		expression, err := compileCachedRegex(wanted)
 		if err != nil {
 			return false, fmt.Errorf("字段 %q 的正则表达式无法编译: %w", condition.FieldName, err)
 		}

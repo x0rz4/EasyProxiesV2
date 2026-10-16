@@ -174,6 +174,7 @@ func (m *Manager) Start(ctx context.Context) error {
 	// Try to start, with automatic port conflict resolution
 	var instance *box.Box
 	maxRetries := 10
+	started := false
 	for retry := 0; retry < maxRetries; retry++ {
 		var err error
 		instance, err = m.createBaseBox(ctx, cfg)
@@ -195,7 +196,15 @@ func (m *Manager) Start(ctx context.Context) error {
 			}
 			return fmt.Errorf("start sing-box: %w", err)
 		}
+		started = true
 		break // Success
+	}
+	// A exhausted retry loop would otherwise fall through with `instance`
+	// pointing at the last closed, never-started box. Publishing that dead
+	// instance as currentBox silently takes the whole data plane offline, so
+	// the exhaustion must surface as an error instead.
+	if !started {
+		return errors.New("start sing-box: port conflict retry budget exhausted")
 	}
 
 	// The first instance supplies per-node dialers. Only uncached or previously
@@ -310,7 +319,7 @@ func (m *Manager) reload(newCfg *config.Config) error {
 		if m.detectMissingNodeLocations(locationCtx, newCfg) {
 			return m.reload(newCfg)
 		}
-		if err := m.retryDegradedGroupRuntimes(ctx, newCfg); err != nil {
+		if err := m.retryFailedGroupRuntimes(ctx, newCfg); err != nil {
 			return err
 		}
 		m.logger.Infof("reload skipped: runtime configuration unchanged")
@@ -359,6 +368,7 @@ func (m *Manager) reload(newCfg *config.Config) error {
 	// Create and start new box instance with automatic port conflict resolution
 	var instance *box.Box
 	maxRetries := 10
+	started := false
 	for retry := 0; retry < maxRetries; retry++ {
 		var err error
 		instance, err = m.createBaseBoxVersion(ctx, newCfg, reloadGeneration)
@@ -378,7 +388,15 @@ func (m *Manager) reload(newCfg *config.Config) error {
 			m.rollbackToOldConfig(ctx, oldCfg)
 			return fmt.Errorf("start new box: %w", err)
 		}
+		started = true
 		break // Success
+	}
+	// Same exhaustion hazard as Start: without this check a fully consumed
+	// retry loop would publish a dead instance as the new base. Roll back and
+	// report instead of continuing with a closed box.
+	if !started {
+		m.rollbackToOldConfig(ctx, oldCfg)
+		return errors.New("start new box: port conflict retry budget exhausted")
 	}
 
 	// New subscription nodes only have dialers after the provisional base has
@@ -481,18 +499,26 @@ func (m *Manager) restorePersistedMonitorHealth(ctx context.Context) error {
 	return nil
 }
 
-func (m *Manager) retryDegradedGroupRuntimes(ctx context.Context, cfg *config.Config) error {
+func (m *Manager) retryFailedGroupRuntimes(ctx context.Context, cfg *config.Config) error {
 	if cfg == nil {
 		return nil
 	}
 	var result error
 	for _, groupCfg := range cfg.Groups {
-		if !groupCfg.Enabled || groupCfg.ID == 0 || m.GroupRuntimeStatus(groupCfg.ID).Status != "degraded" {
+		if !groupCfg.Enabled || groupCfg.ID == 0 {
+			continue
+		}
+		// "degraded" means the incremental apply failed; "error" means the
+		// group lost its runtime entirely (for example after a base reload
+		// failure). Both are recoverable states that must be retried here,
+		// otherwise an "error" group stays offline until manually edited.
+		status := m.GroupRuntimeStatus(groupCfg.ID).Status
+		if status != "degraded" && status != "error" {
 			continue
 		}
 		groupPool := storeGroupFromConfig(groupCfg)
 		if err := m.applyGroupRuntime(ctx, groupPool, groupPool, applyModeForceNoRollback); err != nil {
-			result = errors.Join(result, fmt.Errorf("retry degraded group %d: %w", groupCfg.ID, err))
+			result = errors.Join(result, fmt.Errorf("retry group %d (%s): %w", groupCfg.ID, status, err))
 		}
 	}
 	return result
@@ -522,7 +548,12 @@ func (m *Manager) syncGroupRuntimesAfterBaseReload(ctx context.Context, oldCfg, 
 	}
 	var result error
 	for id := range ids {
-		if groupRuntimeTopologyEqual(oldCfg, newCfg, id) {
+		// A topology-equal group is only skipped when its runtime actually
+		// owns a box. After idle shutdown every slot is box-less while the
+		// configuration is unchanged; without the box check the equality
+		// shortcut would skip rebuilding them on resume and the group
+		// listeners would stay "stopped" until manually touched.
+		if groupRuntimeTopologyEqual(oldCfg, newCfg, id) && m.groupRuntimeHasBox(id) {
 			continue
 		}
 		if err := m.applyGroupRuntime(ctx, oldGroups[id], newGroups[id], applyModeForceNoRollback); err != nil {
@@ -530,6 +561,20 @@ func (m *Manager) syncGroupRuntimesAfterBaseReload(ctx context.Context, oldCfg, 
 		}
 	}
 	return result
+}
+
+// groupRuntimeHasBox reports whether the group runtime slot currently owns a
+// running sing-box instance. Slots created lazily report false.
+func (m *Manager) groupRuntimeHasBox(groupID int64) bool {
+	m.groupSlotsMu.Lock()
+	slot := m.groupSlots[groupID]
+	m.groupSlotsMu.Unlock()
+	if slot == nil {
+		return false
+	}
+	slot.mu.RLock()
+	defer slot.mu.RUnlock()
+	return slot.box != nil
 }
 
 func groupRuntimeTopologyEqual(oldCfg, newCfg *config.Config, groupID int64) bool {
@@ -901,11 +946,13 @@ func (m *Manager) rollbackToOldConfig(ctx context.Context, oldCfg *config.Config
 	instance, err := m.createBaseBox(ctx, oldCfg)
 	if err != nil {
 		m.logger.Errorf("rollback failed to create box: %v", err)
+		m.markRollbackDegraded()
 		return
 	}
 	if err := instance.Start(); err != nil {
 		_ = instance.Close()
 		m.logger.Errorf("rollback failed to start box: %v", err)
+		m.markRollbackDegraded()
 		return
 	}
 	m.mu.Lock()
@@ -913,6 +960,21 @@ func (m *Manager) rollbackToOldConfig(ctx context.Context, oldCfg *config.Config
 	m.cfg = oldCfg
 	m.mu.Unlock()
 	m.logger.Infof("rollback successful")
+}
+
+// markRollbackDegraded records that no base instance is running after a failed
+// rollback. Leaving currentBox==nil while idle==false would make the reload
+// guard ("manager not started") reject every future reload until the process
+// is restarted. Marking the manager idle instead turns the next reload into a
+// cold-start rebuild (oldBox==nil), which is the only self-service recovery
+// path left.
+func (m *Manager) markRollbackDegraded() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.currentBox == nil && !m.idle {
+		m.idle = true
+		m.logger.Errorf("no sing-box instance is running after failed rollback; manager marked idle so the next reload can rebuild the data plane")
+	}
 }
 
 // Close terminates the active instance and auxiliary components.

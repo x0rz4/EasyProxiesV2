@@ -456,11 +456,17 @@ func (p *poolOutbound) Start(stage adapter.StartStage) error {
 }
 
 func (p *poolOutbound) loadSnapshot() (*PoolSnapshot, error) {
+	if p.closed.Load() {
+		return nil, net.ErrClosed
+	}
 	if snapshot := p.current.Load(); snapshot != nil {
 		return snapshot, nil
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.closed.Load() {
+		return nil, net.ErrClosed
+	}
 	if err := p.initializeMembersLocked(); err != nil {
 		return nil, err
 	}
@@ -469,8 +475,13 @@ func (p *poolOutbound) loadSnapshot() (*PoolSnapshot, error) {
 
 // acquireSnapshot pins the loaded snapshot until release is called. The second
 // accepting check closes the Load/increment race with a concurrent publisher.
+// Once Close has run no new snapshot is ever published, so a retry loop here
+// would spin forever; closed pools fail fast with net.ErrClosed instead.
 func (p *poolOutbound) acquireSnapshot() (*PoolSnapshot, func(), error) {
 	for {
+		if p.closed.Load() {
+			return nil, nil, net.ErrClosed
+		}
 		snapshot, err := p.loadSnapshot()
 		if err != nil {
 			return nil, nil, err
@@ -480,8 +491,28 @@ func (p *poolOutbound) acquireSnapshot() (*PoolSnapshot, func(), error) {
 			return snapshot, func() { p.releaseSnapshotReader(snapshot) }, nil
 		}
 		p.releaseSnapshotReader(snapshot)
+		if p.closed.Load() {
+			return nil, nil, net.ErrClosed
+		}
 		runtime.Gosched()
 	}
+}
+
+// dialFailureAttributable reports whether a dial error is evidence against the
+// selected member. Caller-driven cancellation and caller-driven deadlines say
+// nothing about the proxy: charging them would blacklist healthy members
+// whenever clients disconnect mid-dial or an upper layer times out. The
+// context check distinguishes those cases from a dial deadline that expires on
+// its own (ctx.Err() stays nil in that case).
+func dialFailureAttributable(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	if ctx.Err() != nil &&
+		(errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+		return false
+	}
+	return true
 }
 
 func (p *poolOutbound) releaseSnapshotReader(snapshot *PoolSnapshot) {
@@ -1057,7 +1088,9 @@ func (p *poolOutbound) DialContext(ctx context.Context, network string, destinat
 		conn, err := p.dialSelected(ctx, member, network, destination)
 		if err != nil {
 			p.decActive(member)
-			p.recordFailure(member, err, dst)
+			if dialFailureAttributable(ctx, err) {
+				p.recordFailure(member, err, dst)
+			}
 			dialErr = err
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
@@ -1097,7 +1130,9 @@ func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 		conn, err := p.listenPacketSelected(ctx, member, destination)
 		if err != nil {
 			p.decActive(member)
-			p.recordFailure(member, err, dst)
+			if dialFailureAttributable(ctx, err) {
+				p.recordFailure(member, err, dst)
+			}
 			listenErr = err
 			if ctx.Err() != nil {
 				return nil, ctx.Err()

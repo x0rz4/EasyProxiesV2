@@ -192,7 +192,13 @@ func (a *Applier) Apply(ctx context.Context, event Result) (Outcome, error) {
 				out.Reason = "duplicate"
 				return nil
 			}
-			if !event.Observation.StartedAt.After(previous.StartedAt) {
+			// Strictly older probes are stale evidence. An equal StartedAt is
+			// not evidence of staleness: wall-clock granularity (≈1 ms on
+			// Windows) makes back-to-back probes share one timestamp, and the
+			// later Apply call is causally newer even when the clock did not
+			// advance. True replays are already caught by the ProbeID check
+			// above.
+			if event.Observation.StartedAt.Before(previous.StartedAt) {
 				out.Reason = "older_probe"
 				return nil
 			}

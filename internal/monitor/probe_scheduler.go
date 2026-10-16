@@ -72,7 +72,22 @@ type probeScheduler struct {
 	attemptMu       sync.Mutex
 	runningAttempts map[probeAttemptKey]*probeAttemptState
 	detachedProbes  atomic.Int64
+
+	// Convergence stall tracking. Both fields are only touched from the actor
+	// goroutine (run loop and the finishActiveRound path), so no extra lock is
+	// needed.
+	convergenceStallRounds int
+	lastPendingCount       int
 }
+
+// maxConvergenceStallRounds bounds how many consecutive fruitless convergence
+// rounds are attempted before the scheduler gives up on nodes that can never
+// commit a health result (for example "no persisted identity", or results
+// rejected as duplicates). Without this bound each stalled node re-queues
+// itself immediately after its round finishes and the scheduler spins forever
+// at the retry cadence while holding the tags leased away from periodic
+// probing.
+const maxConvergenceStallRounds = 5
 
 type probeAttemptKey struct {
 	entry *entry
@@ -282,10 +297,11 @@ func (s *probeScheduler) run() {
 			case enqueueInitialCommand:
 				started := false
 				added := 0
-				if !s.isInitialRunning() {
-					s.setInitialRunning(true)
-					started = true
-				}
+			if !s.isInitialRunning() {
+				s.setInitialRunning(true)
+				s.resetConvergenceStall()
+				started = true
+			}
 				for _, tag := range value.tags {
 					if tag == "" {
 						continue
@@ -666,12 +682,40 @@ func (s *probeScheduler) collectInitialProbeItems(queue map[string]struct{}) ([]
 func (s *probeScheduler) refreshInitialQueue(queue map[string]struct{}) {
 	pending := s.pendingTags()
 	if len(pending) == 0 {
+		s.resetConvergenceStall()
 		s.finishInitialConvergence(queue)
 		return
 	}
+	if len(pending) == s.lastPendingCount {
+		// No node left the pending set during this round: the remaining nodes
+		// cannot commit health results. Re-queueing them forever would spin
+		// the scheduler at the retry cadence, so after a bounded number of
+		// fruitless rounds convergence stops and leaves the nodes to the
+		// periodic (routine) path.
+		s.convergenceStallRounds++
+		if s.convergenceStallRounds >= maxConvergenceStallRounds {
+			s.resetConvergenceStall()
+			if s.isInitialRunning() {
+				s.setInitialRunning(false)
+				clear(queue)
+				if s.manager.logger != nil {
+					s.manager.logger.Warn("initial health convergence stalled: ", len(pending), " nodes cannot commit health results after ", maxConvergenceStallRounds, " fruitless rounds; giving up (periodic probes keep retrying them)")
+				}
+			}
+			return
+		}
+	} else {
+		s.resetConvergenceStall()
+	}
+	s.lastPendingCount = len(pending)
 	for _, tag := range pending {
 		queue[tag] = struct{}{}
 	}
+}
+
+func (s *probeScheduler) resetConvergenceStall() {
+	s.convergenceStallRounds = 0
+	s.lastPendingCount = 0
 }
 
 func (s *probeScheduler) finishInitialConvergence(queue map[string]struct{}) {

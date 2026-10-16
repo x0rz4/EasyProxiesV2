@@ -433,7 +433,7 @@ func (s *sqliteStore) UpdateNodeLocation(ctx context.Context, nodeID int64, regi
 		}
 		now := time.Now().UTC()
 		_, err = tx.ApplyNodeLocation(ctx, nodeID, nodeloc.Observation{
-			Token: state.Token, ProbeID: fmt.Sprintf("manual:%d", now.UnixNano()), StartedAt: now, CheckedAt: now,
+			Token: state.Token, ProbeID: NewProbeID("manual"), StartedAt: now, CheckedAt: now,
 			Source: nodeloc.SourceManual, Succeeded: true, ISO: region, Country: country,
 		})
 		return err

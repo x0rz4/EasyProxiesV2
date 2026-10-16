@@ -25,7 +25,9 @@ func BeginLandingProbe(ctx context.Context, db Store, nodeID int64, uri, probeID
 	}
 	now := time.Now().UTC()
 	if probeID == "" {
-		probeID = fmt.Sprintf("landing:%d:%d", nodeID, now.UnixNano())
+		// Wall-clock UnixNano alone can repeat within one timer tick; the
+		// monotonic suffix keeps same-tick probes distinct.
+		probeID = NewProbeID(fmt.Sprintf("landing:%d", nodeID))
 	}
 	return nodeloc.Observation{Token: state.Token, ProbeID: probeID, StartedAt: now, Source: nodeloc.SourceGeoIPExit}, nil
 }
