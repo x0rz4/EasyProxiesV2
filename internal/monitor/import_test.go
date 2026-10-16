@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"easy_proxies/internal/config"
@@ -96,5 +97,56 @@ func TestNodeDuplicateErrorReturnsConflictWithExistingID(t *testing.T) {
 	}
 	if payload.ExistingID != 42 {
 		t.Fatalf("payload=%s", response.Body.String())
+	}
+}
+
+func TestImportRejectsUnknownRequestFields(t *testing.T) {
+	manager := &importNodeManager{}
+	server := &Server{nodeMgr: manager}
+	body := []byte(`{"content":"http://user:pass@example.com:80","unknown":true}`)
+	response := httptest.NewRecorder()
+	server.handleImport(response, httptest.NewRequest(http.MethodPost, "/api/import", bytes.NewReader(body)))
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if len(manager.created) != 0 {
+		t.Fatalf("未知字段不应触发写入: %+v", manager.created)
+	}
+}
+
+// 结构化 issues 必须带上行号，且被丢弃的行不再静默。
+func TestImportReportsLineLevelIssues(t *testing.T) {
+	manager := &importNodeManager{}
+	server := &Server{nodeMgr: manager}
+	content := "http://user:pass@example.com:8080#ok\nssr://example"
+	body, err := json.Marshal(map[string]string{"content": content})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	server.handleImport(response, httptest.NewRequest(http.MethodPost, "/api/import", bytes.NewReader(body)))
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Imported int `json:"imported"`
+		Invalid  int `json:"invalid"`
+		Issues   []struct {
+			Line    int    `json:"line"`
+			Kind    string `json:"kind"`
+			Message string `json:"message"`
+		} `json:"issues"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Imported != 1 || payload.Invalid != 1 || len(payload.Issues) != 1 {
+		t.Fatalf("payload=%+v", payload)
+	}
+	issue := payload.Issues[0]
+	if issue.Line != 2 || issue.Kind != "unsupported_protocol" || !strings.Contains(issue.Message, "不支持的协议") {
+		t.Fatalf("issue=%+v", issue)
 	}
 }

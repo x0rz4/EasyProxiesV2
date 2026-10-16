@@ -234,13 +234,14 @@ const (
 	InboundProtocolMixed  = "mixed"
 )
 
+// supportedProxyURISchemes lists the schemes EasyProxies can actually run.
+// It must stay in sync with nodecodec.ParseURI: schemes accepted here but
+// rejected there would surface as "recognized but invalid" for the user.
 var supportedProxyURISchemes = []string{
 	"vmess://",
 	"vless://",
 	"trojan://",
 	"ss://",
-	"ssr://",
-	"hysteria://",
 	"hysteria2://",
 	"hy2://",
 	"anytls://",
@@ -1043,50 +1044,65 @@ func ParseImportContent(content string) ([]NodeConfig, error) {
 const maxDecodedContentBytes = 10 * 1024 * 1024
 
 func parseContent(content string, depth int) ([]NodeConfig, error) {
+	nodes, _, err := parseContentReport(content, depth)
+	return nodes, err
+}
+
+// parseContentReport is parseContent plus the per-line issues collected while
+// parsing, so callers can tell the user which rows were dropped and why.
+func parseContentReport(content string, depth int) ([]NodeConfig, []string, error) {
 	content = strings.TrimSpace(strings.TrimPrefix(content, "\ufeff"))
 	if len(content) > maxDecodedContentBytes {
-		return nil, errors.New("节点内容超过 10MB 限制")
+		return nil, nil, errors.New("节点内容超过 10MB 限制")
 	}
 	if content == "" {
-		return nil, errors.New("节点内容为空")
+		return nil, nil, errors.New("节点内容为空")
 	}
 	if looksLikeHTML(content) {
-		return nil, errors.New("订阅地址返回了 HTML 页面，请检查链接、鉴权参数或请求 User-Agent")
+		return nil, nil, errors.New("订阅地址返回了 HTML 页面，请检查链接、鉴权参数或请求 User-Agent")
 	}
 	if strings.HasPrefix(content, "{") {
-		if nodes, recognized, _, err := parseSingBoxJSON(content); recognized {
-			return nodes, err
+		if nodes, recognized, issues, err := parseSingBoxJSON(content); recognized {
+			return nodes, issues, err
 		}
 	}
 	if hasTopLevelProxiesKey(content) {
-		return parseClashYAML(content)
+		nodes, err := parseClashYAML(content)
+		return nodes, nil, err
 	}
 	if looksLikeInlineYAML(content) {
-		return parseClashYAML(wrapAsClashProxiesDoc(content))
+		nodes, err := parseClashYAML(wrapAsClashProxiesDoc(content))
+		return nodes, nil, err
 	}
 	if depth < 2 {
 		if decoded, ok := tryBase64Decode(content); ok {
 			if len(decoded) > maxDecodedContentBytes {
-				return nil, errors.New("Base64 解码内容超过 10MB 限制")
+				return nil, nil, errors.New("Base64 解码内容超过 10MB 限制")
 			}
-			return parseContent(decoded, depth+1)
+			return parseContentReport(decoded, depth+1)
 		}
 	}
-	return parseNodesFromContent(content)
+	return parseNodesFromContentReport(content)
 }
 
 // ParseImportContentReport is the API-facing variant that also reports
-// individual Sing-box outbounds that were intentionally skipped.
+// individual Sing-box outbounds that were intentionally skipped, plus the rows
+// that looked like proxy URIs but could not be parsed.
 func ParseImportContentReport(content string) ([]NodeConfig, []string, error) {
-	trimmed := strings.TrimSpace(strings.TrimPrefix(content, "\ufeff"))
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return nil, nil, errors.New("import content is empty")
+	}
+	trimmed = strings.TrimPrefix(trimmed, "\ufeff")
 	if strings.HasPrefix(trimmed, "{") {
 		if nodes, recognized, issues, err := parseSingBoxJSON(trimmed); recognized {
 			nodes, err = requireImportedNodes(nodes, err)
 			return nodes, issues, err
 		}
 	}
-	nodes, err := ParseImportContent(content)
-	return nodes, nil, err
+	nodes, issues, err := parseContentReport(trimmed, 0)
+	nodes, err = requireImportedNodes(nodes, err)
+	return nodes, issues, err
 }
 
 func requireImportedNodes(nodes []NodeConfig, err error) ([]NodeConfig, error) {
@@ -1196,8 +1212,16 @@ func tryBase64Decode(content string) (string, bool) {
 
 // parseNodesFromContent parses nodes from plain text content (one URI per line)
 func parseNodesFromContent(content string) ([]NodeConfig, error) {
+	nodes, _, err := parseNodesFromContentReport(content)
+	return nodes, err
+}
+
+// parseNodesFromContentReport also returns per-line issues. Rows that look like
+// proxy URIs but cannot be parsed (unsupported protocol, malformed URI) are
+// reported instead of being silently dropped when other rows succeed.
+func parseNodesFromContentReport(content string) ([]NodeConfig, []string, error) {
 	var nodes []NodeConfig
-	var parseErrors []string
+	var issues []string
 	lines := strings.Split(content, "\n")
 
 	for lineIndex, line := range lines {
@@ -1223,21 +1247,41 @@ func parseNodesFromContent(content string) ([]NodeConfig, error) {
 				}
 			}
 			if err := enrichNodeIdentity(&node); err != nil {
-				parseErrors = append(parseErrors, err.Error())
+				issues = append(issues, describeLineIssue(lineIndex+1, line, err))
 				continue
 			}
 			nodes = append(nodes, node)
 		} else if strings.Contains(line, "://") {
 			if _, err := nodecodec.ParseURI(line); err != nil {
-				parseErrors = append(parseErrors, fmt.Sprintf("第 %d 行: %v", lineIndex+1, err))
+				issues = append(issues, describeLineIssue(lineIndex+1, line, err))
 			}
 		}
 	}
 
-	if len(nodes) == 0 && len(parseErrors) > 0 {
-		return nil, errors.New(strings.Join(parseErrors, "; "))
+	if len(nodes) == 0 && len(issues) > 0 {
+		return nil, issues, errors.New(strings.Join(issues, "; "))
 	}
-	return nodes, nil
+	return nodes, issues, nil
+}
+
+// describeLineIssue renders a per-line parse problem with its line number and a
+// user-facing description. Unsupported schemes get a localized message because
+// nodecodec reports them in English.
+func describeLineIssue(line int, raw string, err error) string {
+	if errors.Is(err, nodecodec.ErrUnsupportedProtocol) {
+		if scheme := proxySchemeOf(raw); scheme != "" {
+			return fmt.Sprintf("第 %d 行: 不支持的协议 %q（部分客户端可以识别，但 EasyProxies 无法运行）", line, scheme)
+		}
+		return fmt.Sprintf("第 %d 行: 不支持的协议（部分客户端可以识别，但 EasyProxies 无法运行）", line)
+	}
+	return fmt.Sprintf("第 %d 行: %v", line, err)
+}
+
+func proxySchemeOf(raw string) string {
+	if index := strings.Index(raw, "://"); index > 0 {
+		return strings.ToLower(strings.TrimSpace(raw[:index]))
+	}
+	return ""
 }
 
 func enrichNodeIdentity(node *NodeConfig) error {

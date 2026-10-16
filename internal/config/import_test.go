@@ -217,6 +217,35 @@ func TestParseClashHTTPAndSOCKSNodes(t *testing.T) {
 	}
 }
 
+// 混合内容里被丢弃的行必须带行号上报，而不是因为其它行解析成功就被静默吞掉。
+func TestParseImportContentReportSurfacesDroppedLines(t *testing.T) {
+	content := "http://user:pass@example.com:8080#ok\nssr://example\nfoo://bar"
+	nodes, issues, err := ParseImportContentReport(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("nodes=%+v", nodes)
+	}
+	if len(issues) != 2 {
+		t.Fatalf("issues=%v", issues)
+	}
+	if !strings.Contains(issues[0], "第 2 行") || !strings.Contains(issues[0], `"ssr"`) {
+		t.Fatalf("第 2 行 issue=%q", issues[0])
+	}
+	if !strings.Contains(issues[1], "第 3 行") || !strings.Contains(issues[1], `"foo"`) {
+		t.Fatalf("第 3 行 issue=%q", issues[1])
+	}
+}
+
+func TestParseNodesFromContentRejectsUnsupportedSchemes(t *testing.T) {
+	for _, scheme := range []string{"ssr://example", "hysteria://example"} {
+		if IsProxyURI(scheme) {
+			t.Fatalf("%s 不应被识别为可运行协议", scheme)
+		}
+	}
+}
+
 func TestParseSubscriptionContentFindsLateClashProxiesKey(t *testing.T) {
 	preamble := strings.Repeat("  fallback-filter:\n    geoip: true\n", 12)
 	content := "port: 7890\ndns:\n" + preamble + `proxies:

@@ -6,7 +6,7 @@ import {
   importNodes, exportProxies,
   fetchNodes, fetchProbeStatus, probeNode, releaseNode, listSubscriptions,
 } from '../api/client'
-import type { ImportNodesResult } from '../api/client'
+import type { ImportIssue, ImportNodesResult } from '../api/client'
 import { regionFlag } from '../utils/region'
 import { PageContent, PageHeader, PageLayout } from './ui/PageLayout'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
@@ -38,6 +38,34 @@ interface MergedNode extends ConfigNodeConfig {
 }
 
 // ---- Helpers ----
+
+/** 导出文件名带时间戳，避免重复下载互相覆盖。 */
+function buildExportFileName(now = new Date()): string {
+  const pad = (value: number) => String(value).padStart(2, '0')
+  const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`
+  return `nodes_export_${stamp}.txt`
+}
+
+function importIssueLabel(kind: string): string {
+  switch (kind) {
+    case 'unsupported_protocol': return '协议不支持'
+    case 'invalid_uri': return '无效 URI'
+    case 'create_failed': return '写入失败'
+    default: return '解析问题'
+  }
+}
+
+/** 输入内容提示：URI 列表可给出行数，其它格式只能等服务端解析。 */
+function describeImportContent(content: string): string {
+  const trimmed = content.trim()
+  if (!trimmed) return '等待输入...'
+  if (trimmed.includes('://')) {
+    const lines = trimmed.split('\n').filter(line => line.trim() && !line.trim().startsWith('#')).length
+    return `${lines} 行有效内容`
+  }
+  if (trimmed.startsWith('{') || /^proxies\s*:/m.test(trimmed)) return 'Clash / Sing-box 配置（解析结果以服务端为准）'
+  return '疑似 Base64 订阅内容（解析结果以服务端为准）'
+}
 
 type ManageSortKey = 'name' | 'status' | 'latency' | 'region' | 'port' | 'source'
 type SortDir = 'asc' | 'desc'
@@ -555,16 +583,16 @@ export default function ManagePanel() {
 
   const handleExport = async () => {
     try {
-      const text = await exportProxies()
-      if (!text.trim()) { toast.error('没有可导出的节点'); return }
-      const blob = new Blob([text], { type: 'text/plain' })
+      const { text, count } = await exportProxies()
+      if (count === 0 || !text.trim()) { toast.error('没有可导出的节点'); return }
+      const blob = new Blob([text], { type: 'text/plain;charset=utf-8' })
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
-      a.download = 'nodes_export.txt'
+      a.download = buildExportFileName()
       a.click()
       URL.revokeObjectURL(url)
-      toast.success('节点已导出')
+      toast.success(`已导出 ${count} 个节点`)
     } catch (err) {
       toast.error(err instanceof Error ? err.message : '导出失败')
     }
@@ -610,6 +638,9 @@ export default function ManagePanel() {
       </div>
     )
   }
+
+  const importIssueList: ImportIssue[] = importResult?.issues
+    ?? (importResult?.errors ?? []).map(message => ({ kind: 'parse', message }))
 
   const thClass = "font-semibold cursor-pointer select-none hover:text-primary transition-colors"
 
@@ -994,7 +1025,6 @@ export default function ManagePanel() {
                   <div className="mt-2 flex flex-wrap gap-1.5">
                     <span className="badge badge-sm badge-outline">解析 {importResult.parsed}</span>
                     <span className="badge badge-sm badge-success">新增 {importResult.created}</span>
-                    {importResult.updated > 0 && <span className="badge badge-sm badge-info">更新 {importResult.updated}</span>}
                     {importResult.duplicates_skipped > 0 && <span className="badge badge-sm badge-warning">重复跳过 {importResult.duplicates_skipped}</span>}
                     {importResult.invalid > 0 && <span className="badge badge-sm badge-error">无效 {importResult.invalid}</span>}
                   </div>
@@ -1014,11 +1044,13 @@ export default function ManagePanel() {
                       </ul>
                     </details>
                   )}
-                  {importResult.errors && importResult.errors.length > 0 && (
-                    <details className="mt-2">
-                      <summary className="cursor-pointer text-xs opacity-70">{importResult.errors.length} 个错误</summary>
+                  {importIssueList.length > 0 && (
+                    <details className="mt-2" open={importIssueList.length <= 3}>
+                      <summary className="cursor-pointer text-xs opacity-70">{importIssueList.length} 个未导入项</summary>
                       <ul className="text-xs mt-1 space-y-0.5">
-                        {importResult.errors.map((err, i) => <li key={i} className="opacity-70">• {err}</li>)}
+                        {importIssueList.map((issue, i) => (
+                          <li key={i} className="opacity-70">• {issue.line ? `第 ${issue.line} 行` : importIssueLabel(issue.kind)}：{issue.message}</li>
+                        ))}
                       </ul>
                     </details>
                   )}
@@ -1043,7 +1075,7 @@ export default function ManagePanel() {
               onChange={(e) => setImportContent(e.target.value)}
             />
             <div className="text-xs text-base-content/40 mt-1">
-              {importContent.trim() ? `${importContent.trim().split('\n').filter(l => l.trim() && !l.trim().startsWith('#')).length} 行有效内容` : '等待输入...'}
+              {describeImportContent(importContent)}
             </div>
             <div className="modal-action">
               <button type="button" className="btn btn-ghost" onClick={() => setImportModalOpen(false)}>

@@ -66,15 +66,28 @@ export function clearToken() {
 
 // ---- Base request helper ----
 
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+function buildHeaders(extra?: HeadersInit): Record<string, string> {
   const headers: Record<string, string> = {
-    ...(options.headers as Record<string, string> || {}),
+    ...(extra as Record<string, string> || {}),
   }
-
   // Add auth header if we have a token
   if (authToken) {
     headers['Authorization'] = `Bearer ${authToken}`
   }
+  return headers
+}
+
+async function readErrorMessage(res: Response): Promise<string> {
+  let msg = `HTTP ${res.status}`
+  try {
+    const body = await res.json()
+    if (body.error) msg = body.error
+  } catch { /* ignore parse errors */ }
+  return msg
+}
+
+async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const headers = buildHeaders(options.headers)
 
   // Set JSON content type for non-GET requests with body
   if (options.body && typeof options.body === 'string') {
@@ -95,12 +108,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   }
 
   if (!res.ok) {
-    let msg = `HTTP ${res.status}`
-    try {
-      const body = await res.json()
-      if (body.error) msg = body.error
-    } catch { /* ignore parse errors */ }
-    throw new ApiError(msg, res.status)
+    throw new ApiError(await readErrorMessage(res), res.status)
   }
 
   // Handle empty responses
@@ -771,20 +779,42 @@ export async function listSubscriptionNodes(id: number): Promise<SubscriptionNod
 
 // ---- Export API ----
 
-export async function exportProxies(): Promise<string> {
-  const headers: Record<string, string> = {}
-  if (authToken) {
-    headers['Authorization'] = `Bearer ${authToken}`
-  }
+export interface ExportResult {
+  /** 导出的纯文本内容，每行一个代理 URI */
+  text: string
+  /** 后端返回的实际导出条数 */
+  count: number
+}
+
+export async function exportProxies(): Promise<ExportResult> {
   const res = await fetch('/api/export', {
-    headers,
+    headers: buildHeaders(),
     credentials: 'include',
   })
-  if (!res.ok) throw new ApiError('导出失败', res.status)
-  return res.text()
+  if (res.status === 401) {
+    clearToken()
+    window.dispatchEvent(new CustomEvent('auth:unauthorized'))
+    throw new ApiError('未授权，请重新登录', 401)
+  }
+  if (!res.ok) {
+    throw new ApiError(await readErrorMessage(res), res.status)
+  }
+  const text = await res.text()
+  const rawCount = res.headers.get('X-Export-Count')
+  const parsed = rawCount === null ? Number.NaN : Number(rawCount)
+  const count = Number.isFinite(parsed) ? parsed : text.split('\n').filter(line => line.trim()).length
+  return { text, count }
 }
 
 // ---- Import API ----
+
+/** 单条导入问题，line 为 0 表示无法定位到具体行。 */
+export interface ImportIssue {
+  line?: number
+  kind: string
+  message: string
+  uri?: string
+}
 
 export interface ImportNodesResult {
   reloaded?: boolean
@@ -793,12 +823,12 @@ export interface ImportNodesResult {
   imported: number
   parsed: number
   created: number
-  updated: number
   duplicates_skipped: number
   invalid: number
   duplicate_groups?: Array<{ existing_node: string; incoming_node: string }>
   endpoint_collisions?: Array<{ endpoint: string; existing_nodes: string[]; incoming_node: string }>
   errors?: string[]
+  issues?: ImportIssue[]
 }
 
 export async function importNodes(content: string): Promise<ImportNodesResult> {
