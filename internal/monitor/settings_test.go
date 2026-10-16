@@ -37,8 +37,7 @@ func TestSettingsEntrySwitchRoundTrip(t *testing.T) {
 		MultiPortEnabled: false, MultiPortAddress: "127.0.0.1", MultiPortBasePort: 24000, MultiPortProtocol: "mixed",
 		PoolMode: "sequential", PoolFailureThreshold: 3, PoolBlacklistDuration: "24h",
 		ManagementEnabled: &enabled, ManagementListen: "127.0.0.1:9090", ManagementHealthCheckInterval: "2h",
-		SubRefreshInterval: "1h", SubRefreshTimeout: "30s", SubRefreshHealthCheckTimeout: "1m", SubRefreshDrainTimeout: "30s",
-		SubRefreshMinAvailableNodes: 1, GeoIPAutoUpdateInterval: "24h",
+		GeoIPAutoUpdateInterval: "24h",
 	}
 	invalidRequest := request
 	invalidRequest.ManagementProbeTarget = "ftp://example.com/check"

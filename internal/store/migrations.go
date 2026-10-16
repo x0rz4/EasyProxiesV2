@@ -499,6 +499,19 @@ created_at TEXT NOT NULL DEFAULT ''
 CREATE INDEX idx_group_heal_events_group ON group_heal_events(group_id,id);
 CREATE INDEX idx_group_heal_events_key ON group_heal_events(group_id,event_key,created_at);`,
 		},
+		{
+			Version:     20,
+			Description: "add session-free API credentials",
+			Up: `CREATE TABLE api_keys (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+name TEXT NOT NULL DEFAULT '',
+token TEXT NOT NULL DEFAULT '',
+created_at TEXT NOT NULL DEFAULT '',
+last_used_at TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX idx_api_keys_token ON api_keys(token);
+CREATE INDEX idx_api_keys_created ON api_keys(id);`,
+		},
 	}
 }
 

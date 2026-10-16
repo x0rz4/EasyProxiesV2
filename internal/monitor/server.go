@@ -686,13 +686,9 @@ type allSettingsResponse struct {
 	ManagementPassword                  string `json:"management_password"`
 	ManagementHealthCheckInterval       string `json:"management_health_check_interval"`
 
-	// Subscription refresh
-	SubRefreshEnabled            bool   `json:"sub_refresh_enabled"`
-	SubRefreshInterval           string `json:"sub_refresh_interval"`
-	SubRefreshTimeout            string `json:"sub_refresh_timeout"`
-	SubRefreshHealthCheckTimeout string `json:"sub_refresh_health_check_timeout"`
-	SubRefreshDrainTimeout       string `json:"sub_refresh_drain_timeout"`
-	SubRefreshMinAvailableNodes  int    `json:"sub_refresh_min_available_nodes"`
+	// Subscription auto-refresh moved to /api/subscription/refresh-settings
+	// (subscription management page); it is intentionally absent from this
+	// generic settings surface.
 
 	// GeoIP
 	GeoIPEnabled            bool   `json:"geoip_enabled"`
@@ -740,13 +736,9 @@ type allSettingsRequest struct {
 	ManagementPassword                  string `json:"management_password"`
 	ManagementHealthCheckInterval       string `json:"management_health_check_interval"`
 
-	// Subscription refresh
-	SubRefreshEnabled            bool   `json:"sub_refresh_enabled"`
-	SubRefreshInterval           string `json:"sub_refresh_interval"`
-	SubRefreshTimeout            string `json:"sub_refresh_timeout"`
-	SubRefreshHealthCheckTimeout string `json:"sub_refresh_health_check_timeout"`
-	SubRefreshDrainTimeout       string `json:"sub_refresh_drain_timeout"`
-	SubRefreshMinAvailableNodes  int    `json:"sub_refresh_min_available_nodes"`
+	// Subscription auto-refresh moved to /api/subscription/refresh-settings
+	// (subscription management page); it is intentionally absent from this
+	// generic settings surface.
 
 	// GeoIP
 	GeoIPEnabled            bool   `json:"geoip_enabled"`
@@ -805,13 +797,6 @@ func (s *Server) getAllSettings() allSettingsResponse {
 		ManagementPassword:                  c.Management.Password,
 		ManagementHealthCheckInterval:       c.Management.HealthCheckInterval.String(),
 
-		SubRefreshEnabled:            c.SubscriptionRefresh.Enabled,
-		SubRefreshInterval:           c.SubscriptionRefresh.Interval.String(),
-		SubRefreshTimeout:            c.SubscriptionRefresh.Timeout.String(),
-		SubRefreshHealthCheckTimeout: c.SubscriptionRefresh.HealthCheckTimeout.String(),
-		SubRefreshDrainTimeout:       c.SubscriptionRefresh.DrainTimeout.String(),
-		SubRefreshMinAvailableNodes:  c.SubscriptionRefresh.MinAvailableNodes,
-
 		GeoIPEnabled:            c.GeoIP.Enabled,
 		GeoIPDatabasePath:       c.GeoIP.DatabasePath,
 		GeoIPAutoUpdateEnabled:  c.GeoIP.AutoUpdateEnabled,
@@ -827,8 +812,7 @@ func (s *Server) updateAllSettings(ctx context.Context, req allSettingsRequest) 
 	if err := config.ValidateSettingsRequest(
 		req.ListenerEnabled, req.MultiPortEnabled, req.ListenerPort, req.MultiPortBasePort,
 		req.ListenerProtocol, req.MultiPortProtocol,
-		req.PoolBlacklistDuration, req.SubRefreshInterval, req.SubRefreshTimeout,
-		req.SubRefreshHealthCheckTimeout, req.SubRefreshDrainTimeout,
+		req.PoolBlacklistDuration,
 		req.GeoIPAutoUpdateInterval, req.ManagementHealthCheckInterval,
 	); err != nil {
 		return SettingsUpdateResult{}, settingsValidationError{fmt.Errorf("参数验证失败: %w", err)}
@@ -900,21 +884,10 @@ func (s *Server) updateAllSettings(ctx context.Context, req allSettingsRequest) 
 		c.Management.HealthCheckInterval = d
 	}
 
-	// Subscription refresh
-	c.SubscriptionRefresh.Enabled = req.SubRefreshEnabled
-	if d, err := time.ParseDuration(req.SubRefreshInterval); err == nil && d > 0 {
-		c.SubscriptionRefresh.Interval = d
-	}
-	if d, err := time.ParseDuration(req.SubRefreshTimeout); err == nil && d > 0 {
-		c.SubscriptionRefresh.Timeout = d
-	}
-	if d, err := time.ParseDuration(req.SubRefreshHealthCheckTimeout); err == nil && d > 0 {
-		c.SubscriptionRefresh.HealthCheckTimeout = d
-	}
-	if d, err := time.ParseDuration(req.SubRefreshDrainTimeout); err == nil && d > 0 {
-		c.SubscriptionRefresh.DrainTimeout = d
-	}
-	c.SubscriptionRefresh.MinAvailableNodes = req.SubRefreshMinAvailableNodes
+	// Subscription refresh is intentionally NOT writable through this endpoint;
+	// it is owned by PUT /api/subscription/refresh-settings so the generic
+	// settings form can never clobber it. Persisted values are preserved.
+	c.SubscriptionRefresh = old.SubscriptionRefresh
 
 	// GeoIP
 	c.GeoIP.Enabled = req.GeoIPEnabled
@@ -951,18 +924,6 @@ func (s *Server) updateAllSettings(ctx context.Context, req allSettingsRequest) 
 	}
 	if s.subRefresher != nil {
 		s.subRefresher.ApplyConfig(c)
-	}
-	if s.store != nil && (old.SubscriptionRefresh.Interval != c.SubscriptionRefresh.Interval || old.SubscriptionRefresh.Timeout != c.SubscriptionRefresh.Timeout) {
-		interval, timeout := 0, 0
-		if old.SubscriptionRefresh.Interval != c.SubscriptionRefresh.Interval {
-			interval = int(c.SubscriptionRefresh.Interval.Seconds())
-		}
-		if old.SubscriptionRefresh.Timeout != c.SubscriptionRefresh.Timeout {
-			timeout = int(c.SubscriptionRefresh.Timeout.Seconds())
-		}
-		if err := s.store.UpdateAllSubscriptionRefreshSettings(ctx, interval, timeout); err != nil {
-			s.logger.Printf("批量更新订阅刷新设置失败: %v", err)
-		}
 	}
 	result := SettingsUpdateResult{Saved: true, NeedReload: plan.NeedReload, NeedRestart: plan.NeedRestart, Applied: plan.Applied, Pending: plan.Pending}
 	if plan.NeedReload && s.nodeMgr != nil {
@@ -1773,6 +1734,138 @@ func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// apiKeyHeader is the canonical header carrying a session-free API credential.
+const apiKeyHeader = "X-API-Key"
+
+// apiKeyFromRequest extracts the caller-supplied API credential. The canonical
+// carrier is the X-API-Key header; `Authorization: Bearer` and the `api_key`
+// query parameter are also accepted so plain curl/scripts stay convenient.
+func apiKeyFromRequest(r *http.Request) string {
+	if key := strings.TrimSpace(r.Header.Get(apiKeyHeader)); key != "" {
+		return key
+	}
+	if header := r.Header.Get("Authorization"); strings.HasPrefix(strings.ToLower(header), "bearer ") {
+		if token := strings.TrimSpace(header[len("Bearer "):]); token != "" {
+			return token
+		}
+	}
+	return strings.TrimSpace(r.URL.Query().Get("api_key"))
+}
+
+// withAPIKey guards the session-free public API surface. A stored API key is
+// required, and session cookies/Bearer sessions are deliberately NOT accepted
+// here: these endpoints must stay usable by unattended scripts and must not be
+// reachable with a browser cookie alone. The privilege granted is exactly the
+// set of routes wrapped by this middleware, i.e. adding a subscription and
+// importing nodes — no read, update, delete, refresh or group access.
+func (s *Server) withAPIKey(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.store == nil {
+			writeAPIError(w, http.StatusServiceUnavailable, "API 凭证不可用：数据存储未初始化")
+			return
+		}
+		token := apiKeyFromRequest(r)
+		if token == "" {
+			w.Header().Set("WWW-Authenticate", apiKeyHeader)
+			writeAPIError(w, http.StatusUnauthorized, "缺少 API Key，请在 X-API-Key 请求头中提供")
+			return
+		}
+		key, err := s.store.GetAPIKeyByToken(r.Context(), token)
+		if err != nil {
+			s.logger.Printf("Failed to load API key: %v", err)
+			writeAPIError(w, http.StatusInternalServerError, "读取 API 凭证失败")
+			return
+		}
+		if key == nil || !secureCompareStrings(key.Token, token) {
+			// Unknown and malformed keys answer identically to avoid probing.
+			w.Header().Set("WWW-Authenticate", apiKeyHeader)
+			writeAPIError(w, http.StatusUnauthorized, "API Key 无效或已被撤销")
+			return
+		}
+		s.recordAPIKeyUse(key.ID)
+		next(w, r)
+	}
+}
+
+// recordAPIKeyUse refreshes last_used_at without blocking the request.
+func (s *Server) recordAPIKeyUse(id int64) {
+	storeImpl := s.store
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := storeImpl.TouchAPIKey(ctx, id, time.Now()); err != nil {
+			s.logger.Printf("Failed to record API key usage: %v", err)
+		}
+	}()
+}
+
+// handleAPIKeys lists and creates session-free API credentials. These routes are
+// session-authenticated; the resulting tokens are only usable on /api/public/*.
+func (s *Server) handleAPIKeys(w http.ResponseWriter, r *http.Request, action string) {
+	if s.store == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "API 凭证不可用：数据存储未初始化")
+		return
+	}
+	switch action {
+	case "list":
+		keys, err := s.store.ListAPIKeys(r.Context())
+		if err != nil {
+			writeAPIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, map[string]any{"api_keys": keys})
+	case "create":
+		var req struct {
+			Name string `json:"name"`
+		}
+		if err := decodeJSON(r, &req); err != nil {
+			writeAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		name := strings.TrimSpace(req.Name)
+		if len(name) > 64 {
+			writeAPIError(w, http.StatusBadRequest, "凭证名称过长（最多 64 字符）")
+			return
+		}
+		token, err := s.generateSessionToken()
+		if err != nil {
+			writeAPIError(w, http.StatusInternalServerError, "生成 API Key 失败")
+			return
+		}
+		key := &store.APIKey{Name: name, Token: token}
+		if err := s.store.CreateAPIKey(r.Context(), key); err != nil {
+			writeAPIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		writeJSON(w, key)
+	default:
+		writeAPIError(w, http.StatusMethodNotAllowed, "请求方法不允许")
+	}
+}
+
+// handleAPIKeyItem revokes a single credential.
+func (s *Server) handleAPIKeyItem(w http.ResponseWriter, r *http.Request, action string) {
+	if s.store == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "API 凭证不可用：数据存储未初始化")
+		return
+	}
+	if action != "delete" {
+		writeAPIError(w, http.StatusMethodNotAllowed, "请求方法不允许")
+		return
+	}
+	id, err := strconv.ParseInt(r.PathValue("apiKeyID"), 10, 64)
+	if err != nil || id <= 0 {
+		writeAPIError(w, http.StatusBadRequest, "无效的凭证 ID")
+		return
+	}
+	if err := s.store.DeleteAPIKey(r.Context(), id); err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "message": "API Key 已撤销"})
+}
+
 // handleAuth 处理登录认证
 func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request, action string) {
 	s.cfgMu.RLock()
@@ -2144,6 +2237,159 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request, action s
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+// subscriptionRefreshSettingsResponse is the wire shape of
+// config.SubscriptionRefreshConfig for the subscription management page.
+type subscriptionRefreshSettingsResponse struct {
+	Enabled            bool   `json:"sub_refresh_enabled"`
+	Interval           string `json:"sub_refresh_interval"`
+	Timeout            string `json:"sub_refresh_timeout"`
+	HealthCheckTimeout string `json:"sub_refresh_health_check_timeout"`
+	DrainTimeout       string `json:"sub_refresh_drain_timeout"`
+	MinAvailableNodes  int    `json:"sub_refresh_min_available_nodes"`
+}
+
+// subscriptionRefreshSettingsRequest is the PUT body for the same surface.
+type subscriptionRefreshSettingsRequest = subscriptionRefreshSettingsResponse
+
+// handleSubscriptionRefreshSettings owns the subscription auto-refresh
+// configuration (GET/PUT /api/subscription/refresh-settings). It is the single
+// writer of config.SubscriptionRefresh, so the generic /api/settings form can
+// never overwrite it with stale values.
+func (s *Server) handleSubscriptionRefreshSettings(w http.ResponseWriter, r *http.Request, action string) {
+	switch action {
+	case "get":
+		writeJSON(w, s.subscriptionRefreshSettings())
+	case "update":
+		var req subscriptionRefreshSettingsRequest
+		if err := decodeJSON(r, &req); err != nil {
+			writeAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		result, err := s.updateSubscriptionRefreshSettings(r.Context(), req)
+		if err != nil {
+			status := http.StatusInternalServerError
+			var validationErr settingsValidationError
+			if errors.As(err, &validationErr) {
+				status = http.StatusBadRequest
+			}
+			writeAPIError(w, status, err.Error())
+			return
+		}
+		writeJSON(w, result)
+	default:
+		writeAPIError(w, http.StatusMethodNotAllowed, "请求方法不允许")
+	}
+}
+
+// subscriptionRefreshSettings reads the current auto-refresh configuration.
+func (s *Server) subscriptionRefreshSettings() subscriptionRefreshSettingsResponse {
+	s.cfgMu.RLock()
+	c := s.cfgSrc
+	s.cfgMu.RUnlock()
+	if c == nil {
+		return subscriptionRefreshSettingsResponse{}
+	}
+
+	c.RLock()
+	defer c.RUnlock()
+	return subscriptionRefreshSettingsResponse{
+		Enabled:            c.SubscriptionRefresh.Enabled,
+		Interval:           c.SubscriptionRefresh.Interval.String(),
+		Timeout:            c.SubscriptionRefresh.Timeout.String(),
+		HealthCheckTimeout: c.SubscriptionRefresh.HealthCheckTimeout.String(),
+		DrainTimeout:       c.SubscriptionRefresh.DrainTimeout.String(),
+		MinAvailableNodes:  c.SubscriptionRefresh.MinAvailableNodes,
+	}
+}
+
+// updateSubscriptionRefreshSettings validates, persists and hot-applies the
+// auto-refresh configuration. Empty or non-positive durations keep the stored
+// value, matching the generic settings form. Only drain timeout and minimum
+// available nodes are owned by the runtime box manager and therefore need a
+// reload; interval/timeout/health-check timeout are applied in place.
+func (s *Server) updateSubscriptionRefreshSettings(ctx context.Context, req subscriptionRefreshSettingsRequest) (SettingsUpdateResult, error) {
+	if err := config.ValidateSubscriptionRefreshSettings(req.Interval, req.Timeout, req.HealthCheckTimeout, req.DrainTimeout); err != nil {
+		return SettingsUpdateResult{}, settingsValidationError{fmt.Errorf("参数验证失败: %w", err)}
+	}
+	if req.MinAvailableNodes < 0 {
+		return SettingsUpdateResult{}, settingsValidationError{errors.New("参数验证失败: 最少可用节点数不能为负")}
+	}
+
+	s.configMutationMu.Lock()
+	defer s.configMutationMu.Unlock()
+
+	s.cfgMu.RLock()
+	c := s.cfgSrc
+	s.cfgMu.RUnlock()
+	if c == nil {
+		return SettingsUpdateResult{}, errors.New("配置存储未初始化")
+	}
+
+	old := c.Snapshot()
+	c = old.Clone()
+
+	c.SubscriptionRefresh.Enabled = req.Enabled
+	if d, err := time.ParseDuration(req.Interval); err == nil && d > 0 {
+		c.SubscriptionRefresh.Interval = d
+	}
+	if d, err := time.ParseDuration(req.Timeout); err == nil && d > 0 {
+		c.SubscriptionRefresh.Timeout = d
+	}
+	if d, err := time.ParseDuration(req.HealthCheckTimeout); err == nil && d > 0 {
+		c.SubscriptionRefresh.HealthCheckTimeout = d
+	}
+	if d, err := time.ParseDuration(req.DrainTimeout); err == nil && d > 0 {
+		c.SubscriptionRefresh.DrainTimeout = d
+	}
+	c.SubscriptionRefresh.MinAvailableNodes = req.MinAvailableNodes
+
+	if err := c.SaveSettings(); err != nil {
+		return SettingsUpdateResult{}, fmt.Errorf("保存配置失败: %w", err)
+	}
+
+	s.cfgMu.Lock()
+	s.cfgSrc = c
+	s.cfgMu.Unlock()
+
+	if s.subRefresher != nil {
+		s.subRefresher.ApplyConfig(c)
+	}
+	// Per-subscription overrides default to the global interval/timeout, so a
+	// change here must be fanned out to every stored subscription.
+	if s.store != nil && (old.SubscriptionRefresh.Interval != c.SubscriptionRefresh.Interval || old.SubscriptionRefresh.Timeout != c.SubscriptionRefresh.Timeout) {
+		interval, timeout := 0, 0
+		if old.SubscriptionRefresh.Interval != c.SubscriptionRefresh.Interval {
+			interval = int(c.SubscriptionRefresh.Interval.Seconds())
+		}
+		if old.SubscriptionRefresh.Timeout != c.SubscriptionRefresh.Timeout {
+			timeout = int(c.SubscriptionRefresh.Timeout.Seconds())
+		}
+		if err := s.store.UpdateAllSubscriptionRefreshSettings(ctx, interval, timeout); err != nil {
+			s.logger.Printf("批量更新订阅刷新设置失败: %v", err)
+		}
+	}
+
+	result := SettingsUpdateResult{
+		Saved:   true,
+		Applied: []string{"sub_refresh_enabled"},
+		Pending: []string{},
+		Message: "订阅自动刷新设置已保存并生效",
+	}
+	if old.SubscriptionRefresh.DrainTimeout != c.SubscriptionRefresh.DrainTimeout || old.SubscriptionRefresh.MinAvailableNodes != c.SubscriptionRefresh.MinAvailableNodes {
+		if s.nodeMgr != nil {
+			if err := s.nodeMgr.TriggerReload(ctx); err != nil {
+				result.NeedReload = true
+				result.Pending = append(result.Pending, "runtime_config")
+				result.ReloadError = err.Error()
+				result.Message = "设置已保存；运行时重载未完成"
+			} else {
+				result.Applied = append(result.Applied, "runtime_config")
+			}
+		}
+	}
+	return result, nil
 }
 
 // handleSubscriptionStatus returns the current subscription refresh status.

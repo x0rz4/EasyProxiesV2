@@ -2106,8 +2106,7 @@ func (c *Config) SaveSettings() error {
 // a descriptive error for any invalid values, instead of silently ignoring them.
 func ValidateSettingsRequest(listenerEnabled, multiPortEnabled bool, listenerPort, multiPortBasePort uint16,
 	listenerProtocol, multiPortProtocol,
-	poolBlacklistDuration, subRefreshInterval, subRefreshTimeout,
-	subRefreshHealthCheckTimeout, subRefreshDrainTimeout,
+	poolBlacklistDuration,
 	geoIPAutoUpdateInterval, managementHealthCheckInterval string) error {
 
 	// Validate ports
@@ -2132,10 +2131,6 @@ func ValidateSettingsRequest(listenerEnabled, multiPortEnabled bool, listenerPor
 		value string
 	}{
 		{"黑名单持续时间", poolBlacklistDuration},
-		{"订阅刷新间隔", subRefreshInterval},
-		{"订阅获取超时", subRefreshTimeout},
-		{"健康检查超时", subRefreshHealthCheckTimeout},
-		{"排空超时", subRefreshDrainTimeout},
 		{"GeoIP 更新间隔", geoIPAutoUpdateInterval},
 		{"周期健康检查间隔", managementHealthCheckInterval},
 	}
@@ -2149,6 +2144,36 @@ func ValidateSettingsRequest(listenerEnabled, multiPortEnabled bool, listenerPor
 			if d <= 0 {
 				return fmt.Errorf("%s 必须大于 0: %q", field.name, field.value)
 			}
+		}
+	}
+
+	return nil
+}
+
+// ValidateSubscriptionRefreshSettings validates the subscription auto-refresh
+// configuration exposed by /api/subscription/refresh-settings (subscription
+// management page). Durations follow Go's time.ParseDuration format.
+func ValidateSubscriptionRefreshSettings(interval, timeout, healthCheckTimeout, drainTimeout string) error {
+	durationFields := []struct {
+		name  string
+		value string
+	}{
+		{"刷新间隔", interval},
+		{"获取超时", timeout},
+		{"健康检查超时", healthCheckTimeout},
+		{"排空超时", drainTimeout},
+	}
+
+	for _, field := range durationFields {
+		if field.value == "" {
+			continue
+		}
+		d, err := time.ParseDuration(field.value)
+		if err != nil {
+			return fmt.Errorf("%s 格式无效: %q (%v)", field.name, field.value, err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("%s 必须大于 0: %q", field.name, field.value)
 		}
 	}
 

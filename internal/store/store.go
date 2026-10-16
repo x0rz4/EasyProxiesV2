@@ -148,6 +148,23 @@ type Store interface {
 	// CleanupExpiredSessions removes all expired sessions.
 	CleanupExpiredSessions(ctx context.Context) error
 
+	// --- API keys ---
+
+	// CreateAPIKey stores a new API credential.
+	CreateAPIKey(ctx context.Context, key *APIKey) error
+
+	// ListAPIKeys returns every API credential, newest first.
+	ListAPIKeys(ctx context.Context) ([]APIKey, error)
+
+	// GetAPIKeyByToken resolves an API credential by its token; nil when absent.
+	GetAPIKeyByToken(ctx context.Context, token string) (*APIKey, error)
+
+	// DeleteAPIKey removes an API credential by ID.
+	DeleteAPIKey(ctx context.Context, id int64) error
+
+	// TouchAPIKey records the most recent successful use of a credential.
+	TouchAPIKey(ctx context.Context, id int64, usedAt time.Time) error
+
 	// --- Subscription status ---
 
 	// GetSubscriptionStatus returns the current subscription refresh status.
@@ -528,6 +545,17 @@ type Session struct {
 	Token     string    `json:"token"`
 	CreatedAt time.Time `json:"created_at"`
 	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// APIKey is a long-lived credential that authorises a fixed set of
+// session-free public API operations (adding subscriptions, importing nodes).
+// Unlike a Session it never expires and must be revoked explicitly.
+type APIKey struct {
+	ID         int64     `json:"id"`
+	Name       string    `json:"name"`
+	Token      string    `json:"token"`
+	CreatedAt  time.Time `json:"created_at"`
+	LastUsedAt time.Time `json:"last_used_at"`
 }
 
 // SubscriptionStatus represents subscription refresh status.

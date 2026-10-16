@@ -5,6 +5,9 @@ import type {
   DebugResponse,
   SettingsData,
   SettingsUpdateResponse,
+  SubscriptionRefreshSettings,
+  APIKey,
+  APIKeysResponse,
   ConfigNodesResponse,
   ConfigNodePayload,
   ConfigNodeMutationResponse,
@@ -730,6 +733,36 @@ export async function updateGeoipDatabase(): Promise<GeoipStatus> {
 
 export async function fetchSubscriptionStatus(): Promise<SubscriptionStatus> {
   return request<SubscriptionStatus>('/api/subscription/status')
+}
+
+// ---- Subscription auto-refresh settings (subscription management page) ----
+
+export async function fetchSubscriptionRefreshSettings(): Promise<SubscriptionRefreshSettings> {
+  return request<SubscriptionRefreshSettings>('/api/subscription/refresh-settings')
+}
+
+export async function updateSubscriptionRefreshSettings(payload: SubscriptionRefreshSettings): Promise<SettingsUpdateResponse> {
+  return request<SettingsUpdateResponse>('/api/subscription/refresh-settings', {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  })
+}
+
+// ---- Session-free API credentials ----
+
+export async function listAPIKeys(): Promise<APIKeysResponse> {
+  return request<APIKeysResponse>('/api/api-keys')
+}
+
+export async function createAPIKey(name: string): Promise<APIKey> {
+  return request<APIKey>('/api/api-keys', {
+    method: 'POST',
+    body: JSON.stringify({ name }),
+  })
+}
+
+export async function deleteAPIKey(id: number): Promise<{ ok: boolean; message: string }> {
+  return request(`/api/api-keys/${id}`, { method: 'DELETE' })
 }
 
 export async function refreshSubscription(): Promise<SubscriptionRefreshResponse> {

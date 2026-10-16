@@ -28,6 +28,11 @@ func (s *Server) routes() http.Handler {
 	authenticated := func(pattern string, handler http.HandlerFunc) {
 		api.HandleFunc(pattern, s.withAuth(handler))
 	}
+	// publicAPI routes are unauthenticated by session but require a stored API
+	// key (X-API-Key). They expose exactly two write operations.
+	publicAPI := func(pattern string, handler http.HandlerFunc) {
+		api.HandleFunc(pattern, s.withAPIKey(handler))
+	}
 
 	public("GET /api/auth", bindRouteAction("status", s.handleAuth))
 	public("POST /api/auth", bindRouteAction("login", s.handleAuth))
@@ -83,6 +88,8 @@ func (s *Server) routes() http.Handler {
 	authenticated("POST /api/import", s.handleImport)
 	authenticated("GET /api/subscription/status", s.handleSubscriptionStatus)
 	authenticated("POST /api/subscription/refresh", s.handleSubscriptionRefresh)
+	authenticated("GET /api/subscription/refresh-settings", bindRouteAction("get", s.handleSubscriptionRefreshSettings))
+	authenticated("PUT /api/subscription/refresh-settings", bindRouteAction("update", s.handleSubscriptionRefreshSettings))
 	authenticated("GET /api/subscriptions", bindRouteAction("list", s.handleSubscriptions))
 	authenticated("POST /api/subscriptions", bindRouteAction("create", s.handleSubscriptions))
 	authenticated("GET /api/subscriptions/{subscriptionID}", bindRouteAction("get", s.handleSubscriptionItem))
@@ -94,6 +101,16 @@ func (s *Server) routes() http.Handler {
 	authenticated("GET /api/subscriptions/{subscriptionID}/nodes", bindRouteAction("nodes", s.handleSubscriptionItem))
 
 	authenticated("POST /api/reload", s.handleReload)
+
+	// —— 免登录 API 凭证（需要会话认证才能管理）——
+	authenticated("GET /api/api-keys", bindRouteAction("list", s.handleAPIKeys))
+	authenticated("POST /api/api-keys", bindRouteAction("create", s.handleAPIKeys))
+	authenticated("DELETE /api/api-keys/{apiKeyID}", bindRouteAction("delete", s.handleAPIKeyItem))
+
+	// —— 免登录公开 API（X-API-Key 鉴权）——
+	// 作用域刻意保持最小：仅允许添加订阅与导入节点。
+	publicAPI("POST /api/public/subscriptions", bindRouteAction("create", s.handleSubscriptions))
+	publicAPI("POST /api/public/import", s.handleImport)
 	authenticated("GET /api/groups", bindRouteAction("list", s.handleGroups))
 	authenticated("GET /api/groups/{groupID}/healing-events", s.handleGroupHealEvents)
 	authenticated("POST /api/groups", bindRouteAction("create", s.handleGroups))

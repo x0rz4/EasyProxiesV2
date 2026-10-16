@@ -258,13 +258,8 @@ export interface SettingsData {
   management_password: string
   management_health_check_interval: string
 
-  // Subscription refresh
-  sub_refresh_enabled: boolean
-  sub_refresh_interval: string
-  sub_refresh_timeout: string
-  sub_refresh_health_check_timeout: string
-  sub_refresh_drain_timeout: string
-  sub_refresh_min_available_nodes: number
+  // Subscription auto-refresh lives on the subscription management page and is
+  // exposed by /api/subscription/refresh-settings, not by this surface.
 
   // GeoIP
   geoip_enabled: boolean
@@ -274,6 +269,29 @@ export interface SettingsData {
 
   // Subscriptions
   subscriptions: string[]
+}
+
+/** Subscription auto-refresh configuration (subscription management page). */
+export interface SubscriptionRefreshSettings {
+  sub_refresh_enabled: boolean
+  sub_refresh_interval: string
+  sub_refresh_timeout: string
+  sub_refresh_health_check_timeout: string
+  sub_refresh_drain_timeout: string
+  sub_refresh_min_available_nodes: number
+}
+
+/** A session-free API credential usable on /api/public/* endpoints. */
+export interface APIKey {
+  id: number
+  name: string
+  token: string
+  created_at: string
+  last_used_at: string
+}
+
+export interface APIKeysResponse {
+  api_keys: APIKey[]
 }
 
 export interface SettingsUpdateResponse {

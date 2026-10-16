@@ -1387,6 +1387,96 @@ func (s *sqliteStore) CleanupExpiredSessions(ctx context.Context) error {
 	return err
 }
 
+// ===================== API keys =====================
+
+func (s *sqliteStore) CreateAPIKey(ctx context.Context, key *APIKey) error {
+	if key == nil {
+		return errors.New("api key is nil")
+	}
+	createdAt := key.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
+	result, err := s.writeConn().ExecContext(ctx,
+		`INSERT INTO api_keys (name, token, created_at, last_used_at) VALUES (?, ?, ?, ?)`,
+		key.Name,
+		key.Token,
+		createdAt.UTC().Format(time.RFC3339),
+		"",
+	)
+	if err != nil {
+		return fmt.Errorf("create api key: %w", err)
+	}
+	if id, idErr := result.LastInsertId(); idErr == nil {
+		key.ID = id
+	}
+	key.CreatedAt = createdAt
+	key.LastUsedAt = time.Time{}
+	return nil
+}
+
+func (s *sqliteStore) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
+	rows, err := s.readConn().QueryContext(ctx,
+		`SELECT id, name, token, created_at, last_used_at FROM api_keys ORDER BY id DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("list api keys: %w", err)
+	}
+	defer rows.Close()
+
+	keys := make([]APIKey, 0, 4)
+	for rows.Next() {
+		var key APIKey
+		var createdAtStr, lastUsedAtStr string
+		if err := rows.Scan(&key.ID, &key.Name, &key.Token, &createdAtStr, &lastUsedAtStr); err != nil {
+			return nil, fmt.Errorf("scan api key: %w", err)
+		}
+		key.CreatedAt = parseTime(createdAtStr)
+		key.LastUsedAt = parseTime(lastUsedAtStr)
+		keys = append(keys, key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate api keys: %w", err)
+	}
+	return keys, nil
+}
+
+func (s *sqliteStore) GetAPIKeyByToken(ctx context.Context, token string) (*APIKey, error) {
+	if token == "" {
+		return nil, nil
+	}
+	row := s.readConn().QueryRowContext(ctx,
+		`SELECT id, name, token, created_at, last_used_at FROM api_keys WHERE token = ?`, token)
+
+	var key APIKey
+	var createdAtStr, lastUsedAtStr string
+	err := row.Scan(&key.ID, &key.Name, &key.Token, &createdAtStr, &lastUsedAtStr)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get api key: %w", err)
+	}
+	key.CreatedAt = parseTime(createdAtStr)
+	key.LastUsedAt = parseTime(lastUsedAtStr)
+	return &key, nil
+}
+
+func (s *sqliteStore) DeleteAPIKey(ctx context.Context, id int64) error {
+	_, err := s.writeConn().ExecContext(ctx, "DELETE FROM api_keys WHERE id = ?", id)
+	return err
+}
+
+func (s *sqliteStore) TouchAPIKey(ctx context.Context, id int64, usedAt time.Time) error {
+	if usedAt.IsZero() {
+		usedAt = time.Now()
+	}
+	_, err := s.writeConn().ExecContext(ctx,
+		"UPDATE api_keys SET last_used_at = ? WHERE id = ?",
+		usedAt.UTC().Format(time.RFC3339), id,
+	)
+	return err
+}
+
 // ===================== Subscription status =====================
 
 func (s *sqliteStore) GetSubscriptionStatus(ctx context.Context) (*SubscriptionStatus, error) {

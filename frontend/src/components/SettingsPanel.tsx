@@ -12,7 +12,7 @@ import { PageContent, PageHeader, PageLayout } from './ui/PageLayout'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import {
-  Settings, RefreshCw, Save, Check, AlertTriangle, Globe, Wifi, Network, Layers, Monitor, Map as MapIcon, RefreshCcw
+  Settings, RefreshCw, Save, Check, AlertTriangle, Globe, Wifi, Network, Layers, Monitor, Map as MapIcon
 } from 'lucide-react'
 
 const settingResultLabels: Record<string, string> = {
@@ -23,7 +23,6 @@ const settingResultLabels: Record<string, string> = {
   management_startup_availability_policy: '启动准入策略',
   management_health_check_interval: '健康检查间隔',
   external_ip: '外部 IP',
-  sub_refresh_enabled: '订阅自动刷新',
 }
 
 const formatSettingResults = (items: string[]) =>
@@ -74,13 +73,6 @@ const defaultSettings: SettingsData = {
   management_startup_availability_policy: 'optimistic',
   management_password: '',
   management_health_check_interval: '2h0m0s',
-
-  sub_refresh_enabled: false,
-  sub_refresh_interval: '1h0m0s',
-  sub_refresh_timeout: '30s',
-  sub_refresh_health_check_timeout: '1m0s',
-  sub_refresh_drain_timeout: '30s',
-  sub_refresh_min_available_nodes: 1,
 
   geoip_enabled: false,
   geoip_database_path: './GeoLite2-Country.mmdb',
@@ -730,91 +722,6 @@ export default function SettingsPanel() {
                   />
                 </fieldset>
               )}
-            </div>
-          )}
-        </div>
-
-        {/* ===== 订阅刷新 ===== */}
-        <div className="panel-card space-y-5 p-5 transition-shadow hover:shadow-md lg:p-6">
-          <div className="flex items-center gap-3 mb-2 border-b border-base-200 pb-4">
-            <div className="w-10 h-10 rounded-xl bg-warning/10 flex items-center justify-center text-warning shrink-0">
-              <RefreshCcw className="h-5 w-5" />
-            </div>
-            <div>
-              <h3 className="font-bold text-lg text-base-content">订阅自动刷新</h3>
-              <p className="text-xs text-base-content/50 font-medium">配置订阅定时更新及健康检查</p>
-            </div>
-          </div>
-
-          <label className="flex items-center justify-between cursor-pointer gap-4 bg-base-200/30 p-4 rounded-xl border border-base-200 hover:border-base-300 transition-colors">
-            <span className="font-semibold text-base-content/90">启用定时刷新</span>
-            <input
-              type="checkbox"
-              className="toggle toggle-primary toggle-md"
-              checked={settings.sub_refresh_enabled}
-              onChange={(e) => updateField('sub_refresh_enabled', e.target.checked)}
-            />
-          </label>
-
-          {settings.sub_refresh_enabled && (
-            <div className="space-y-4 pt-2 animate-in fade-in slide-in-from-top-2">
-              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                <fieldset className="fieldset">
-                  <legend className="fieldset-legend font-semibold text-base-content/80">刷新间隔</legend>
-                  <input
-                    type="text"
-                    className="input input-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
-                    placeholder="1h"
-                    value={settings.sub_refresh_interval}
-                    onChange={(e) => updateField('sub_refresh_interval', e.target.value)}
-                  />
-                </fieldset>
-                <fieldset className="fieldset">
-                  <legend className="fieldset-legend font-semibold text-base-content/80">获取超时</legend>
-                  <input
-                    type="text"
-                    className="input input-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
-                    placeholder="30s"
-                    value={settings.sub_refresh_timeout}
-                    onChange={(e) => updateField('sub_refresh_timeout', e.target.value)}
-                  />
-                </fieldset>
-              </div>
-
-              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                <fieldset className="fieldset">
-                  <legend className="fieldset-legend font-semibold text-base-content/80">健康检查超时</legend>
-                  <input
-                    type="text"
-                    className="input input-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
-                    placeholder="1m"
-                    value={settings.sub_refresh_health_check_timeout}
-                    onChange={(e) => updateField('sub_refresh_health_check_timeout', e.target.value)}
-                  />
-                </fieldset>
-                <fieldset className="fieldset">
-                  <legend className="fieldset-legend font-semibold text-base-content/80">排空超时</legend>
-                  <input
-                    type="text"
-                    className="input input-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
-                    placeholder="30s"
-                    value={settings.sub_refresh_drain_timeout}
-                    onChange={(e) => updateField('sub_refresh_drain_timeout', e.target.value)}
-                  />
-                </fieldset>
-              </div>
-
-              <fieldset className="fieldset">
-                <legend className="fieldset-legend font-semibold text-base-content/80">最少可用节点数</legend>
-                <input
-                  type="number"
-                  className="input input-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
-                  value={settings.sub_refresh_min_available_nodes}
-                  onChange={(e) => updateField('sub_refresh_min_available_nodes', parseInt(e.target.value) || 1)}
-                  min={0}
-                />
-                <p className="label text-base-content/50 mt-1">低于此值时不切换新节点</p>
-              </fieldset>
             </div>
           )}
         </div>
