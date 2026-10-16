@@ -173,3 +173,51 @@ func TestQueueSweepsAndSurvivesFailures(t *testing.T) {
 		t.Fatalf("a failed recompute must be reported: %v", logged)
 	}
 }
+
+// TestQueueRetriesAFailedFlush covers the durability half: a flush that fails
+// must re-run the same batch at debounce cadence, not silently wait for the
+// next sweep (which can be the full sweep interval away).
+func TestQueueRetriesAFailedFlush(t *testing.T) {
+	recorder := newRecorder()
+	queue := NewQueue(recorder,
+		WithDebounce(20*time.Millisecond), WithSweepInterval(time.Hour),
+		WithQueueLogf(func(string, ...any) {}))
+	defer queue.Close()
+
+	// First recompute fails; the retry after the debounce must carry the same
+	// node and succeed.
+	recorder.err = errors.New("数据库忙")
+	queue.Enqueue(3)
+	assertTagIDs(t, recorder.next(t), 3)
+
+	recorder.err = nil
+	assertTagIDs(t, recorder.next(t), 3)
+	recorder.quiet(t, 200*time.Millisecond)
+}
+
+// TestQueueFlushesUnderContinuousEvents covers the debounce cap: a stream of
+// events that never goes quiet must still flush within maxWait instead of
+// postponing every flush until the sweep.
+func TestQueueFlushesUnderContinuousEvents(t *testing.T) {
+	recorder := newRecorder()
+	// 50ms debounce → maxWait = min(50ms*16, 30s) = 800ms. Without the cap the
+	// per-event reset would postpone every flush indefinitely.
+	queue := NewQueue(recorder,
+		WithDebounce(50*time.Millisecond), WithSweepInterval(time.Hour))
+	defer queue.Close()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			queue.Enqueue(int64(1))
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+
+	if call := recorder.next(t); call == nil {
+		t.Fatal("continuous events never flushed")
+	}
+	<-done
+}

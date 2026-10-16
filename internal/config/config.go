@@ -973,38 +973,49 @@ func NormalizeSubscriptionFormat(value string) (string, error) {
 // format. Auto mode performs structural detection; explicit modes provide
 // clearer errors when a provider returns a login page or the wrong payload.
 func ParseSubscriptionContentAs(content, format string) ([]NodeConfig, error) {
+	nodes, _, err := ParseSubscriptionContentAsReport(content, format)
+	return nodes, err
+}
+
+// ParseSubscriptionContentAsReport is ParseSubscriptionContentAs plus the
+// per-row issues collected while parsing, so the subscriber can surface rows
+// that were dropped instead of silently shrinking the node list.
+func ParseSubscriptionContentAsReport(content, format string) ([]NodeConfig, []string, error) {
 	format, err := NormalizeSubscriptionFormat(format)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	content = strings.TrimSpace(strings.TrimPrefix(content, "\ufeff"))
 	if looksLikeHTML(content) {
-		return nil, errors.New("订阅地址返回了 HTML 页面，请检查链接、鉴权参数或请求 User-Agent")
+		return nil, nil, errors.New("订阅地址返回了 HTML 页面，请检查链接、鉴权参数或请求 User-Agent")
 	}
 	switch format {
 	case SubscriptionFormatAuto:
-		return parseSubscriptionContent(content)
+		return parseContentReport(content, 0)
 	case SubscriptionFormatClash:
 		if looksLikeInlineYAML(content) {
 			content = wrapAsClashProxiesDoc(content)
 		} else if !hasTopLevelProxiesKey(content) {
-			return nil, errors.New("Clash/Mihomo 响应中未找到顶层 proxies 数组")
+			return nil, nil, errors.New("Clash/Mihomo 响应中未找到顶层 proxies 数组")
 		}
 		nodes, err := parseClashYAML(content)
-		return requireSubscriptionNodes(nodes, err)
+		nodes, err = requireSubscriptionNodes(nodes, err)
+		return nodes, nil, err
 	case SubscriptionFormatBase64:
 		decoded, ok := tryBase64Decode(content)
 		if !ok {
-			return nil, errors.New("订阅响应不是有效的 Base64 内容")
+			return nil, nil, errors.New("订阅响应不是有效的 Base64 内容")
 		}
-		nodes, err := parseContent(decoded, 1)
-		return requireSubscriptionNodes(deduplicateParsedNodes(nodes), err)
+		nodes, issues, err := parseContentReport(decoded, 1)
+		nodes, err = requireSubscriptionNodes(deduplicateParsedNodes(nodes), err)
+		return nodes, issues, err
 	case SubscriptionFormatSingBox:
-		nodes, recognized, _, err := parseSingBoxJSON(content)
+		nodes, recognized, issues, err := parseSingBoxJSON(content)
 		if !recognized {
-			return nil, errors.New("订阅响应不是包含 outbounds 的 Sing-box JSON/JSONC")
+			return nil, nil, errors.New("订阅响应不是包含 outbounds 的 Sing-box JSON/JSONC")
 		}
-		return requireSubscriptionNodes(deduplicateParsedNodes(nodes), err)
+		nodes, err = requireSubscriptionNodes(deduplicateParsedNodes(nodes), err)
+		return nodes, issues, err
 	default:
 		panic("unreachable subscription format")
 	}

@@ -214,7 +214,14 @@ func (s *Service) Recompute(ctx context.Context, nodeIDs []int64) ([]int64, erro
 		}
 	}
 	if len(changed) > 0 && s.notify != nil {
-		s.notify(changed)
+		// The notifier reaches the runtime through per-group rebuilds that take
+		// the boxmgr write lock and clone the whole config twice. Running it
+		// inline would stall this queue — and therefore every future recompute —
+		// for the length of those rebuilds, so it runs detached. The changed set
+		// is copied: the caller may reuse the slice, and the queue may be
+		// racing ahead with the next batch.
+		changedCopy := append([]int64(nil), changed...)
+		go s.notify(changedCopy)
 	}
 	return changed, nil
 }

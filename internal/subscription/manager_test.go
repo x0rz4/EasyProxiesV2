@@ -36,7 +36,7 @@ func TestFetchSubscriptionUsesSelectedFormatAndUserAgent(t *testing.T) {
 	mgr := New(&config.Config{}, nil, WithHTTPClient(server.Client()))
 	defer mgr.Stop()
 	sub := &store.Subscription{URL: server.URL, Format: config.SubscriptionFormatClash, UserAgent: "provider-client/1.0"}
-	nodes, _, _, err := mgr.fetchSubscription(context.Background(), sub, time.Second)
+	nodes, _, _, _, err := mgr.fetchSubscription(context.Background(), sub, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -535,16 +535,25 @@ func flushStatsToStore(ctx context.Context, boxMgr *boxmgr.Manager, s store.Stor
 	}
 	uriToID := make(map[string]int64, len(storeNodes))
 	identityToID := make(map[string]int64, len(storeNodes))
+	// Name is not unique across nodes; a name only resolves when exactly one
+	// store node carries it. A naive map would silently attribute A's stats
+	// to B whenever two nodes share a display name.
 	nameToID := make(map[string]int64, len(storeNodes))
+	ambiguousNames := make(map[string]struct{})
 	for _, n := range storeNodes {
 		uriToID[n.URI] = n.ID
 		if n.IdentityHash != "" {
 			identityToID[n.IdentityHash] = n.ID
 		}
+		if _, seen := nameToID[n.Name]; seen {
+			ambiguousNames[n.Name] = struct{}{}
+			continue
+		}
 		nameToID[n.Name] = n.ID
 	}
 
 	var updates []store.StatsUpdate
+	var unresolved int
 	for _, snap := range snapshots {
 		// Preserve the last committed database health snapshot until this concrete
 		// runtime generation has completed its own startup verification.
@@ -561,9 +570,13 @@ func flushStatsToStore(ctx context.Context, boxMgr *boxmgr.Manager, s store.Stor
 			}
 		}
 		if !ok {
-			nodeID, ok = nameToID[snap.Name]
+			// Name fallback: only when unambiguous.
+			if _, dup := ambiguousNames[snap.Name]; !dup {
+				nodeID, ok = nameToID[snap.Name]
+			}
 		}
 		if !ok || nodeID == 0 {
+			unresolved++
 			continue
 		}
 
@@ -588,5 +601,8 @@ func flushStatsToStore(ctx context.Context, boxMgr *boxmgr.Manager, s store.Stor
 		if err := s.BatchUpdateStats(ctx, updates); err != nil {
 			log.Printf("[app] stats flush failed: %v", err)
 		}
+	}
+	if unresolved > 0 {
+		log.Printf("[app] stats flush: %d runtime snapshot(s) could not be matched to a store node and were skipped", unresolved)
 	}
 }

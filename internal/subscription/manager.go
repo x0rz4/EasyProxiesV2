@@ -412,7 +412,7 @@ func (m *Manager) refreshSubscription(ctx context.Context, sub *store.Subscripti
 		_, seconds := m.defaults()
 		timeout = time.Duration(seconds) * time.Second
 	}
-	nodes, etag, lastModified, err := m.fetchSubscription(ctx, sub, timeout)
+	nodes, parseIssues, etag, lastModified, err := m.fetchSubscription(ctx, sub, timeout)
 	if errors.Is(err, errSubscriptionNotModified) {
 		// Keep the stored ETag/Last-Modified; nothing else to do. LastSuccess
 		// stays untouched — the evidence is the stored snapshot, not a new
@@ -428,6 +428,11 @@ func (m *Manager) refreshSubscription(ctx context.Context, sub *store.Subscripti
 	}
 	if err == nil && len(nodes) == 0 {
 		err = errors.New("订阅未返回有效节点")
+	}
+	// Rows the parser dropped are not fatal, but they silently shrink the node
+	// list; log them so the operator can see the gap.
+	for _, issue := range parseIssues {
+		m.logger.Warnf("subscription %d parse issue: %s", sub.ID, issue)
 	}
 	if err != nil {
 		m.mu.Lock()
@@ -526,16 +531,16 @@ func (m *Manager) refreshSubscription(ctx context.Context, sub *store.Subscripti
 	return nil
 }
 
-func (m *Manager) fetchSubscription(parent context.Context, sub *store.Subscription, timeout time.Duration) ([]config.NodeConfig, string, string, error) {
+func (m *Manager) fetchSubscription(parent context.Context, sub *store.Subscription, timeout time.Duration) ([]config.NodeConfig, []string, string, string, error) {
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sub.URL, nil)
 	if err != nil {
-		return nil, "", "", fmt.Errorf("create request: %w", err)
+		return nil, nil, "", "", fmt.Errorf("create request: %w", err)
 	}
 	format, err := config.NormalizeSubscriptionFormat(sub.Format)
 	if err != nil {
-		return nil, "", "", err
+		return nil, nil, "", "", err
 	}
 	userAgent := strings.TrimSpace(sub.UserAgent)
 	if userAgent == "" {
@@ -554,23 +559,23 @@ func (m *Manager) fetchSubscription(parent context.Context, sub *store.Subscript
 	}
 	resp, err := m.httpClient.Do(req)
 	if err != nil {
-		return nil, "", "", fmt.Errorf("fetch: %w", err)
+		return nil, nil, "", "", fmt.Errorf("fetch: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotModified {
-		return nil, "", "", errSubscriptionNotModified
+		return nil, nil, "", "", errSubscriptionNotModified
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, "", "", fmt.Errorf("status %d", resp.StatusCode)
+		return nil, nil, "", "", fmt.Errorf("status %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024+1))
 	if err != nil {
-		return nil, "", "", fmt.Errorf("read body: %w", err)
+		return nil, nil, "", "", fmt.Errorf("read body: %w", err)
 	}
 	if len(body) > 10*1024*1024 {
-		return nil, "", "", errors.New("subscription response exceeds 10MB")
+		return nil, nil, "", "", errors.New("subscription response exceeds 10MB")
 	}
-	nodes, err := config.ParseSubscriptionContentAs(string(body), format)
+	nodes, parseIssues, err := config.ParseSubscriptionContentAsReport(string(body), format)
 	if err != nil {
 		contentType := strings.TrimSpace(strings.Split(resp.Header.Get("Content-Type"), ";")[0])
 		if contentType != "" {
@@ -583,7 +588,7 @@ func (m *Manager) fetchSubscription(parent context.Context, sub *store.Subscript
 		// the next refresh can still be conditional.
 		etag, lastModified = sub.ETag, sub.LastModified
 	}
-	return nodes, etag, lastModified, err
+	return nodes, parseIssues, etag, lastModified, err
 }
 
 func defaultSubscriptionUserAgent(format string) string {

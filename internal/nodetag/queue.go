@@ -24,6 +24,11 @@ const (
 // against per-node requests is preserved by the one channel.
 const allNodes = int64(0)
 
+// maxWaitAbsolute caps how long a tag batch may age before it flushes even
+// though events keep arriving. It bounds the continuous-stream degradation of
+// the per-event debounce reset.
+const maxWaitAbsolute = 30 * time.Second
+
 // Recomputer is the half of Service a queue drives.
 type Recomputer interface {
 	Recompute(ctx context.Context, nodeIDs []int64) ([]int64, error)
@@ -186,9 +191,35 @@ func (q *Queue) run() {
 	sweep := time.NewTicker(q.sweep)
 	defer sweep.Stop()
 
+	// The debounce resets on every event, which under a continuous event stream
+	// postpones the flush forever and degenerates into sweep-only recomputes.
+	// maxWait bounds the total age of a batch: the flush runs at the earlier of
+	// "quiet for debounce" and "first event is maxWait old". The bound is
+	// proportional to the debounce (16 quiet periods' worth) but never more
+	// than maxWaitAbsolute, so a very large debounce still flushes.
+	maxWait := q.debounce * 16
+	if maxWait > maxWaitAbsolute {
+		maxWait = maxWaitAbsolute
+	}
+	var firstEvent time.Time
+
 	pending := map[int64]struct{}{}
 	full := false
 	var deadline <-chan time.Time
+	// flushBatch runs the recompute; on failure the batch is kept and the
+	// deadline re-armed so it retries at debounce cadence. Returns the batch
+	// state for the caller to continue with.
+	flushBatch := func() {
+		if q.flush(pending, full) {
+			pending, full = map[int64]struct{}{}, false
+			firstEvent = time.Time{}
+			return
+		}
+		// Keep pending/full; retry after the debounce period.
+		stopTimer(timer)
+		timer.Reset(q.debounce)
+		deadline = timer.C
+	}
 	for {
 		select {
 		case nodeID, open := <-q.events:
@@ -204,23 +235,41 @@ func (q *Queue) run() {
 			if q.overflow.Swap(false) {
 				full = true
 			}
-			if deadline != nil {
-				stopTimer(timer)
+			if firstEvent.IsZero() {
+				firstEvent = time.Now()
 			}
-			timer.Reset(q.debounce)
+			stopTimer(timer)
+			// Cap the debounce: once the batch has aged past maxWait, flush at
+			// the debounce boundary regardless of further events.
+			quiet := q.debounce
+			if age := time.Since(firstEvent); age+quiet > maxWait {
+				quiet = maxWait - age
+				if quiet < time.Millisecond {
+					quiet = time.Millisecond
+				}
+			}
+			timer.Reset(quiet)
 			deadline = timer.C
 		case <-deadline:
 			deadline = nil
-			q.flush(pending, full)
-			pending, full = map[int64]struct{}{}, false
+			flushBatch()
 		case <-sweep.C:
 			if deadline != nil {
 				stopTimer(timer)
 				deadline = nil
 			}
 			// The sweep is the expiry path, so it is always a full run.
-			q.flush(pending, true)
-			pending, full = map[int64]struct{}{}, false
+			if q.flush(pending, true) {
+				pending, full = map[int64]struct{}{}, false
+				firstEvent = time.Time{}
+			} else {
+				// Sweep failure: the batch (now marked full) retries via the
+				// re-armed deadline below.
+				full = true
+				stopTimer(timer)
+				timer.Reset(q.debounce)
+				deadline = timer.C
+			}
 		}
 	}
 }
@@ -236,9 +285,13 @@ func stopTimer(timer *time.Timer) {
 	}
 }
 
-func (q *Queue) flush(pending map[int64]struct{}, full bool) {
+// flush runs one recompute for the batch. On failure it re-arms the timer at
+// debounce cadence with the same batch, so a transient store error retries
+// within seconds instead of the batch silently waiting for the next sweep
+// (up to the full sweep interval away).
+func (q *Queue) flush(pending map[int64]struct{}, full bool) bool {
 	if !full && len(pending) == 0 {
-		return
+		return true
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), q.timeout)
 	defer cancel()
@@ -259,9 +312,10 @@ func (q *Queue) flush(pending map[int64]struct{}, full bool) {
 	}
 	if err != nil {
 		q.logf("nodetag: 自动标签重算失败: %v", err)
-		return
+		return false
 	}
 	if len(changed) > 0 {
 		q.logf("nodetag: %d 个节点的标签已更新", len(changed))
 	}
+	return true
 }

@@ -167,9 +167,15 @@ func (m *Manager) Start(ctx context.Context) error {
 	}
 	m.applyConfigSettings(m.cfg)
 	m.baseCtx = ctx
-	cfg := m.cfg
 	m.mu.Unlock()
+	// applyCachedNodeLocations mutates nodes' Region/Country in place. Mutating
+	// the shared published config here would race readers of m.cfg, so Start
+	// works on a private clone and publishes it as the runtime config.
+	cfg := m.cfg.Clone()
 	m.applyCachedNodeLocations(ctx, cfg)
+	m.mu.Lock()
+	m.cfg = cfg
+	m.mu.Unlock()
 
 	// Try to start, with automatic port conflict resolution
 	var instance *box.Box
@@ -429,9 +435,8 @@ func (m *Manager) reload(newCfg *config.Config) error {
 		m.monitorMgr.SweepStaleNodes()
 	}
 
-	m.applyConfigSettings(newCfg)
-
 	m.mu.Lock()
+	m.applyConfigSettings(newCfg)
 	// Rebase before committing: the snapshot this reload was built from may
 	// be tens of seconds old, and mutations that landed on m.cfg during the
 	// window (retagging, landing reclassification, node CRUD) would otherwise
@@ -833,8 +838,8 @@ func (m *Manager) reloadNodesIncrementally(ctx context.Context, instance *box.Bo
 		m.cleanupCreatedMembers(instance, createdTags)
 		return fmt.Errorf("publish incremental pool topology: %w", err)
 	}
-	m.applyConfigSettings(newCfg)
 	m.mu.Lock()
+	m.applyConfigSettings(newCfg)
 	if m.currentBox != instance {
 		m.mu.Unlock()
 		return errors.New("incremental reload lost active box ownership after publication")
@@ -888,14 +893,44 @@ func removeOutboundSafely(instance *box.Box, tag string) (err error) {
 }
 
 func (m *Manager) drainRetiredMember(instance *box.Box, member pool.RetiredMember, snapshotVersion uint64, timeout time.Duration) {
+	// The manager context is the cancel channel: Close empties baseCtx, so a
+	// drain that would otherwise wait on a leaked long-lived connection ends
+	// with the manager instead of keeping the goroutine and outbound alive
+	// past shutdown.
+	m.mu.RLock()
+	baseCtx := m.baseCtx
+	m.mu.RUnlock()
+	var closed <-chan struct{}
+	if baseCtx != nil {
+		closed = baseCtx.Done()
+	}
+
 	deadline := time.Now().Add(timeout)
 	for !member.Drained() && (timeout <= 0 || time.Now().Before(deadline)) {
-		time.Sleep(100 * time.Millisecond)
+		if m.waitDrain(closed) {
+			break
+		}
 	}
 	for !member.Drained() {
+		if closed == nil {
+			// No manager context (already closed or never started): keep the
+			// legacy retain-forever semantics without a cancel path.
+			refs, operations, active := member.Counts()
+			m.logger.Warnf("retired outbound %s from snapshot v%d still draining (snapshot_refs=%d operations=%d active=%d); retaining it", member.Tag(), snapshotVersion, refs, operations, active)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		select {
+		case <-closed:
+			refs, operations, active := member.Counts()
+			m.logger.Warnf("retired outbound %s from snapshot v%d force-closed on manager shutdown (snapshot_refs=%d operations=%d active=%d)", member.Tag(), snapshotVersion, refs, operations, active)
+			_ = member.Close()
+			member.ReleaseState()
+			return
+		case <-time.After(5 * time.Second):
+		}
 		refs, operations, active := member.Counts()
 		m.logger.Warnf("retired outbound %s from snapshot v%d still draining (snapshot_refs=%d operations=%d active=%d); retaining it", member.Tag(), snapshotVersion, refs, operations, active)
-		time.Sleep(5 * time.Second)
 	}
 	if err := removeOutboundSafely(instance, member.Tag()); err != nil {
 		// Remove may already have deleted the manager lookup. Never retry it;
@@ -904,6 +939,21 @@ func (m *Manager) drainRetiredMember(instance *box.Box, member pool.RetiredMembe
 		m.logger.Errorf("remove retired outbound %s failed after manager mutation: %v (saved close: %v)", member.Tag(), err, closeErr)
 	}
 	member.ReleaseState()
+}
+
+// waitDrain sleeps one drain poll interval, returning true when the manager
+// closed in the meantime.
+func (m *Manager) waitDrain(closed <-chan struct{}) bool {
+	if closed == nil {
+		time.Sleep(100 * time.Millisecond)
+		return false
+	}
+	select {
+	case <-closed:
+		return true
+	case <-time.After(100 * time.Millisecond):
+		return false
+	}
 }
 
 func effectiveHealthCheckInterval(cfg *config.Config) time.Duration {
@@ -1432,7 +1482,9 @@ func (m *Manager) applyGroupRuntimeIncremental(cfg *config.Config, groupCfg conf
 }
 
 func (m *Manager) drainRetiredGroupMember(instance *box.Box, groupID int64, slot *groupRuntimeSlot, ticket *groupRetirement, member pool.RetiredMember, version uint64) {
+	m.mu.RLock()
 	timeout := m.drainTimeout
+	m.mu.RUnlock()
 	deadline := time.Now().Add(timeout)
 	for !member.Drained() && (timeout <= 0 || time.Now().Before(deadline)) {
 		select {
@@ -1801,7 +1853,11 @@ func (m *Manager) drainOldBox(oldBox *box.Box, timeout time.Duration) {
 
 // waitForHealthCheck polls until enough nodes are available or timeout.
 func (m *Manager) waitForHealthCheck(timeout time.Duration) error {
-	if m.monitorMgr == nil || m.minAvailableNodes <= 0 {
+	m.mu.RLock()
+	minAvailable := m.minAvailableNodes
+	monitorMgr := m.monitorMgr
+	m.mu.RUnlock()
+	if monitorMgr == nil || minAvailable <= 0 {
 		return nil
 	}
 	if timeout <= 0 {
@@ -1814,15 +1870,15 @@ func (m *Manager) waitForHealthCheck(timeout time.Duration) error {
 
 	for {
 		available, total := m.availableNodeCount()
-		if available >= m.minAvailableNodes {
+		if available >= minAvailable {
 			m.logger.Infof("health check passed: %d/%d nodes available", available, total)
 			return nil
 		}
-		if _, ready := m.monitorMgr.TargetForProbe(); !ready {
+		if _, ready := monitorMgr.TargetForProbe(); !ready {
 			return errors.New("health check unavailable: no probe target configured")
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("timeout: %d/%d nodes available (need >= %d)", available, total, m.minAvailableNodes)
+			return fmt.Errorf("timeout: %d/%d nodes available (need >= %d)", available, total, minAvailable)
 		}
 		<-ticker.C
 	}
@@ -2274,6 +2330,20 @@ func (m *Manager) TriggerReload(ctx context.Context) error {
 		return errConfigUnavailable
 	}
 
+	// The store was opened from the running config's database path; a changed
+	// database_path in YAML cannot take effect through a reload (the new path
+	// would be ignored while the new config claims it). Reject it explicitly so
+	// the operator sees why, instead of the field silently diverging.
+	m.mu.RLock()
+	currentDBPath := ""
+	if m.cfg != nil {
+		currentDBPath = m.cfg.DatabasePath
+	}
+	m.mu.RUnlock()
+	if currentDBPath != "" && newCfg.DatabasePath != currentDBPath {
+		return fmt.Errorf("database_path 不能通过热重载变更（当前 %s，配置 %s）；请重启进程", currentDBPath, newCfg.DatabasePath)
+	}
+
 	// Merge inline nodes (from config.yaml) with store nodes (subscription + manual).
 	// Inline nodes take priority; store nodes are added if their URI is not already present.
 	if m.store != nil {
@@ -2422,6 +2492,14 @@ func (m *Manager) ReloadWithPortMap(newCfg *config.Config, portMap map[string]ui
 // The manager enters an idle state and can be resumed by TriggerReload when
 // nodes are re-enabled.
 func (m *Manager) enterIdle(newCfg *config.Config) error {
+	// enterIdle closes the running box and clears group runtimes — the same
+	// lifecycle operations reload serializes, so it must hold reloadMu too:
+	// without it a concurrent Reload can observe the half-torn-down state (or
+	// resurrect a box enterIdle is closing). reloadMu is not held by the
+	// TriggerReload/ReloadWithPortMap paths that reach here.
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+
 	m.mu.Lock()
 	oldBox := m.currentBox
 	wasIdle := m.idle

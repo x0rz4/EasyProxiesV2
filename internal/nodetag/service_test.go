@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"easy_proxies/internal/nodefacts"
 	"easy_proxies/internal/store"
@@ -231,9 +232,11 @@ func TestRecomputeNotifiesOnlyVisibleChanges(t *testing.T) {
 	dataStore := openTagStore(t)
 	node := newNode(t, dataStore, "fast", 50)
 
-	var notified []int64
+	// The notifier runs detached from the recompute, so the test waits for it
+	// on a channel instead of reading a slice after RecomputeAll returns.
+	notified := make(chan []int64, 4)
 	service := NewService(dataStore, WithMembershipNotifier(func(nodeIDs []int64) {
-		notified = append(notified, nodeIDs...)
+		notified <- append([]int64(nil), nodeIDs...)
 	}))
 	quick := newAutoTag(t, dataStore, "快", 0, 0,
 		nodefacts.Condition{FieldName: nodefacts.FieldLatencyMs, Op: nodefacts.OpLte, Value: 100})
@@ -245,8 +248,13 @@ func TestRecomputeNotifiesOnlyVisibleChanges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RecomputeAll: %v", err)
 	}
-	if len(changed) != 0 || len(notified) != 0 {
-		t.Fatalf("an invisible auto row reported changed=%v notified=%v", changed, notified)
+	if len(changed) != 0 {
+		t.Fatalf("an invisible auto row reported changed=%v", changed)
+	}
+	select {
+	case nodeIDs := <-notified:
+		t.Fatalf("an invisible auto row notified %v", nodeIDs)
+	case <-time.After(100 * time.Millisecond):
 	}
 	// The row is still written — the rule did match, and rule_version has to be
 	// recorded so a later rule edit can be told apart.
@@ -260,7 +268,12 @@ func TestRecomputeNotifiesOnlyVisibleChanges(t *testing.T) {
 		t.Fatalf("RecomputeAll after adding a tag: %v", err)
 	}
 	assertTagIDs(t, changed, node)
-	assertTagIDs(t, notified, node)
+	select {
+	case nodeIDs := <-notified:
+		assertTagIDs(t, nodeIDs, node)
+	case <-time.After(2 * time.Second):
+		t.Fatal("a visible tag change did not notify membership")
+	}
 	assertNames(t, projectionOf(t, dataStore, node), "亚洲", "快")
 }
 

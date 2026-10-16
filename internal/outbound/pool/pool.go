@@ -233,12 +233,16 @@ type PreparedUpdate interface {
 
 type poolOutbound struct {
 	outbound.Adapter
-	ctx                   context.Context
-	logger                log.ContextLogger
-	manager               adapter.OutboundManager
-	router                adapter.Router
-	options               Options
-	mode                  string
+	ctx     context.Context
+	logger  log.ContextLogger
+	manager adapter.OutboundManager
+	router  adapter.Router
+	options Options
+	mode    string
+	// modeAtomic mirrors mode for the unsynchronized data-path reads in
+	// selectMember/selectionIndex. Commit mutates mode under p.mu and then
+	// stores here; the dial path never takes p.mu, so it reads only this.
+	modeAtomic            atomic.Pointer[string]
 	current               atomic.Pointer[PoolSnapshot]
 	mu                    sync.Mutex
 	topology              []*MemberRef
@@ -298,6 +302,7 @@ func newPool(ctx context.Context, router adapter.Router, logger log.ContextLogge
 		runtimeByTag:  make(map[string]*memberRuntime, len(normalized.Members)),
 	}
 	p.randomState.Store(uint64(time.Now().UnixNano()) | 1)
+	p.modeAtomic.Store(&normalized.Mode)
 	p.failureThreshold.Store(int64(normalized.FailureThreshold))
 	p.failureWindowNanos.Store(int64(normalized.FailureWindow))
 	if normalized.Mode == modeLowestLatency && normalized.PreferredMember == "" {
@@ -971,6 +976,8 @@ func (u *preparedPoolUpdate) Commit() (uint64, []RetiredMember, error) {
 	var events []group.GroupStateEvent
 	version, retired, err := p.reconcileMembersWithPolicyLocked(u.update.Members, func() {
 		p.mode = u.update.Mode
+		mode := u.update.Mode
+		p.modeAtomic.Store(&mode)
 		p.options.Mode = u.update.Mode
 		p.options.FailureWindow = u.update.FailureWindow
 		p.options.FailureThreshold = u.update.FailureThreshold
@@ -1231,11 +1238,22 @@ func (p *poolOutbound) availableMembers(snapshot *PoolSnapshot, now time.Time, n
 	return append(buf[:0], snapshot.Members...)
 }
 
-func (p *poolOutbound) selectMember(snapshot *PoolSnapshot, candidates []*memberState) *memberState {
-	mode := snapshot.mode
-	if mode == "" {
-		mode = p.mode
+// dataPathMode resolves the dispatch mode for the unsynchronized dial path:
+// prefer the mode pinned into the snapshot at publish time, falling back to the
+// atomic mirror of p.mode (never the plain field, which Commit writes under
+// p.mu).
+func (p *poolOutbound) dataPathMode(snapshot *PoolSnapshot) string {
+	if snapshot.mode != "" {
+		return snapshot.mode
 	}
+	if mirrored := p.modeAtomic.Load(); mirrored != nil {
+		return *mirrored
+	}
+	return p.mode
+}
+
+func (p *poolOutbound) selectMember(snapshot *PoolSnapshot, candidates []*memberState) *memberState {
+	mode := p.dataPathMode(snapshot)
 	if mode == modeLowestLatency && !sameCandidateSlice(candidates, snapshot.tcpMembers) && !sameCandidateSlice(candidates, snapshot.udpMembers) {
 		if current := p.currentMember.Load(); current != nil {
 			for _, member := range candidates {
@@ -1260,10 +1278,7 @@ func sameCandidateSlice(left, right []*MemberRef) bool {
 }
 
 func (p *poolOutbound) selectionIndex(snapshot *PoolSnapshot, candidates []*MemberRef) int {
-	mode := snapshot.mode
-	if mode == "" {
-		mode = p.mode
-	}
+	mode := p.dataPathMode(snapshot)
 	switch mode {
 	case modeRandom:
 		return int(p.nextRandom() % uint64(len(candidates)))
