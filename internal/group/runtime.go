@@ -260,6 +260,11 @@ func ReconcileSilent(groupID int64, update RuntimeUpdate) []GroupStateEvent {
 	for _, member := range runtime.members {
 		oldByNodeID[member.nodeID] = member
 	}
+	removedNodeIDs := make([]int64, 0, len(oldByNodeID))
+	updateMembersByNodeID := make(map[int64]struct{}, len(update.Members))
+	for _, initial := range update.Members {
+		updateMembersByNodeID[initial.NodeID] = struct{}{}
+	}
 	currentNodeID := int64(0)
 	if current := runtime.members[runtime.currentTag]; current != nil {
 		currentNodeID = current.nodeID
@@ -329,8 +334,43 @@ func ReconcileSilent(groupID int64, update RuntimeUpdate) []GroupStateEvent {
 		events = append(events, GroupStateEvent{GroupID: groupID, NodeID: nextCurrentNodeID,
 			CurrentNodeID: nextCurrentNodeID, CurrentChanged: true})
 	}
+	for nodeID := range oldByNodeID {
+		if _, stillMember := updateMembersByNodeID[nodeID]; !stillMember {
+			removedNodeIDs = append(removedNodeIDs, nodeID)
+		}
+	}
 	runtime.mu.Unlock()
+	pruneGlobalEvictions(removedNodeIDs)
 	return events
+}
+
+// pruneGlobalEvictions drops global eviction marks for nodes that are no
+// longer members of any group runtime. A node removed from every group can
+// never be probed back to health, so its mark would live forever — and
+// re-adding the node later would immediately force it back into evicted
+// state (Register and ReconcileSilent both honor the mark).
+func pruneGlobalEvictions(removedNodeIDs []int64) {
+	for _, nodeID := range removedNodeIDs {
+		if _, marked := globalEvictedNodes.Load(nodeID); !marked {
+			continue
+		}
+		stillEvictedSomewhere := false
+		groupRuntimeStore.Range(func(_, value any) bool {
+			runtime := value.(*groupRuntime)
+			runtime.mu.Lock()
+			for _, member := range runtime.members {
+				if member.nodeID == nodeID && member.evicted {
+					stillEvictedSomewhere = true
+					break
+				}
+			}
+			runtime.mu.Unlock()
+			return !stillEvictedSomewhere
+		})
+		if !stillEvictedSomewhere {
+			globalEvictedNodes.Delete(nodeID)
+		}
+	}
 }
 
 // NotifyEvents completes a silent reconciliation after the matching pool

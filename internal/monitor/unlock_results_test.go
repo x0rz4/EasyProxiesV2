@@ -10,6 +10,7 @@ import (
 	"time"
 
 	json "easy_proxies/internal/jsonx"
+	"easy_proxies/internal/noderesult"
 	"easy_proxies/internal/store"
 )
 
@@ -36,8 +37,8 @@ func TestHandleUnlockResultsKeysByNodeIDAcrossTagGenerations(t *testing.T) {
 		NodeID:    node.ID,
 		Tag:       "0123456789abcdef@v1",
 		Name:      "tokyo",
-		Services:  []store.UnlockServiceResult{{Name: "netflix", Status: "unlocked"}},
-		IP:        store.UnlockIPInfo{IP: "203.0.113.7", ISOCode: "JP"},
+		Services:  []noderesult.Service{{Name: "netflix", Status: "unlocked"}},
+		IP:        noderesult.IPInfo{IP: "203.0.113.7", ISOCode: "JP"},
 		Duration:  1234,
 		CheckedAt: time.Now().UTC(),
 	}

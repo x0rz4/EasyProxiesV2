@@ -9,6 +9,7 @@ import (
 
 	"easy_proxies/internal/group"
 	"easy_proxies/internal/nodeloc"
+	"easy_proxies/internal/noderesult"
 )
 
 // Store defines all data storage operations.
@@ -570,48 +571,17 @@ type SubscriptionStatus struct {
 	UpdatedAt    time.Time `json:"updated_at"`
 }
 
-// UnlockServiceResult is the persisted outcome of one streaming/AI service
-// check. Mirrors unlock.ServiceResult; kept in this package so the store layer
-// does not depend on the unlock package.
-type UnlockServiceResult struct {
-	Name        string `json:"name"`
-	DisplayName string `json:"display_name"`
-	Category    string `json:"category,omitempty"`
-	Description string `json:"description,omitempty"`
-	Status      string `json:"status"`
-	Region      string `json:"region,omitempty"`
-	Detail      string `json:"detail,omitempty"`
-}
-
-// UnlockIPInfo is the persisted native-IP classification. Mirrors unlock.IPInfo.
-type UnlockIPInfo struct {
-	IP         string `json:"ip"`
-	Country    string `json:"country,omitempty"`
-	ISOCode    string `json:"iso_code,omitempty"`
-	Region     string `json:"region,omitempty"`
-	Pure       bool   `json:"pure"`
-	ASN        string `json:"asn,omitempty"`
-	Org        string `json:"org,omitempty"`
-	IPType     string `json:"ip_type,omitempty"`
-	UsageType  string `json:"usage_type,omitempty"`
-	FraudScore int    `json:"fraud_score,omitempty"`
-	RiskLevel  string `json:"risk_level,omitempty"`
-}
-
-// UnlockResult is the latest unlock detection result stored for a node.
-// ResultJSON holds the original unlock.Result payload (including the full
-// per-service detail/region) so the WebUI can reconstruct it verbatim.
+// UnlockResult is the latest unlock detection result stored for a node: the
+// detector's own report plus the node it belongs to and when it was written.
+// ResultJSON holds that report serialized verbatim (including the full
+// per-service detail/region) so the WebUI can reconstruct it without the store
+// having to model every field.
 type UnlockResult struct {
-	NodeID     int64                 `json:"node_id"`
-	Tag        string                `json:"tag"`
-	Name       string                `json:"name"`
-	Services   []UnlockServiceResult `json:"services"`
-	IP         UnlockIPInfo          `json:"ip"`
-	Error      string                `json:"error,omitempty"`
-	Duration   int64                 `json:"duration_ms"`
-	CheckedAt  time.Time             `json:"checked_at"`
-	ResultJSON string                `json:"result_json,omitempty"`
-	UpdatedAt  time.Time             `json:"updated_at"`
+	NodeID int64 `json:"node_id"`
+	noderesult.Unlock
+	CheckedAt  time.Time `json:"checked_at"`
+	ResultJSON string    `json:"result_json,omitempty"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 // NodeDetectionResult stores the latest routing-neutral diagnostic result.
@@ -639,27 +609,14 @@ type NodeDetectionResult struct {
 	UpdatedAt             time.Time `json:"updated_at"`
 }
 
+// NodeIPQualityResult is one provider's IP-quality verdict stored for a node.
+// The provider's own report is embedded, so a completed check is persisted
+// without a field-by-field copy.
 type NodeIPQualityResult struct {
-	NodeID        int64     `json:"node_id"`
-	TaskID        string    `json:"task_id,omitempty"`
-	Provider      string    `json:"provider"`
-	Status        string    `json:"status"`
-	IP            string    `json:"ip,omitempty"`
-	Family        string    `json:"family,omitempty"`
-	Country       string    `json:"country,omitempty"`
-	CountryCode   string    `json:"country_code,omitempty"`
-	ASN           string    `json:"asn,omitempty"`
-	Org           string    `json:"org,omitempty"`
-	ISP           string    `json:"isp,omitempty"`
-	IsBroadcast   *bool     `json:"is_broadcast"`
-	IsResidential *bool     `json:"is_residential"`
-	FraudScore    *int      `json:"fraud_score"`
-	Proxy         *bool     `json:"proxy"`
-	Hosting       *bool     `json:"hosting"`
-	Mobile        *bool     `json:"mobile"`
-	Reason        string    `json:"reason,omitempty"`
-	CheckedAt     time.Time `json:"checked_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	NodeID int64  `json:"node_id"`
+	TaskID string `json:"task_id,omitempty"`
+	noderesult.Quality
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type NodeDetectionTask struct {

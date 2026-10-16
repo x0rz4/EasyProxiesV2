@@ -251,3 +251,39 @@ func TestObservedFailureResetsRecoveryStreak(t *testing.T) {
 		t.Fatal("member did not recover after a fresh run of successes")
 	}
 }
+
+func TestReconcileSilentPrunesGlobalEvictionForFullyRemovedNode(t *testing.T) {
+	Reset()
+	defer Reset()
+	now := time.Now()
+	// Node 42 is a member of group 1 and gets evicted there; the eviction
+	// propagates to group 2 as well (global mark).
+	Register(401, 5*time.Minute, 1, "node-a", map[string]GroupInitialState{"node-a": {NodeID: 42}})
+	Register(402, 5*time.Minute, 1, "node-a", map[string]GroupInitialState{"node-a": {NodeID: 42}})
+	if !RecordFailure(401, "node-a", errors.New("down"), now) {
+		t.Fatal("member was not evicted")
+	}
+	if MemberAvailable(402, "node-a") {
+		t.Fatal("eviction did not propagate")
+	}
+
+	// Removing the node from group 1 keeps the mark: it is still an evicted
+	// member of group 2.
+	ReconcileSilent(401, RuntimeUpdate{FailureWindow: 5 * time.Minute, FailureThreshold: 1,
+		Members: map[string]GroupInitialState{}})
+	if MemberAvailable(402, "node-a") {
+		t.Fatal("mark was pruned while another group still had it evicted")
+	}
+
+	// Removing it from every group must drop the mark — it can never be probed
+	// back to health there, and re-adding it later must not re-inherit the
+	// stale eviction.
+	ReconcileSilent(402, RuntimeUpdate{FailureWindow: 5 * time.Minute, FailureThreshold: 1,
+		Members: map[string]GroupInitialState{}})
+
+	// Re-register the node fresh; the stale global mark must not evict it.
+	Register(403, 5*time.Minute, 1, "node-a", map[string]GroupInitialState{"node-a": {NodeID: 42}})
+	if !MemberAvailable(403, "node-a") {
+		t.Fatal("re-added node inherited a stale global eviction mark")
+	}
+}

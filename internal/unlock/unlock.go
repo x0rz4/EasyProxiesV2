@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"easy_proxies/internal/geoip"
+	"easy_proxies/internal/noderesult"
 )
 
 // DialFunc opens a raw connection through one node's outbound.
@@ -24,41 +25,16 @@ const (
 	StatusFailed        = "failed"
 )
 
-// ServiceResult is the stable API representation of one detector result.
-type ServiceResult struct {
-	Name        string `json:"name"`
-	DisplayName string `json:"display_name"`
-	Category    string `json:"category,omitempty"`
-	Description string `json:"description,omitempty"`
-	Status      string `json:"status"`
-	Region      string `json:"region,omitempty"`
-	Detail      string `json:"detail,omitempty"`
-}
+// ServiceResult is the stable API representation of one detector result. It is
+// an alias for the shared persisted shape, so a detector result is stored and
+// served verbatim.
+type ServiceResult = noderesult.Service
 
 // IPInfo describes the observed exit IP and its best-effort classification.
-type IPInfo struct {
-	IP         string `json:"ip"`
-	Country    string `json:"country,omitempty"`
-	ISOCode    string `json:"iso_code,omitempty"`
-	Region     string `json:"region,omitempty"`
-	Pure       bool   `json:"pure"`
-	ASN        string `json:"asn,omitempty"`
-	Org        string `json:"org,omitempty"`
-	IPType     string `json:"ip_type,omitempty"`
-	UsageType  string `json:"usage_type,omitempty"`
-	FraudScore int    `json:"fraud_score,omitempty"`
-	RiskLevel  string `json:"risk_level,omitempty"`
-}
+type IPInfo = noderesult.IPInfo
 
 // Result is the full unlock report for one node.
-type Result struct {
-	Tag      string          `json:"tag"`
-	Name     string          `json:"name"`
-	Services []ServiceResult `json:"services"`
-	IP       IPInfo          `json:"ip"`
-	Error    string          `json:"error,omitempty"`
-	Duration int64           `json:"duration_ms"`
-}
+type Result = noderesult.Unlock
 
 // Check runs every registered default detector. The public response remains
 // compatible with the monitor API while detector implementation is modular.

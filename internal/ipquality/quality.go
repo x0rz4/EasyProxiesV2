@@ -16,6 +16,7 @@ import (
 
 	json "easy_proxies/internal/jsonx"
 	"easy_proxies/internal/nodedetect"
+	"easy_proxies/internal/noderesult"
 )
 
 const (
@@ -26,25 +27,9 @@ const (
 	StatusDisabled = "disabled"
 )
 
-type Result struct {
-	Provider      string    `json:"provider"`
-	Status        string    `json:"status"`
-	IP            string    `json:"ip,omitempty"`
-	Family        string    `json:"family,omitempty"`
-	Country       string    `json:"country,omitempty"`
-	CountryCode   string    `json:"country_code,omitempty"`
-	ASN           string    `json:"asn,omitempty"`
-	Org           string    `json:"org,omitempty"`
-	ISP           string    `json:"isp,omitempty"`
-	IsBroadcast   *bool     `json:"is_broadcast"`
-	IsResidential *bool     `json:"is_residential"`
-	FraudScore    *int      `json:"fraud_score"`
-	Proxy         *bool     `json:"proxy"`
-	Hosting       *bool     `json:"hosting"`
-	Mobile        *bool     `json:"mobile"`
-	Reason        string    `json:"reason,omitempty"`
-	CheckedAt     time.Time `json:"checked_at"`
-}
+// Result is one provider's verdict. It is an alias for the shared persisted
+// shape so a provider result can be stored without a field-by-field copy.
+type Result = noderesult.Quality
 
 type Provider interface {
 	Name() string

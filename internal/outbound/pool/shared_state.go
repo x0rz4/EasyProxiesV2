@@ -13,7 +13,7 @@ import (
 // This enables hybrid mode where pool and multi-port modes share the same node state.
 type sharedMemberState struct {
 	mu               sync.Mutex
-	failures         int
+	failures         []time.Time
 	blacklisted      bool
 	blacklistedUntil time.Time
 	entry            atomic.Pointer[monitor.EntryHandle]
@@ -81,18 +81,34 @@ func (s *sharedMemberState) entryHandle() *monitor.EntryHandle {
 	return s.entry.Load()
 }
 
-// recordFailure increments failure count and triggers blacklist if threshold reached.
-// Returns: (current failures, blacklisted, blacklist until time)
-func (s *sharedMemberState) recordFailure(cause error, threshold int, duration time.Duration, destination string) (int, bool, time.Time) {
+// recordFailure records a timestamped failure and triggers the blacklist once
+// the threshold is reached within the failure window. Failures older than the
+// window no longer count (matching the group path's sliding window): without
+// this, three scattered failures across three days blacklisted a healthy node
+// for the full blacklist duration. A zero window keeps the old cumulative
+// behavior for callers that do not bound it.
+// Returns: (failures counted in the window, blacklisted, blacklist until time)
+func (s *sharedMemberState) recordFailure(cause error, threshold int, duration, window time.Duration, destination string) (int, bool, time.Time) {
 	s.mu.Lock()
-	s.failures++
-	count := s.failures
+	now := time.Now()
+	s.failures = append(s.failures, now)
+	if window > 0 {
+		cutoff := now.Add(-window)
+		kept := s.failures[:0]
+		for _, ts := range s.failures {
+			if ts.After(cutoff) {
+				kept = append(kept, ts)
+			}
+		}
+		s.failures = kept
+	}
+	count := len(s.failures)
 	triggered := false
 	var until time.Time
-	if s.failures >= threshold {
+	if count >= threshold {
 		triggered = true
-		until = time.Now().Add(duration)
-		s.failures = 0
+		until = now.Add(duration)
+		s.failures = s.failures[:0]
 		s.blacklisted = true
 		s.blacklistedUntil = until
 	}
@@ -118,7 +134,7 @@ func (s *sharedMemberState) recordSuccess(destination string) {
 // can carry application traffic.
 func (s *sharedMemberState) recordEstablishedSuccess() {
 	s.mu.Lock()
-	s.failures = 0
+	s.failures = s.failures[:0]
 	s.mu.Unlock()
 }
 
@@ -143,7 +159,7 @@ func (s *sharedMemberState) isBlacklisted(now time.Time) bool {
 
 func (s *sharedMemberState) forceRelease() {
 	s.mu.Lock()
-	s.failures = 0
+	s.failures = s.failures[:0]
 	s.blacklisted = false
 	s.blacklistedUntil = time.Time{}
 	s.mu.Unlock()

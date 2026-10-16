@@ -337,10 +337,10 @@ func TestDialSuccessDoesNotClearPassiveFailuresBeforeResponse(t *testing.T) {
 	ResetSharedStateStore()
 	t.Cleanup(ResetSharedStateStore)
 	state := acquireSharedState("node")
-	state.recordFailure(errors.New("reset"), 3, time.Minute, "example.com:443")
+	state.recordFailure(errors.New("reset"), 3, time.Minute, 0, "example.com:443")
 	state.recordSuccess("example.com:443")
-	if state.failures != 1 {
-		t.Fatalf("dial success cleared passive failures: %d", state.failures)
+	if len(state.failures) != 1 {
+		t.Fatalf("dial success cleared passive failures: %d", len(state.failures))
 	}
 	left, right := net.Pipe()
 	defer right.Close()
@@ -352,8 +352,8 @@ func TestDialSuccessDoesNotClearPassiveFailuresBeforeResponse(t *testing.T) {
 	if _, err := conn.Read(buffer); err != nil {
 		t.Fatal(err)
 	}
-	if state.failures != 0 {
-		t.Fatalf("response bytes did not clear passive failures: %d", state.failures)
+	if len(state.failures) != 0 {
+		t.Fatalf("response bytes did not clear passive failures: %d", len(state.failures))
 	}
 }
 
@@ -524,8 +524,8 @@ func TestDialContextFallsBackToAnotherMember(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.shared.failures != 1 {
-		t.Fatalf("first member failures = %d, want 1", first.shared.failures)
+	if len(first.shared.failures) != 1 {
+		t.Fatalf("first member failures = %d, want 1", len(first.shared.failures))
 	}
 	if second.shared.activeCount() != 1 {
 		t.Fatalf("second member active count = %d, want 1", second.shared.activeCount())
@@ -1060,3 +1060,47 @@ func TestEstablishedIOErrorDoesNotEvictGroupMember(t *testing.T) {
 var _ net.Conn = (*halfCloseConn)(nil)
 var _ interface{ CloseWrite() error } = (*trackedConn)(nil)
 var _ interface{ CloseRead() error } = (*trackedConn)(nil)
+
+func TestSharedFailureWindowIgnoresExpiredFailures(t *testing.T) {
+	ResetSharedStateStore()
+	t.Cleanup(ResetSharedStateStore)
+	state := acquireSharedState("windowed")
+
+	// Two failures just inside the window, then one after it expired: only
+	// the fresh pair counts, so the threshold is not reached and the node is
+	// not blacklisted for scattered failures.
+	threshold := 3
+	window := time.Minute
+	state.mu.Lock()
+	state.failures = []time.Time{time.Now().Add(-2 * window), time.Now().Add(-window)}
+	state.mu.Unlock()
+
+	_, blacklisted, _ := state.recordFailure(errors.New("one"), threshold, time.Hour, window, "example.com:443")
+	if blacklisted {
+		t.Fatal("two in-window failures triggered the blacklist")
+	}
+	_, blacklisted, _ = state.recordFailure(errors.New("two"), threshold, time.Hour, window, "example.com:443")
+	if blacklisted {
+		t.Fatal("three scattered failures triggered the blacklist")
+	}
+	_, blacklisted, until := state.recordFailure(errors.New("three"), threshold, time.Hour, window, "example.com:443")
+	if !blacklisted {
+		t.Fatal("three in-window failures did not trigger the blacklist")
+	}
+	if !until.After(time.Now()) {
+		t.Fatalf("blacklist until %v is not in the future", until)
+	}
+
+	// A zero window keeps the cumulative behavior for callers that do not
+	// bound it.
+	ResetSharedStateStore()
+	legacy := acquireSharedState("legacy")
+	legacy.recordFailure(errors.New("old"), 3, time.Hour, 0, "example.com:443")
+	legacy.mu.Lock()
+	legacy.failures[0] = time.Now().Add(-72 * time.Hour)
+	legacy.mu.Unlock()
+	_, blacklisted, _ = legacy.recordFailure(errors.New("new"), 3, time.Hour, 0, "example.com:443")
+	if blacklisted {
+		t.Fatal("zero window unexpectedly applied a window")
+	}
+}

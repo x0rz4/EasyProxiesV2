@@ -568,7 +568,7 @@ func (m *nodeCheckManager) runQuality(task *nodeCheckTask) {
 // this file funnels through here, so this is also the one place the tag queue has
 // to hear about a new ipq.* fact.
 func (m *nodeCheckManager) saveQuality(task *nodeCheckTask, node Snapshot, quality ipquality.Result) {
-	result := store.NodeIPQualityResult{NodeID: node.NodeID, TaskID: task.snapshot.ID, Provider: quality.Provider, Status: quality.Status, IP: quality.IP, Family: quality.Family, Country: quality.Country, CountryCode: quality.CountryCode, ASN: quality.ASN, Org: quality.Org, ISP: quality.ISP, IsBroadcast: quality.IsBroadcast, IsResidential: quality.IsResidential, FraudScore: quality.FraudScore, Proxy: quality.Proxy, Hosting: quality.Hosting, Mobile: quality.Mobile, Reason: quality.Reason, CheckedAt: quality.CheckedAt}
+	result := store.NodeIPQualityResult{NodeID: node.NodeID, TaskID: task.snapshot.ID, Quality: quality}
 	if !m.applyDiagnosticResult(task, node, probe.Quality, nil, &result) {
 		return
 	}

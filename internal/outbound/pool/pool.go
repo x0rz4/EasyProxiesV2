@@ -1592,7 +1592,7 @@ func (p *poolOutbound) recordFailure(member *memberState, cause error, destinati
 		return
 	}
 	threshold := p.currentFailureThreshold()
-	failures, blacklisted, until := member.shared.recordFailure(cause, threshold, p.options.BlacklistDuration, destination)
+	failures, blacklisted, until := member.shared.recordFailure(cause, threshold, p.options.BlacklistDuration, p.currentFailureWindow(), destination)
 	if blacklisted {
 		p.logger.Warn("proxy ", member.tag, " blacklisted for ", p.options.BlacklistDuration, ": ", cause)
 		p.rebuildCandidatesNow()

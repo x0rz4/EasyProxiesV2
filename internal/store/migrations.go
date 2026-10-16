@@ -512,6 +512,11 @@ last_used_at TEXT NOT NULL DEFAULT ''
 CREATE UNIQUE INDEX idx_api_keys_token ON api_keys(token);
 CREATE INDEX idx_api_keys_created ON api_keys(id);`,
 		},
+		{
+			Version:     21,
+			Description: "index node_timeline.created_at for time-window cleanup",
+			Up:          `CREATE INDEX idx_timeline_created_at ON node_timeline(created_at);`,
+		},
 	}
 }
 

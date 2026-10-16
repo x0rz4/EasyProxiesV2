@@ -825,6 +825,20 @@ func orderedRegions(regionMembers map[string][]string) []string {
 	return result
 }
 
+// maskSecret keeps the first and last character of a credential for
+// recognition and hides the rest; empty and single-character secrets render
+// as a fixed marker so the log never shows the actual value.
+func maskSecret(secret string) string {
+	switch len(secret) {
+	case 0:
+		return ""
+	case 1:
+		return "*"
+	default:
+		return secret[:1] + "…" + secret[len(secret)-1:]
+	}
+}
+
 func printProxyLinks(cfg *config.Config, metadata map[string]poolout.MemberMeta) {
 	log.Println("")
 	log.Println("📡 Proxy Links:")
@@ -837,44 +851,29 @@ func printProxyLinks(cfg *config.Config, metadata map[string]poolout.MemberMeta)
 		return
 	}
 
+	// Credentials are masked: logs are frequently pasted into issues and
+	// chats, and these lines would otherwise leak every entry-point password.
 	if showPoolEntry {
 		// Pool mode: single entry point for all nodes
 		var auth string
 		if cfg.Listener.Username != "" {
-			auth = fmt.Sprintf("%s:%s@", cfg.Listener.Username, cfg.Listener.Password)
+			auth = fmt.Sprintf("%s:%s@", cfg.Listener.Username, maskSecret(cfg.Listener.Password))
 		}
 		proxyURL := fmt.Sprintf("http://%s%s:%d", auth, cfg.Listener.Address, cfg.Listener.Port)
 		log.Printf("🌐 Pool Entry Point:")
 		log.Printf("   %s", proxyURL)
 		log.Println("")
-		log.Printf("   Nodes in pool (%d):", len(metadata))
-		for _, meta := range metadata {
-			log.Printf("   • %s", meta.Name)
-		}
+		log.Printf("   Nodes in pool: %d", len(metadata))
 		if showMultiPort {
 			log.Println("")
 		}
 	}
 
 	if showMultiPort {
-		// Multi-port mode: each node has its own port
-		log.Printf("🔌 Multi-Port Entry Points (%d nodes):", len(cfg.Nodes))
-		log.Println("")
-		for _, node := range cfg.Nodes {
-			var auth string
-			username := node.Username
-			password := node.Password
-			if username == "" {
-				username = cfg.MultiPort.Username
-				password = cfg.MultiPort.Password
-			}
-			if username != "" {
-				auth = fmt.Sprintf("%s:%s@", username, password)
-			}
-			proxyURL := fmt.Sprintf("http://%s%s:%d", auth, cfg.MultiPort.Address, node.Port)
-			log.Printf("   [%d] %s", node.Port, node.Name)
-			log.Printf("       %s", proxyURL)
-		}
+		// Multi-port mode: each node has its own port. Listing every node made
+		// each reload O(N) log lines; the WebUI is the per-node reference.
+		log.Printf("🔌 Multi-Port Entry Points: %d nodes, base address %s, ports %d–%d",
+			len(cfg.Nodes), cfg.MultiPort.Address, cfg.MultiPort.BasePort, cfg.MultiPort.BasePort+uint16(len(cfg.Nodes))-1)
 	}
 
 	log.Println("═══════════════════════════════════════════════════════════════")

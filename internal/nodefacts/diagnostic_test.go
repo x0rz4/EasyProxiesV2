@@ -1,6 +1,7 @@
 package nodefacts
 
 import (
+	"easy_proxies/internal/noderesult"
 	"easy_proxies/internal/store"
 	"testing"
 	"time"
@@ -14,10 +15,10 @@ func TestDiagnosticSummarySeparatesUnknownAndRestricted(t *testing.T) {
 		want   string
 	}{
 		{"unknown", nil, ""},
-		{"complete", &store.UnlockResult{Services: []store.UnlockServiceResult{{Status: "unlocked"}}}, "unlocked"},
-		{"limited", &store.UnlockResult{Services: []store.UnlockServiceResult{{Status: "partial"}}}, "locked"},
-		{"mixed", &store.UnlockResult{Services: []store.UnlockServiceResult{{Status: "unlocked"}, {Status: "locked"}}}, "mixed"},
-		{"error", &store.UnlockResult{Error: "timeout", Services: []store.UnlockServiceResult{{Status: "unlocked"}}}, "failed"},
+		{"complete", &store.UnlockResult{Services: []noderesult.Service{{Status: "unlocked"}}}, "unlocked"},
+		{"limited", &store.UnlockResult{Services: []noderesult.Service{{Status: "partial"}}}, "locked"},
+		{"mixed", &store.UnlockResult{Services: []noderesult.Service{{Status: "unlocked"}, {Status: "locked"}}}, "mixed"},
+		{"error", &store.UnlockResult{Error: "timeout", Services: []noderesult.Service{{Status: "unlocked"}}}, "failed"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			facts := NewNodeFacts(1, "", "")

@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"easy_proxies/internal/noderesult"
 	"easy_proxies/internal/store"
 )
 
@@ -358,8 +359,8 @@ func TestLoadUnlockFacts(t *testing.T) {
 	source := newCountingSource(store.Node{ID: 1, Name: "n"})
 	source.unlocks[1] = &store.UnlockResult{
 		NodeID: 1, CheckedAt: checkedAt,
-		IP: store.UnlockIPInfo{IP: "1.2.3.4", Pure: true},
-		Services: []store.UnlockServiceResult{
+		IP: noderesult.IPInfo{IP: "1.2.3.4", Pure: true},
+		Services: []noderesult.Service{
 			{Name: "Netflix", Status: "unlocked", Region: "HK", Detail: "原生解锁"},
 			{Name: "youtube", Status: "failed", Detail: "timeout"},
 			{Name: "  ", Status: "unlocked"},
@@ -397,7 +398,7 @@ func TestLoadUnlockToleratesMissingAndCorruptPayloads(t *testing.T) {
 		// No IP means the native-IP verdict was never established; a corrupt payload
 		// must leave the extended facts unknown instead of failing the recompute.
 		ResultJSON: `{"ip":{"risk_level":`,
-		Services:   []store.UnlockServiceResult{{Name: "netflix", Status: "unlocked"}},
+		Services:   []noderesult.Service{{Name: "netflix", Status: "unlocked"}},
 	}
 	facts := mustLoadOne(t, source)
 	assertUnknown(t, facts, FieldUnlockIPPure, FieldUnlockIPRiskLevel, FieldUnlockIPFraudScore)
@@ -496,8 +497,8 @@ func TestLoadedFactsSatisfyRules(t *testing.T) {
 	source.stats[1] = &store.NodeStats{NodeID: 1, LastLatencyMs: 88,
 		InitialCheckDone: true, Available: true, UpdatedAt: loadNow.Add(-time.Minute)}
 	source.unlocks[1] = &store.UnlockResult{NodeID: 1, CheckedAt: loadNow.Add(-time.Minute),
-		IP:       store.UnlockIPInfo{IP: "1.2.3.4", Pure: true},
-		Services: []store.UnlockServiceResult{{Name: "netflix", Status: "unlocked"}}}
+		IP:       noderesult.IPInfo{IP: "1.2.3.4", Pure: true},
+		Services: []noderesult.Service{{Name: "netflix", Status: "unlocked"}}}
 	facts := mustLoadOne(t, source)
 
 	rule := Condition{Match: MatchAll, Children: []Condition{

@@ -39,7 +39,7 @@ install.sh                    Linux Docker / 二进制安装及更新入口
 
 ---
 
-## 3. Module Map（`internal/`，20 个包）
+## 3. Module Map（`internal/`，26 个包）
 
 ### 装配与基础
 
@@ -49,6 +49,7 @@ install.sh                    Linux Docker / 二进制安装及更新入口
 | `config` | 配置结构与解析：YAML 加载/校验、节点 URI 与订阅内容解析（clash/v2ray/base64）、`NodeConfig.NodeKey()` | `Load` / `LoadForReload`（重载路径，允许部分字段变化）、`ParseSubscriptionContent`、`ParseImportContent` |
 | `store` | 唯一的持久化层（`Store` 接口 86 个方法）：nodes / subscriptions / stats / sessions / unlock / detection / group pools / tags | `Open()` 内部跑 `Migrate`；`migrations.go`、`sqlite.go`、`sqlite_tags.go`、`node_identity.go`、`migrate_legacy.go` |
 | `jsonx` | JSON 编解码统一出口（Sonic + `MarshalCanonical`） | `Marshal` / `Unmarshal` / `MarshalCanonical` |
+| `noderesult` | 检测结果负载的**唯一**定义（叶子包，不 import 本项目任何包）：`Quality`（ipquality）/ `Service`+`IPInfo`+`Unlock`（unlock）。`store` 嵌入这些类型加元数据字段，`unlock`/`ipquality` 用 `type` 别名指回来，因此检测结果落库/出 API 不需要逐字段转换 | `noderesult.Quality` / `Unlock` / `Service` / `IPInfo` |
 
 ### 数据面（代理运行）
 
@@ -80,8 +81,8 @@ install.sh                    Linux Docker / 二进制安装及更新入口
 | 包 | 职责 |
 | --- | --- |
 | `nodedetect` | 手动触发的路由无关诊断：延迟 / 测速 / 出口 IP。**绝不发布健康事件** |
-| `unlock` | 流媒体与 AI 服务的解锁检测（netflix / disney+ / chatgpt / gemini / claude / youtube / bahamut / tiktok / amazon / reddit），`init()` 注册式 |
-| `ipquality` | IP 质量 provider 适配（ippure / ip-api），每个 provider 结果独立、不做综合评分 |
+| `unlock` | 流媒体与 AI 服务的解锁检测（netflix / disney+ / chatgpt / gemini / claude / youtube / bahamut / tiktok / amazon / reddit），`init()` 注册式。结果类型是 `noderesult` 的别名 |
+| `ipquality` | IP 质量 provider 适配（ippure / ip-api），每个 provider 结果独立、不做综合评分。结果类型是 `noderesult.Quality` 的别名 |
 | `geoip` | mmdb 下载/更新 + 地区查询；`router.go` 提供按地区的路由辅助 |
 | `subscription` | 上游订阅拉取与刷新、节点归属（membership）变更；实现 `monitor.SubscriptionRefresher` |
 | `subrender` | 把节点 URI 渲染成 Clash/Mihomo 订阅文档与入口代理（无运行时依赖，供 `/sub/*` 复用） |
@@ -95,6 +96,7 @@ main → app → boxmgr ──→ builder ──→ config/store/groupmember/run
               └──→ group
 app → nodetag ←(事实)→ nodefacts        monitor 是 unlock/ipquality 与 nodefacts 的桥接层
 subscription → boxmgr（经 interface）
+store / unlock / ipquality → noderesult（叶子，检测结果类型的唯一来源）
 ```
 
 ---

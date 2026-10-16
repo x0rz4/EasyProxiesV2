@@ -10,6 +10,7 @@ import (
 
 	"easy_proxies/internal/group"
 	json "easy_proxies/internal/jsonx"
+	"easy_proxies/internal/noderesult"
 	"easy_proxies/internal/probe"
 	"easy_proxies/internal/store"
 )
@@ -194,7 +195,7 @@ func TestSuccessfulDiagnosticsDoNotRecoverEvictedMember(t *testing.T) {
 			case probe.Quality:
 				event.Quality = &store.NodeIPQualityResult{NodeID: node.ID, Provider: "fixture", Status: "success"}
 			case probe.Unlock:
-				event.Unlock = &store.UnlockResult{NodeID: node.ID, Tag: "health@v1", Services: []store.UnlockServiceResult{}}
+				event.Unlock = &store.UnlockResult{NodeID: node.ID, Tag: "health@v1", Services: []noderesult.Service{}}
 			}
 			if err := server.applyMeasuredResult(event); err != nil {
 				t.Fatal(err)

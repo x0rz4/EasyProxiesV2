@@ -246,7 +246,15 @@ func (p *groupStatePersister) Observe(event group.GroupStateEvent) {
 	if p.closed {
 		return
 	}
-	p.events <- event
+	// Non-blocking: the observer runs on the group failure/dial paths, so a
+	// full buffer must drop events rather than backpressure the data plane or
+	// stall Close. The next successful event for the same group overwrites the
+	// persisted state anyway, and the periodic stat flush re-syncs currents.
+	select {
+	case p.events <- event:
+	default:
+		log.Printf("[app] group state persist queue full, dropping event group=%d node=%d", event.GroupID, event.NodeID)
+	}
 }
 
 func (p *groupStatePersister) Close() {

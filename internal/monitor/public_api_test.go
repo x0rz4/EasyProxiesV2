@@ -1,7 +1,9 @@
 package monitor
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"log"
 	"net/http"
@@ -9,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"easy_proxies/internal/store"
 )
@@ -170,5 +173,47 @@ func TestAPIKeyManagementRequiresSession(t *testing.T) {
 	}
 	if !strings.Contains(recorder.Body.String(), key.Token) {
 		t.Fatalf("listing did not include the stored credential: %s", recorder.Body.String())
+	}
+}
+
+// TestLoginRateLimitLocksOutBursts pins the brute-force guard: within the
+// failure window only maxLoginFailuresWithin wrong passwords are counted, then
+// the source is locked out even with the correct password, and a successful
+// login clears the record.
+func TestLoginRateLimitLocksOutBursts(t *testing.T) {
+	s, _ := newAPIKeyTestServer(t)
+	s.cfg.Password = "secret"
+	s.sessionTTL = time.Hour
+	mux := s.routes()
+
+	post := func(password string) *httptest.ResponseRecorder {
+		t.Helper()
+		body, _ := json.Marshal(map[string]string{"password": password})
+		request := httptest.NewRequest(http.MethodPost, "/api/auth", bytes.NewReader(body))
+		request.RemoteAddr = "203.0.113.9:4444"
+		recorder := httptest.NewRecorder()
+		mux.ServeHTTP(recorder, request)
+		return recorder
+	}
+
+	for i := 0; i < maxLoginFailuresWithin; i++ {
+		if code := post("wrong").Code; code != http.StatusUnauthorized {
+			t.Fatalf("wrong password attempt %d status=%d, want 401", i+1, code)
+		}
+	}
+	// The source is now locked out: even the correct password is rejected.
+	if code := post("secret").Code; code != http.StatusUnauthorized {
+		t.Fatalf("correct password during lockout status=%d, want 401", code)
+	}
+
+	// A different source is unaffected.
+	request := httptest.NewRequest(http.MethodPost, "/api/auth", nil)
+	body, _ := json.Marshal(map[string]string{"password": "secret"})
+	request = httptest.NewRequest(http.MethodPost, "/api/auth", bytes.NewReader(body))
+	request.RemoteAddr = "198.51.100.7:5555"
+	recorder := httptest.NewRecorder()
+	mux.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("other source login status=%d, want 200", recorder.Code)
 	}
 }
