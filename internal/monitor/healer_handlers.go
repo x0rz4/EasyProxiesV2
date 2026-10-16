@@ -6,13 +6,11 @@ import (
 )
 
 func (s *Server) handleGroupHealEvents(w http.ResponseWriter, r *http.Request) {
-	if s.store == nil {
-		writeAPIError(w, http.StatusServiceUnavailable, "数据存储不可用")
+	if !s.requireStore(w, storeUnavailableGeneric) {
 		return
 	}
-	id, err := strconv.ParseInt(r.PathValue("groupID"), 10, 64)
-	if err != nil || id <= 0 {
-		writeAPIError(w, http.StatusBadRequest, "无效分组 ID")
+	id, ok := pathID(w, r, "groupID", "无效分组 ID")
+	if !ok {
 		return
 	}
 	pool, err := s.store.GetGroupPool(r.Context(), id)

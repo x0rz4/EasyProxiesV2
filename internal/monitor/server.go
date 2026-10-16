@@ -1799,8 +1799,7 @@ func apiKeyFromRequest(r *http.Request) string {
 // importing nodes — no read, update, delete, refresh or group access.
 func (s *Server) withAPIKey(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.store == nil {
-			writeAPIError(w, http.StatusServiceUnavailable, "API 凭证不可用：数据存储未初始化")
+		if !s.requireStore(w, storeUnavailableCredentials) {
 			return
 		}
 		token := apiKeyFromRequest(r)
@@ -1841,8 +1840,7 @@ func (s *Server) recordAPIKeyUse(id int64) {
 // handleAPIKeys lists and creates session-free API credentials. These routes are
 // session-authenticated; the resulting tokens are only usable on /api/public/*.
 func (s *Server) handleAPIKeys(w http.ResponseWriter, r *http.Request, action string) {
-	if s.store == nil {
-		writeAPIError(w, http.StatusServiceUnavailable, "API 凭证不可用：数据存储未初始化")
+	if !s.requireStore(w, storeUnavailableCredentials) {
 		return
 	}
 	switch action {
@@ -1885,17 +1883,15 @@ func (s *Server) handleAPIKeys(w http.ResponseWriter, r *http.Request, action st
 
 // handleAPIKeyItem revokes a single credential.
 func (s *Server) handleAPIKeyItem(w http.ResponseWriter, r *http.Request, action string) {
-	if s.store == nil {
-		writeAPIError(w, http.StatusServiceUnavailable, "API 凭证不可用：数据存储未初始化")
+	if !s.requireStore(w, storeUnavailableCredentials) {
 		return
 	}
 	if action != "delete" {
 		writeAPIError(w, http.StatusMethodNotAllowed, "请求方法不允许")
 		return
 	}
-	id, err := strconv.ParseInt(r.PathValue("apiKeyID"), 10, 64)
-	if err != nil || id <= 0 {
-		writeAPIError(w, http.StatusBadRequest, "无效的凭证 ID")
+	id, ok := pathID(w, r, "apiKeyID", "无效的凭证 ID")
+	if !ok {
 		return
 	}
 	if err := s.store.DeleteAPIKey(r.Context(), id); err != nil {
@@ -2644,11 +2640,13 @@ func (s *Server) handleSubscriptionItem(w http.ResponseWriter, r *http.Request, 
 		writeAPIError(w, http.StatusServiceUnavailable, "订阅管理器未初始化")
 		return
 	}
-	id, err := strconv.ParseInt(r.PathValue("subscriptionID"), 10, 64)
-	if err != nil || id <= 0 {
-		writeAPIError(w, http.StatusBadRequest, "无效的订阅 ID")
+	id, ok := pathID(w, r, "subscriptionID", "无效的订阅 ID")
+	if !ok {
 		return
 	}
+	// err is carried across the switch below: each action assigns it and one
+	// shared tail maps it, so it is declared here rather than in each branch.
+	var err error
 	if action == "get" || action == "update" || action == "delete" {
 		s.handleSubscriptionCRUD(w, r, id, action)
 		return
@@ -2754,17 +2752,6 @@ func decodeJSONBody(r *http.Request, dst any) error {
 func writeAPIError(w http.ResponseWriter, status int, message string) {
 	w.WriteHeader(status)
 	writeJSON(w, map[string]any{"error": message})
-}
-
-func subscriptionErrorStatus(err error) int {
-	message := strings.ToLower(err.Error())
-	if strings.Contains(message, "不存在") || strings.Contains(message, "not found") {
-		return http.StatusNotFound
-	}
-	if strings.Contains(message, "不能为空") || strings.Contains(message, "必须") || strings.Contains(message, "invalid") || strings.Contains(message, "unique") {
-		return http.StatusBadRequest
-	}
-	return http.StatusInternalServerError
 }
 
 // nodePayload is the JSON request body for node CRUD operations.
@@ -3044,18 +3031,14 @@ func (s *Server) ensureNodeManager(w http.ResponseWriter) bool {
 }
 
 func (s *Server) respondNodeError(w http.ResponseWriter, err error) {
-	status := http.StatusInternalServerError
+	// The status policy lives in nodeErrorStatus; this wrapper only adds the
+	// fields a duplicate-node conflict has to carry back to the client.
+	status := nodeErrorStatus(err)
 	payload := map[string]any{"error": err.Error()}
 	var duplicate *NodeDuplicateError
-	switch {
-	case errors.Is(err, ErrNodeNotFound):
-		status = http.StatusNotFound
-	case errors.As(err, &duplicate):
-		status = http.StatusConflict
+	if errors.As(err, &duplicate) {
 		payload["existing_node_id"] = duplicate.ExistingID
 		payload["existing_node_name"] = duplicate.ExistingName
-	case errors.Is(err, ErrNodeConflict), errors.Is(err, ErrInvalidNode):
-		status = http.StatusBadRequest
 	}
 	w.WriteHeader(status)
 	writeJSON(w, payload)
@@ -3186,8 +3169,7 @@ type groupPoolResponse struct {
 }
 
 func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request, action string) {
-	if s.store == nil {
-		writeAPIError(w, http.StatusServiceUnavailable, "数据存储不可用")
+	if !s.requireStore(w, storeUnavailableGeneric) {
 		return
 	}
 	switch action {
@@ -3226,13 +3208,11 @@ func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request, action str
 }
 
 func (s *Server) handleGroupItem(w http.ResponseWriter, r *http.Request, action string) {
-	if s.store == nil {
-		writeAPIError(w, http.StatusServiceUnavailable, "数据存储不可用")
+	if !s.requireStore(w, storeUnavailableGeneric) {
 		return
 	}
-	groupID, err := strconv.ParseInt(r.PathValue("groupID"), 10, 64)
-	if err != nil || groupID <= 0 {
-		writeAPIError(w, http.StatusBadRequest, "无效的分组 ID")
+	groupID, ok := pathID(w, r, "groupID", "无效的分组 ID")
+	if !ok {
 		return
 	}
 	mutationRequest := action == "remove-member" || action == "remove-exclusion" || action == "update" || action == "delete"
@@ -3242,9 +3222,8 @@ func (s *Server) handleGroupItem(w http.ResponseWriter, r *http.Request, action 
 		defer operationLock.Unlock()
 	}
 	if action == "activate" {
-		nodeID, err := strconv.ParseInt(r.PathValue("nodeID"), 10, 64)
-		if err != nil || nodeID <= 0 {
-			writeAPIError(w, http.StatusBadRequest, "无效的节点 ID")
+		nodeID, ok := pathID(w, r, "nodeID", "无效的节点 ID")
+		if !ok {
 			return
 		}
 		groupPool, lookupErr := s.store.GetGroupPool(r.Context(), groupID)
@@ -3270,9 +3249,8 @@ func (s *Server) handleGroupItem(w http.ResponseWriter, r *http.Request, action 
 		return
 	}
 	if action == "restore" {
-		nodeID, err := strconv.ParseInt(r.PathValue("nodeID"), 10, 64)
-		if err != nil || nodeID <= 0 {
-			writeAPIError(w, http.StatusBadRequest, "无效的节点 ID")
+		nodeID, ok := pathID(w, r, "nodeID", "无效的节点 ID")
+		if !ok {
 			return
 		}
 		if err := s.store.ClearGroupNodeState(r.Context(), groupID, nodeID); err != nil {
@@ -3288,9 +3266,8 @@ func (s *Server) handleGroupItem(w http.ResponseWriter, r *http.Request, action 
 		return
 	}
 	if action == "remove-member" {
-		nodeID, err := strconv.ParseInt(r.PathValue("nodeID"), 10, 64)
-		if err != nil || nodeID <= 0 {
-			writeAPIError(w, http.StatusBadRequest, "无效的节点 ID")
+		nodeID, ok := pathID(w, r, "nodeID", "无效的节点 ID")
+		if !ok {
 			return
 		}
 		runtimeState, ok := group.GroupRuntimeSnapshots()[groupID]
@@ -3342,9 +3319,8 @@ func (s *Server) handleGroupItem(w http.ResponseWriter, r *http.Request, action 
 		return
 	}
 	if action == "remove-exclusion" {
-		nodeID, err := strconv.ParseInt(r.PathValue("nodeID"), 10, 64)
-		if err != nil || nodeID <= 0 {
-			writeAPIError(w, http.StatusBadRequest, "无效的节点 ID")
+		nodeID, ok := pathID(w, r, "nodeID", "无效的节点 ID")
+		if !ok {
 			return
 		}
 		s.groupMutationMu.Lock()

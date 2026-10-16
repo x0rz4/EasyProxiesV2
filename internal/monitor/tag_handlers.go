@@ -49,8 +49,7 @@ type mutexGroupInput struct {
 
 func (s *Server) handleTags(w http.ResponseWriter, r *http.Request, action string) {
 	limitTagRequestBody(w, r)
-	if s.store == nil {
-		writeAPIError(w, http.StatusServiceUnavailable, "数据存储不可用")
+	if !s.requireStore(w, storeUnavailableGeneric) {
 		return
 	}
 	switch action {
@@ -125,9 +124,8 @@ func (s *Server) handleTagItem(w http.ResponseWriter, r *http.Request, action st
 		return
 	}
 
-	tagID, err := strconv.ParseInt(r.PathValue("tagID"), 10, 64)
-	if err != nil || tagID <= 0 {
-		writeAPIError(w, http.StatusBadRequest, "无效的标签 ID")
+	tagID, ok := pathID(w, r, "tagID", "无效的标签 ID")
+	if !ok {
 		return
 	}
 	if action == "auto" {
@@ -138,8 +136,7 @@ func (s *Server) handleTagItem(w http.ResponseWriter, r *http.Request, action st
 }
 
 func (s *Server) handleTagByID(w http.ResponseWriter, r *http.Request, tagID int64, action string) {
-	if s.store == nil {
-		writeAPIError(w, http.StatusServiceUnavailable, "数据存储不可用")
+	if !s.requireStore(w, storeUnavailableGeneric) {
 		return
 	}
 	existing, err := s.store.GetTag(r.Context(), tagID)
@@ -174,8 +171,7 @@ func (s *Server) handleTagByID(w http.ResponseWriter, r *http.Request, tagID int
 }
 
 func (s *Server) handleTagAuto(w http.ResponseWriter, r *http.Request, tagID int64) {
-	if s.store == nil {
-		writeAPIError(w, http.StatusServiceUnavailable, "数据存储不可用")
+	if !s.requireStore(w, storeUnavailableGeneric) {
 		return
 	}
 	var input struct {
@@ -381,8 +377,7 @@ func (s *Server) handleTagTemplates(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTagAssignments(w http.ResponseWriter, r *http.Request) {
-	if s.store == nil {
-		writeAPIError(w, http.StatusServiceUnavailable, "数据存储不可用")
+	if !s.requireStore(w, storeUnavailableGeneric) {
 		return
 	}
 	nodeIDs, err := parseTagIDQuery(r.URL.Query().Get("node_ids"))
@@ -420,8 +415,7 @@ func (s *Server) handleTagAssignments(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTagNodes(w http.ResponseWriter, r *http.Request, target string) {
-	if s.store == nil {
-		writeAPIError(w, http.StatusServiceUnavailable, "数据存储不可用")
+	if !s.requireStore(w, storeUnavailableGeneric) {
 		return
 	}
 	if target == "batch" {
@@ -508,8 +502,7 @@ func (s *Server) handleTagNodes(w http.ResponseWriter, r *http.Request, target s
 }
 
 func (s *Server) handleTagMutexGroups(w http.ResponseWriter, r *http.Request, action, rawID string) {
-	if s.store == nil {
-		writeAPIError(w, http.StatusServiceUnavailable, "数据存储不可用")
+	if !s.requireStore(w, storeUnavailableGeneric) {
 		return
 	}
 	groups, err := s.store.ListTagMutexGroups(r.Context())
@@ -832,17 +825,7 @@ type tagConflictError struct{ name string }
 func (e tagConflictError) Error() string { return fmt.Sprintf("标签名称已存在: %s", e.name) }
 
 func writeTagMutationError(w http.ResponseWriter, err error) {
-	var conflict tagConflictError
-	if errors.As(err, &conflict) {
-		writeAPIError(w, http.StatusConflict, err.Error())
-		return
-	}
-	message := strings.ToLower(err.Error())
-	if strings.Contains(message, "不可用") && strings.Contains(message, "服务") {
-		writeAPIError(w, http.StatusServiceUnavailable, err.Error())
-		return
-	}
-	writeAPIError(w, http.StatusBadRequest, err.Error())
+	writeAPIError(w, tagErrorStatus(err), err.Error())
 }
 
 func validateTagName(value string) (string, error) {

@@ -29,9 +29,8 @@ func (s *Server) handleGroupSubscription(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	groupID, err := strconv.ParseInt(r.PathValue("groupID"), 10, 64)
-	if err != nil || groupID <= 0 {
-		http.NotFound(w, r)
+	groupID, ok := pathIDOrNotFound(w, r, "groupID")
+	if !ok {
 		return
 	}
 	groupPool, err := s.store.GetGroupPool(r.Context(), groupID)

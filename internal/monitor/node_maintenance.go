@@ -68,8 +68,7 @@ type NodeMaintenanceEntry struct {
 // Disabled and not-yet-checked nodes report no offline duration at all — their
 // frozen last known state must never be read as a live outage.
 func (s *Server) handleNodeMaintenance(w http.ResponseWriter, r *http.Request) {
-	if s.store == nil {
-		writeAPIError(w, http.StatusServiceUnavailable, "数据存储未初始化")
+	if !s.requireStore(w, storeUnavailableNotInitialized) {
 		return
 	}
 

@@ -249,8 +249,7 @@ func writeNodeCheckJSONStatus(w http.ResponseWriter, status int, value any) {
 }
 
 func (s *Server) handleNodeCheckResults(w http.ResponseWriter, r *http.Request) {
-	if s.store == nil {
-		writeAPIError(w, http.StatusServiceUnavailable, "数据存储未初始化")
+	if !s.requireStore(w, storeUnavailableNotInitialized) {
 		return
 	}
 	detections, err := s.store.ListNodeDetectionResults(r.Context())

@@ -44,8 +44,7 @@ func differenceIDs(left, right []int64) []int64 {
 
 func (s *Server) handleGroupPreview(w http.ResponseWriter, r *http.Request) {
 	limitTagRequestBody(w, r)
-	if s.store == nil {
-		writeAPIError(w, 503, "数据存储不可用")
+	if !s.requireStore(w, storeUnavailableGeneric) {
 		return
 	}
 	draft := store.GroupPool{Enabled: true, RegionRuleVersion: 2}

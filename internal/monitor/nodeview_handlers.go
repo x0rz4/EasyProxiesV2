@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -106,8 +105,7 @@ func (s *Server) handleNodeQuery(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, 400, err.Error())
 		return
 	}
-	if s.store == nil {
-		writeAPIError(w, 503, "数据存储不可用")
+	if !s.requireStore(w, storeUnavailableGeneric) {
 		return
 	}
 	if input.FilterID > 0 {
@@ -175,8 +173,7 @@ type savedFilterView struct {
 
 func (s *Server) handleSavedFilters(w http.ResponseWriter, r *http.Request, action string) {
 	limitTagRequestBody(w, r)
-	if s.store == nil {
-		writeAPIError(w, 503, "数据存储不可用")
+	if !s.requireStore(w, storeUnavailableGeneric) {
 		return
 	}
 	if action == "list" {
@@ -199,10 +196,9 @@ func (s *Server) handleSavedFilters(w http.ResponseWriter, r *http.Request, acti
 	}
 	id := int64(0)
 	if action != "create" {
-		var err error
-		id, err = strconv.ParseInt(r.PathValue("filterID"), 10, 64)
-		if err != nil || id <= 0 {
-			writeAPIError(w, 400, "无效筛选 ID")
+		var ok bool
+		id, ok = pathID(w, r, "filterID", "无效筛选 ID")
+		if !ok {
 			return
 		}
 	}
