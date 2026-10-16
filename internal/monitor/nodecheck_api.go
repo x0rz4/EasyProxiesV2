@@ -76,123 +76,148 @@ func (r nodeCheckSettingsResponse) toConfig() (config.NodeCheckConfig, error) {
 	return value, nil
 }
 
-func (s *Server) handleNodeCheckSettings(w http.ResponseWriter, r *http.Request, action string) {
+func (s *Server) handleNodeCheckSettingsGet(w http.ResponseWriter, r *http.Request) {
+	source := s.nodeCheckConfigSource(w)
+	if source == nil {
+		return
+	}
+	writeJSON(w, nodeCheckSettingsFromConfig(source.Snapshot().Management.NodeCheck))
+}
+
+func (s *Server) handleNodeCheckSettingsUpdate(w http.ResponseWriter, r *http.Request) {
+	source := s.nodeCheckConfigSource(w)
+	if source == nil {
+		return
+	}
+	var request nodeCheckSettingsResponse
+	if err := decodeJSON(r, &request); err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	value, err := request.toConfig()
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.configMutationMu.Lock()
+	defer s.configMutationMu.Unlock()
+	snapshot := source.Snapshot()
+	old := snapshot.Management.NodeCheck
+	source.Lock()
+	source.Management.NodeCheck = value
+	source.Unlock()
+	if err := source.SaveSettings(); err != nil {
+		source.Lock()
+		source.Management.NodeCheck = old
+		source.Unlock()
+		writeAPIError(w, http.StatusInternalServerError, "保存检测设置失败: "+err.Error())
+		return
+	}
+	writeJSON(w, nodeCheckSettingsFromConfig(value))
+}
+
+// nodeCheckConfigSource returns the live config backing the node-check
+// settings surface, answering 503 itself when config is not available yet.
+func (s *Server) nodeCheckConfigSource(w http.ResponseWriter) *config.Config {
 	s.cfgMu.RLock()
 	source := s.cfgSrc
 	s.cfgMu.RUnlock()
 	if source == nil {
 		writeAPIError(w, http.StatusServiceUnavailable, "配置存储未初始化")
-		return
 	}
-	switch action {
-	case "get":
-		writeJSON(w, nodeCheckSettingsFromConfig(source.Snapshot().Management.NodeCheck))
-	case "update":
-		var request nodeCheckSettingsResponse
-		if err := decodeJSON(r, &request); err != nil {
-			writeAPIError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		value, err := request.toConfig()
-		if err != nil {
-			writeAPIError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		s.configMutationMu.Lock()
-		defer s.configMutationMu.Unlock()
-		snapshot := source.Snapshot()
-		old := snapshot.Management.NodeCheck
-		source.Lock()
-		source.Management.NodeCheck = value
-		source.Unlock()
-		if err := source.SaveSettings(); err != nil {
-			source.Lock()
-			source.Management.NodeCheck = old
-			source.Unlock()
-			writeAPIError(w, http.StatusInternalServerError, "保存检测设置失败: "+err.Error())
-			return
-		}
-		writeJSON(w, nodeCheckSettingsFromConfig(value))
-	default:
-		w.WriteHeader(http.StatusMethodNotAllowed)
-	}
+	return source
 }
 
-func (s *Server) handleNodeCheckTasks(w http.ResponseWriter, r *http.Request, action string) {
+func (s *Server) handleNodeCheckTasksList(w http.ResponseWriter, r *http.Request) {
 	if s.nodeChecks == nil || s.store == nil {
 		writeAPIError(w, http.StatusServiceUnavailable, "综合检测服务未初始化")
 		return
 	}
-	switch action {
-	case "create":
-		var request nodeCheckCreateRequest
-		if err := decodeJSON(r, &request); err != nil {
-			writeAPIError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		task, err := s.nodeChecks.create(request)
-		if err != nil {
-			writeAPIError(w, http.StatusConflict, err.Error())
-			return
-		}
-		writeNodeCheckJSONStatus(w, http.StatusAccepted, map[string]any{"task": task.copySnapshot()})
-	case "list":
-		tasks, err := s.store.ListNodeDetectionTasks(r.Context(), 20)
-		if err != nil {
-			writeAPIError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		result := make([]nodeCheckTaskSnapshot, 0, len(tasks))
-		for _, task := range tasks {
-			result = append(result, taskSnapshotFromStore(task))
-		}
-		writeJSON(w, map[string]any{"tasks": result})
-	default:
-		w.WriteHeader(http.StatusMethodNotAllowed)
+	tasks, err := s.store.ListNodeDetectionTasks(r.Context(), 20)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
 	}
+	result := make([]nodeCheckTaskSnapshot, 0, len(tasks))
+	for _, task := range tasks {
+		result = append(result, taskSnapshotFromStore(task))
+	}
+	writeJSON(w, map[string]any{"tasks": result})
 }
 
-func (s *Server) handleNodeCheckTaskItem(w http.ResponseWriter, r *http.Request, action string) {
-	if s.nodeChecks == nil {
+func (s *Server) handleNodeCheckTasksCreate(w http.ResponseWriter, r *http.Request) {
+	if s.nodeChecks == nil || s.store == nil {
 		writeAPIError(w, http.StatusServiceUnavailable, "综合检测服务未初始化")
 		return
+	}
+	var request nodeCheckCreateRequest
+	if err := decodeJSON(r, &request); err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	task, err := s.nodeChecks.create(request)
+	if err != nil {
+		writeAPIError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeNodeCheckJSONStatus(w, http.StatusAccepted, map[string]any{"task": task.copySnapshot()})
+}
+
+// nodeCheckTaskID resolves the {taskID} path segment, answering 404 itself.
+func (s *Server) nodeCheckTaskID(w http.ResponseWriter, r *http.Request) (string, bool) {
+	if s.nodeChecks == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "综合检测服务未初始化")
+		return "", false
 	}
 	id := r.PathValue("taskID")
 	if id == "" {
 		w.WriteHeader(http.StatusNotFound)
+		return "", false
+	}
+	return id, true
+}
+
+func (s *Server) handleNodeCheckTaskGet(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.nodeCheckTaskID(w, r)
+	if !ok {
 		return
 	}
-	if action == "events" {
-		s.streamNodeCheckTask(w, r, id)
+	if task := s.nodeChecks.get(id); task != nil {
+		writeJSON(w, map[string]any{"task": task.copySnapshot()})
 		return
 	}
-	switch action {
-	case "get":
-		if task := s.nodeChecks.get(id); task != nil {
-			writeJSON(w, map[string]any{"task": task.copySnapshot()})
-			return
-		}
-		tasks, err := s.store.ListNodeDetectionTasks(r.Context(), 100)
-		if err != nil {
-			writeAPIError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		for _, task := range tasks {
-			if task.ID == id {
-				writeJSON(w, map[string]any{"task": taskSnapshotFromStore(task)})
-				return
-			}
-		}
-		writeAPIError(w, http.StatusNotFound, "检测任务不存在")
-	case "cancel":
-		if !s.nodeChecks.cancel(id) {
-			writeAPIError(w, http.StatusNotFound, "检测任务不存在或已结束")
-			return
-		}
-		writeJSON(w, map[string]any{"message": "已请求取消检测任务"})
-	default:
-		w.WriteHeader(http.StatusMethodNotAllowed)
+	tasks, err := s.store.ListNodeDetectionTasks(r.Context(), 100)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
 	}
+	for _, task := range tasks {
+		if task.ID == id {
+			writeJSON(w, map[string]any{"task": taskSnapshotFromStore(task)})
+			return
+		}
+	}
+	writeAPIError(w, http.StatusNotFound, "检测任务不存在")
+}
+
+func (s *Server) handleNodeCheckTaskCancel(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.nodeCheckTaskID(w, r)
+	if !ok {
+		return
+	}
+	if !s.nodeChecks.cancel(id) {
+		writeAPIError(w, http.StatusNotFound, "检测任务不存在或已结束")
+		return
+	}
+	writeJSON(w, map[string]any{"message": "已请求取消检测任务"})
+}
+
+func (s *Server) handleNodeCheckTaskEvents(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.nodeCheckTaskID(w, r)
+	if !ok {
+		return
+	}
+	s.streamNodeCheckTask(w, r, id)
 }
 
 func (s *Server) streamNodeCheckTask(w http.ResponseWriter, r *http.Request, id string) {

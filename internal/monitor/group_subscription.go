@@ -25,6 +25,17 @@ type subscriptionNode struct {
 // handleGroupSubscription serves token-protected, real-time group
 // subscriptions without requiring a WebUI session.
 func (s *Server) handleGroupSubscription(w http.ResponseWriter, r *http.Request) {
+	s.serveGroupSubscription(w, r, false)
+}
+
+// handleGroupSubscriptionEntry is the same document pinned to the entry
+// (single active outbound) mode. It is a separate route rather than a mode
+// query because subscription clients that only take a URL need it.
+func (s *Server) handleGroupSubscriptionEntry(w http.ResponseWriter, r *http.Request) {
+	s.serveGroupSubscription(w, r, true)
+}
+
+func (s *Server) serveGroupSubscription(w http.ResponseWriter, r *http.Request, entryMode bool) {
 	if s.store == nil {
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return
@@ -53,7 +64,7 @@ func (s *Server) handleGroupSubscription(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	mode := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("mode")))
-	if r.Pattern == "GET /sub/{groupID}/entry" {
+	if entryMode {
 		mode = "entry"
 	}
 	if mode == "" {

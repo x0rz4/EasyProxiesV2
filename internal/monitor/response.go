@@ -2,15 +2,19 @@ package monitor
 
 import (
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
+
+	json "easy_proxies/internal/jsonx"
 )
 
 // This file centralizes the HTTP response plumbing that handlers otherwise
-// repeat: turning a domain error into a status code, reading a path parameter
-// that must be a positive ID, and refusing a request whose backing service is
-// unavailable.
+// repeat: decoding a request body, serializing a response, turning a domain
+// error into a status code, reading a path parameter that must be a positive
+// ID, and refusing a request whose backing service is unavailable.
 //
 // The error mapping is deliberately three policies in one place rather than a
 // single function. Each domain classifies its own errors and they genuinely
@@ -124,4 +128,43 @@ func tagErrorStatus(err error) int {
 		return http.StatusServiceUnavailable
 	}
 	return http.StatusBadRequest
+}
+
+func writeJSON(w http.ResponseWriter, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	enc := json.NewEncoder(w)
+	_ = enc.Encode(payload)
+}
+
+// maxDefaultJSONBodyBytes bounds request bodies for handlers that do not
+// declare their own budget. JSON API payloads are small; the memory-DoS
+// surface is the low-privilege endpoints (/api/auth, /api/public/*, group and
+// subscription CRUD) that previously read the body without any cap. Handlers
+// needing a larger budget (import: 12 MB, tag routes: 64 KB) wrap r.Body
+// with http.MaxBytesReader themselves and call decodeJSONBody.
+const maxDefaultJSONBodyBytes = 1 << 20
+
+func decodeJSON(r *http.Request, dst any) error {
+	r.Body = http.MaxBytesReader(nil, r.Body, maxDefaultJSONBodyBytes)
+	return decodeJSONBody(r, dst)
+}
+
+// decodeJSONBody decodes without imposing a body limit; the caller owns the
+// budget.
+func decodeJSONBody(r *http.Request, dst any) error {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dst); err != nil {
+		return fmt.Errorf("请求格式错误: %w", err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return errors.New("请求只能包含一个 JSON 对象")
+	}
+	return nil
+}
+
+func writeAPIError(w http.ResponseWriter, status int, message string) {
+	w.WriteHeader(status)
+	writeJSON(w, map[string]any{"error": message})
 }

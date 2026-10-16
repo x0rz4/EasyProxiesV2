@@ -32,6 +32,10 @@ func newAPIKeyTestServer(t *testing.T) (*Server, *store.APIKey) {
 		store:    db,
 		logger:   log.New(io.Discard, "", 0),
 		sessions: map[string]*Session{},
+		// createSession stamps ExpiresAt from sessionTTL. A zero TTL makes every
+		// session expire the instant it is issued, so the session-based cases
+		// below would pass or fail depending on where the clock ticked.
+		sessionTTL: time.Hour,
 	}, key
 }
 

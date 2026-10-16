@@ -303,3 +303,73 @@ func (m *tagAPIRuntimeManager) ApplyGroupMembershipChanges(_ context.Context, no
 	m.membershipChanges = append(m.membershipChanges, append([]int64(nil), nodeIDs...))
 	return nil
 }
+
+// TestTagMutexGroupCRUDRoundTrip exercises all five mutex-group routes
+// end to end. They used to share one handler that dispatched on an action
+// string; each now has its own handler, so this pins that none of the five
+// actions was lost in that split.
+func TestTagMutexGroupCRUDRoundTrip(t *testing.T) {
+	server, _ := newTagAPITestServer(t)
+
+	// list: empty to start.
+	response := serveTagAPI(server, http.MethodGet, "/api/tags/mutex-groups", "")
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"mutex_groups"`) {
+		t.Fatalf("list status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	// create.
+	response = serveTagAPI(server, http.MethodPost, "/api/tags/mutex-groups", `{"name":"streaming","description":"视频"}`)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", response.Code, response.Body.String())
+	}
+	var created struct {
+		MutexGroup store.TagMutexGroup `json:"mutex_group"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode create: %v (body=%s)", err, response.Body.String())
+	}
+	if created.MutexGroup.ID <= 0 || created.MutexGroup.Name != "streaming" {
+		t.Fatalf("created group = %+v", created.MutexGroup)
+	}
+	path := "/api/tags/mutex-groups/" + strconv.FormatInt(created.MutexGroup.ID, 10)
+
+	// create with a duplicate name is a conflict, not a silent overwrite.
+	if response = serveTagAPI(server, http.MethodPost, "/api/tags/mutex-groups", `{"name":"streaming"}`); response.Code != http.StatusConflict {
+		t.Fatalf("duplicate create status=%d, want 409", response.Code)
+	}
+
+	// get.
+	response = serveTagAPI(server, http.MethodGet, path, "")
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "streaming") {
+		t.Fatalf("get status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	// update renames in place; the id must not change.
+	response = serveTagAPI(server, http.MethodPut, path, `{"name":"video"}`)
+	if response.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s", response.Code, response.Body.String())
+	}
+	var updated struct {
+		MutexGroup store.TagMutexGroup `json:"mutex_group"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &updated); err != nil {
+		t.Fatalf("decode update: %v", err)
+	}
+	if updated.MutexGroup.ID != created.MutexGroup.ID || updated.MutexGroup.Name != "video" {
+		t.Fatalf("updated group = %+v, want id %d name video", updated.MutexGroup, created.MutexGroup.ID)
+	}
+
+	// delete, then the same id is gone.
+	response = serveTagAPI(server, http.MethodDelete, path, "")
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"ok":true`) {
+		t.Fatalf("delete status=%d body=%s", response.Code, response.Body.String())
+	}
+	if response = serveTagAPI(server, http.MethodGet, path, ""); response.Code != http.StatusNotFound {
+		t.Fatalf("get after delete status=%d, want 404", response.Code)
+	}
+
+	// A non-numeric id is a 400 from pathID, not a 404.
+	if response = serveTagAPI(server, http.MethodGet, "/api/tags/mutex-groups/abc", ""); response.Code != http.StatusBadRequest {
+		t.Fatalf("non-numeric id status=%d, want 400; body=%s", response.Code, response.Body.String())
+	}
+}

@@ -171,43 +171,66 @@ type savedFilterView struct {
 	Spec nodeview.Spec `json:"spec"`
 }
 
-func (s *Server) handleSavedFilters(w http.ResponseWriter, r *http.Request, action string) {
+func (s *Server) handleSavedFiltersList(w http.ResponseWriter, r *http.Request) {
 	limitTagRequestBody(w, r)
 	if !s.requireStore(w, storeUnavailableGeneric) {
 		return
 	}
-	if action == "list" {
-		filters, err := s.store.ListSavedFilters(r.Context())
-		if err != nil {
-			writeAPIError(w, 500, err.Error())
-			return
-		}
-		items := make([]savedFilterView, 0, len(filters))
-		for _, filter := range filters {
-			var spec nodeview.Spec
-			if err := json.Unmarshal([]byte(filter.SpecJSON), &spec); err != nil {
-				writeAPIError(w, 500, "保存的筛选无效")
-				return
-			}
-			items = append(items, savedFilterView{filter, spec})
-		}
-		writeJSON(w, map[string]any{"filters": items})
+	filters, err := s.store.ListSavedFilters(r.Context())
+	if err != nil {
+		writeAPIError(w, 500, err.Error())
 		return
 	}
-	id := int64(0)
-	if action != "create" {
-		var ok bool
-		id, ok = pathID(w, r, "filterID", "无效筛选 ID")
-		if !ok {
+	items := make([]savedFilterView, 0, len(filters))
+	for _, filter := range filters {
+		var spec nodeview.Spec
+		if err := json.Unmarshal([]byte(filter.SpecJSON), &spec); err != nil {
+			writeAPIError(w, 500, "保存的筛选无效")
 			return
 		}
+		items = append(items, savedFilterView{filter, spec})
 	}
-	if action == "delete" {
-		if err := s.store.DeleteSavedFilter(r.Context(), id); err != nil {
-			writeAPIError(w, 404, err.Error())
-			return
-		}
-		writeJSON(w, map[string]bool{"success": true})
+	writeJSON(w, map[string]any{"filters": items})
+}
+
+func (s *Server) handleSavedFiltersCreate(w http.ResponseWriter, r *http.Request) {
+	s.saveFilter(w, r, 0)
+}
+
+func (s *Server) handleSavedFiltersUpdate(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.savedFilterID(w, r)
+	if !ok {
+		return
+	}
+	s.saveFilter(w, r, id)
+}
+
+func (s *Server) handleSavedFiltersDelete(w http.ResponseWriter, r *http.Request) {
+	limitTagRequestBody(w, r)
+	if !s.requireStore(w, storeUnavailableGeneric) {
+		return
+	}
+	id, ok := s.savedFilterID(w, r)
+	if !ok {
+		return
+	}
+	if err := s.store.DeleteSavedFilter(r.Context(), id); err != nil {
+		writeAPIError(w, 404, err.Error())
+		return
+	}
+	writeJSON(w, map[string]bool{"success": true})
+}
+
+// savedFilterID resolves the {filterID} path segment, answering 400 itself.
+func (s *Server) savedFilterID(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	return pathID(w, r, "filterID", "无效筛选 ID")
+}
+
+// saveFilter validates and upserts a saved filter. A zero id creates; a
+// non-zero id updates the existing row.
+func (s *Server) saveFilter(w http.ResponseWriter, r *http.Request, id int64) {
+	limitTagRequestBody(w, r)
+	if !s.requireStore(w, storeUnavailableGeneric) {
 		return
 	}
 	var input savedFilterView
