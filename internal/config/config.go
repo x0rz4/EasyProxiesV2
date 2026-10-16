@@ -1,7 +1,6 @@
 package config
 
 import (
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -11,8 +10,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -1193,21 +1190,11 @@ func tryBase64Decode(content string) (string, bool) {
 	if content == "" || strings.Contains(content, "://") {
 		return "", false
 	}
-	content = strings.Map(func(r rune) rune {
-		if r == '\r' || r == '\n' || r == ' ' || r == '\t' {
-			return -1
-		}
-		return r
-	}, content)
-	for _, enc := range []*base64.Encoding{
-		base64.StdEncoding, base64.URLEncoding,
-		base64.RawStdEncoding, base64.RawURLEncoding,
-	} {
-		if decoded, err := enc.DecodeString(content); err == nil {
-			return string(decoded), true
-		}
+	decoded, ok := nodecodec.DecodeBase64Loose(content)
+	if !ok {
+		return "", false
 	}
-	return "", false
+	return string(decoded), true
 }
 
 // parseNodesFromContent parses nodes from plain text content (one URI per line)
@@ -1377,48 +1364,27 @@ func IsProxyURI(s string) bool {
 	return false
 }
 
-// clashConfig represents a minimal Clash configuration for parsing proxies
+// clashConfig represents a minimal Clash configuration for parsing proxies.
 type clashConfig struct {
-	Proxies []clashProxy `yaml:"proxies"`
+	Proxies []nodecodec.ClashProxy `yaml:"proxies"`
 }
 
-type clashProxy struct {
-	Name              string                 `yaml:"name"`
-	Type              string                 `yaml:"type"`
-	Server            string                 `yaml:"server"`
-	Port              int                    `yaml:"port"`
-	UUID              string                 `yaml:"uuid"`
-	Username          string                 `yaml:"username"`
-	Password          string                 `yaml:"password"`
-	Cipher            string                 `yaml:"cipher"`
-	AlterId           int                    `yaml:"alterId"`
-	Network           string                 `yaml:"network"`
-	TLS               bool                   `yaml:"tls"`
-	SkipCertVerify    bool                   `yaml:"skip-cert-verify"`
-	ServerName        string                 `yaml:"servername"`
-	SNI               string                 `yaml:"sni"`
-	Flow              string                 `yaml:"flow"`
-	UDP               bool                   `yaml:"udp"`
-	WSOpts            *clashWSOptions        `yaml:"ws-opts"`
-	GrpcOpts          *clashGrpcOptions      `yaml:"grpc-opts"`
-	RealityOpts       *clashRealityOptions   `yaml:"reality-opts"`
-	ClientFingerprint string                 `yaml:"client-fingerprint"`
-	Plugin            string                 `yaml:"plugin"`
-	PluginOpts        map[string]interface{} `yaml:"plugin-opts"`
-}
-
-type clashWSOptions struct {
-	Path    string            `yaml:"path"`
-	Headers map[string]string `yaml:"headers"`
-}
-
-type clashGrpcOptions struct {
-	GrpcServiceName string `yaml:"grpc-service-name"`
-}
-
-type clashRealityOptions struct {
-	PublicKey string `yaml:"public-key"`
-	ShortID   string `yaml:"short-id"`
+// singBoxIssue renders a conversion cause in the importer's own language. The
+// codec reports causes, not prose, so the wording stays here with the rest of
+// the user-facing import messages.
+func singBoxIssue(err error) string {
+	switch {
+	case errors.Is(err, nodecodec.ErrUnsupportedProtocol):
+		return "暂不支持的 outbound 类型"
+	case errors.Is(err, nodecodec.ErrLossyConversion):
+		return "包含 detour，无法无损转换"
+	case errors.Is(err, nodecodec.ErrMissingEndpoint):
+		return "缺少有效的 server/server_port"
+	case errors.Is(err, nodecodec.ErrMissingCredentials):
+		return "缺少凭据（method/password/uuid）"
+	default:
+		return err.Error()
+	}
 }
 
 // parseSingBoxJSON accepts standard sing-box JSON and its commonly used JSONC
@@ -1437,25 +1403,26 @@ func parseSingBoxJSON(content string) ([]NodeConfig, bool, []string, error) {
 	var nodes []NodeConfig
 	var issues []string
 	for index, outbound := range document.Outbounds {
-		tag := mapString(outbound, "tag")
-		kind := strings.ToLower(mapString(outbound, "type"))
+		tag := nodecodec.MapString(outbound, "tag")
+		kind := strings.ToLower(nodecodec.MapString(outbound, "type"))
 		if kind == "" {
 			issues = append(issues, fmt.Sprintf("outbound %d 缺少 type", index+1))
 			continue
 		}
 		switch kind {
 		case "selector", "urltest", "direct", "block", "dns":
-			issues = append(issues, fmt.Sprintf("%s (%s): 非代理出口，已跳过", defaultString(tag, fmt.Sprintf("outbound-%d", index+1)), kind))
+			issues = append(issues, fmt.Sprintf("%s (%s): 非代理出口，已跳过", nodecodec.DefaultString(tag, fmt.Sprintf("outbound-%d", index+1)), kind))
 			continue
 		}
-		uri, convertErr := singBoxOutboundURI(outbound)
+		spec, convertErr := nodecodec.FromSingBoxOutbound(outbound)
 		if convertErr != nil {
-			issues = append(issues, fmt.Sprintf("%s (%s): %v", defaultString(tag, fmt.Sprintf("outbound-%d", index+1)), kind, convertErr))
+			issues = append(issues, fmt.Sprintf("%s (%s): %s", nodecodec.DefaultString(tag, fmt.Sprintf("outbound-%d", index+1)), kind, singBoxIssue(convertErr)))
 			continue
 		}
-		node := NodeConfig{Name: tag, URI: uri}
+		spec.Name = tag
+		node := NodeConfig{Name: tag, URI: spec.ToURI()}
 		if err := enrichNodeIdentity(&node); err != nil {
-			issues = append(issues, fmt.Sprintf("%s (%s): %v", defaultString(tag, fmt.Sprintf("outbound-%d", index+1)), kind, err))
+			issues = append(issues, fmt.Sprintf("%s (%s): %v", nodecodec.DefaultString(tag, fmt.Sprintf("outbound-%d", index+1)), kind, err))
 			continue
 		}
 		nodes = append(nodes, node)
@@ -1469,189 +1436,6 @@ func parseSingBoxJSON(content string) ([]NodeConfig, bool, []string, error) {
 	return nodes, true, issues, nil
 }
 
-func singBoxOutboundURI(outbound map[string]any) (string, error) {
-	kind := strings.ToLower(mapString(outbound, "type"))
-	if kind == "shadowsocks" {
-		kind = "ss"
-	}
-	if kind == "hy2" {
-		kind = "hysteria2"
-	}
-	switch kind {
-	case "vmess", "vless", "trojan", "ss", "hysteria2", "anytls", "http", "socks", "socks5":
-	default:
-		return "", fmt.Errorf("暂不支持的 outbound 类型")
-	}
-	if mapString(outbound, "detour") != "" {
-		return "", errors.New("包含 detour，无法无损转换")
-	}
-	server := mapString(outbound, "server")
-	port := mapInt(outbound, "server_port")
-	if server == "" || port <= 0 || port > 65535 {
-		return "", errors.New("缺少有效的 server/server_port")
-	}
-	if kind == "socks" {
-		kind = "socks5"
-	}
-	q := url.Values{}
-	for _, key := range []string{"flow", "packet_encoding", "network"} {
-		if value := mapString(outbound, key); value != "" {
-			q.Set(key, value)
-		}
-	}
-	if kind == "vmess" {
-		q.Set("alterId", strconv.Itoa(mapInt(outbound, "alter_id")))
-		if value := mapString(outbound, "security"); value != "" {
-			q.Set("encryption", value)
-		}
-	}
-	if kind == "ss" {
-		method, password := mapString(outbound, "method"), mapString(outbound, "password")
-		if method == "" || password == "" {
-			return "", errors.New("缺少 method/password")
-		}
-		encoded := base64.RawURLEncoding.EncodeToString([]byte(method + ":" + password))
-		u := &url.URL{Scheme: "ss", Host: net.JoinHostPort(server, strconv.Itoa(port)), User: url.User(encoded), Fragment: mapString(outbound, "tag")}
-		if plugin := mapString(outbound, "plugin"); plugin != "" {
-			q.Set("plugin", plugin)
-			q.Set("plugin-opts", mapString(outbound, "plugin_opts"))
-		}
-		u.RawQuery = q.Encode()
-		return u.String(), nil
-	}
-	if tls := mapMap(outbound, "tls"); tls != nil && mapBool(tls, "enabled") {
-		q.Set("security", "tls")
-		if value := mapString(tls, "server_name"); value != "" {
-			q.Set("sni", value)
-		}
-		if mapBool(tls, "insecure") {
-			q.Set("insecure", "true")
-		}
-		if alpn := mapStringSlice(tls, "alpn"); len(alpn) > 0 {
-			q.Set("alpn", strings.Join(alpn, ","))
-		}
-		if utls := mapMap(tls, "utls"); utls != nil && mapBool(utls, "enabled") {
-			q.Set("fp", mapString(utls, "fingerprint"))
-		}
-		if reality := mapMap(tls, "reality"); reality != nil && mapBool(reality, "enabled") {
-			q.Set("security", "reality")
-			q.Set("pbk", mapString(reality, "public_key"))
-			q.Set("sid", mapString(reality, "short_id"))
-		}
-	}
-	if transport := mapMap(outbound, "transport"); transport != nil {
-		transportType := mapString(transport, "type")
-		if transportType != "" {
-			q.Set("type", transportType)
-		}
-		if value := mapString(transport, "path"); value != "" {
-			q.Set("path", value)
-		}
-		if value := mapString(transport, "service_name"); value != "" {
-			q.Set("serviceName", value)
-		}
-		if headers := mapMap(transport, "headers"); headers != nil {
-			if host := mapString(headers, "Host"); host != "" {
-				q.Set("host", host)
-			} else if host := mapString(headers, "host"); host != "" {
-				q.Set("host", host)
-			}
-		}
-	}
-	if kind == "hysteria2" {
-		if value := mapInt(outbound, "up_mbps"); value > 0 {
-			q.Set("upMbps", strconv.Itoa(value))
-		}
-		if value := mapInt(outbound, "down_mbps"); value > 0 {
-			q.Set("downMbps", strconv.Itoa(value))
-		}
-		if obfs := mapMap(outbound, "obfs"); obfs != nil {
-			q.Set("obfs", mapString(obfs, "type"))
-			q.Set("obfs-password", mapString(obfs, "password"))
-		}
-	}
-	u := &url.URL{Scheme: kind, Host: net.JoinHostPort(server, strconv.Itoa(port)), Fragment: mapString(outbound, "tag")}
-	username, password := mapString(outbound, "username"), mapString(outbound, "password")
-	switch kind {
-	case "vmess", "vless":
-		username = mapString(outbound, "uuid")
-	case "trojan", "hysteria2", "anytls":
-		username = password
-	}
-	if username != "" {
-		if password != "" && kind != "trojan" && kind != "hysteria2" && kind != "anytls" {
-			u.User = url.UserPassword(username, password)
-		} else {
-			u.User = url.User(username)
-		}
-	}
-	if kind == "http" {
-		if path := mapString(outbound, "path"); path != "" {
-			u.Path = path
-		}
-	}
-	u.RawQuery = q.Encode()
-	return u.String(), nil
-}
-
-func mapString(values map[string]any, key string) string {
-	value, ok := values[key]
-	if !ok || value == nil {
-		return ""
-	}
-	if text, ok := value.(string); ok {
-		return text
-	}
-	if list, ok := value.([]any); ok && len(list) > 0 {
-		return fmt.Sprint(list[0])
-	}
-	if list, ok := value.([]string); ok && len(list) > 0 {
-		return list[0]
-	}
-	return fmt.Sprint(value)
-}
-
-func mapInt(values map[string]any, key string) int {
-	value := mapString(values, key)
-	parsed, _ := strconv.Atoi(strings.TrimSuffix(value, ".0"))
-	return parsed
-}
-
-func mapBool(values map[string]any, key string) bool {
-	value, ok := values[key]
-	if !ok {
-		return false
-	}
-	if flag, ok := value.(bool); ok {
-		return flag
-	}
-	return strings.EqualFold(fmt.Sprint(value), "true") || fmt.Sprint(value) == "1"
-}
-
-func mapMap(values map[string]any, key string) map[string]any {
-	value, _ := values[key].(map[string]any)
-	return value
-}
-
-func mapStringSlice(values map[string]any, key string) []string {
-	if stringsList, ok := values[key].([]string); ok {
-		return append([]string(nil), stringsList...)
-	}
-	raw, _ := values[key].([]any)
-	result := make([]string, 0, len(raw))
-	for _, value := range raw {
-		result = append(result, fmt.Sprint(value))
-	}
-	return result
-}
-
-func defaultString(value, fallback string) string {
-	if strings.TrimSpace(value) == "" {
-		return fallback
-	}
-	return value
-}
-
 // parseClashYAML parses Clash YAML format and converts to NodeConfig
 func parseClashYAML(content string) ([]NodeConfig, error) {
 	var clash clashConfig
@@ -1662,16 +1446,24 @@ func parseClashYAML(content string) ([]NodeConfig, error) {
 	var nodes []NodeConfig
 	var issues []string
 	for _, proxy := range clash.Proxies {
-		uri := convertClashProxyToURI(proxy)
 		label := strings.TrimSpace(proxy.Name)
 		if label == "" {
 			label = "未命名节点"
 		}
-		if uri == "" {
-			issues = append(issues, fmt.Sprintf("%s: 不支持 type=%q", label, proxy.Type))
+		// Clash entry → Spec → link. Going through Spec keeps the renderer and
+		// the parser in lockstep: the old hand-written formatters emitted only
+		// the fields they knew about and dropped vmess alterId and cipher.
+		spec, err := nodecodec.FromClashProxy(proxy)
+		if err != nil {
+			if errors.Is(err, nodecodec.ErrUnsupportedProtocol) {
+				issues = append(issues, fmt.Sprintf("%s: 不支持 type=%q", label, proxy.Type))
+				continue
+			}
+			issues = append(issues, fmt.Sprintf("%s (%s): %v", label, proxy.Type, err))
 			continue
 		}
-		node := NodeConfig{Name: proxy.Name, URI: uri}
+		spec.Name = proxy.Name
+		node := NodeConfig{Name: proxy.Name, URI: spec.ToURI()}
 		if err := enrichNodeIdentity(&node); err != nil {
 			issues = append(issues, fmt.Sprintf("%s (%s): %v", label, proxy.Type, err))
 			continue
@@ -1688,234 +1480,6 @@ func parseClashYAML(content string) ([]NodeConfig, error) {
 		return nil, fmt.Errorf("Clash/Mihomo YAML 中没有可用节点: %s", strings.Join(issues, "; "))
 	}
 	return nodes, nil
-}
-
-// convertClashProxyToURI converts a Clash proxy config to a standard URI
-func convertClashProxyToURI(p clashProxy) string {
-	switch strings.ToLower(p.Type) {
-	case "vmess":
-		return buildVMessURI(p)
-	case "vless":
-		return buildVLESSURI(p)
-	case "trojan":
-		return buildTrojanURI(p)
-	case "ss", "shadowsocks":
-		return buildShadowsocksURI(p)
-	case "hysteria2", "hy2":
-		return buildHysteria2URI(p)
-	case "anytls":
-		return buildAnyTLSURI(p)
-	case "http", "socks", "socks5":
-		return buildSimpleProxyURI(p)
-	default:
-		return ""
-	}
-}
-
-func buildSimpleProxyURI(p clashProxy) string {
-	scheme := strings.ToLower(p.Type)
-	if scheme == "socks" {
-		scheme = "socks5"
-	}
-	u := &url.URL{Scheme: scheme, Host: net.JoinHostPort(p.Server, strconv.Itoa(p.Port)), Fragment: p.Name}
-	if p.Username != "" || p.Password != "" {
-		u.User = url.UserPassword(p.Username, p.Password)
-	}
-	q := url.Values{}
-	if p.Network != "" {
-		q.Set("network", p.Network)
-	}
-	if p.TLS {
-		q.Set("security", "tls")
-		if p.ServerName != "" {
-			q.Set("sni", p.ServerName)
-		} else if p.SNI != "" {
-			q.Set("sni", p.SNI)
-		}
-	}
-	if p.SkipCertVerify {
-		q.Set("insecure", "true")
-	}
-	u.RawQuery = q.Encode()
-	return u.String()
-}
-
-func buildVMessURI(p clashProxy) string {
-	params := url.Values{}
-	if p.Network != "" && p.Network != "tcp" {
-		params.Set("type", p.Network)
-	}
-	if p.TLS {
-		params.Set("security", "tls")
-		if p.ServerName != "" {
-			params.Set("sni", p.ServerName)
-		} else if p.SNI != "" {
-			params.Set("sni", p.SNI)
-		}
-	}
-	if p.WSOpts != nil {
-		if p.WSOpts.Path != "" {
-			params.Set("path", p.WSOpts.Path)
-		}
-		if host, ok := p.WSOpts.Headers["Host"]; ok {
-			params.Set("host", host)
-		}
-	}
-	if p.ClientFingerprint != "" {
-		params.Set("fp", p.ClientFingerprint)
-	}
-
-	query := ""
-	if len(params) > 0 {
-		query = "?" + params.Encode()
-	}
-
-	return fmt.Sprintf("vmess://%s@%s:%d%s#%s", p.UUID, p.Server, p.Port, query, url.QueryEscape(p.Name))
-}
-
-func buildVLESSURI(p clashProxy) string {
-	params := url.Values{}
-	params.Set("encryption", "none")
-
-	if p.Network != "" && p.Network != "tcp" {
-		params.Set("type", p.Network)
-	}
-	if p.Flow != "" {
-		params.Set("flow", p.Flow)
-	}
-	if p.TLS {
-		params.Set("security", "tls")
-		if p.ServerName != "" {
-			params.Set("sni", p.ServerName)
-		} else if p.SNI != "" {
-			params.Set("sni", p.SNI)
-		}
-	}
-	if p.RealityOpts != nil {
-		params.Set("security", "reality")
-		if p.RealityOpts.PublicKey != "" {
-			params.Set("pbk", p.RealityOpts.PublicKey)
-		}
-		if p.RealityOpts.ShortID != "" {
-			params.Set("sid", p.RealityOpts.ShortID)
-		}
-		if p.ServerName != "" {
-			params.Set("sni", p.ServerName)
-		}
-	}
-	if p.WSOpts != nil {
-		if p.WSOpts.Path != "" {
-			params.Set("path", p.WSOpts.Path)
-		}
-		if host, ok := p.WSOpts.Headers["Host"]; ok {
-			params.Set("host", host)
-		}
-	}
-	if p.GrpcOpts != nil && p.GrpcOpts.GrpcServiceName != "" {
-		params.Set("serviceName", p.GrpcOpts.GrpcServiceName)
-	}
-	if p.ClientFingerprint != "" {
-		params.Set("fp", p.ClientFingerprint)
-	}
-
-	return fmt.Sprintf("vless://%s@%s:%d?%s#%s", p.UUID, p.Server, p.Port, params.Encode(), url.QueryEscape(p.Name))
-}
-
-func buildTrojanURI(p clashProxy) string {
-	params := url.Values{}
-	if p.Network != "" && p.Network != "tcp" {
-		params.Set("type", p.Network)
-	}
-	if p.ServerName != "" {
-		params.Set("sni", p.ServerName)
-	} else if p.SNI != "" {
-		params.Set("sni", p.SNI)
-	}
-	if p.SkipCertVerify {
-		params.Set("allowInsecure", "1")
-	}
-	if p.WSOpts != nil {
-		if p.WSOpts.Path != "" {
-			params.Set("path", p.WSOpts.Path)
-		}
-		if host, ok := p.WSOpts.Headers["Host"]; ok {
-			params.Set("host", host)
-		}
-	}
-	if p.ClientFingerprint != "" {
-		params.Set("fp", p.ClientFingerprint)
-	}
-
-	query := ""
-	if len(params) > 0 {
-		query = "?" + params.Encode()
-	}
-
-	return fmt.Sprintf("trojan://%s@%s:%d%s#%s", p.Password, p.Server, p.Port, query, url.QueryEscape(p.Name))
-}
-
-func buildShadowsocksURI(p clashProxy) string {
-	// Encode method:password in base64
-	userInfo := base64.StdEncoding.EncodeToString([]byte(p.Cipher + ":" + p.Password))
-	params := url.Values{}
-	if p.Plugin != "" {
-		params.Set("plugin", p.Plugin)
-		if len(p.PluginOpts) > 0 {
-			keys := make([]string, 0, len(p.PluginOpts))
-			for key := range p.PluginOpts {
-				keys = append(keys, key)
-			}
-			sort.Strings(keys)
-			parts := make([]string, 0, len(keys))
-			for _, key := range keys {
-				parts = append(parts, key+"="+fmt.Sprint(p.PluginOpts[key]))
-			}
-			params.Set("plugin-opts", strings.Join(parts, ";"))
-		}
-	}
-	query := ""
-	if len(params) > 0 {
-		query = "?" + params.Encode()
-	}
-	return fmt.Sprintf("ss://%s@%s:%d%s#%s", userInfo, p.Server, p.Port, query, url.QueryEscape(p.Name))
-}
-
-func buildHysteria2URI(p clashProxy) string {
-	params := url.Values{}
-	if p.ServerName != "" {
-		params.Set("sni", p.ServerName)
-	} else if p.SNI != "" {
-		params.Set("sni", p.SNI)
-	}
-	if p.SkipCertVerify {
-		params.Set("insecure", "1")
-	}
-
-	query := ""
-	if len(params) > 0 {
-		query = "?" + params.Encode()
-	}
-
-	return fmt.Sprintf("hysteria2://%s@%s:%d%s#%s", p.Password, p.Server, p.Port, query, url.QueryEscape(p.Name))
-}
-
-func buildAnyTLSURI(p clashProxy) string {
-	params := url.Values{}
-	if p.ServerName != "" {
-		params.Set("sni", p.ServerName)
-	} else if p.SNI != "" {
-		params.Set("sni", p.SNI)
-	}
-	if p.SkipCertVerify {
-		params.Set("insecure", "1")
-	}
-
-	query := ""
-	if len(params) > 0 {
-		query = "?" + params.Encode()
-	}
-
-	return fmt.Sprintf("anytls://%s@%s:%d%s#%s", p.Password, p.Server, p.Port, query, url.QueryEscape(p.Name))
 }
 
 // RLock acquires a read lock on the config.

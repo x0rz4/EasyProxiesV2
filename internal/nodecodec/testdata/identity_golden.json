@@ -1,0 +1,900 @@
+[
+  {
+    "name": "vmess/legacy/padded-std",
+    "uri": "vmess://eyJhZGQiOiJFeGFtcGxlLkNPTSIsImFpZCI6IjAiLCJhbHBuIjoiaDIsaHR0cC8xLjEiLCJmcCI6ImNocm9tZSIsImhvc3QiOiJjZG4uZXhhbXBsZS5jb20iLCJpZCI6IjRGOEE5QzBFLTExMTEtMjIyMi0zMzMzLTQ0NDQ1NTU1NjY2NiIsIm5ldCI6IndzIiwicGF0aCI6Ii93cyIsInBvcnQiOiI0NDMiLCJwcyI6IuekuuS+i+iKgueCuSIsInNjeSI6ImF1dG8iLCJzbmkiOiJlZGdlLmV4YW1wbGUuY29tIiwidGxzIjoidGxzIiwidHlwZSI6Im5vbmUiLCJ2IjoiMiJ9#padded-std",
+    "protocol": "vmess",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vmess\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"4f8a9c0e-1111-2222-3333-444455556666\"},\"options\":{\"alpn\":[\"h2,http/1.1\"],\"alterid\":[\"0\"],\"encryption\":[\"auto\"],\"fp\":[\"chrome\"],\"host\":[\"cdn.example.com\"],\"insecure\":[\"false\"],\"path\":[\"/ws\"],\"security\":[\"tls\"],\"sni\":[\"edge.example.com\"],\"type\":[\"ws\"]}}",
+    "hash": "v1:fca95249e533a1271771db8e018de34bc2390fd04ae4de51f67e0a1de64cec64",
+    "endpoint_key": "vmess|example.com|443"
+  },
+  {
+    "name": "vmess/legacy/padded-url",
+    "uri": "vmess://eyJhZGQiOiJFeGFtcGxlLkNPTSIsImFpZCI6IjAiLCJhbHBuIjoiaDIsaHR0cC8xLjEiLCJmcCI6ImNocm9tZSIsImhvc3QiOiJjZG4uZXhhbXBsZS5jb20iLCJpZCI6IjRGOEE5QzBFLTExMTEtMjIyMi0zMzMzLTQ0NDQ1NTU1NjY2NiIsIm5ldCI6IndzIiwicGF0aCI6Ii93cyIsInBvcnQiOiI0NDMiLCJwcyI6IuekuuS-i-iKgueCuSIsInNjeSI6ImF1dG8iLCJzbmkiOiJlZGdlLmV4YW1wbGUuY29tIiwidGxzIjoidGxzIiwidHlwZSI6Im5vbmUiLCJ2IjoiMiJ9#padded-url",
+    "protocol": "vmess",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vmess\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"4f8a9c0e-1111-2222-3333-444455556666\"},\"options\":{\"alpn\":[\"h2,http/1.1\"],\"alterid\":[\"0\"],\"encryption\":[\"auto\"],\"fp\":[\"chrome\"],\"host\":[\"cdn.example.com\"],\"insecure\":[\"false\"],\"path\":[\"/ws\"],\"security\":[\"tls\"],\"sni\":[\"edge.example.com\"],\"type\":[\"ws\"]}}",
+    "hash": "v1:fca95249e533a1271771db8e018de34bc2390fd04ae4de51f67e0a1de64cec64",
+    "endpoint_key": "vmess|example.com|443"
+  },
+  {
+    "name": "vmess/legacy/raw-std",
+    "uri": "vmess://eyJhZGQiOiJFeGFtcGxlLkNPTSIsImFpZCI6IjAiLCJhbHBuIjoiaDIsaHR0cC8xLjEiLCJmcCI6ImNocm9tZSIsImhvc3QiOiJjZG4uZXhhbXBsZS5jb20iLCJpZCI6IjRGOEE5QzBFLTExMTEtMjIyMi0zMzMzLTQ0NDQ1NTU1NjY2NiIsIm5ldCI6IndzIiwicGF0aCI6Ii93cyIsInBvcnQiOiI0NDMiLCJwcyI6IuekuuS+i+iKgueCuSIsInNjeSI6ImF1dG8iLCJzbmkiOiJlZGdlLmV4YW1wbGUuY29tIiwidGxzIjoidGxzIiwidHlwZSI6Im5vbmUiLCJ2IjoiMiJ9#raw-std",
+    "protocol": "vmess",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vmess\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"4f8a9c0e-1111-2222-3333-444455556666\"},\"options\":{\"alpn\":[\"h2,http/1.1\"],\"alterid\":[\"0\"],\"encryption\":[\"auto\"],\"fp\":[\"chrome\"],\"host\":[\"cdn.example.com\"],\"insecure\":[\"false\"],\"path\":[\"/ws\"],\"security\":[\"tls\"],\"sni\":[\"edge.example.com\"],\"type\":[\"ws\"]}}",
+    "hash": "v1:fca95249e533a1271771db8e018de34bc2390fd04ae4de51f67e0a1de64cec64",
+    "endpoint_key": "vmess|example.com|443"
+  },
+  {
+    "name": "vmess/legacy/raw-url",
+    "uri": "vmess://eyJhZGQiOiJFeGFtcGxlLkNPTSIsImFpZCI6IjAiLCJhbHBuIjoiaDIsaHR0cC8xLjEiLCJmcCI6ImNocm9tZSIsImhvc3QiOiJjZG4uZXhhbXBsZS5jb20iLCJpZCI6IjRGOEE5QzBFLTExMTEtMjIyMi0zMzMzLTQ0NDQ1NTU1NjY2NiIsIm5ldCI6IndzIiwicGF0aCI6Ii93cyIsInBvcnQiOiI0NDMiLCJwcyI6IuekuuS-i-iKgueCuSIsInNjeSI6ImF1dG8iLCJzbmkiOiJlZGdlLmV4YW1wbGUuY29tIiwidGxzIjoidGxzIiwidHlwZSI6Im5vbmUiLCJ2IjoiMiJ9#raw-url",
+    "protocol": "vmess",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vmess\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"4f8a9c0e-1111-2222-3333-444455556666\"},\"options\":{\"alpn\":[\"h2,http/1.1\"],\"alterid\":[\"0\"],\"encryption\":[\"auto\"],\"fp\":[\"chrome\"],\"host\":[\"cdn.example.com\"],\"insecure\":[\"false\"],\"path\":[\"/ws\"],\"security\":[\"tls\"],\"sni\":[\"edge.example.com\"],\"type\":[\"ws\"]}}",
+    "hash": "v1:fca95249e533a1271771db8e018de34bc2390fd04ae4de51f67e0a1de64cec64",
+    "endpoint_key": "vmess|example.com|443"
+  },
+  {
+    "name": "vmess/legacy/line-wrapped",
+    "uri": "vmess://eyJhZGQiOiJFeGFtcGxlLkNPTSIsImFpZCI6IjAi\nLCJhbHBuIjoiaDIsaHR0cC8xLjEiLCJmcCI6ImNocm9tZSIsImhvc3QiOiJjZG4uZXhhbXBsZS5jb20iLCJpZCI6IjRGOEE5QzBFLTExMTEtMjIyMi0zMzMzLTQ0NDQ1NTU1NjY2NiIsIm5ldCI6IndzIiwicGF0aCI6Ii93cyIsInBvcnQiOiI0NDMiLCJwcyI6IuekuuS+i+iKgueCuSIsInNjeSI6ImF1dG8iLCJzbmkiOiJlZGdlLmV4YW1wbGUuY29tIiwidGxzIjoidGxzIiwidHlwZSI6Im5vbmUiLCJ2IjoiMiJ9#wrapped",
+    "protocol": "vmess",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vmess\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"4f8a9c0e-1111-2222-3333-444455556666\"},\"options\":{\"alpn\":[\"h2,http/1.1\"],\"alterid\":[\"0\"],\"encryption\":[\"auto\"],\"fp\":[\"chrome\"],\"host\":[\"cdn.example.com\"],\"insecure\":[\"false\"],\"path\":[\"/ws\"],\"security\":[\"tls\"],\"sni\":[\"edge.example.com\"],\"type\":[\"ws\"]}}",
+    "hash": "v1:fca95249e533a1271771db8e018de34bc2390fd04ae4de51f67e0a1de64cec64",
+    "endpoint_key": "vmess|example.com|443"
+  },
+  {
+    "name": "vmess/legacy/uppercase-uuid-lowered",
+    "uri": "vmess://eyJhZGQiOiJFeGFtcGxlLkNPTSIsImFpZCI6IjAiLCJhbHBuIjoiaDIsaHR0cC8xLjEiLCJmcCI6ImNocm9tZSIsImhvc3QiOiJjZG4uZXhhbXBsZS5jb20iLCJpZCI6IjRGOEE5QzBFLTExMTEtMjIyMi0zMzMzLTQ0NDQ1NTU1NjY2NiIsIm5ldCI6IndzIiwicGF0aCI6Ii93cyIsInBvcnQiOiI0NDMiLCJwcyI6IuekuuS+i+iKgueCuSIsInNjeSI6ImF1dG8iLCJzbmkiOiJlZGdlLmV4YW1wbGUuY29tIiwidGxzIjoidGxzIiwidHlwZSI6Im5vbmUiLCJ2IjoiMiJ9#uuid-case",
+    "protocol": "vmess",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vmess\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"4f8a9c0e-1111-2222-3333-444455556666\"},\"options\":{\"alpn\":[\"h2,http/1.1\"],\"alterid\":[\"0\"],\"encryption\":[\"auto\"],\"fp\":[\"chrome\"],\"host\":[\"cdn.example.com\"],\"insecure\":[\"false\"],\"path\":[\"/ws\"],\"security\":[\"tls\"],\"sni\":[\"edge.example.com\"],\"type\":[\"ws\"]}}",
+    "hash": "v1:fca95249e533a1271771db8e018de34bc2390fd04ae4de51f67e0a1de64cec64",
+    "endpoint_key": "vmess|example.com|443"
+  },
+  {
+    "name": "vmess/legacy/missing-aid-scy-net",
+    "uri": "vmess://eyJhZGQiOiJFeGFtcGxlLkNPTSIsImFscG4iOiJoMixodHRwLzEuMSIsImZwIjoiY2hyb21lIiwiaG9zdCI6ImNkbi5leGFtcGxlLmNvbSIsImlkIjoiNEY4QTlDMEUtMTExMS0yMjIyLTMzMzMtNDQ0NDU1NTU2NjY2IiwicGF0aCI6Ii93cyIsInBvcnQiOiI0NDMiLCJwcyI6IuekuuS+i+iKgueCuSIsInNuaSI6ImVkZ2UuZXhhbXBsZS5jb20iLCJ0bHMiOiJ0bHMiLCJ0eXBlIjoibm9uZSIsInYiOiIyIn0=",
+    "protocol": "vmess",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vmess\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"4f8a9c0e-1111-2222-3333-444455556666\"},\"options\":{\"alpn\":[\"h2,http/1.1\"],\"alterid\":[\"0\"],\"encryption\":[\"auto\"],\"fp\":[\"chrome\"],\"insecure\":[\"false\"],\"security\":[\"tls\"],\"sni\":[\"edge.example.com\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:6da5608a6c10e7b0456b2d045ce9d1f2702a9d3949be9b44d153eddd9fb7ebd9",
+    "endpoint_key": "vmess|example.com|443"
+  },
+  {
+    "name": "vmess/legacy/numeric-aid",
+    "uri": "vmess://eyJhZGQiOiJFeGFtcGxlLkNPTSIsImFpZCI6NjQsImFscG4iOiJoMixodHRwLzEuMSIsImZwIjoiY2hyb21lIiwiaG9zdCI6ImNkbi5leGFtcGxlLmNvbSIsImlkIjoiNEY4QTlDMEUtMTExMS0yMjIyLTMzMzMtNDQ0NDU1NTU2NjY2IiwibmV0Ijoid3MiLCJwYXRoIjoiL3dzIiwicG9ydCI6IjQ0MyIsInBzIjoi56S65L6L6IqC54K5Iiwic2N5IjoiYXV0byIsInNuaSI6ImVkZ2UuZXhhbXBsZS5jb20iLCJ0bHMiOiJ0bHMiLCJ0eXBlIjoibm9uZSIsInYiOiIyIn0=",
+    "protocol": "vmess",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vmess\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"4f8a9c0e-1111-2222-3333-444455556666\"},\"options\":{\"alpn\":[\"h2,http/1.1\"],\"alterid\":[\"64\"],\"encryption\":[\"auto\"],\"fp\":[\"chrome\"],\"host\":[\"cdn.example.com\"],\"insecure\":[\"false\"],\"path\":[\"/ws\"],\"security\":[\"tls\"],\"sni\":[\"edge.example.com\"],\"type\":[\"ws\"]}}",
+    "hash": "v1:71c0304dc64324c7dd75c9b966aa3255a58289b8473813abc0627cbb866e5d9d",
+    "endpoint_key": "vmess|example.com|443"
+  },
+  {
+    "name": "vmess/legacy/grpc-service",
+    "uri": "vmess://eyJhZGQiOiJFeGFtcGxlLkNPTSIsImFpZCI6IjAiLCJhbHBuIjoiaDIsaHR0cC8xLjEiLCJmcCI6ImNocm9tZSIsImhvc3QiOiJjZG4uZXhhbXBsZS5jb20iLCJpZCI6IjRGOEE5QzBFLTExMTEtMjIyMi0zMzMzLTQ0NDQ1NTU1NjY2NiIsIm5ldCI6ImdycGMiLCJwYXRoIjoic3ZjLW5hbWUiLCJwb3J0IjoiNDQzIiwicHMiOiLnpLrkvovoioLngrkiLCJzY3kiOiJhdXRvIiwic25pIjoiZWRnZS5leGFtcGxlLmNvbSIsInRscyI6InRscyIsInR5cGUiOiJub25lIiwidiI6IjIifQ==",
+    "protocol": "vmess",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vmess\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"4f8a9c0e-1111-2222-3333-444455556666\"},\"options\":{\"alpn\":[\"h2,http/1.1\"],\"alterid\":[\"0\"],\"encryption\":[\"auto\"],\"fp\":[\"chrome\"],\"host\":[\"cdn.example.com\"],\"insecure\":[\"false\"],\"path\":[\"svc-name\"],\"security\":[\"tls\"],\"sni\":[\"edge.example.com\"],\"type\":[\"grpc\"]}}",
+    "hash": "v1:f5fdfde477cf715878938304b16f00d5e0b437be2c08ad3c86734c362b49efc5",
+    "endpoint_key": "vmess|example.com|443"
+  },
+  {
+    "name": "vmess/legacy/h2",
+    "uri": "vmess://eyJhZGQiOiJFeGFtcGxlLkNPTSIsImFpZCI6IjAiLCJhbHBuIjoiaDIsaHR0cC8xLjEiLCJmcCI6ImNocm9tZSIsImhvc3QiOiJjZG4uZXhhbXBsZS5jb20iLCJpZCI6IjRGOEE5QzBFLTExMTEtMjIyMi0zMzMzLTQ0NDQ1NTU1NjY2NiIsIm5ldCI6ImgyIiwicGF0aCI6Ii93cyIsInBvcnQiOiI0NDMiLCJwcyI6IuekuuS+i+iKgueCuSIsInNjeSI6ImF1dG8iLCJzbmkiOiJlZGdlLmV4YW1wbGUuY29tIiwidGxzIjoidGxzIiwidHlwZSI6Im5vbmUiLCJ2IjoiMiJ9",
+    "protocol": "vmess",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vmess\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"4f8a9c0e-1111-2222-3333-444455556666\"},\"options\":{\"alpn\":[\"h2,http/1.1\"],\"alterid\":[\"0\"],\"encryption\":[\"auto\"],\"fp\":[\"chrome\"],\"host\":[\"cdn.example.com\"],\"insecure\":[\"false\"],\"path\":[\"/ws\"],\"security\":[\"tls\"],\"sni\":[\"edge.example.com\"],\"type\":[\"h2\"]}}",
+    "hash": "v1:5b1c95623652deeff9d95f88e7231c518d0128edc5d45a51a3b22545eed2aa1f",
+    "endpoint_key": "vmess|example.com|443"
+  },
+  {
+    "name": "vmess/legacy/tcp-drops-transport-keys",
+    "uri": "vmess://eyJhZGQiOiJFeGFtcGxlLkNPTSIsImFpZCI6IjAiLCJhbHBuIjoiaDIsaHR0cC8xLjEiLCJmcCI6ImNocm9tZSIsImhvc3QiOiJjZG4uZXhhbXBsZS5jb20iLCJpZCI6IjRGOEE5QzBFLTExMTEtMjIyMi0zMzMzLTQ0NDQ1NTU1NjY2NiIsIm5ldCI6InRjcCIsInBhdGgiOiIvd3MiLCJwb3J0IjoiNDQzIiwicHMiOiLnpLrkvovoioLngrkiLCJzY3kiOiJhdXRvIiwic25pIjoiZWRnZS5leGFtcGxlLmNvbSIsInRscyI6InRscyIsInR5cGUiOiJub25lIiwidiI6IjIifQ==",
+    "protocol": "vmess",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vmess\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"4f8a9c0e-1111-2222-3333-444455556666\"},\"options\":{\"alpn\":[\"h2,http/1.1\"],\"alterid\":[\"0\"],\"encryption\":[\"auto\"],\"fp\":[\"chrome\"],\"insecure\":[\"false\"],\"security\":[\"tls\"],\"sni\":[\"edge.example.com\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:6da5608a6c10e7b0456b2d045ce9d1f2702a9d3949be9b44d153eddd9fb7ebd9",
+    "endpoint_key": "vmess|example.com|443"
+  },
+  {
+    "name": "vmess/legacy/no-tls",
+    "uri": "vmess://eyJhZGQiOiJFeGFtcGxlLkNPTSIsImFpZCI6IjAiLCJhbHBuIjoiaDIsaHR0cC8xLjEiLCJmcCI6ImNocm9tZSIsImhvc3QiOiJjZG4uZXhhbXBsZS5jb20iLCJpZCI6IjRGOEE5QzBFLTExMTEtMjIyMi0zMzMzLTQ0NDQ1NTU1NjY2NiIsIm5ldCI6IndzIiwicGF0aCI6Ii93cyIsInBvcnQiOiI0NDMiLCJwcyI6IuekuuS+i+iKgueCuSIsInNjeSI6ImF1dG8iLCJ0eXBlIjoibm9uZSIsInYiOiIyIn0=",
+    "protocol": "vmess",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vmess\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"4f8a9c0e-1111-2222-3333-444455556666\"},\"options\":{\"alpn\":[\"h2,http/1.1\"],\"alterid\":[\"0\"],\"encryption\":[\"auto\"],\"fp\":[\"chrome\"],\"host\":[\"cdn.example.com\"],\"path\":[\"/ws\"],\"security\":[\"none\"],\"type\":[\"ws\"]}}",
+    "hash": "v1:69e56044962acade466c74f9a720ac9cbe144f6e05bf41213c44d74704b9b6f1",
+    "endpoint_key": "vmess|example.com|443"
+  },
+  {
+    "name": "vmess/legacy/alpn-order",
+    "uri": "vmess://eyJhZGQiOiJFeGFtcGxlLkNPTSIsImFpZCI6IjAiLCJhbHBuIjoiaHR0cC8xLjEsaDIiLCJmcCI6ImNocm9tZSIsImhvc3QiOiJjZG4uZXhhbXBsZS5jb20iLCJpZCI6IjRGOEE5QzBFLTExMTEtMjIyMi0zMzMzLTQ0NDQ1NTU1NjY2NiIsIm5ldCI6IndzIiwicGF0aCI6Ii93cyIsInBvcnQiOiI0NDMiLCJwcyI6IuekuuS+i+iKgueCuSIsInNjeSI6ImF1dG8iLCJzbmkiOiJlZGdlLmV4YW1wbGUuY29tIiwidGxzIjoidGxzIiwidHlwZSI6Im5vbmUiLCJ2IjoiMiJ9",
+    "protocol": "vmess",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vmess\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"4f8a9c0e-1111-2222-3333-444455556666\"},\"options\":{\"alpn\":[\"h2,http/1.1\"],\"alterid\":[\"0\"],\"encryption\":[\"auto\"],\"fp\":[\"chrome\"],\"host\":[\"cdn.example.com\"],\"insecure\":[\"false\"],\"path\":[\"/ws\"],\"security\":[\"tls\"],\"sni\":[\"edge.example.com\"],\"type\":[\"ws\"]}}",
+    "hash": "v1:fca95249e533a1271771db8e018de34bc2390fd04ae4de51f67e0a1de64cec64",
+    "endpoint_key": "vmess|example.com|443"
+  },
+  {
+    "name": "vmess/legacy/no-port",
+    "uri": "vmess://eyJhZGQiOiJFeGFtcGxlLkNPTSIsImFpZCI6IjAiLCJhbHBuIjoiaDIsaHR0cC8xLjEiLCJmcCI6ImNocm9tZSIsImhvc3QiOiJjZG4uZXhhbXBsZS5jb20iLCJpZCI6IjRGOEE5QzBFLTExMTEtMjIyMi0zMzMzLTQ0NDQ1NTU1NjY2NiIsIm5ldCI6IndzIiwicGF0aCI6Ii93cyIsInBzIjoi56S65L6L6IqC54K5Iiwic2N5IjoiYXV0byIsInNuaSI6ImVkZ2UuZXhhbXBsZS5jb20iLCJ0bHMiOiJ0bHMiLCJ0eXBlIjoibm9uZSIsInYiOiIyIn0=",
+    "protocol": "vmess",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vmess\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"4f8a9c0e-1111-2222-3333-444455556666\"},\"options\":{\"alpn\":[\"h2,http/1.1\"],\"alterid\":[\"0\"],\"encryption\":[\"auto\"],\"fp\":[\"chrome\"],\"host\":[\"cdn.example.com\"],\"insecure\":[\"false\"],\"path\":[\"/ws\"],\"security\":[\"tls\"],\"sni\":[\"edge.example.com\"],\"type\":[\"ws\"]}}",
+    "hash": "v1:fca95249e533a1271771db8e018de34bc2390fd04ae4de51f67e0a1de64cec64",
+    "endpoint_key": "vmess|example.com|443"
+  },
+  {
+    "name": "vmess/legacy/no-server",
+    "uri": "vmess://eyJhaWQiOiIwIiwiYWxwbiI6ImgyLGh0dHAvMS4xIiwiZnAiOiJjaHJvbWUiLCJob3N0IjoiY2RuLmV4YW1wbGUuY29tIiwiaWQiOiI0RjhBOUMwRS0xMTExLTIyMjItMzMzMy00NDQ0NTU1NTY2NjYiLCJuZXQiOiJ3cyIsInBhdGgiOiIvd3MiLCJwb3J0IjoiNDQzIiwicHMiOiLnpLrkvovoioLngrkiLCJzY3kiOiJhdXRvIiwic25pIjoiZWRnZS5leGFtcGxlLmNvbSIsInRscyI6InRscyIsInR5cGUiOiJub25lIiwidiI6IjIifQ==",
+    "err": "vmess URI missing or invalid server"
+  },
+  {
+    "name": "vmess/legacy/no-uuid",
+    "uri": "vmess://eyJhZGQiOiJFeGFtcGxlLkNPTSIsImFpZCI6IjAiLCJhbHBuIjoiaDIsaHR0cC8xLjEiLCJmcCI6ImNocm9tZSIsImhvc3QiOiJjZG4uZXhhbXBsZS5jb20iLCJuZXQiOiJ3cyIsInBhdGgiOiIvd3MiLCJwb3J0IjoiNDQzIiwicHMiOiLnpLrkvovoioLngrkiLCJzY3kiOiJhdXRvIiwic25pIjoiZWRnZS5leGFtcGxlLmNvbSIsInRscyI6InRscyIsInR5cGUiOiJub25lIiwidiI6IjIifQ==",
+    "err": "vmess URI missing UUID"
+  },
+  {
+    "name": "vmess/url/basic",
+    "uri": "vmess://abc@example.com:443#url-basic",
+    "protocol": "vmess",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vmess\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"abc\"},\"options\":{\"alterid\":[\"0\"],\"encryption\":[\"auto\"],\"security\":[\"none\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:f3af6e63680d1e6c287e7327185a6bdc88b249dbfd26e3088b19a675af7fc5d2",
+    "endpoint_key": "vmess|example.com|443"
+  },
+  {
+    "name": "vmess/url/full",
+    "uri": "vmess://abc@example.com:443?alterId=0\u0026encryption=auto\u0026type=ws\u0026host=cdn.example\u0026path=%2Fws\u0026security=tls\u0026sni=edge.example#url-full",
+    "protocol": "vmess",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vmess\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"abc\"},\"options\":{\"alterid\":[\"0\"],\"encryption\":[\"auto\"],\"host\":[\"cdn.example\"],\"insecure\":[\"false\"],\"path\":[\"/ws\"],\"security\":[\"tls\"],\"sni\":[\"edge.example\"],\"type\":[\"ws\"]}}",
+    "hash": "v1:ad7437db63c5da62100ef885325cd4fb9597c7511c9eef0925cb7460edc87c7a",
+    "endpoint_key": "vmess|example.com|443"
+  },
+  {
+    "name": "vmess/url/aid-alias",
+    "uri": "vmess://abc@example.com:443?aid=7\u0026type=ws\u0026path=%2Fws#url-aid",
+    "protocol": "vmess",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vmess\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"abc\"},\"options\":{\"alterid\":[\"7\"],\"encryption\":[\"auto\"],\"path\":[\"/ws\"],\"security\":[\"none\"],\"type\":[\"ws\"]}}",
+    "hash": "v1:7095a3d254de6eeb694dc917d424351c958d1a4ec1fb2ee4eb950fa5dac11a66",
+    "endpoint_key": "vmess|example.com|443"
+  },
+  {
+    "name": "vmess/url/upper-security",
+    "uri": "vmess://abc@example.com:443?security=TLS\u0026sni=edge.example#url-upper",
+    "protocol": "vmess",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vmess\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"abc\"},\"options\":{\"alterid\":[\"0\"],\"encryption\":[\"auto\"],\"insecure\":[\"false\"],\"security\":[\"tls\"],\"sni\":[\"edge.example\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:09d8e7b64a5eb5a8902bc2d2cf7b23751d954cd608740ad289a8725459f9553f",
+    "endpoint_key": "vmess|example.com|443"
+  },
+  {
+    "name": "vmess/url/allowinsecure-alias",
+    "uri": "vmess://abc@example.com:443?security=tls\u0026allowInsecure=1#url-insecure",
+    "protocol": "vmess",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vmess\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"abc\"},\"options\":{\"alterid\":[\"0\"],\"encryption\":[\"auto\"],\"insecure\":[\"true\"],\"security\":[\"tls\"],\"sni\":[\"example.com\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:feb5200b86601135be5cd9cbaf32bcb07f3df2fe386a6adc54757ece70b6a899",
+    "endpoint_key": "vmess|example.com|443"
+  },
+  {
+    "name": "vmess/url/skip-cert-verify-alias",
+    "uri": "vmess://abc@example.com:443?security=tls\u0026skip-cert-verify=true#url-skipverify",
+    "protocol": "vmess",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vmess\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"abc\"},\"options\":{\"alterid\":[\"0\"],\"encryption\":[\"auto\"],\"insecure\":[\"true\"],\"security\":[\"tls\"],\"sni\":[\"example.com\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:feb5200b86601135be5cd9cbaf32bcb07f3df2fe386a6adc54757ece70b6a899",
+    "endpoint_key": "vmess|example.com|443"
+  },
+  {
+    "name": "vmess/url/grpc-servicename-keys",
+    "uri": "vmess://abc@example.com:443?type=grpc\u0026serviceName=a\u0026servicename=b\u0026grpc-service-name=c#url-grpc",
+    "protocol": "vmess",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vmess\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"abc\"},\"options\":{\"alterid\":[\"0\"],\"encryption\":[\"auto\"],\"security\":[\"none\"],\"servicename\":[\"a\",\"b\",\"c\"],\"type\":[\"grpc\"]}}",
+    "hash": "v1:9189c98f0bc15c0ddc6dede4b8d8f9aeb3fa6d2aaeaafbbcc8b998a387758ae7",
+    "endpoint_key": "vmess|example.com|443"
+  },
+  {
+    "name": "vmess/url/no-uuid",
+    "uri": "vmess://example.com:443#url-nouuid",
+    "err": "vmess URI missing UUID"
+  },
+  {
+    "name": "vmess/url/reality",
+    "uri": "vmess://abc@example.com:443?security=reality\u0026pbk=KEY\u0026sid=ab#url-reality",
+    "protocol": "vmess",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vmess\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"abc\"},\"options\":{\"alterid\":[\"0\"],\"encryption\":[\"auto\"],\"insecure\":[\"false\"],\"pbk\":[\"KEY\"],\"security\":[\"reality\"],\"sid\":[\"ab\"],\"sni\":[\"example.com\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:2813ef56cde963f8c1f7577c87e76ad7cb2ccb1d0ed641a4812526b6994a3bc1",
+    "endpoint_key": "vmess|example.com|443"
+  },
+  {
+    "name": "vmess/url/unknown-query",
+    "uri": "vmess://abc@example.com:443?mux=1\u0026type=ws\u0026path=%2Fws#url-unknown",
+    "protocol": "vmess",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vmess\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"abc\"},\"options\":{\"alterid\":[\"0\"],\"encryption\":[\"auto\"],\"mux\":[\"1\"],\"path\":[\"/ws\"],\"security\":[\"none\"],\"type\":[\"ws\"]}}",
+    "hash": "v1:325972d327f667cd9f8aee2b18a1a8683cdc78910ccdb4e59f6b083abac320a9",
+    "endpoint_key": "vmess|example.com|443"
+  },
+  {
+    "name": "vless/basic",
+    "uri": "vless://ABC@Example.COM:443#vless-basic",
+    "protocol": "vless",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vless\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"abc\"},\"options\":{\"encryption\":[\"none\"],\"security\":[\"none\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:6b430f08600c465545a20ae896db2c4db38b430578ed6c4b0014ccb8a4563ce0",
+    "endpoint_key": "vless|example.com|443"
+  },
+  {
+    "name": "vless/ws-tls",
+    "uri": "vless://abc@example.com:443?type=ws\u0026security=tls\u0026path=%2Fproxy\u0026sni=edge.example#vless-ws",
+    "protocol": "vless",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vless\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"abc\"},\"options\":{\"encryption\":[\"none\"],\"insecure\":[\"false\"],\"path\":[\"/proxy\"],\"security\":[\"tls\"],\"sni\":[\"edge.example\"],\"type\":[\"ws\"]}}",
+    "hash": "v1:46a9e1e813fdd667f2c1f92bcab52c0cc3490e555100f6362de0b412929b0fae",
+    "endpoint_key": "vless|example.com|443"
+  },
+  {
+    "name": "vless/defaults",
+    "uri": "vless://abc@example.com?type=WS\u0026security=TLS\u0026path=%2Fproxy\u0026sni=edge.example#vless-defaults",
+    "protocol": "vless",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vless\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"abc\"},\"options\":{\"encryption\":[\"none\"],\"insecure\":[\"false\"],\"path\":[\"/proxy\"],\"security\":[\"tls\"],\"sni\":[\"edge.example\"],\"type\":[\"ws\"]}}",
+    "hash": "v1:46a9e1e813fdd667f2c1f92bcab52c0cc3490e555100f6362de0b412929b0fae",
+    "endpoint_key": "vless|example.com|443"
+  },
+  {
+    "name": "vless/encryption-default",
+    "uri": "vless://abc@example.com:443?encryption=none\u0026type=tcp#vless-enc",
+    "protocol": "vless",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vless\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"abc\"},\"options\":{\"encryption\":[\"none\"],\"security\":[\"none\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:6b430f08600c465545a20ae896db2c4db38b430578ed6c4b0014ccb8a4563ce0",
+    "endpoint_key": "vless|example.com|443"
+  },
+  {
+    "name": "vless/reality",
+    "uri": "vless://abc@example.com:443?type=tcp\u0026security=reality\u0026fp=chrome\u0026pbk=PUBKEY\u0026sid=1234\u0026sni=www.example.com\u0026flow=xtls-rprx-vision#vless-reality",
+    "protocol": "vless",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vless\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"abc\"},\"options\":{\"encryption\":[\"none\"],\"flow\":[\"xtls-rprx-vision\"],\"fp\":[\"chrome\"],\"insecure\":[\"false\"],\"pbk\":[\"PUBKEY\"],\"security\":[\"reality\"],\"sid\":[\"1234\"],\"sni\":[\"www.example.com\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:c639bab507bc901cd2d80e411dc3043846ad4691eb9363fc242ebf8355285d46",
+    "endpoint_key": "vless|example.com|443"
+  },
+  {
+    "name": "vless/flow",
+    "uri": "vless://abc@example.com:443?type=tcp\u0026security=tls\u0026flow=xtls-rprx-vision#vless-flow",
+    "protocol": "vless",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vless\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"abc\"},\"options\":{\"encryption\":[\"none\"],\"flow\":[\"xtls-rprx-vision\"],\"insecure\":[\"false\"],\"security\":[\"tls\"],\"sni\":[\"example.com\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:0c54bd6ea07d27394877a5b215ac571abcfdd9408cd4eaf41a31f014694b69e6",
+    "endpoint_key": "vless|example.com|443"
+  },
+  {
+    "name": "vless/packetencoding-camel",
+    "uri": "vless://abc@example.com:443?type=tcp\u0026packetEncoding=xudp#vless-pe-camel",
+    "protocol": "vless",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vless\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"abc\"},\"options\":{\"encryption\":[\"none\"],\"packetencoding\":[\"xudp\"],\"security\":[\"none\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:cf84adbc2bb8576eaeb2142b9947048c7143f7d20e8ded9877f78955e2542405",
+    "endpoint_key": "vless|example.com|443"
+  },
+  {
+    "name": "vless/packetencoding-snake",
+    "uri": "vless://abc@example.com:443?type=tcp\u0026packet_encoding=xudp#vless-pe-snake",
+    "protocol": "vless",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vless\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"abc\"},\"options\":{\"encryption\":[\"none\"],\"packetencoding\":[\"xudp\"],\"security\":[\"none\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:cf84adbc2bb8576eaeb2142b9947048c7143f7d20e8ded9877f78955e2542405",
+    "endpoint_key": "vless|example.com|443"
+  },
+  {
+    "name": "vless/network-alias-only",
+    "uri": "vless://abc@example.com:443?network=ws\u0026path=%2Fws#vless-network-alias",
+    "protocol": "vless",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vless\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"abc\"},\"options\":{\"encryption\":[\"none\"],\"network\":[\"ws\"],\"security\":[\"none\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:0a16da37f89b83740db86a10efd7dc31ef0676ec2b36ec78a227775946846cc9",
+    "endpoint_key": "vless|example.com|443"
+  },
+  {
+    "name": "vless/network-only-no-path",
+    "uri": "vless://abc@example.com:443?network=ws#vless-network-only",
+    "protocol": "vless",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vless\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"abc\"},\"options\":{\"encryption\":[\"none\"],\"network\":[\"ws\"],\"security\":[\"none\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:0a16da37f89b83740db86a10efd7dc31ef0676ec2b36ec78a227775946846cc9",
+    "endpoint_key": "vless|example.com|443"
+  },
+  {
+    "name": "vless/network-grpc-only",
+    "uri": "vless://abc@example.com:443?network=grpc\u0026serviceName=svc#vless-network-grpc",
+    "protocol": "vless",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vless\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"abc\"},\"options\":{\"encryption\":[\"none\"],\"network\":[\"grpc\"],\"security\":[\"none\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:e0b8bf13f1e8b31ba631c0d29bb5e238c657c449f73d63709d2445d35634d524",
+    "endpoint_key": "vless|example.com|443"
+  },
+  {
+    "name": "vless/type-and-network",
+    "uri": "vless://abc@example.com:443?type=ws\u0026network=grpc\u0026path=%2Fws#vless-both",
+    "protocol": "vless",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vless\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"abc\"},\"options\":{\"encryption\":[\"none\"],\"network\":[\"grpc\"],\"path\":[\"/ws\"],\"security\":[\"none\"],\"type\":[\"ws\"]}}",
+    "hash": "v1:bb9a1ed4b1ef7170e99b4440340170d11d201272ccbf357f0e49b9b5962bde15",
+    "endpoint_key": "vless|example.com|443"
+  },
+  {
+    "name": "vless/sni-alias-peer",
+    "uri": "vless://abc@example.com:443?type=tcp\u0026security=tls\u0026peer=edge.example#vless-peer",
+    "protocol": "vless",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vless\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"abc\"},\"options\":{\"encryption\":[\"none\"],\"insecure\":[\"false\"],\"security\":[\"tls\"],\"sni\":[\"edge.example\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:bdb234536696ea5585f785b6d80b584e31a4f9713960cb9b027050b38e0f00a9",
+    "endpoint_key": "vless|example.com|443"
+  },
+  {
+    "name": "vless/sni-alias-servername",
+    "uri": "vless://abc@example.com:443?type=tcp\u0026security=tls\u0026server_name=edge.example#vless-servername",
+    "protocol": "vless",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vless\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"abc\"},\"options\":{\"encryption\":[\"none\"],\"insecure\":[\"false\"],\"security\":[\"tls\"],\"sni\":[\"edge.example\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:bdb234536696ea5585f785b6d80b584e31a4f9713960cb9b027050b38e0f00a9",
+    "endpoint_key": "vless|example.com|443"
+  },
+  {
+    "name": "vless/alpn-order",
+    "uri": "vless://abc@example.com:443?type=tcp\u0026security=tls\u0026alpn=h2,http/1.1#vless-alpn",
+    "protocol": "vless",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vless\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"abc\"},\"options\":{\"alpn\":[\"h2,http/1.1\"],\"encryption\":[\"none\"],\"insecure\":[\"false\"],\"security\":[\"tls\"],\"sni\":[\"example.com\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:0b42e8f967e480a271cb86ee13ef651f80c23157437cde416c5fcb206362ac52",
+    "endpoint_key": "vless|example.com|443"
+  },
+  {
+    "name": "vless/grpc-service-name",
+    "uri": "vless://abc@example.com:443?type=grpc\u0026security=tls\u0026grpc-service-name=svc#vless-grpc",
+    "protocol": "vless",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vless\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"abc\"},\"options\":{\"encryption\":[\"none\"],\"insecure\":[\"false\"],\"security\":[\"tls\"],\"servicename\":[\"svc\"],\"sni\":[\"example.com\"],\"type\":[\"grpc\"]}}",
+    "hash": "v1:39cd6065dd4c39c17575c5274738d2de2ce4475b90f4f293b2381cf9421d8a84",
+    "endpoint_key": "vless|example.com|443"
+  },
+  {
+    "name": "vless/insecure-false",
+    "uri": "vless://abc@example.com:443?type=tcp\u0026security=tls\u0026insecure=false#vless-insecure-false",
+    "protocol": "vless",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vless\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"abc\"},\"options\":{\"encryption\":[\"none\"],\"insecure\":[\"false\"],\"security\":[\"tls\"],\"sni\":[\"example.com\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:796953cb9fcd3ab369157fbb2b042081034e7775c415f7f09cfc3eee63a1a0e4",
+    "endpoint_key": "vless|example.com|443"
+  },
+  {
+    "name": "vless/insecure-yes",
+    "uri": "vless://abc@example.com:443?type=tcp\u0026security=tls\u0026insecure=yes#vless-insecure-yes",
+    "protocol": "vless",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vless\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"abc\"},\"options\":{\"encryption\":[\"none\"],\"insecure\":[\"true\"],\"security\":[\"tls\"],\"sni\":[\"example.com\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:3efafebf1830d6ec4db5e1334f59aa9f183d753187c4507e4894c0af8f70d6b5",
+    "endpoint_key": "vless|example.com|443"
+  },
+  {
+    "name": "vless/missing-uuid",
+    "uri": "vless://example.com:443#vless-nouuid",
+    "err": "vless URI missing UUID"
+  },
+  {
+    "name": "vless/spanish-host",
+    "uri": "vless://abc@例え.EXAMPLE.com:443?type=tcp#vless-idn",
+    "protocol": "vless",
+    "server": "xn--r8jz45g.example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vless\",\"server\":\"xn--r8jz45g.example.com\",\"port\":443,\"auth\":{\"username\":\"abc\"},\"options\":{\"encryption\":[\"none\"],\"security\":[\"none\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:ac1980d16f0ec29e83eab4dd37f016209663cb401ee5e608e6d548966c0e587a",
+    "endpoint_key": "vless|xn--r8jz45g.example.com|443"
+  },
+  {
+    "name": "vless/ipv6",
+    "uri": "vless://abc@[2001:db8::1]:8443?type=tcp\u0026security=tls#vless-ipv6",
+    "protocol": "vless",
+    "server": "2001:db8::1",
+    "port": 8443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vless\",\"server\":\"2001:db8::1\",\"port\":8443,\"auth\":{\"username\":\"abc\"},\"options\":{\"encryption\":[\"none\"],\"insecure\":[\"false\"],\"security\":[\"tls\"],\"sni\":[\"2001:db8::1\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:017f0012812ee78433f509a5947628e034b351e59823d81d80cb6c40cbcd54c6",
+    "endpoint_key": "vless|2001:db8::1|8443"
+  },
+  {
+    "name": "vless/trailing-dot",
+    "uri": "vless://abc@example.com.:443?type=tcp#vless-dot",
+    "protocol": "vless",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vless\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"abc\"},\"options\":{\"encryption\":[\"none\"],\"security\":[\"none\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:6b430f08600c465545a20ae896db2c4db38b430578ed6c4b0014ccb8a4563ce0",
+    "endpoint_key": "vless|example.com|443"
+  },
+  {
+    "name": "trojan/basic",
+    "uri": "trojan://one@example.com:443#trojan-basic",
+    "protocol": "trojan",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"trojan\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"one\"},\"options\":{\"insecure\":[\"false\"],\"security\":[\"tls\"],\"sni\":[\"example.com\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:2f4937adbf522ea14297c8121576399ac456bb072d32a05f02b6d1a619e870e0",
+    "endpoint_key": "trojan|example.com|443"
+  },
+  {
+    "name": "trojan/defaults",
+    "uri": "trojan://one@example.com#trojan-defaults",
+    "protocol": "trojan",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"trojan\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"one\"},\"options\":{\"insecure\":[\"false\"],\"security\":[\"tls\"],\"sni\":[\"example.com\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:2f4937adbf522ea14297c8121576399ac456bb072d32a05f02b6d1a619e870e0",
+    "endpoint_key": "trojan|example.com|443"
+  },
+  {
+    "name": "trojan/ws",
+    "uri": "trojan://one@example.com:443?type=ws\u0026path=%2Fa\u0026host=cdn.example#trojan-ws",
+    "protocol": "trojan",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"trojan\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"one\"},\"options\":{\"host\":[\"cdn.example\"],\"insecure\":[\"false\"],\"path\":[\"/a\"],\"security\":[\"tls\"],\"sni\":[\"example.com\"],\"type\":[\"ws\"]}}",
+    "hash": "v1:206da23d527875882d582825a5e7ee95c572c78ce6ae4e6069935008cc6f6fd3",
+    "endpoint_key": "trojan|example.com|443"
+  },
+  {
+    "name": "trojan/tcp-drops-transport-keys",
+    "uri": "trojan://one@example.com:443?type=tcp\u0026path=%2Fa\u0026host=cdn.example#trojan-tcp",
+    "protocol": "trojan",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"trojan\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"one\"},\"options\":{\"insecure\":[\"false\"],\"security\":[\"tls\"],\"sni\":[\"example.com\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:2f4937adbf522ea14297c8121576399ac456bb072d32a05f02b6d1a619e870e0",
+    "endpoint_key": "trojan|example.com|443"
+  },
+  {
+    "name": "trojan/insecure",
+    "uri": "trojan://one@example.com:443?insecure=1#trojan-insecure",
+    "protocol": "trojan",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"trojan\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"one\"},\"options\":{\"insecure\":[\"true\"],\"security\":[\"tls\"],\"sni\":[\"example.com\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:6a17e8dd4de38750fef053dabcd58504de509901f5312f44c32e8fae0b604509",
+    "endpoint_key": "trojan|example.com|443"
+  },
+  {
+    "name": "trojan/allowInsecure",
+    "uri": "trojan://one@example.com:443?allowInsecure=1#trojan-allowinsecure",
+    "protocol": "trojan",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"trojan\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"one\"},\"options\":{\"insecure\":[\"true\"],\"security\":[\"tls\"],\"sni\":[\"example.com\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:6a17e8dd4de38750fef053dabcd58504de509901f5312f44c32e8fae0b604509",
+    "endpoint_key": "trojan|example.com|443"
+  },
+  {
+    "name": "trojan/allowInsecure-wins-over-insecure",
+    "uri": "trojan://one@example.com:443?allowInsecure=1\u0026insecure=0#trojan-precedence",
+    "protocol": "trojan",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"trojan\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"one\"},\"options\":{\"insecure\":[\"false\",\"true\"],\"security\":[\"tls\"],\"sni\":[\"example.com\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:b2af893e7d2a6252889745b4986bc12db30fb9d70dd1d7ac9a8cb78737392540",
+    "endpoint_key": "trojan|example.com|443"
+  },
+  {
+    "name": "trojan/skip-cert-verify",
+    "uri": "trojan://one@example.com:443?skip-cert-verify=true#trojan-skipverify",
+    "protocol": "trojan",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"trojan\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"one\"},\"options\":{\"insecure\":[\"true\"],\"security\":[\"tls\"],\"sni\":[\"example.com\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:6a17e8dd4de38750fef053dabcd58504de509901f5312f44c32e8fae0b604509",
+    "endpoint_key": "trojan|example.com|443"
+  },
+  {
+    "name": "trojan/missing-password",
+    "uri": "trojan://example.com:443#trojan-nopass",
+    "err": "trojan URI missing password"
+  },
+  {
+    "name": "ss/sip002-rawurl-userinfo",
+    "uri": "ss://YWVzLTI1Ni1nY206c2VjcmV0@example.com:8388#ss-rawurl",
+    "protocol": "ss",
+    "server": "example.com",
+    "port": 8388,
+    "canonical_json": "{\"version\":1,\"protocol\":\"ss\",\"server\":\"example.com\",\"port\":8388,\"auth\":{\"password\":\"secret\"},\"options\":{\"method\":[\"aes-256-gcm\"]}}",
+    "hash": "v1:6d597190d1f59e70e47a9a1de75aeb512e3ef57b8c4828d27e274592e5f26f8a",
+    "endpoint_key": "ss|example.com|8388"
+  },
+  {
+    "name": "ss/sip002-std-userinfo",
+    "uri": "ss://YWVzLTI1Ni1nY206c2VjcmV0@example.com:8388#ss-std",
+    "protocol": "ss",
+    "server": "example.com",
+    "port": 8388,
+    "canonical_json": "{\"version\":1,\"protocol\":\"ss\",\"server\":\"example.com\",\"port\":8388,\"auth\":{\"password\":\"secret\"},\"options\":{\"method\":[\"aes-256-gcm\"]}}",
+    "hash": "v1:6d597190d1f59e70e47a9a1de75aeb512e3ef57b8c4828d27e274592e5f26f8a",
+    "endpoint_key": "ss|example.com|8388"
+  },
+  {
+    "name": "ss/whole-rawurl",
+    "uri": "ss://YWVzLTI1Ni1nY206c2VjcmV0QGV4YW1wbGUuY29tOjgzODg#ss-whole-rawurl",
+    "protocol": "ss",
+    "server": "example.com",
+    "port": 8388,
+    "canonical_json": "{\"version\":1,\"protocol\":\"ss\",\"server\":\"example.com\",\"port\":8388,\"auth\":{\"password\":\"secret\"},\"options\":{\"method\":[\"aes-256-gcm\"]}}",
+    "hash": "v1:6d597190d1f59e70e47a9a1de75aeb512e3ef57b8c4828d27e274592e5f26f8a",
+    "endpoint_key": "ss|example.com|8388"
+  },
+  {
+    "name": "ss/whole-std",
+    "uri": "ss://YWVzLTI1Ni1nY206c2VjcmV0QGV4YW1wbGUuY29tOjgzODg=#ss-whole-std",
+    "protocol": "ss",
+    "server": "example.com",
+    "port": 8388,
+    "canonical_json": "{\"version\":1,\"protocol\":\"ss\",\"server\":\"example.com\",\"port\":8388,\"auth\":{\"password\":\"secret\"},\"options\":{\"method\":[\"aes-256-gcm\"]}}",
+    "hash": "v1:6d597190d1f59e70e47a9a1de75aeb512e3ef57b8c4828d27e274592e5f26f8a",
+    "endpoint_key": "ss|example.com|8388"
+  },
+  {
+    "name": "ss/plain-userinfo",
+    "uri": "ss://aes-256-gcm:secret@example.com:8388#ss-plain",
+    "protocol": "ss",
+    "server": "example.com",
+    "port": 8388,
+    "canonical_json": "{\"version\":1,\"protocol\":\"ss\",\"server\":\"example.com\",\"port\":8388,\"auth\":{\"password\":\"secret\"},\"options\":{\"method\":[\"aes-256-gcm\"]}}",
+    "hash": "v1:6d597190d1f59e70e47a9a1de75aeb512e3ef57b8c4828d27e274592e5f26f8a",
+    "endpoint_key": "ss|example.com|8388"
+  },
+  {
+    "name": "ss/escaped-password",
+    "uri": "ss://aes-256-gcm:se%40cret@example.com:8388#ss-escaped",
+    "protocol": "ss",
+    "server": "example.com",
+    "port": 8388,
+    "canonical_json": "{\"version\":1,\"protocol\":\"ss\",\"server\":\"example.com\",\"port\":8388,\"auth\":{\"password\":\"se@cret\"},\"options\":{\"method\":[\"aes-256-gcm\"]}}",
+    "hash": "v1:7b13454e8b3d058452917e3f1de1ed9ad1060deff6bd6301d719595e17fa137e",
+    "endpoint_key": "ss|example.com|8388"
+  },
+  {
+    "name": "ss/method-uppercase-lowered",
+    "uri": "ss://QUVTLTI1Ni1HQ006c2VjcmV0@example.com:8388#ss-upper",
+    "protocol": "ss",
+    "server": "example.com",
+    "port": 8388,
+    "canonical_json": "{\"version\":1,\"protocol\":\"ss\",\"server\":\"example.com\",\"port\":8388,\"auth\":{\"password\":\"secret\"},\"options\":{\"method\":[\"aes-256-gcm\"]}}",
+    "hash": "v1:6d597190d1f59e70e47a9a1de75aeb512e3ef57b8c4828d27e274592e5f26f8a",
+    "endpoint_key": "ss|example.com|8388"
+  },
+  {
+    "name": "ss/default-port",
+    "uri": "ss://aes-256-gcm:secret@example.com#ss-default-port",
+    "protocol": "ss",
+    "server": "example.com",
+    "port": 8388,
+    "canonical_json": "{\"version\":1,\"protocol\":\"ss\",\"server\":\"example.com\",\"port\":8388,\"auth\":{\"password\":\"secret\"},\"options\":{\"method\":[\"aes-256-gcm\"]}}",
+    "hash": "v1:6d597190d1f59e70e47a9a1de75aeb512e3ef57b8c4828d27e274592e5f26f8a",
+    "endpoint_key": "ss|example.com|8388"
+  },
+  {
+    "name": "ss/plugin",
+    "uri": "ss://YWVzLTI1Ni1nY206c2VjcmV0@example.com:8388?plugin=obfs-local\u0026plugin-opts=obfs%3Dhttp%3Bobfs-host%3Dcdn.example#ss-plugin",
+    "protocol": "ss",
+    "server": "example.com",
+    "port": 8388,
+    "canonical_json": "{\"version\":1,\"protocol\":\"ss\",\"server\":\"example.com\",\"port\":8388,\"auth\":{\"password\":\"secret\"},\"options\":{\"method\":[\"aes-256-gcm\"],\"plugin\":[\"obfs-local\"],\"plugin-opts\":[\"obfs=http;obfs-host=cdn.example\"]}}",
+    "hash": "v1:baf537fbdaea8aef445b39770a4ae30c9301a72d1c484e7828337ceca08f99f7",
+    "endpoint_key": "ss|example.com|8388"
+  },
+  {
+    "name": "ss/plugin-opts-snake-alias",
+    "uri": "ss://YWVzLTI1Ni1nY206c2VjcmV0@example.com:8388?plugin=obfs-local\u0026plugin_opts=obfs%3Dhttp#ss-plugin-snake",
+    "protocol": "ss",
+    "server": "example.com",
+    "port": 8388,
+    "canonical_json": "{\"version\":1,\"protocol\":\"ss\",\"server\":\"example.com\",\"port\":8388,\"auth\":{\"password\":\"secret\"},\"options\":{\"method\":[\"aes-256-gcm\"],\"plugin\":[\"obfs-local\"],\"plugin-opts\":[\"obfs=http\"]}}",
+    "hash": "v1:82e58d93112dca1465fbe71d5d34e82f811318e323af3be2777357aa9d238230",
+    "endpoint_key": "ss|example.com|8388"
+  },
+  {
+    "name": "ss/plugin-opts-segment-order",
+    "uri": "ss://YWVzLTI1Ni1nY206c2VjcmV0@example.com:8388?plugin=obfs-local\u0026plugin-opts=obfs-host%3Dcdn.example%3Bobfs%3Dhttp#ss-plugin-order",
+    "protocol": "ss",
+    "server": "example.com",
+    "port": 8388,
+    "canonical_json": "{\"version\":1,\"protocol\":\"ss\",\"server\":\"example.com\",\"port\":8388,\"auth\":{\"password\":\"secret\"},\"options\":{\"method\":[\"aes-256-gcm\"],\"plugin\":[\"obfs-local\"],\"plugin-opts\":[\"obfs-host=cdn.example;obfs=http\"]}}",
+    "hash": "v1:e641717de06bef3dc373d0507a5236bf60b3606770b2df5c407117d0642d5ba6",
+    "endpoint_key": "ss|example.com|8388"
+  },
+  {
+    "name": "ss/missing-password",
+    "uri": "ss://YWVzLTI1Ni1nY206@example.com:8388#ss-nopass",
+    "err": "shadowsocks userinfo must be method:password"
+  },
+  {
+    "name": "ss/missing-method",
+    "uri": "ss://OnNlY3JldA@example.com:8388#ss-nomethod",
+    "err": "shadowsocks userinfo must be method:password"
+  },
+  {
+    "name": "hysteria2/basic",
+    "uri": "hysteria2://pass@example.com:443#hy2-basic",
+    "protocol": "hysteria2",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"hysteria2\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"pass\"},\"options\":{\"insecure\":[\"false\"],\"security\":[\"tls\"],\"sni\":[\"example.com\"]}}",
+    "hash": "v1:d2f4a357000093e051e80f59f347067ade3dbf5660b85625ac0afb8d67aaa976",
+    "endpoint_key": "hysteria2|example.com|443"
+  },
+  {
+    "name": "hysteria2/alias-hy2",
+    "uri": "hy2://pass@example.com:443#hy2-alias",
+    "protocol": "hysteria2",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"hysteria2\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"pass\"},\"options\":{\"insecure\":[\"false\"],\"security\":[\"tls\"],\"sni\":[\"example.com\"]}}",
+    "hash": "v1:d2f4a357000093e051e80f59f347067ade3dbf5660b85625ac0afb8d67aaa976",
+    "endpoint_key": "hysteria2|example.com|443"
+  },
+  {
+    "name": "hysteria2/default-port",
+    "uri": "hysteria2://pass@example.com#hy2-default-port",
+    "protocol": "hysteria2",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"hysteria2\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"pass\"},\"options\":{\"insecure\":[\"false\"],\"security\":[\"tls\"],\"sni\":[\"example.com\"]}}",
+    "hash": "v1:d2f4a357000093e051e80f59f347067ade3dbf5660b85625ac0afb8d67aaa976",
+    "endpoint_key": "hysteria2|example.com|443"
+  },
+  {
+    "name": "hysteria2/userinfo-userpass",
+    "uri": "hysteria2://user:pass@example.com:443#hy2-userpass",
+    "protocol": "hysteria2",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"hysteria2\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"password\":\"pass\",\"username\":\"user\"},\"options\":{\"insecure\":[\"false\"],\"security\":[\"tls\"],\"sni\":[\"example.com\"]}}",
+    "hash": "v1:e05711b3e8427d8f993235f956ad095da644bb9c18ca7b36c819a84870486e5d",
+    "endpoint_key": "hysteria2|example.com|443"
+  },
+  {
+    "name": "hysteria2/full",
+    "uri": "hysteria2://pass@example.com:443?sni=edge.example\u0026insecure=1\u0026alpn=h3\u0026obfs=salamander\u0026obfs-password=obfspass\u0026upMbps=100\u0026downMbps=200#hy2-full",
+    "protocol": "hysteria2",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"hysteria2\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"pass\"},\"options\":{\"alpn\":[\"h3\"],\"downmbps\":[\"200\"],\"insecure\":[\"true\"],\"obfs\":[\"salamander\"],\"obfs-password\":[\"obfspass\"],\"security\":[\"tls\"],\"sni\":[\"edge.example\"],\"upmbps\":[\"100\"]}}",
+    "hash": "v1:1e23aaab93485b5b78193d468296d86bfdca23e622c9f29131562e43697aabee",
+    "endpoint_key": "hysteria2|example.com|443"
+  },
+  {
+    "name": "hysteria2/obfsPassword-alias",
+    "uri": "hysteria2://pass@example.com:443?obfs=salamander\u0026obfsPassword=x#hy2-obfspass-alias",
+    "protocol": "hysteria2",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"hysteria2\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"pass\"},\"options\":{\"insecure\":[\"false\"],\"obfs\":[\"salamander\"],\"obfspassword\":[\"x\"],\"security\":[\"tls\"],\"sni\":[\"example.com\"]}}",
+    "hash": "v1:5eb3511c7598406c93e56368b8824ccaffa73d8fe904a4a482fe862beb31ad5c",
+    "endpoint_key": "hysteria2|example.com|443"
+  },
+  {
+    "name": "hysteria2/missing-password",
+    "uri": "hysteria2://example.com:443#hy2-nopass",
+    "err": "hysteria2 URI missing password"
+  },
+  {
+    "name": "anytls/basic",
+    "uri": "anytls://pass@example.com:443#anytls-basic",
+    "protocol": "anytls",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"anytls\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"pass\"},\"options\":{\"insecure\":[\"false\"],\"security\":[\"tls\"],\"sni\":[\"example.com\"]}}",
+    "hash": "v1:4bebe6c2d40acf34847274516708e5c605e330972bc54fb75dfea39e47a8fa4d",
+    "endpoint_key": "anytls|example.com|443"
+  },
+  {
+    "name": "anytls/default-port",
+    "uri": "anytls://pass@example.com#anytls-default-port",
+    "protocol": "anytls",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"anytls\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"pass\"},\"options\":{\"insecure\":[\"false\"],\"security\":[\"tls\"],\"sni\":[\"example.com\"]}}",
+    "hash": "v1:4bebe6c2d40acf34847274516708e5c605e330972bc54fb75dfea39e47a8fa4d",
+    "endpoint_key": "anytls|example.com|443"
+  },
+  {
+    "name": "anytls/full",
+    "uri": "anytls://pass@example.com:443?sni=edge.example\u0026insecure=1\u0026fp=chrome\u0026alpn=h2#anytls-full",
+    "protocol": "anytls",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"anytls\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"pass\"},\"options\":{\"alpn\":[\"h2\"],\"fp\":[\"chrome\"],\"insecure\":[\"true\"],\"security\":[\"tls\"],\"sni\":[\"edge.example\"]}}",
+    "hash": "v1:957a2372dab5e0ca512c9c0db2a66fc370d18b35b618cc4de5ebe1d071f0b9f7",
+    "endpoint_key": "anytls|example.com|443"
+  },
+  {
+    "name": "anytls/missing-password",
+    "uri": "anytls://example.com:443#anytls-nopass",
+    "err": "anytls URI missing password"
+  },
+  {
+    "name": "http/basic",
+    "uri": "http://user:pass@example.com:8080#http-basic",
+    "protocol": "http",
+    "server": "example.com",
+    "port": 8080,
+    "canonical_json": "{\"version\":1,\"protocol\":\"http\",\"server\":\"example.com\",\"port\":8080,\"auth\":{\"password\":\"pass\",\"username\":\"user\"}}",
+    "hash": "v1:bb476ef6fc0d2f5f9020c47c91e2aa9c556d21389acd9d08412ca1d05aa26816",
+    "endpoint_key": "http|example.com|8080"
+  },
+  {
+    "name": "http/default-port",
+    "uri": "http://user:pass@example.com#http-default-port",
+    "protocol": "http",
+    "server": "example.com",
+    "port": 80,
+    "canonical_json": "{\"version\":1,\"protocol\":\"http\",\"server\":\"example.com\",\"port\":80,\"auth\":{\"password\":\"pass\",\"username\":\"user\"}}",
+    "hash": "v1:a789e8844bca637b8157313a4e31e772ef974157cecbde09bff88069b38852d4",
+    "endpoint_key": "http|example.com|80"
+  },
+  {
+    "name": "http/tls-default-port",
+    "uri": "http://user:pass@example.com?security=tls#http-tls-default-port",
+    "protocol": "http",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"http\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"password\":\"pass\",\"username\":\"user\"},\"options\":{\"insecure\":[\"false\"],\"security\":[\"tls\"],\"sni\":[\"example.com\"]}}",
+    "hash": "v1:17f910558311ba7244a3be51b327e00798c3b594d4a9aeb578e799d5665d59d6",
+    "endpoint_key": "http|example.com|443"
+  },
+  {
+    "name": "http/with-path",
+    "uri": "http://user:pass@example.com:8080/proxy#http-path",
+    "protocol": "http",
+    "server": "example.com",
+    "port": 8080,
+    "canonical_json": "{\"version\":1,\"protocol\":\"http\",\"server\":\"example.com\",\"port\":8080,\"auth\":{\"password\":\"pass\",\"username\":\"user\"},\"options\":{\"path\":[\"/proxy\"]}}",
+    "hash": "v1:eac868b855044a890967e270be2ba01bd42a7743c034a235b79e6adbb03f00b1",
+    "endpoint_key": "http|example.com|8080"
+  },
+  {
+    "name": "http/no-credentials",
+    "uri": "http://example.com:8080#http-anon",
+    "protocol": "http",
+    "server": "example.com",
+    "port": 8080,
+    "canonical_json": "{\"version\":1,\"protocol\":\"http\",\"server\":\"example.com\",\"port\":8080}",
+    "hash": "v1:78b999b8c8542a30fafee1826a0c9058d429a9f65d62ed17452b19f2375d17c1",
+    "endpoint_key": "http|example.com|8080"
+  },
+  {
+    "name": "socks5/basic",
+    "uri": "socks5://user:pass@example.com:1080#socks5-basic",
+    "protocol": "socks5",
+    "server": "example.com",
+    "port": 1080,
+    "canonical_json": "{\"version\":1,\"protocol\":\"socks5\",\"server\":\"example.com\",\"port\":1080,\"auth\":{\"password\":\"pass\",\"username\":\"user\"}}",
+    "hash": "v1:3d418208296114b84d59ad4d5806ef308514a931cb6063c37a5117c12f6cf136",
+    "endpoint_key": "socks5|example.com|1080"
+  },
+  {
+    "name": "socks5/alias-socks",
+    "uri": "socks://user:pass@example.com:1080#socks5-alias",
+    "protocol": "socks5",
+    "server": "example.com",
+    "port": 1080,
+    "canonical_json": "{\"version\":1,\"protocol\":\"socks5\",\"server\":\"example.com\",\"port\":1080,\"auth\":{\"password\":\"pass\",\"username\":\"user\"}}",
+    "hash": "v1:3d418208296114b84d59ad4d5806ef308514a931cb6063c37a5117c12f6cf136",
+    "endpoint_key": "socks5|example.com|1080"
+  },
+  {
+    "name": "socks5/default-port",
+    "uri": "socks5://user:pass@example.com#socks5-default-port",
+    "protocol": "socks5",
+    "server": "example.com",
+    "port": 1080,
+    "canonical_json": "{\"version\":1,\"protocol\":\"socks5\",\"server\":\"example.com\",\"port\":1080,\"auth\":{\"password\":\"pass\",\"username\":\"user\"}}",
+    "hash": "v1:3d418208296114b84d59ad4d5806ef308514a931cb6063c37a5117c12f6cf136",
+    "endpoint_key": "socks5|example.com|1080"
+  },
+  {
+    "name": "socks5/network-query",
+    "uri": "socks5://user:pass@example.com:1080?network=tcp#socks5-network",
+    "protocol": "socks5",
+    "server": "example.com",
+    "port": 1080,
+    "canonical_json": "{\"version\":1,\"protocol\":\"socks5\",\"server\":\"example.com\",\"port\":1080,\"auth\":{\"password\":\"pass\",\"username\":\"user\"},\"options\":{\"network\":[\"tcp\"]}}",
+    "hash": "v1:4c43c5f5103bb27afaaf07cbe60e63ce2558d6bfb1501849b679816cd09bcd3d",
+    "endpoint_key": "socks5|example.com|1080"
+  },
+  {
+    "name": "unsupported/ssr",
+    "uri": "ssr://example.com:8388#ssr",
+    "err": "unsupported proxy protocol: \"ssr\" is accepted by some clients but is not runnable by EasyProxies",
+    "unsupported": true
+  },
+  {
+    "name": "unsupported/hysteria-v1",
+    "uri": "hysteria://pass@example.com:443#hysteria",
+    "err": "unsupported proxy protocol: \"hysteria\" is accepted by some clients but is not runnable by EasyProxies",
+    "unsupported": true
+  },
+  {
+    "name": "unsupported/unknown-scheme",
+    "uri": "wireguard://key@example.com:51820#wg",
+    "err": "unsupported proxy protocol: \"wireguard\"",
+    "unsupported": true
+  },
+  {
+    "name": "malformed/empty",
+    "uri": "",
+    "err": "empty proxy URI"
+  },
+  {
+    "name": "malformed/no-scheme",
+    "uri": "example.com:443",
+    "err": "proxy URI missing scheme"
+  },
+  {
+    "name": "malformed/blank",
+    "uri": "   ",
+    "err": "empty proxy URI"
+  },
+  {
+    "name": "malformed/bom-prefixed",
+    "uri": "﻿vless://abc@example.com:443?type=tcp#bom",
+    "protocol": "vless",
+    "server": "example.com",
+    "port": 443,
+    "canonical_json": "{\"version\":1,\"protocol\":\"vless\",\"server\":\"example.com\",\"port\":443,\"auth\":{\"username\":\"abc\"},\"options\":{\"encryption\":[\"none\"],\"security\":[\"none\"],\"type\":[\"tcp\"]}}",
+    "hash": "v1:6b430f08600c465545a20ae896db2c4db38b430578ed6c4b0014ccb8a4563ce0",
+    "endpoint_key": "vless|example.com|443"
+  }
+]

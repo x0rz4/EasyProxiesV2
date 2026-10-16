@@ -5,7 +5,6 @@ package nodecodec
 
 import (
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -44,31 +43,20 @@ type Result struct {
 }
 
 // ParseURI validates rawURI and returns its canonical semantic identity.
+//
+// It is a thin wrapper over FromURI so that the identity and the behaviour view
+// can never be produced by two different parsers.
 func ParseURI(rawURI string) (Result, error) {
-	rawURI = strings.TrimSpace(strings.TrimPrefix(rawURI, "\ufeff"))
-	if rawURI == "" {
-		return Result{}, errors.New("empty proxy URI")
+	spec, err := FromURI(rawURI)
+	if err != nil {
+		return Result{}, err
 	}
-	schemeEnd := strings.Index(rawURI, "://")
-	if schemeEnd <= 0 {
-		return Result{}, errors.New("proxy URI missing scheme")
-	}
-	scheme := normalizeProtocol(rawURI[:schemeEnd])
-	switch scheme {
-	case "vmess":
-		return parseVMess(rawURI)
-	case "ss":
-		return parseShadowsocks(rawURI)
-	case "vless", "trojan", "hysteria2", "anytls", "http", "socks5":
-		return parseURLIdentity(rawURI, scheme)
-	case "ssr", "hysteria":
-		return Result{}, fmt.Errorf("%w: %q is accepted by some clients but is not runnable by EasyProxies", ErrUnsupportedProtocol, scheme)
-	default:
-		return Result{}, fmt.Errorf("%w: %q", ErrUnsupportedProtocol, scheme)
-	}
+	return spec.Result()
 }
 
-func normalizeProtocol(value string) string {
+// NormalizeProtocol folds the protocol aliases clients emit (shadowsocks, hy2,
+// socks) onto the canonical name the rest of the codebase switches on.
+func NormalizeProtocol(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "shadowsocks":
 		return "ss"
@@ -81,7 +69,11 @@ func normalizeProtocol(value string) string {
 	}
 }
 
-func defaultPort(protocol string) uint16 {
+// DefaultPort returns the port a link implies when it omits one. Every codec
+// path must use it: subrender used to reject a portless link outright while the
+// identity happily assigned it a default, so the same node existed and could not
+// be exported.
+func DefaultPort(protocol string) uint16 {
 	switch protocol {
 	case "http":
 		return 80
@@ -92,58 +84,6 @@ func defaultPort(protocol string) uint16 {
 	default:
 		return 443
 	}
-}
-
-func parseURLIdentity(rawURI, protocol string) (Result, error) {
-	u, err := url.Parse(rawURI)
-	if err != nil {
-		return Result{}, fmt.Errorf("parse %s URI: %w", protocol, err)
-	}
-	server, err := normalizeHost(u.Hostname())
-	if err != nil || server == "" {
-		return Result{}, fmt.Errorf("%s URI missing or invalid server", protocol)
-	}
-	port := defaultPort(protocol)
-	if protocol == "http" && strings.EqualFold(u.Query().Get("security"), "tls") {
-		port = 443
-	}
-	if value := u.Port(); value != "" {
-		parsed, parseErr := strconv.ParseUint(value, 10, 16)
-		if parseErr != nil || parsed == 0 {
-			return Result{}, fmt.Errorf("%s URI has invalid port %q", protocol, value)
-		}
-		port = uint16(parsed)
-	}
-
-	auth := map[string]string{}
-	if u.User != nil {
-		auth["username"] = u.User.Username()
-		if password, ok := u.User.Password(); ok {
-			auth["password"] = password
-		}
-	}
-	switch protocol {
-	case "vless", "vmess":
-		if auth["username"] == "" {
-			return Result{}, fmt.Errorf("%s URI missing UUID", protocol)
-		}
-		auth["username"] = strings.ToLower(auth["username"])
-	case "trojan", "hysteria2", "anytls":
-		if auth["username"] == "" {
-			return Result{}, fmt.Errorf("%s URI missing password", protocol)
-		}
-	}
-
-	options := normalizeQuery(protocol, u.Query())
-	if security := firstOption(options, "security"); security == "tls" || security == "reality" {
-		setDefault(options, "sni", server)
-		setDefault(options, "insecure", "false")
-	}
-	if protocol == "http" && u.EscapedPath() != "" && u.EscapedPath() != "/" {
-		options["path"] = []string{u.EscapedPath()}
-	}
-	identity := Identity{Version: IdentityVersion, Protocol: protocol, Server: server, Port: port, Auth: auth, Options: options}
-	return finish(identity)
 }
 
 func normalizeQuery(protocol string, values url.Values) map[string][]string {
@@ -191,7 +131,7 @@ func normalizeQuery(protocol string, values url.Values) map[string][]string {
 	case "hysteria2", "anytls":
 		setDefault(result, "security", "tls")
 	}
-	if security := firstOption(result, "security"); security == "tls" || security == "reality" {
+	if security := FirstOption(result, "security"); security == "tls" || security == "reality" {
 		setDefault(result, "insecure", "false")
 	}
 	if result["type"] != nil && result["type"][0] == "tcp" {
@@ -231,119 +171,8 @@ func isCosmeticQueryKey(key string) bool {
 	}
 }
 
-func parseVMess(rawURI string) (Result, error) {
-	payload := strings.TrimPrefix(rawURI, rawURI[:strings.Index(rawURI, "://")+3])
-	if fragment := strings.IndexByte(payload, '#'); fragment >= 0 {
-		payload = payload[:fragment]
-	}
-	if decoded, ok := decodeBase64(payload); ok {
-		var data map[string]any
-		if json.Unmarshal(decoded, &data) == nil && stringValue(data["add"]) != "" {
-			server, err := normalizeHost(stringValue(data["add"]))
-			if err != nil {
-				return Result{}, err
-			}
-			port64, _ := strconv.ParseUint(stringValue(data["port"]), 10, 16)
-			if port64 == 0 {
-				port64 = 443
-			}
-			uuid := strings.ToLower(stringValue(data["id"]))
-			if uuid == "" {
-				return Result{}, errors.New("vmess URI missing UUID")
-			}
-			q := url.Values{}
-			q.Set("alterId", defaultString(stringValue(data["aid"]), "0"))
-			q.Set("encryption", defaultString(stringValue(data["scy"]), "auto"))
-			q.Set("type", defaultString(stringValue(data["net"]), "tcp"))
-			if value := stringValue(data["tls"]); value != "" {
-				q.Set("security", value)
-			}
-			for jsonKey, queryKey := range map[string]string{"host": "host", "path": "path", "sni": "sni", "alpn": "alpn", "fp": "fp"} {
-				if value := stringValue(data[jsonKey]); value != "" {
-					q.Set(queryKey, value)
-				}
-			}
-			identity := Identity{Version: IdentityVersion, Protocol: "vmess", Server: server, Port: uint16(port64),
-				Auth: map[string]string{"username": uuid}, Options: normalizeQuery("vmess", q)}
-			if security := firstOption(identity.Options, "security"); security == "tls" || security == "reality" {
-				setDefault(identity.Options, "sni", server)
-			}
-			return finish(identity)
-		}
-	}
-	return parseURLIdentity(rawURI, "vmess")
-}
-
-func parseShadowsocks(rawURI string) (Result, error) {
-	u, err := url.Parse(rawURI)
-	if err != nil {
-		return Result{}, fmt.Errorf("parse shadowsocks URI: %w", err)
-	}
-	var method, password, server string
-	var port uint16
-	if u.Hostname() != "" && u.User != nil {
-		server, err = normalizeHost(u.Hostname())
-		if err != nil {
-			return Result{}, err
-		}
-		port = defaultPort("ss")
-		if u.Port() != "" {
-			value, parseErr := strconv.ParseUint(u.Port(), 10, 16)
-			if parseErr != nil || value == 0 {
-				return Result{}, errors.New("shadowsocks URI has invalid port")
-			}
-			port = uint16(value)
-		}
-		userinfo := ""
-		if u.User != nil {
-			userinfo = u.User.String()
-		}
-		method, password, err = decodeSSUserInfo(userinfo)
-	} else {
-		payload := strings.TrimPrefix(rawURI, rawURI[:strings.Index(rawURI, "://")+3])
-		if idx := strings.IndexAny(payload, "#?"); idx >= 0 {
-			payload = payload[:idx]
-		}
-		decoded, ok := decodeBase64(payload)
-		if !ok {
-			return Result{}, errors.New("decode shadowsocks payload")
-		}
-		text := string(decoded)
-		at := strings.LastIndex(text, "@")
-		if at < 0 {
-			return Result{}, errors.New("shadowsocks payload missing endpoint")
-		}
-		method, password, err = splitMethodPassword(text[:at])
-		if err == nil {
-			hostURL, parseErr := url.Parse("ss://" + text[at+1:])
-			if parseErr != nil {
-				err = parseErr
-			} else {
-				server, err = normalizeHost(hostURL.Hostname())
-				value, parseErr := strconv.ParseUint(hostURL.Port(), 10, 16)
-				if parseErr != nil || value == 0 {
-					err = errors.New("shadowsocks payload has invalid port")
-				} else {
-					port = uint16(value)
-				}
-			}
-		}
-	}
-	if err != nil || method == "" || password == "" || server == "" {
-		if err == nil {
-			err = errors.New("shadowsocks URI missing method, password or server")
-		}
-		return Result{}, err
-	}
-	options := normalizeQuery("ss", u.Query())
-	identity := Identity{Version: IdentityVersion, Protocol: "ss", Server: server, Port: port,
-		Auth: map[string]string{"password": password}, Options: options}
-	identity.Options["method"] = []string{strings.ToLower(method)}
-	return finish(identity)
-}
-
 func decodeSSUserInfo(value string) (string, string, error) {
-	if decoded, ok := decodeBase64(value); ok {
+	if decoded, ok := DecodeBase64Loose(value); ok {
 		return splitMethodPassword(string(decoded))
 	}
 	decoded, err := url.QueryUnescape(value)
@@ -399,50 +228,6 @@ func normalizeHost(host string) (string, error) {
 	return strings.ToLower(ascii), nil
 }
 
-func decodeBase64(value string) ([]byte, bool) {
-	value = strings.Map(func(r rune) rune {
-		if r == '\r' || r == '\n' || r == ' ' || r == '\t' {
-			return -1
-		}
-		return r
-	}, strings.TrimSpace(value))
-	for _, encoding := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
-		if decoded, err := encoding.DecodeString(value); err == nil {
-			return decoded, true
-		}
-	}
-	return nil, false
-}
-
-func stringValue(value any) string {
-	switch typed := value.(type) {
-	case string:
-		return typed
-	case float64:
-		return strconv.FormatFloat(typed, 'f', -1, 64)
-	case nil:
-		return ""
-	default:
-		return fmt.Sprint(typed)
-	}
-}
-
-func defaultString(value, fallback string) string {
-	if strings.TrimSpace(value) == "" {
-		return fallback
-	}
-	return value
-}
-
-func normalizeBool(value string) string {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "1", "true", "yes", "on":
-		return "true"
-	default:
-		return "false"
-	}
-}
-
 func splitAndSort(value string) []string {
 	parts := strings.Split(value, ",")
 	for i := range parts {
@@ -452,15 +237,15 @@ func splitAndSort(value string) []string {
 	return slices.Compact(parts)
 }
 
+func normalizeBool(value string) string {
+	if Truthy(value) {
+		return "true"
+	}
+	return "false"
+}
+
 func setDefault(values map[string][]string, key, value string) {
 	if len(values[key]) == 0 || values[key][0] == "" {
 		values[key] = []string{value}
 	}
-}
-
-func firstOption(values map[string][]string, key string) string {
-	if len(values[key]) == 0 {
-		return ""
-	}
-	return values[key][0]
 }
