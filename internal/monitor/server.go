@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"easy_proxies/internal/config"
@@ -1306,24 +1307,61 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request, action
 	}
 }
 
-// handleProbeAll probes all nodes in batches and returns results via SSE
+// handleProbeAll probes all nodes in batches and returns results via SSE.
+// The write side runs in its own goroutine: the result callback is invoked on
+// the probe scheduler's actor goroutine, and a synchronous write to a slow or
+// stalled SSE client would freeze the whole scheduler (event and command
+// buffers back up, periodic probing and reload enqueueing stall with it).
+// Progress frames are expendable and dropped when the client cannot keep up;
+// the per-write deadline bounds how long a wedged connection can hold the
+// writer goroutine.
 func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "SSE not supported", http.StatusInternalServerError)
 		return
 	}
+	// Headers are set before any write; the start event no longer doubles as
+	// the header setter because the writer goroutine owns all writes now.
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	type sseFrame struct{ data []byte }
+	frames := make(chan sseFrame, 128)
+	var writeFailed atomic.Bool
+	responseController := http.NewResponseController(w)
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		for frame := range frames {
+			_ = responseController.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", frame.data); err != nil {
+				writeFailed.Store(true)
+				for range frames { // drain so producers never block on a dead client
+				}
+				return
+			}
+			flusher.Flush()
+		}
+	}()
+	send := func(payload map[string]any) {
+		if writeFailed.Load() {
+			return
+		}
+		data, _ := json.Marshal(payload)
+		select {
+		case frames <- sseFrame{data: data}:
+		default: // the client cannot keep up; progress frames are expendable
+		}
+	}
+
 	started := false
 	completed := 0
 	total := 0
 	summary, err := s.mgr.RunProbeBatch(r.Context(), ProbeRoundManual, false, func(count int) {
 		started, total = true, count
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		data, _ := json.Marshal(map[string]any{"type": "start", "total": total})
-		fmt.Fprintf(w, "data: %s\n\n", data)
-		flusher.Flush()
+		send(map[string]any{"type": "start", "total": total})
 	}, func(result ProbeBatchResult) {
 		completed++
 		status, errorMessage := "success", ""
@@ -1335,14 +1373,30 @@ func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 		if total > 0 {
 			progress = float64(completed) / float64(total) * 100
 		}
-		data, _ := json.Marshal(map[string]any{
+		send(map[string]any{
 			"type": "progress", "tag": result.Tag, "name": result.Name,
 			"latency": latency, "status": status, "error": errorMessage,
 			"current": completed, "total": total, "progress": progress,
 		})
-		fmt.Fprintf(w, "data: %s\n\n", data)
-		flusher.Flush()
 	})
+	// The completion frame carries the totals the UI needs; give it a short
+	// blocking window instead of the drop-on-full path used for progress. It
+	// must be sent before the channel is closed below.
+	if err == nil {
+		data, _ := json.Marshal(map[string]any{
+			"type": "complete", "total": summary.Total,
+			"success": summary.Success, "failed": summary.Failed,
+		})
+		select {
+		case frames <- sseFrame{data: data}:
+		case <-time.After(1 * time.Second):
+		}
+	}
+	close(frames)
+	select {
+	case <-writerDone:
+	case <-time.After(2 * time.Second):
+	}
 	if errors.Is(err, ErrProbeRoundInProgress) && !started {
 		writeAPIError(w, http.StatusConflict, "已有全量探测正在运行")
 		return
@@ -1353,12 +1407,6 @@ func (s *Server) handleProbeAll(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	data, _ := json.Marshal(map[string]any{
-		"type": "complete", "total": summary.Total,
-		"success": summary.Success, "failed": summary.Failed,
-	})
-	fmt.Fprintf(w, "data: %s\n\n", data)
-	flusher.Flush()
 }
 
 // handleUnlockAll runs unlock checks for all nodes and streams results via SSE.
@@ -2025,7 +2073,7 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Content string `json:"content"` // 节点配置文本（URI / Clash YAML / Base64 均可）
 	}
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSONBody(r, &req); err != nil {
 		var oversized *http.MaxBytesError
 		message := err.Error()
 		if errors.As(err, &oversized) {
@@ -2581,7 +2629,22 @@ func (s *Server) handleSubscriptionCRUD(w http.ResponseWriter, r *http.Request, 
 	}
 }
 
+// maxDefaultJSONBodyBytes bounds request bodies for handlers that do not
+// declare their own budget. JSON API payloads are small; the memory-DoS
+// surface is the low-privilege endpoints (/api/auth, /api/public/*, group and
+// subscription CRUD) that previously read the body without any cap. Handlers
+// needing a larger budget (import: 12 MB, tag routes: 64 KB) wrap r.Body
+// with http.MaxBytesReader themselves and call decodeJSONBody.
+const maxDefaultJSONBodyBytes = 1 << 20
+
 func decodeJSON(r *http.Request, dst any) error {
+	r.Body = http.MaxBytesReader(nil, r.Body, maxDefaultJSONBodyBytes)
+	return decodeJSONBody(r, dst)
+}
+
+// decodeJSONBody decodes without imposing a body limit; the caller owns the
+// budget.
+func decodeJSONBody(r *http.Request, dst any) error {
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(dst); err != nil {

@@ -880,7 +880,10 @@ func mutexGroupFromInput(input mutexGroupInput, existing *store.TagMutexGroup, g
 }
 
 func decodeTagJSON(_ http.ResponseWriter, r *http.Request, dst any) error {
-	return decodeJSON(r, dst)
+	// The tag routes already wrap r.Body with a 64 KB MaxBytesReader
+	// (limitTagRequestBody); decodeJSON would shrink that to the default 1 MB
+	// — irrelevant here, but decodeJSONBody keeps the single-budget rule.
+	return decodeJSONBody(r, dst)
 }
 
 func limitTagRequestBody(w http.ResponseWriter, r *http.Request) {

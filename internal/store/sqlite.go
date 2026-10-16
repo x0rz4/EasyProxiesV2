@@ -902,6 +902,47 @@ func (s *sqliteStore) reconcileSubscriptionLogicalNodes(ctx context.Context, sub
 		return err
 	}
 
+	// Resolve the current identity holder for every unique logical name in
+	// one batched lookup instead of one point query per name — a 5000-node
+	// subscription otherwise issues up to 5000 SELECTs inside the snapshot
+	// transaction.
+	neededIdentities := make([]string, 0, len(incomingByName))
+	for logicalName, input := range incomingByName {
+		if incomingCounts[logicalName] == 1 && input.IdentityHash != "" {
+			neededIdentities = append(neededIdentities, input.IdentityHash)
+		}
+	}
+	identityToNodeID := make(map[string]int64, len(neededIdentities))
+	for start := 0; start < len(neededIdentities); start += 500 {
+		end := start + 500
+		if end > len(neededIdentities) {
+			end = len(neededIdentities)
+		}
+		batch := neededIdentities[start:end]
+		query := "SELECT id, identity_hash FROM nodes WHERE identity_hash IN (" +
+			strings.Repeat("?,", len(batch)-1) + "?)"
+		args := make([]any, len(batch))
+		for i, hash := range batch {
+			args[i] = hash
+		}
+		rows, err := s.writeConn().QueryContext(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("resolve current identities for subscription %d: %w", subscriptionID, err)
+		}
+		for rows.Next() {
+			var id int64
+			var hash string
+			if err := rows.Scan(&id, &hash); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan current identity for subscription %d: %w", subscriptionID, err)
+			}
+			identityToNodeID[hash] = id
+		}
+		if err := rows.Close(); err != nil {
+			return fmt.Errorf("finish identity lookup for subscription %d: %w", subscriptionID, err)
+		}
+	}
+
 	for logicalName, input := range incomingByName {
 		if incomingCounts[logicalName] != 1 {
 			continue
@@ -916,11 +957,7 @@ func (s *sqliteStore) reconcileSubscriptionLogicalNodes(ctx context.Context, sub
 			continue
 		}
 
-		var targetID int64
-		err := s.writeConn().QueryRowContext(ctx, "SELECT id FROM nodes WHERE identity_hash=?", input.IdentityHash).Scan(&targetID)
-		if err != nil && err != sql.ErrNoRows {
-			return fmt.Errorf("resolve current identity for %q: %w", input.Name, err)
-		}
+		targetID := identityToNodeID[input.IdentityHash]
 		targetIsEligible := false
 		for _, candidate := range eligible {
 			if candidate.id == targetID {
@@ -998,25 +1035,45 @@ func (s *sqliteStore) requireSubscription(ctx context.Context, subscriptionID in
 
 func (s *sqliteStore) upsertSubscriptionNodes(ctx context.Context, subscriptionID int64, nodes []SubscriptionNodeInput) error {
 	now := formatTime(time.Now().UTC())
-	for position, node := range nodes {
-		prepareSubscriptionNodeIdentity(&node)
-		_, err := s.writeConn().ExecContext(ctx, `INSERT INTO nodes
+	// Both statements run once per node; a large subscription (5000 nodes)
+	// executes them ~10000 times per refresh. Preparing once removes that
+	// many per-Exec SQL parses from the single-writer connection's serialized
+	// transaction.
+	nodeStmt, err := s.writeConn().PrepareContext(ctx, `INSERT INTO nodes
 			(uri, name, source, port, username, password, region, country, enabled, identity_hash, canonical_json, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(identity_hash) WHERE identity_hash<>'' DO UPDATE SET
 			name=excluded.name,
 			port=CASE WHEN nodes.port=0 THEN excluded.port ELSE nodes.port END,
 			username=excluded.username, password=excluded.password,
-			updated_at=excluded.updated_at`, node.URI, node.Name,
+			updated_at=excluded.updated_at
+			WHERE nodes.name<>excluded.name OR nodes.port<>excluded.port
+			OR nodes.username<>excluded.username OR nodes.password<>excluded.password`)
+	if err != nil {
+		return fmt.Errorf("prepare subscription node upsert: %w", err)
+	}
+	defer nodeStmt.Close()
+	linkStmt, err := s.writeConn().PrepareContext(ctx, `INSERT INTO subscription_nodes (subscription_id, node_id, position)
+			SELECT ?, id, ? FROM nodes WHERE identity_hash=?
+			ON CONFLICT(subscription_id, node_id) DO UPDATE SET position=excluded.position
+			WHERE subscription_nodes.position<>excluded.position`)
+	if err != nil {
+		return fmt.Errorf("prepare subscription node link: %w", err)
+	}
+	defer linkStmt.Close()
+	for position, node := range nodes {
+		prepareSubscriptionNodeIdentity(&node)
+		// The WHERE clause on DO UPDATE keeps unchanged rows untouched:
+		// bumping nodes.updated_at on every refresh poisoned every consumer
+		// that reads that column for change detection (identity
+		// reconciliation, subscription diffing, UI ordering) — a refresh with
+		// identical content flagged the whole fleet as "all changed".
+		if _, err := nodeStmt.ExecContext(ctx, node.URI, node.Name,
 			NodeSourceSubscription, node.Port, node.Username, node.Password, node.Region, node.Country,
-			boolToInt(node.Enabled), node.IdentityHash, node.CanonicalJSON, now, now)
-		if err != nil {
+			boolToInt(node.Enabled), node.IdentityHash, node.CanonicalJSON, now, now); err != nil {
 			return fmt.Errorf("upsert subscription node %q: %w", node.URI, err)
 		}
-		if _, err := s.writeConn().ExecContext(ctx, `INSERT INTO subscription_nodes (subscription_id, node_id, position)
-			SELECT ?, id, ? FROM nodes WHERE identity_hash=?
-			ON CONFLICT(subscription_id, node_id) DO UPDATE SET position=excluded.position`,
-			subscriptionID, position, node.IdentityHash); err != nil {
+		if _, err := linkStmt.ExecContext(ctx, subscriptionID, position, node.IdentityHash); err != nil {
 			return fmt.Errorf("link subscription node %q: %w", node.URI, err)
 		}
 	}

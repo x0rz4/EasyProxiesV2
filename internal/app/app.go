@@ -178,6 +178,9 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	statsCtx, statsCancel := context.WithCancel(ctx)
 	defer statsCancel()
 	go periodicStatsFlush(statsCtx, boxMgr, dataStore)
+	// Timeline rows were never cleaned up (CleanupTimeline had no caller),
+	// so node_timeline grew without bound for as long as the process ran.
+	go periodicTimelineCleanup(statsCtx, dataStore)
 
 	// ── 8. Wait for shutdown signal ──
 	sigCh := make(chan os.Signal, 1)
@@ -481,6 +484,25 @@ func periodicStatsFlush(ctx context.Context, boxMgr *boxmgr.Manager, s store.Sto
 			return
 		case <-ticker.C:
 			flushStatsToStore(ctx, boxMgr, s)
+		}
+	}
+}
+
+// periodicTimelineCleanup bounds node_timeline growth. The per-node keep
+// count matches the CleanupTimeline default; an hourly cadence is plenty
+// because the table only exceeds its steady-state size (nodes × keep) by the
+// probes of one interval.
+func periodicTimelineCleanup(ctx context.Context, s store.Store) {
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := s.CleanupTimeline(ctx, 20); err != nil {
+				log.Printf("[app] cleanup node timeline: %v", err)
+			}
 		}
 	}
 }

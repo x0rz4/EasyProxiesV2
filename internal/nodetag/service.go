@@ -163,26 +163,55 @@ func (s *Service) Recompute(ctx context.Context, nodeIDs []int64) ([]int64, erro
 	if err != nil {
 		return nil, err
 	}
-	previous, err := s.assignments(ctx, nodeIDs, store.NodeTagSourceAuto)
+	previous, err := s.autoAssignments(ctx, nodeIDs)
 	if err != nil {
 		return nil, err
 	}
 
 	now := s.now()
 	reported := map[int64]bool{}
-	assignments := make([]store.NodeAutoTagAssignment, 0, len(factSets))
 	var changed []int64
+	assignments := make([]store.NodeAutoTagAssignment, 0, len(factSets))
+	// A targeted recompute (nodeIDs != nil) must always rewrite its nodes:
+	// callers use it to force a projection refresh after renames and manual
+	// edits, and those sets are small. Only full recomputes (nil nodeIDs)
+	// filter down to changed nodes — that is where the write amplification
+	// lives (everyday sweeps over thousands of nodes).
+	targeted := nodeIDs != nil
 	for _, facts := range factSets {
 		decision := Resolve(facts.NodeID, s.match(facts, rules, now, reported),
 			manual[facts.NodeID], meta)
-		assignments = append(assignments, decision.Assignment())
-		if projectionChanged(previous[facts.NodeID], decision.TagIDs,
-			manual[facts.NodeID], meta) {
+		prevRows := previous[facts.NodeID]
+		prevTagIDs := make([]int64, 0, len(prevRows))
+		for _, row := range prevRows {
+			prevTagIDs = append(prevTagIDs, row.TagID)
+		}
+		// Two independent change signals:
+		//   - projectionChanged: the visible tag names differ — this is what
+		//     group membership reacts to.
+		//   - ruleVersionsChanged: a rule edit bumped a version without
+		//     changing any projection. The row must still be rewritten so the
+		//     stored version tracks the rule that produced it.
+		// Full sweeps with stable rules leave both checks false and write
+		// nothing at all.
+		projection := projectionChanged(prevTagIDs, decision.TagIDs,
+			manual[facts.NodeID], meta)
+		if projection {
 			changed = append(changed, facts.NodeID)
 		}
+		if targeted || projection || ruleVersionsChanged(prevRows, decision.RuleVersions) {
+			assignments = append(assignments, decision.Assignment())
+		}
 	}
-	if err := s.store.ReplaceAutoNodeTags(ctx, assignments); err != nil {
-		return nil, err
+	// Only nodes whose projection or rule_version actually changed are
+	// rewritten. Unchanged nodes already store exactly the rows the decision
+	// produces, so skipping them is a no-op semantically, but it turns a full
+	// sweep from O(N) DELETEs + O(N×T) INSERTs into zero writes when nothing
+	// moved — the dominant write-amplification source on large fleets.
+	if len(assignments) > 0 {
+		if err := s.store.ReplaceAutoNodeTags(ctx, assignments); err != nil {
+			return nil, err
+		}
 	}
 	if len(changed) > 0 && s.notify != nil {
 		s.notify(changed)
@@ -226,6 +255,38 @@ func (s *Service) assignments(ctx context.Context, nodeIDs []int64, source strin
 		sort.Slice(tagIDs, func(first, second int) bool { return tagIDs[first] < tagIDs[second] })
 	}
 	return byNode, nil
+}
+
+// autoAssignments groups one node's stored auto rows including rule_version,
+// so a recompute can detect version-only changes after a rule edit.
+func (s *Service) autoAssignments(ctx context.Context, nodeIDs []int64) (map[int64][]store.NodeTag, error) {
+	rows, err := s.store.ListNodeTags(ctx, store.NodeTagFilter{NodeIDs: nodeIDs, Source: store.NodeTagSourceAuto})
+	if err != nil {
+		return nil, err
+	}
+	byNode := make(map[int64][]store.NodeTag)
+	for _, row := range rows {
+		byNode[row.NodeID] = append(byNode[row.NodeID], row)
+	}
+	for _, nodeRows := range byNode {
+		sort.Slice(nodeRows, func(first, second int) bool { return nodeRows[first].TagID < nodeRows[second].TagID })
+	}
+	return byNode, nil
+}
+
+// ruleVersionsChanged reports whether the stored auto rows carry different
+// rule versions than the fresh decision. TagID sets are compared by the
+// caller first, so equal-length positional comparison is valid here.
+func ruleVersionsChanged(previous []store.NodeTag, versions []int) bool {
+	if len(previous) != len(versions) {
+		return true
+	}
+	for index, version := range versions {
+		if previous[index].RuleVersion != version {
+			return true
+		}
+	}
+	return false
 }
 
 // projectionChanged reports whether the node's visible tag names differ before

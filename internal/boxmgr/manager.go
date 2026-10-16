@@ -432,6 +432,13 @@ func (m *Manager) reload(newCfg *config.Config) error {
 	m.applyConfigSettings(newCfg)
 
 	m.mu.Lock()
+	// Rebase before committing: the snapshot this reload was built from may
+	// be tens of seconds old, and mutations that landed on m.cfg during the
+	// window (retagging, landing reclassification, node CRUD) would otherwise
+	// be rolled back by the stale commit.
+	if rebased := rebaseReloadedNodes(oldCfg, m.cfg, newCfg); rebased > 0 {
+		m.logger.Warnf("reload rebased %d node mutation(s) that landed during the reload window", rebased)
+	}
 	m.currentBox = instance
 	m.cfg = newCfg
 	m.runtimeGeneration = reloadGeneration

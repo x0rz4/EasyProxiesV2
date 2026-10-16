@@ -127,7 +127,20 @@ type groupRuntime struct {
 	recovery   RecoveryPolicy
 	currentTag string
 	members    map[string]*groupMemberRuntime
+
+	// Current-tag notification coalescing. Sequential/balanced/random dispatch
+	// update currentTag on every dial; the value itself is always current in
+	// memory, but the event fan-out (persistence observer + subscribers) must
+	// not run on the per-connection path at full rate. Guarded by mu.
+	lastCurrentNotify    time.Time
+	currentNotifyPending bool
+	currentPendingNodeID int64
 }
+
+// currentTagNotifyInterval caps how often CurrentChanged events are fanned out
+// per group. Anything shorter only delays an informational update; failure and
+// recovery events are never throttled.
+const currentTagNotifyInterval = 500 * time.Millisecond
 
 var (
 	groupRuntimeStore  sync.Map // map[int64]*groupRuntime
@@ -190,11 +203,13 @@ func SetGroupStateObserver(observer func(GroupStateEvent)) {
 }
 
 func notifyGroupState(event GroupStateEvent) {
+	// Subscriber callbacks run on data-plane paths (dial failure, dial
+	// success); a panicking subscriber must not take the connection loop down.
 	groupObserverMu.RLock()
 	observer := groupObserver
 	groupObserverMu.RUnlock()
 	if observer != nil {
-		observer(event)
+		runStateCallback(observer, event)
 	}
 	stateSubscriberMu.RLock()
 	subscribers := make([]func(GroupStateEvent), 0, len(stateSubscribers))
@@ -203,8 +218,13 @@ func notifyGroupState(event GroupStateEvent) {
 	}
 	stateSubscriberMu.RUnlock()
 	for _, subscriber := range subscribers {
-		subscriber(event)
+		runStateCallback(subscriber, event)
 	}
+}
+
+func runStateCallback(callback func(GroupStateEvent), event GroupStateEvent) {
+	defer func() { _ = recover() }()
+	callback(event)
 }
 
 // RuntimeUpdate describes a complete group state topology. It is consumed by
@@ -426,7 +446,16 @@ func CurrentTag(groupID int64) string {
 		pruneFailures(member, runtime.window, time.Now())
 		if len(member.failureHistory) == 0 {
 			tag := runtime.currentTag
+			flush := runtime.currentNotifyPending && time.Since(runtime.lastCurrentNotify) >= currentTagNotifyInterval
+			if flush {
+				runtime.currentNotifyPending = false
+				runtime.lastCurrentNotify = time.Now()
+			}
+			nodeID := runtime.currentPendingNodeID
 			runtime.mu.Unlock()
+			if flush {
+				notifyGroupState(GroupStateEvent{GroupID: groupID, NodeID: nodeID, CurrentNodeID: nodeID, CurrentChanged: true})
+			}
 			return tag
 		}
 	}
@@ -435,6 +464,7 @@ func CurrentTag(groupID int64) string {
 		return ""
 	}
 	runtime.currentTag = ""
+	runtime.currentNotifyPending = false
 	runtime.mu.Unlock()
 	notifyGroupState(GroupStateEvent{GroupID: groupID, CurrentChanged: true})
 	return ""
@@ -463,6 +493,20 @@ func SetCurrentTag(groupID int64, tag string) {
 		event.CurrentNodeID = member.nodeID
 	}
 	event.CurrentChanged = true
+	// Sequential/balanced/random dispatch hit this on every dial. The in-memory
+	// value is always fresh, but the synchronous fan-out (persistence observer,
+	// candidate rebuilds) must not run per connection: coalesce CurrentChanged
+	// notifications to at most one per interval. Failure/recovery paths never
+	// throttle.
+	now := time.Now()
+	if !runtime.lastCurrentNotify.IsZero() && now.Sub(runtime.lastCurrentNotify) < currentTagNotifyInterval {
+		runtime.currentNotifyPending = true
+		runtime.currentPendingNodeID = event.CurrentNodeID
+		runtime.mu.Unlock()
+		return
+	}
+	runtime.lastCurrentNotify = now
+	runtime.currentNotifyPending = false
 	runtime.mu.Unlock()
 	notifyGroupState(event)
 }
@@ -490,6 +534,17 @@ func RecordFailure(groupID int64, tag string, cause error, at time.Time) bool {
 		if ts >= cutoff {
 			history = append(history, ts)
 		}
+	}
+	// Concurrent dials against the same dead member report failures within one
+	// wall-clock second. Counting each one evicts a member from a single burst
+	// and diverges from the probe path's same-second dedup
+	// (RecordGroupHealthFailure): one second is one evidence unit. The current
+	// tag and recovery streak were already invalidated by the first failure of
+	// this second, so an early return preserves those semantics.
+	if len(history) > 0 && history[len(history)-1] == at.Unix() {
+		evicted := member.evicted
+		runtime.mu.Unlock()
+		return evicted
 	}
 	member.failureHistory = append(history, at.Unix())
 	member.recoverySuccesses = 0

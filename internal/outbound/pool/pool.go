@@ -1577,7 +1577,13 @@ func (p *poolOutbound) recordFailure(member *memberState, cause error, destinati
 		} else {
 			p.logger.Warn("group ", p.options.GroupID, " marked ", member.tag, " suspect: ", cause)
 		}
-		p.rebuildCandidatesNow()
+		// group.RecordFailure already published a StateChanged event whose
+		// handler rebuilds the candidates synchronously; a second rebuild here
+		// would double the snapshot churn on every failure. Only pools without
+		// a registered group-state subscriber need the direct rebuild.
+		if p.unsubscribeGroupState == nil {
+			p.rebuildCandidatesNow()
+		}
 		p.scheduleExpiryRebuild(p.currentFailureWindow())
 		return
 	}

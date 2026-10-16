@@ -400,6 +400,11 @@ func (m *Manager) refreshDue(ctx context.Context, dueOnly bool) error {
 	return joined
 }
 
+// errSubscriptionNotModified signals a 304 response. The caller skips the
+// entire downstream chain (parse, snapshot commit, double full-node listing)
+// because nothing can have changed.
+var errSubscriptionNotModified = errors.New("订阅内容未变化（304）")
+
 func (m *Manager) refreshSubscription(ctx context.Context, sub *store.Subscription) error {
 	attempt := time.Now().UTC()
 	timeout := time.Duration(sub.RefreshTimeoutSeconds) * time.Second
@@ -408,6 +413,19 @@ func (m *Manager) refreshSubscription(ctx context.Context, sub *store.Subscripti
 		timeout = time.Duration(seconds) * time.Second
 	}
 	nodes, etag, lastModified, err := m.fetchSubscription(ctx, sub, timeout)
+	if errors.Is(err, errSubscriptionNotModified) {
+		// Keep the stored ETag/Last-Modified; nothing else to do. LastSuccess
+		// stays untouched — the evidence is the stored snapshot, not a new
+		// download.
+		m.mu.Lock()
+		m.status.LastError = ""
+		m.mu.Unlock()
+		sub.LastAttempt, sub.LastError = attempt, ""
+		if updateErr := m.store.UpdateSubscription(ctx, sub); updateErr != nil {
+			m.logger.Warnf("record 304 for subscription %d: %v", sub.ID, updateErr)
+		}
+		return nil
+	}
 	if err == nil && len(nodes) == 0 {
 		err = errors.New("订阅未返回有效节点")
 	}
@@ -525,11 +543,23 @@ func (m *Manager) fetchSubscription(parent context.Context, sub *store.Subscript
 	}
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Accept", subscriptionAccept(format))
+	// Conditional request: the stored validators were saved but never sent, so
+	// every refresh re-downloaded and re-parsed the full body even when the
+	// upstream content was unchanged. A 304 short-circuits the whole chain.
+	if sub.ETag != "" {
+		req.Header.Set("If-None-Match", sub.ETag)
+	}
+	if sub.LastModified != "" {
+		req.Header.Set("If-Modified-Since", sub.LastModified)
+	}
 	resp, err := m.httpClient.Do(req)
 	if err != nil {
 		return nil, "", "", fmt.Errorf("fetch: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotModified {
+		return nil, "", "", errSubscriptionNotModified
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, "", "", fmt.Errorf("status %d", resp.StatusCode)
 	}
@@ -547,7 +577,13 @@ func (m *Manager) fetchSubscription(parent context.Context, sub *store.Subscript
 			err = fmt.Errorf("解析订阅响应（Content-Type %s）: %w", contentType, err)
 		}
 	}
-	return nodes, resp.Header.Get("ETag"), resp.Header.Get("Last-Modified"), err
+	etag, lastModified := resp.Header.Get("ETag"), resp.Header.Get("Last-Modified")
+	if etag == "" && lastModified == "" {
+		// Upstream did not return fresh validators; keep the stored ones so
+		// the next refresh can still be conditional.
+		etag, lastModified = sub.ETag, sub.LastModified
+	}
+	return nodes, etag, lastModified, err
 }
 
 func defaultSubscriptionUserAgent(format string) string {

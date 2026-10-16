@@ -5,8 +5,16 @@ import (
 	"sync/atomic"
 )
 
-// Each subscription owns an unbounded FIFO. Publishing only appends to the
-// queue, so slow control-plane callbacks cannot block probe workers.
+// healthEventQueueLimit bounds each subscription's FIFO. Publishing only
+// appends to the queue, so slow control-plane callbacks cannot block probe
+// workers — but without a bound a wedged consumer would grow its queue
+// without limit, because probe results keep arriving for as long as the
+// process runs. Once the limit is hit further events are dropped: every
+// consumer of this hub (pool candidate rebuilds, UI streams) reconciles from
+// current snapshots, so a dropped event costs at most one extra refresh.
+const healthEventQueueLimit = 4096
+
+// Each subscription owns a bounded FIFO.
 type healthEventSubscription struct {
 	callback func(HealthResultEvent)
 	tags     []string
@@ -17,6 +25,7 @@ type healthEventSubscription struct {
 	wake     chan struct{}
 	stop     chan struct{}
 	closed   bool
+	dropped  int64
 }
 
 func newHealthEventSubscription(callback func(HealthResultEvent), tags []string, nodeIDs []int64, global bool) *healthEventSubscription {
@@ -31,12 +40,26 @@ func (s *healthEventSubscription) enqueue(event HealthResultEvent) {
 		s.mu.Unlock()
 		return
 	}
+	if len(s.queue) >= healthEventQueueLimit {
+		s.dropped++
+		s.mu.Unlock()
+		return
+	}
 	s.queue = append(s.queue, event)
 	s.mu.Unlock()
 	select {
 	case s.wake <- struct{}{}:
 	default:
 	}
+}
+
+// Dropped reports how many events were shed because the consumer could not
+// keep up. Exposed for diagnostics; a monotonically increasing value means
+// the subscriber callback is wedged.
+func (s *healthEventSubscription) Dropped() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.dropped
 }
 
 func (s *healthEventSubscription) run() {
