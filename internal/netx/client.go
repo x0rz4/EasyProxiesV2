@@ -10,6 +10,7 @@ package netx
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net"
 	"net/http"
 	"time"
@@ -127,4 +128,20 @@ func tlsConfig(insecure bool) *tls.Config {
 	}
 	// #nosec G402 -- opt-in via Options.InsecureSkipVerify, documented there.
 	return &tls.Config{InsecureSkipVerify: true}
+}
+
+// PortAvailable reports whether a TCP listener can bind address:port right
+// now. It backs config-time port assignment: a port is only "free" if the
+// local process can actually take it, which a table of already-assigned ports
+// cannot see (another process may hold it). The probe is inherently racy —
+// the port can be taken between this check and the real bind — so callers use
+// it to pick a candidate, and their own Start retry loop remains the
+// authority on conflicts.
+func PortAvailable(address string, port uint16) bool {
+	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", address, port))
+	if err != nil {
+		return false
+	}
+	_ = listener.Close()
+	return true
 }

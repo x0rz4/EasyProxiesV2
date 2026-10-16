@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net"
 	"net/url"
 	"reflect"
 	"regexp"
@@ -21,6 +20,7 @@ import (
 	"easy_proxies/internal/group"
 	"easy_proxies/internal/groupmember"
 	"easy_proxies/internal/monitor"
+	"easy_proxies/internal/netx"
 	"easy_proxies/internal/nodecodec"
 	"easy_proxies/internal/outbound/pool"
 	"easy_proxies/internal/runtimetag"
@@ -2603,17 +2603,6 @@ func extractPortFromBindError(err error) uint16 {
 	return 0
 }
 
-// isPortAvailable checks if a port is available for binding.
-func isPortAvailable(address string, port uint16) bool {
-	addr := fmt.Sprintf("%s:%d", address, port)
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return false
-	}
-	_ = ln.Close()
-	return true
-}
-
 // reassignConflictingPort finds the node using the conflicting port and assigns a new port.
 func reassignConflictingPort(cfg *config.Config, conflictPort uint16) bool {
 	if cfg == nil || !cfg.MultiPort.Enabled {
@@ -2637,7 +2626,7 @@ func reassignConflictingPort(cfg *config.Config, conflictPort uint16) bool {
 			if address == "" {
 				address = "0.0.0.0"
 			}
-			for newPort <= 65535 && (usedPorts[uint16(newPort)] || !isPortAvailable(address, uint16(newPort))) {
+			for newPort <= 65535 && (usedPorts[uint16(newPort)] || !netx.PortAvailable(address, uint16(newPort))) {
 				newPort++
 			}
 			if newPort > 65535 {

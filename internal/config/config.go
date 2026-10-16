@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -17,6 +16,7 @@ import (
 
 	"easy_proxies/internal/group"
 	json "easy_proxies/internal/jsonx"
+	"easy_proxies/internal/netx"
 	"easy_proxies/internal/nodecodec"
 
 	"github.com/tailscale/hujson"
@@ -631,7 +631,7 @@ func (c *Config) normalizeInternal(skipSubscriptionFetch bool) error {
 
 		// Only multi-port listeners need per-node port allocation.
 		if c.Nodes[idx].Port == 0 && c.MultiPort.Enabled {
-			for portCursor <= 65535 && !isPortAvailable(c.MultiPort.Address, uint16(portCursor)) {
+			for portCursor <= 65535 && !netx.PortAvailable(c.MultiPort.Address, uint16(portCursor)) {
 				log.Printf("⚠️  Port %d is in use, trying next port", portCursor)
 				portCursor++
 			}
@@ -669,7 +669,7 @@ func (c *Config) normalizeInternal(skipSubscriptionFetch bool) error {
 			if c.Nodes[idx].Port == poolPort {
 				// Find next available port
 				newPort := int(c.Nodes[idx].Port) + 1
-				for newPort <= 65535 && (usedPorts[uint16(newPort)] || !isPortAvailable(c.MultiPort.Address, uint16(newPort))) {
+				for newPort <= 65535 && (usedPorts[uint16(newPort)] || !netx.PortAvailable(c.MultiPort.Address, uint16(newPort))) {
 					newPort++
 				}
 				if newPort > 65535 {
@@ -755,7 +755,7 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 	for idx := range c.Nodes {
 		if c.Nodes[idx].Port == 0 && c.MultiPort.Enabled {
 			// Find next available port that's not used
-			for portCursor <= 65535 && (usedPorts[uint16(portCursor)] || !isPortAvailable(c.MultiPort.Address, uint16(portCursor))) {
+			for portCursor <= 65535 && (usedPorts[uint16(portCursor)] || !netx.PortAvailable(c.MultiPort.Address, uint16(portCursor))) {
 				portCursor++
 			}
 			if portCursor > 65535 {
@@ -1753,17 +1753,6 @@ func ValidateSubscriptionRefreshSettings(interval, timeout, healthCheckTimeout, 
 	}
 
 	return nil
-}
-
-// isPortAvailable checks if a port is available for binding.
-func isPortAvailable(address string, port uint16) bool {
-	addr := fmt.Sprintf("%s:%d", address, port)
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return false
-	}
-	_ = ln.Close()
-	return true
 }
 
 // writeFileAtomic writes data to a file atomically by writing to a temporary

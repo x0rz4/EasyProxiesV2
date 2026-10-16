@@ -93,7 +93,7 @@ func (l *Loader) Load(ctx context.Context, nodeIDs []int64) ([]NodeFacts, error)
 	}
 	out := make([]NodeFacts, 0, len(nodes))
 	for _, node := range nodes {
-		facts := NewNodeFacts(node.ID, node.Name, NormalizeRegion(node.Region))
+		facts := NewNodeFacts(node.ID, node.Name, noderegion.Normalize(node.Region))
 		applyNodeFields(facts, node)
 		applySourceFields(facts, subscriptionIDs[node.ID], subscriptionNames, manualTags[node.ID])
 		applyStatsFields(facts, stats[node.ID])
@@ -108,11 +108,6 @@ func (l *Loader) Load(ctx context.Context, nodeIDs []int64) ([]NodeFacts, error)
 }
 
 const fieldNodeRegionLegacy = "_legacy.node.region"
-
-// NormalizeRegion returns a canonical country code, or empty for unknown.
-func NormalizeRegion(region string) string {
-	return noderegion.Normalize(region)
-}
 
 func (l *Loader) manualTagNames(ctx context.Context, ids []int64) (map[int64][]string, error) {
 	assignments, err := l.source.ListNodeTags(ctx, store.NodeTagFilter{
@@ -178,7 +173,7 @@ func knownTextAt(value string, checkedAt time.Time) Fact[string] {
 // max_age_seconds can never expire them — they are not measurements.
 func applyNodeFields(facts NodeFacts, node store.Node) {
 	facts.Set(FieldNodeName, StringValue(Known(node.Name)))
-	facts.Set(FieldNodeRegion, EnumValue(knownText(NormalizeRegion(node.Region))))
+	facts.Set(FieldNodeRegion, EnumValue(knownText(noderegion.Normalize(node.Region))))
 	facts.Set(fieldNodeRegionLegacy, EnumValue(Known(noderegion.Legacy(node.Region))))
 	facts.Set(FieldNodeCountry, StringValue(knownText(node.Country)))
 	facts.Set(FieldNodeProtocol, EnumValue(knownText(uriProtocol(node.URI))))
