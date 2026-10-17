@@ -39,7 +39,7 @@ install.sh                    Linux Docker / 二进制安装及更新入口
 
 ---
 
-## 3. Module Map（`internal/`，27 个包）
+## 3. Module Map（`internal/`，28 个包）
 
 ### 装配与基础
 
@@ -68,7 +68,8 @@ install.sh                    Linux Docker / 二进制安装及更新入口
 
 | 包 | 职责 |
 | --- | --- |
-| `monitor` | 管理面全部内容：HTTP API + 内嵌 WebUI、节点运行态注册表（`entry` + `nodeRegistry`）、健康探测 actor（`probe_scheduler`）、健康事件 hub、综合检测任务引擎（`nodecheck`）、标签 HTTP 面（`tag_handlers`/`tag_schema`）、分组订阅输出、会话认证。**只依赖接口，不 import `boxmgr`/`outbound/pool`**（反向才是允许的：`boxmgr`、`pool`、`subscription` 都 import 它，并实现它定义的 `NodeManager` / `GroupRuntimeManager` / `SubscriptionRefresher`）。 |
+| `monitor` | **运行时**：节点运行态注册表（`entry` + `nodeRegistry`）、健康探测 actor（`probe_scheduler`）、健康事件 hub（`health_event_hub`）、健康结果投影（`health_applier`）、流量采样；`ports.go` 定义消费方接口 `NodeManager` / `GroupRuntimeManager` / `GroupMembershipManager` / `SubscriptionRefresher` 与领域错误，`tag_providers.go` 定义标签事实提供者。**不含任何 HTTP、路由、Session 或 DTO**（已迁至 `httpapi`）。**只依赖接口，不 import `boxmgr`/`outbound/pool`**（反向才是允许的：`boxmgr`、`pool`、`subscription` 都 import 它并实现上述接口）。 |
+| `httpapi` | **管理面 HTTP 层**：`Server` 生命周期、路由表、全部 handler 与 DTO、响应管线（`pathID` / `requireStore` / 三个域状态函数）、会话认证、SSE、静态资源与 `//go:embed assets/*`。它 import `monitor` 读运行时状态、直连 `store` 做持久化；`monitor` **不**反向 import 它。`boxmgr` 持有 `*httpapi.Server` 并经 `MonitorServer()` 暴露给 `app`。 |
 
 ### 事实与标签
 
@@ -94,7 +95,9 @@ install.sh                    Linux Docker / 二进制安装及更新入口
 main → app → boxmgr ──→ builder ──→ config/store/groupmember/runtimetag/nodecodec
               │  └──→ monitor（boxmgr 把 box context 注入给 pool，pool 反向查 monitor）
               ├──→ outbound/pool ──→ monitor（延迟/黑名单/健康事件）+ group（状态机）
-              └──→ group
+              ├──→ group
+              └──→ httpapi（持有 Server 并在内部启动；app 经 MonitorServer() 调 Start/Shutdown）
+httpapi → monitor / store / config（单向；monitor 从不 import httpapi）
 app → nodetag ←(事实)→ nodefacts        monitor 是 unlock/ipquality 与 nodefacts 的桥接层
 subscription → boxmgr（经 interface）
 store / unlock / ipquality → noderesult（叶子，检测结果类型的唯一来源）
@@ -115,7 +118,7 @@ nodedetect / unlock / ipquality / geoip → netx（叶子，拨号 http.Client �
 ### 4.2 控制面 API
 
 `/api/*` 需认证（`management.password` 为空则免密；Cookie `session_token` 或 `Authorization: Bearer`，会话 24h 存 SQLite）；
-`/sub/{groupID}` 公开但用分组 `SubscriptionToken` 做常量时间比较。路由表见 `internal/monitor/routes.go`（节点 / 分组 / 标签 / 订阅 / 综合检测 / 设置 / Debug / GeoIP 若干组）。
+`/sub/{groupID}` 公开但用分组 `SubscriptionToken` 做常量时间比较。路由表见 `internal/httpapi/routes.go`（节点 / 分组 / 标签 / 订阅 / 综合检测 / 设置 / Debug / GeoIP 若干组）。
 
 ### 4.3 标签重算 → 分组增量重建
 
@@ -246,5 +249,5 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 9. 新增解锁检测器：加一个 `checker_*.go`，实现 `Checker` 接口并在 `init()` 里 `RegisterChecker`，取一个未占用的 `Order()`。provider 字段、内置标签模板、schema 枚举会自动派生；重复 key 或别名冲突会在启动时 panic。
 10. **`golang.org/x/net` 必须钉在 `v0.50.0`（`x/crypto` ≤ `v0.48.0`）**：sing-box v1.13.x 用 `//go:linkname` 直接抓 `x/net/http2.(*Transport).connPool` 这个**私有字段**，而该字段自 x/net `v0.51.0` 起已改名 `connPoolOrDef` → 一旦升级 x/net，链接器就会报 `relocation target ... not defined`。后果随 Go 版本放大：`go test` 下 `subscription` / `boxmgr` / `app` 三个包必然 `[build failed]`；Go ≥ 1.27 时**连生产构建都失败**（1.26 只是靠链接期 DCE 侥幸通过，不要依赖）。由于 `modernc.org/sqlite` 与 `geoip2-golang` 会反向要求更高的 x/net，这两个版本也要跟着钉住（当前 `v1.52.0` / `v2.2.0`）。调整这几个依赖后务必跑一次 `go build ./cmd/easy_proxies` 验证链接。
 11. **经节点拨号的 HTTP 客户端一律走 `netx`，且 `DialFunc` 不允许为 nil**：`netx` 造的是**裸** `http.Transport`（这是刻意的：每个消费者只要它声明的那几个字段）。因此 `nil` 拨号不等于"用标准库默认值"——那样会静默丢掉 `http.DefaultTransport` 的 HTTP/2、代理环境变量与共享空闲连接池。主机本地（不经节点）的请求，例如 `IPAPIClient` 的批量查询，应直接用 `&http.Client{Timeout: ...}`，不要经过 `netx`。新增消费者时把差异写成显式 `Options`，不要在调用处重拼 transport。
-12. **错误→状态码是三个策略，不是一个**（`monitor/response.go`）：`nodeErrorStatus`（类型驱动，`respondNodeError` 靠它额外带 `existing_node_id`）、`subscriptionErrorStatus`（消息驱动，未识别 → 500）、`tagErrorStatus`（消息驱动，未识别 → 400）。它们**故意不一致**：同样是"节点不存在"，tag 域是 400（请求体点了不存在的节点）、订阅域是 404，且 `tag_handlers_test.go` 钉住了这个 400。调用方必须显式点名自己用哪个策略——`errorToStatus(err)` 这种统一分发器今天写不对，因为两个域只能靠"谁调用的"区分，错误的类型和文案都区分不出来。同理 `monitor/response.go` 的 `pathID`（400）与 `pathIDOrNotFound`（公开 `/sub/*` 用 404，避免探测 ID 形态）不可互换。
+12. **错误→状态码是三个策略，不是一个**（`httpapi/response.go`）：`nodeErrorStatus`（类型驱动，`respondNodeError` 靠它额外带 `existing_node_id`）、`subscriptionErrorStatus`（消息驱动，未识别 → 500）、`tagErrorStatus`（消息驱动，未识别 → 400）。它们**故意不一致**：同样是"节点不存在"，tag 域是 400（请求体点了不存在的节点）、订阅域是 404，且 `tag_handlers_test.go` 钉住了这个 400。调用方必须显式点名自己用哪个策略——`errorToStatus(err)` 这种统一分发器今天写不对，因为两个域只能靠"谁调用的"区分，错误的类型和文案都区分不出来。同理 `httpapi/response.go` 的 `pathID`（400）与 `pathIDOrNotFound`（公开 `/sub/*` 用 404，避免探测 ID 形态）不可互换。
 13. **不要为"减少 handler 样板"引入泛型 `handle[Req, Resp]` 包装**：实测 14 个解码请求体的 handler 各自带 3–19 个错误分支，包装只省掉最外层的 decode/serialize，分支一个不少，缩短量为 0；最贴近该形状的 `handleReload` 还会因丢掉 `respondNodeError` 的 `existing_node_id` 而行为变化。真正有效的是 `pathID` / `requireStore` / 三个域状态函数。若 httpapi 拆分时要重提，从这次测量出发，不要从想法出发。
