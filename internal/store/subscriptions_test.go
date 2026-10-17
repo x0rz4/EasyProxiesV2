@@ -32,7 +32,10 @@ func TestSubscriptionsAndSnapshots(t *testing.T) {
 
 	a.Name = "A updated"
 	a.RefreshTimeoutSeconds = 15
-	if err := db.UpdateSubscription(ctx, a); err != nil {
+	if err := db.UpdateSubscriptionSettings(ctx, a.ID, SubscriptionSettings{
+		Name: a.Name, URL: a.URL, Format: a.Format, UserAgent: a.UserAgent, Enabled: a.Enabled,
+		RefreshIntervalSeconds: a.RefreshIntervalSeconds, RefreshTimeoutSeconds: a.RefreshTimeoutSeconds, SortOrder: a.SortOrder,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	list, err := db.ListSubscriptions(ctx)
@@ -73,7 +76,7 @@ func TestSubscriptionsAndSnapshots(t *testing.T) {
 
 	snapshotTime := time.Now().UTC().Truncate(time.Second)
 	shared.Name = "shared refreshed"
-	if err := db.CommitSnapshot(ctx, a.ID, []SubscriptionNodeInput{shared}, SubscriptionSnapshot{
+	if _, err := db.CommitSnapshot(ctx, a.ID, []SubscriptionNodeInput{shared}, SubscriptionSnapshot{
 		Attempt: snapshotTime, Success: snapshotTime, ETag: "v2", LastModified: "yesterday",
 	}); err != nil {
 		t.Fatal(err)
@@ -131,7 +134,7 @@ func TestCommitSnapshotMergesAndRetainsMissingNodes(t *testing.T) {
 	a := SubscriptionNodeInput{URI: "http://a.example:80", Name: "A", Region: "hk", Country: "Hong Kong", Enabled: true}
 	b := SubscriptionNodeInput{URI: "http://b.example:80", Name: "B", Enabled: true}
 	first := time.Now().UTC().Add(-time.Minute).Truncate(time.Second)
-	if err := db.CommitSnapshot(ctx, sub.ID, []SubscriptionNodeInput{a, b}, SubscriptionSnapshot{Attempt: first, Success: first, ETag: "first"}); err != nil {
+	if _, err := db.CommitSnapshot(ctx, sub.ID, []SubscriptionNodeInput{a, b}, SubscriptionSnapshot{Attempt: first, Success: first, ETag: "first"}); err != nil {
 		t.Fatal(err)
 	}
 	aNode, err := db.GetNodeByURI(ctx, a.URI)
@@ -144,7 +147,7 @@ func TestCommitSnapshotMergesAndRetainsMissingNodes(t *testing.T) {
 	second := time.Now().UTC().Truncate(time.Second)
 	b.Name, b.Port = "B updated", 8080
 	c := SubscriptionNodeInput{URI: "http://c.example:80", Name: "C", Enabled: true}
-	if err := db.CommitSnapshot(ctx, sub.ID, []SubscriptionNodeInput{b, c}, SubscriptionSnapshot{Attempt: second, Success: second, ETag: "second"}); err != nil {
+	if _, err := db.CommitSnapshot(ctx, sub.ID, []SubscriptionNodeInput{b, c}, SubscriptionSnapshot{Attempt: second, Success: second, ETag: "second"}); err != nil {
 		t.Fatal(err)
 	}
 	members, err := db.ListSubscriptionNodes(ctx, sub.ID)
@@ -186,7 +189,7 @@ func TestCommitSnapshotMergesAndRetainsMissingNodes(t *testing.T) {
 	if err != nil || len(effective) != 3 {
 		t.Fatalf("re-enabled retained members were not restored: nodes=%+v err=%v", effective, err)
 	}
-	if err := db.CommitSnapshot(ctx, sub.ID, nil, SubscriptionSnapshot{Attempt: time.Now(), Success: time.Now(), ETag: "empty"}); err == nil {
+	if _, err := db.CommitSnapshot(ctx, sub.ID, nil, SubscriptionSnapshot{Attempt: time.Now(), Success: time.Now(), ETag: "empty"}); err == nil {
 		t.Fatal("empty snapshot unexpectedly replaced retained members")
 	}
 	afterEmpty, _ := db.ListSubscriptionNodes(ctx, sub.ID)
@@ -213,7 +216,7 @@ func TestCommitSnapshotReconcilesUniqueLogicalNodeInPlace(t *testing.T) {
 		URI: "http://old-user:old-pass@old.example:3129", Name: logicalName,
 		LogicalName: logicalName, Port: 24038, Region: "hk", Enabled: true,
 	}
-	if err := db.CommitSnapshot(ctx, sub.ID, []SubscriptionNodeInput{oldInput}, SubscriptionSnapshot{Attempt: time.Now(), Success: time.Now()}); err != nil {
+	if _, err := db.CommitSnapshot(ctx, sub.ID, []SubscriptionNodeInput{oldInput}, SubscriptionSnapshot{Attempt: time.Now(), Success: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 	oldNode, err := db.GetNodeByURI(ctx, oldInput.URI)
@@ -242,7 +245,7 @@ func TestCommitSnapshotReconcilesUniqueLogicalNodeInPlace(t *testing.T) {
 		URI: "http://new-user:new-pass@new.example:8080", Name: logicalName,
 		LogicalName: logicalName, Port: 24155, Region: "us", Enabled: true,
 	}
-	if err := db.CommitSnapshot(ctx, sub.ID, []SubscriptionNodeInput{newInput}, SubscriptionSnapshot{Attempt: time.Now(), Success: time.Now()}); err != nil {
+	if _, err := db.CommitSnapshot(ctx, sub.ID, []SubscriptionNodeInput{newInput}, SubscriptionSnapshot{Attempt: time.Now(), Success: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 	members, err := db.ListSubscriptionNodes(ctx, sub.ID)
@@ -287,11 +290,11 @@ func TestCommitSnapshotCleansAccumulatedLogicalDuplicatesUsingOldestNode(t *test
 	const logicalName = "lite-家庭宽带-香港hgc"
 	oldInput := SubscriptionNodeInput{URI: "http://first:pass@one.example:3129", Name: logicalName, Port: 24038, Enabled: true}
 	currentInput := SubscriptionNodeInput{URI: "http://second:pass@two.example:3129", Name: logicalName, Port: 24155, Enabled: true}
-	if err := db.CommitSnapshot(ctx, sub.ID, []SubscriptionNodeInput{oldInput}, SubscriptionSnapshot{Attempt: time.Now(), Success: time.Now()}); err != nil {
+	if _, err := db.CommitSnapshot(ctx, sub.ID, []SubscriptionNodeInput{oldInput}, SubscriptionSnapshot{Attempt: time.Now(), Success: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 	oldNode, _ := db.GetNodeByURI(ctx, oldInput.URI)
-	if err := db.CommitSnapshot(ctx, sub.ID, []SubscriptionNodeInput{currentInput}, SubscriptionSnapshot{Attempt: time.Now(), Success: time.Now()}); err != nil {
+	if _, err := db.CommitSnapshot(ctx, sub.ID, []SubscriptionNodeInput{currentInput}, SubscriptionSnapshot{Attempt: time.Now(), Success: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 	before, _ := db.ListSubscriptionNodes(ctx, sub.ID)
@@ -299,7 +302,7 @@ func TestCommitSnapshotCleansAccumulatedLogicalDuplicatesUsingOldestNode(t *test
 		t.Fatalf("legacy setup did not contain two nodes: %+v", before)
 	}
 	currentInput.LogicalName = logicalName
-	if err := db.CommitSnapshot(ctx, sub.ID, []SubscriptionNodeInput{currentInput}, SubscriptionSnapshot{Attempt: time.Now(), Success: time.Now()}); err != nil {
+	if _, err := db.CommitSnapshot(ctx, sub.ID, []SubscriptionNodeInput{currentInput}, SubscriptionSnapshot{Attempt: time.Now(), Success: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 	after, err := db.ListSubscriptionNodes(ctx, sub.ID)
@@ -327,12 +330,266 @@ func TestCommitSnapshotKeepsDistinctIncomingNodesWithSameName(t *testing.T) {
 		{URI: "http://one:pass@one.example:8080", Name: logicalName, LogicalName: logicalName, Enabled: true},
 		{URI: "http://two:pass@two.example:8080", Name: logicalName, LogicalName: logicalName, Enabled: true},
 	}
-	if err := db.CommitSnapshot(ctx, sub.ID, inputs, SubscriptionSnapshot{Attempt: time.Now(), Success: time.Now()}); err != nil {
+	if _, err := db.CommitSnapshot(ctx, sub.ID, inputs, SubscriptionSnapshot{Attempt: time.Now(), Success: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 	members, err := db.ListSubscriptionNodes(ctx, sub.ID)
 	if err != nil || len(members) != 2 {
 		t.Fatalf("legitimate same-name nodes were merged: members=%+v err=%v", members, err)
+	}
+}
+
+func TestUpdateSubscriptionSettingsPreservesRefreshMetadata(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "settings.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	sub := &Subscription{Name: "keep", URL: "https://keep.example/sub", Enabled: true}
+	if err := db.CreateSubscription(ctx, sub); err != nil {
+		t.Fatal(err)
+	}
+	committedAt := time.Now().UTC().Truncate(time.Second)
+	if _, err := db.CommitSnapshot(ctx, sub.ID, []SubscriptionNodeInput{{URI: "http://a.example:80", Name: "A", Enabled: true}},
+		SubscriptionSnapshot{Attempt: committedAt, Success: committedAt, ETag: `"v1"`, LastModified: "Wed, 21 Oct 2015 07:28:00 GMT"}); err != nil {
+		t.Fatal(err)
+	}
+	settings := SubscriptionSettings{Name: "renamed", URL: sub.URL, Format: "auto", Enabled: true,
+		RefreshIntervalSeconds: 600, RefreshTimeoutSeconds: 15}
+	if err := db.UpdateSubscriptionSettings(ctx, sub.ID, settings); err != nil {
+		t.Fatal(err)
+	}
+	// A rename must not rewind the last successful snapshot or its validators.
+	got, _ := db.GetSubscription(ctx, sub.ID)
+	if got.Name != "renamed" || got.NodeCount != 1 || !got.LastSuccess.Equal(committedAt) || got.ETag != `"v1"` || got.LastModified == "" {
+		t.Fatalf("metadata after rename=%+v", got)
+	}
+	settings.URL = "https://other.example/sub"
+	if err := db.UpdateSubscriptionSettings(ctx, sub.ID, settings); err != nil {
+		t.Fatal(err)
+	}
+	// A new URL describes a different resource, so the validators must go.
+	got, _ = db.GetSubscription(ctx, sub.ID)
+	if got.URL != settings.URL || got.ETag != "" || got.LastModified != "" {
+		t.Fatalf("validators survived a URL change: %+v", got)
+	}
+	if got.LastSuccess.IsZero() {
+		t.Fatalf("URL change reset last success: %+v", got)
+	}
+}
+
+func TestRecordSubscriptionFailurePreservesUserEdits(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "failure.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	sub := &Subscription{Name: "failing", URL: "https://failing.example/sub", Enabled: true}
+	if err := db.CreateSubscription(ctx, sub); err != nil {
+		t.Fatal(err)
+	}
+	successAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	if _, err := db.CommitSnapshot(ctx, sub.ID, []SubscriptionNodeInput{{URI: "http://a.example:80", Name: "A", Enabled: true}},
+		SubscriptionSnapshot{Attempt: successAt, Success: successAt, ETag: `"v1"`}); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a settings edit during a slow fetch, then the failure write.
+	if err := db.UpdateSubscriptionSettings(ctx, sub.ID, SubscriptionSettings{Name: "edited", URL: sub.URL, Format: "auto",
+		Enabled: false, RefreshIntervalSeconds: 900, RefreshTimeoutSeconds: 20}); err != nil {
+		t.Fatal(err)
+	}
+	attempt := time.Now().UTC().Truncate(time.Second)
+	if err := db.RecordSubscriptionFailure(ctx, sub.ID, attempt, "status 502"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := db.GetSubscription(ctx, sub.ID)
+	if got.Name != "edited" || got.Enabled || got.RefreshIntervalSeconds != 900 {
+		t.Fatalf("failure write reverted user settings: %+v", got)
+	}
+	if got.LastError != "status 502" || !got.LastAttempt.Equal(attempt) || !got.LastSuccess.Equal(successAt) {
+		t.Fatalf("failure metadata=%+v", got)
+	}
+	if got.ETag != `"v1"` || got.NodeCount != 1 {
+		t.Fatalf("failure write touched snapshot metadata: %+v", got)
+	}
+	notModifiedAt := attempt.Add(time.Minute)
+	if err := db.RecordSubscriptionNotModified(ctx, sub.ID, notModifiedAt); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = db.GetSubscription(ctx, sub.ID)
+	if got.LastError != "" || !got.LastAttempt.Equal(notModifiedAt) {
+		t.Fatalf("304 metadata=%+v", got)
+	}
+}
+
+func TestCommitSnapshotPrunesNodesMissingFromConsecutiveSnapshots(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "prune.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	sub := &Subscription{Name: "aging", URL: "https://aging.example/sub", Enabled: true}
+	other := &Subscription{Name: "other", URL: "https://other.example/sub", Enabled: true}
+	if err := db.CreateSubscription(ctx, sub); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateSubscription(ctx, other); err != nil {
+		t.Fatal(err)
+	}
+	a := SubscriptionNodeInput{URI: "http://a.example:80", Name: "A", Enabled: true}
+	b := SubscriptionNodeInput{URI: "http://b.example:80", Name: "B", Enabled: true}
+	shared := SubscriptionNodeInput{URI: "http://shared.example:80", Name: "shared", Enabled: true}
+	if _, err := db.CommitSnapshot(ctx, sub.ID, []SubscriptionNodeInput{a, b, shared}, SubscriptionSnapshot{RemoveAfterMisses: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReplaceSubscriptionNodes(ctx, other.ID, []SubscriptionNodeInput{shared}); err != nil {
+		t.Fatal(err)
+	}
+	bNode, err := db.GetNodeByURI(ctx, b.URI)
+	aNode, err := db.GetNodeByURI(ctx, a.URI)
+	if err != nil || bNode == nil || aNode == nil {
+		t.Fatalf("nodes: A=%+v B=%+v err=%v", aNode, bNode, err)
+	}
+	group := &GroupPool{Name: "aging", BindAddress: "127.0.0.1", BindPort: 10188, Protocol: "mixed",
+		DispatchMode: "fixed", ExplicitNodeIDs: []int64{bNode.ID, aNode.ID}, ExcludedNodeIDs: []int64{bNode.ID},
+		CurrentActiveNodeID: bNode.ID, Enabled: true}
+	if err := db.CreateGroupPool(ctx, group); err != nil {
+		t.Fatal(err)
+	}
+
+	// First omission only ages the member.
+	result, err := db.CommitSnapshot(ctx, sub.ID, []SubscriptionNodeInput{a}, SubscriptionSnapshot{RemoveAfterMisses: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Removed != 0 || result.NodeCount != 3 {
+		t.Fatalf("first omission result=%+v", result)
+	}
+	members, _ := db.ListSubscriptionNodes(ctx, sub.ID)
+	missed := map[string]int{}
+	for _, member := range members {
+		missed[member.Node.URI] = member.MissedRefreshes
+	}
+	if missed[b.URI] != 1 || missed[shared.URI] != 1 || missed[a.URI] != 0 {
+		t.Fatalf("missed counters=%v", missed)
+	}
+
+	// Second omission removes both stale memberships; only B loses its node,
+	// because the shared node still belongs to the other subscription.
+	result, err = db.CommitSnapshot(ctx, sub.ID, []SubscriptionNodeInput{a}, SubscriptionSnapshot{RemoveAfterMisses: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Removed != 1 || result.NodeCount != 1 {
+		t.Fatalf("second omission result=%+v", result)
+	}
+	if gone, _ := db.GetNodeByURI(ctx, b.URI); gone != nil {
+		t.Fatalf("stale exclusive node survived: %+v", gone)
+	}
+	if kept, _ := db.GetNodeByURI(ctx, shared.URI); kept == nil {
+		t.Fatal("node shared with another subscription was deleted")
+	}
+	otherMembers, _ := db.ListSubscriptionNodes(ctx, other.ID)
+	if len(otherMembers) != 1 {
+		t.Fatalf("other subscription membership=%+v", otherMembers)
+	}
+	storedGroup, _ := db.GetGroupPool(ctx, group.ID)
+	if storedGroup == nil {
+		t.Fatal("group disappeared")
+	}
+	if len(storedGroup.ExplicitNodeIDs) != 1 || storedGroup.ExplicitNodeIDs[0] != aNode.ID {
+		t.Fatalf("explicit references=%v", storedGroup.ExplicitNodeIDs)
+	}
+	if len(storedGroup.ExcludedNodeIDs) != 0 {
+		t.Fatalf("excluded references=%v", storedGroup.ExcludedNodeIDs)
+	}
+	if storedGroup.CurrentActiveNodeID != 0 {
+		t.Fatalf("active pointer=%d", storedGroup.CurrentActiveNodeID)
+	}
+}
+
+func TestCommitSnapshotReportsCreatedAndUpdated(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "counts.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	sub := &Subscription{Name: "counts", URL: "https://counts.example/sub", Enabled: true}
+	if err := db.CreateSubscription(ctx, sub); err != nil {
+		t.Fatal(err)
+	}
+	a := SubscriptionNodeInput{URI: "http://a.example:80", Name: "A", Enabled: true}
+	result, err := db.CommitSnapshot(ctx, sub.ID, []SubscriptionNodeInput{a}, SubscriptionSnapshot{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Created != 1 || result.Updated != 0 || result.NodeCount != 1 {
+		t.Fatalf("first commit=%+v", result)
+	}
+	result, err = db.CommitSnapshot(ctx, sub.ID, []SubscriptionNodeInput{a}, SubscriptionSnapshot{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Created != 0 || result.Updated != 1 {
+		t.Fatalf("repeat commit=%+v", result)
+	}
+	// A rotated endpoint under the same provider name reuses the node in place.
+	rotated := SubscriptionNodeInput{URI: "http://a2.example:80", Name: "A", LogicalName: "A", Enabled: true}
+	result, err = db.CommitSnapshot(ctx, sub.ID, []SubscriptionNodeInput{rotated}, SubscriptionSnapshot{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Created != 0 || result.Updated != 1 {
+		t.Fatalf("logical reuse commit=%+v", result)
+	}
+}
+
+func TestResetSubscriptionNodesRemovesExclusiveNodes(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "reset.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	a := &Subscription{Name: "A", URL: "https://a.example/sub", Enabled: true}
+	b := &Subscription{Name: "B", URL: "https://b.example/sub", Enabled: true}
+	if err := db.CreateSubscription(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateSubscription(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	shared := SubscriptionNodeInput{URI: "http://shared.example:80", Name: "shared", Enabled: true}
+	exclusive := SubscriptionNodeInput{URI: "http://exclusive.example:80", Name: "exclusive", Enabled: true}
+	if err := db.ReplaceSubscriptionNodes(ctx, a.ID, []SubscriptionNodeInput{exclusive, shared}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReplaceSubscriptionNodes(ctx, b.ID, []SubscriptionNodeInput{shared}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ResetSubscriptionNodes(ctx, a.ID); err != nil {
+		t.Fatal(err)
+	}
+	if gone, _ := db.GetNodeByURI(ctx, exclusive.URI); gone != nil {
+		t.Fatalf("exclusive node survived reset: %+v", gone)
+	}
+	if kept, _ := db.GetNodeByURI(ctx, shared.URI); kept == nil {
+		t.Fatal("shared node was deleted")
+	}
+	members, _ := db.ListSubscriptionNodes(ctx, a.ID)
+	if len(members) != 0 {
+		t.Fatalf("members after reset=%+v", members)
+	}
+	if got, _ := db.GetSubscription(ctx, a.ID); got.NodeCount != 0 {
+		t.Fatalf("node count after reset=%+v", got)
+	}
+	otherMembers, _ := db.ListSubscriptionNodes(ctx, b.ID)
+	if len(otherMembers) != 1 {
+		t.Fatalf("other membership after reset=%+v", otherMembers)
 	}
 }
 

@@ -161,7 +161,11 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	// Always created so it can dynamically respond to config changes
 	// (e.g., user enables subscriptions via WebUI). The manager's internal
 	// refresh loop checks config state to decide when to actually refresh.
-	subMgr := subscription.New(cfg, boxMgr, subscription.WithStore(dataStore))
+	// A refresh changes which nodes exist, so every auto tag needs re-deriving.
+	// This runs for background (create/update) and timer refreshes too, which the
+	// HTTP handler cannot see.
+	subMgr := subscription.New(cfg, boxMgr, subscription.WithStore(dataStore),
+		subscription.WithRefreshObserver(retagQueue.EnqueueAll))
 	subMgr.Start()
 	defer subMgr.Stop()
 

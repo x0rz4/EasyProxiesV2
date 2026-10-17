@@ -75,7 +75,15 @@ type Store interface {
 	GetSubscription(ctx context.Context, id int64) (*Subscription, error)
 	GetSubscriptionByURL(ctx context.Context, url string) (*Subscription, error)
 	CreateSubscription(ctx context.Context, subscription *Subscription) error
-	UpdateSubscription(ctx context.Context, subscription *Subscription) error
+	// UpdateSubscriptionSettings writes only the operator-editable columns. A
+	// changed URL also drops the stored HTTP validators, because they describe
+	// the previous resource. Refresh metadata is never touched.
+	UpdateSubscriptionSettings(ctx context.Context, id int64, settings SubscriptionSettings) error
+	// RecordSubscriptionFailure writes only the attempt time and error, so a
+	// slow failing fetch can never roll back concurrent settings edits.
+	RecordSubscriptionFailure(ctx context.Context, id int64, attempt time.Time, message string) error
+	// RecordSubscriptionNotModified records a 304 attempt and clears the error.
+	RecordSubscriptionNotModified(ctx context.Context, id int64, attempt time.Time) error
 	MarkSubscriptionAttempt(ctx context.Context, id int64, at time.Time) error
 	DeleteSubscription(ctx context.Context, id int64) error
 	// AdoptOrphanSubscriptionNodes converts historical subscription nodes with
@@ -89,11 +97,16 @@ type Store interface {
 	// at least one enabled subscription, de-duplicated by node ID.
 	ListEffectiveSubscriptionNodes(ctx context.Context) ([]Node, error)
 	// ReplaceSubscriptionNodes is an explicit authoritative replacement. Normal
-	// refreshes use CommitSnapshot and therefore do not remove missing members.
+	// refreshes use CommitSnapshot.
 	ReplaceSubscriptionNodes(ctx context.Context, subscriptionID int64, nodes []SubscriptionNodeInput) error
-	// CommitSnapshot incrementally merges a successful non-empty snapshot and
-	// retains members omitted by the latest provider response.
-	CommitSnapshot(ctx context.Context, subscriptionID int64, nodes []SubscriptionNodeInput, snapshot SubscriptionSnapshot) error
+	// ResetSubscriptionNodes drops every membership of one subscription and the
+	// nodes that belonged exclusively to it. Used when the operator points the
+	// subscription at a different upstream.
+	ResetSubscriptionNodes(ctx context.Context, subscriptionID int64) error
+	// CommitSnapshot incrementally merges a successful non-empty snapshot.
+	// Members omitted by the latest response are retained but marked stale, and
+	// removed once snapshot.RemoveAfterMisses consecutive snapshots omit them.
+	CommitSnapshot(ctx context.Context, subscriptionID int64, nodes []SubscriptionNodeInput, snapshot SubscriptionSnapshot) (SubscriptionCommitResult, error)
 
 	// --- Node stats ---
 
@@ -461,11 +474,33 @@ type Subscription struct {
 	UpdatedAt              time.Time `json:"updated_at"`
 }
 
+// SubscriptionSettings is the operator-editable part of a subscription.
+type SubscriptionSettings struct {
+	Name                   string
+	URL                    string
+	Format                 string
+	UserAgent              string
+	Enabled                bool
+	RefreshIntervalSeconds int
+	RefreshTimeoutSeconds  int
+	SortOrder              int
+}
+
 // SubscriptionNode describes a node's membership in a subscription.
 type SubscriptionNode struct {
-	SubscriptionID int64 `json:"subscription_id"`
-	Position       int   `json:"position"`
-	Node           Node  `json:"node"`
+	SubscriptionID  int64     `json:"subscription_id"`
+	Position        int       `json:"position"`
+	MissedRefreshes int       `json:"missed_refreshes"`
+	LastSeenAt      time.Time `json:"last_seen_at"`
+	Node            Node      `json:"node"`
+}
+
+// SubscriptionCommitResult reports what one snapshot commit changed.
+type SubscriptionCommitResult struct {
+	Created   int
+	Updated   int
+	Removed   int
+	NodeCount int
 }
 
 // SubscriptionNodeInput contains the node data required to commit a snapshot.
@@ -488,12 +523,15 @@ type SubscriptionNodeInput struct {
 }
 
 // SubscriptionSnapshot is refresh metadata committed with a node snapshot.
+// RemoveAfterMisses is the number of consecutive snapshots that may omit a
+// member before it is removed; zero disables pruning.
 type SubscriptionSnapshot struct {
-	Attempt      time.Time
-	Success      time.Time
-	Error        string
-	ETag         string
-	LastModified string
+	Attempt           time.Time
+	Success           time.Time
+	Error             string
+	ETag              string
+	LastModified      string
+	RemoveAfterMisses int
 }
 
 // NodeStats holds runtime statistics for a node.

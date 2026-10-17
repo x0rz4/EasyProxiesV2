@@ -651,12 +651,13 @@ export interface SubscriptionStatus {
   last_error?: string
   refresh_count?: number
   is_refreshing?: boolean
-	message?: string
-	parsed?: number
-	created?: number
-	updated?: number
-	duplicates_skipped?: number
-	invalid?: number
+  refreshing_ids?: number[]
+  message?: string
+  parsed?: number
+  created?: number
+  updated?: number
+  duplicates_skipped?: number
+  invalid?: number
 }
 
 // ---- SSE Probe types ----

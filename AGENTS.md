@@ -122,6 +122,8 @@ nodedetect / unlock / ipquality / geoip → netx（叶子，拨号 http.Client �
 `/api/*` 需认证（`management.password` 为空则免密；Cookie `session_token` 或 `Authorization: Bearer`，会话 24h 存 SQLite）；
 `/sub/{groupID}` 公开但用分组 `SubscriptionToken` 做常量时间比较。路由表见 `internal/httpapi/routes.go`（节点 / 分组 / 标签 / 订阅 / 综合检测 / 设置 / Debug / GeoIP 若干组）。
 
+订阅刷新（`internal/subscription`）：新增 / 启用 / 改配置后在后台异步抓取一次（接口本身立即返回）；全量刷新并发抓取（上限 3）、串行提交；同一次刷新未出现于上游的成员累计 `missed_refreshes`，连续 2 次缺失即删除该成员与仅属于该订阅的节点，并清理分组里的显式 / 排除 / active 引用；修改订阅 URL 视为换源，立即清空旧成员。刷新进行中再次触发返回 `controlplane.ErrRefreshInProgress`（HTTP 409）。
+
 ### 4.3 标签重算 → 分组增量重建
 
 ```
@@ -212,7 +214,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 
 ## 8. Database & Config Conventions
 
-- **migration 只追加**：`internal/store/migrations.go` 的列表按 `Version` 递增、只允许在末尾新增（每个 migration 独立事务，`schema_migrations` 记录已应用版本）。新列必须带 `NOT NULL DEFAULT`，保证升级行为不变。当前最新为 v14。
+- **migration 只追加**：`internal/store/migrations.go` 的列表按 `Version` 递增、只允许在末尾新增（每个 migration 独立事务，`schema_migrations` 记录已应用版本）。新列必须带 `NOT NULL DEFAULT`，保证升级行为不变。当前最新为 v22（v22 为 `subscription_nodes` 增加 `missed_refreshes` / `last_seen_at`）。
 - 表结构变更后需同步 `sqlite.go` 的列常量 / `scan*` / `INSERT` / `UPDATE`；改 `store.GroupPool` 还要同步 `config.GroupPoolConfig` + `boxmgr` 的双向转换与相等性判断（否则热重载判定不到变化）。
 - `nodes.tags` **只是 `node_tags` 的只读投影**（由 `refreshNodeTagProjection` 重写）；改标签必须走 store 的 tag API（`SetManualNodeTags` / `ReplaceAutoNodeTags`），旁路写入会被下次重算覆盖。
 - 配置优先级：**store（数据库）优先于 `config.yaml`**；启动时 `loadNodesFromStore` / `loadGroupsFromStore` / `loadTagNamesFromStore` 会用库里的数据覆盖配置中的对应字段。`yaml:"-"` 的字段即"只来自 store"。
@@ -253,3 +255,4 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 11. **经节点拨号的 HTTP 客户端一律走 `netx`，且 `DialFunc` 不允许为 nil**：`netx` 造的是**裸** `http.Transport`（这是刻意的：每个消费者只要它声明的那几个字段）。因此 `nil` 拨号不等于"用标准库默认值"——那样会静默丢掉 `http.DefaultTransport` 的 HTTP/2、代理环境变量与共享空闲连接池。主机本地（不经节点）的请求，例如 `IPAPIClient` 的批量查询，应直接用 `&http.Client{Timeout: ...}`，不要经过 `netx`。新增消费者时把差异写成显式 `Options`，不要在调用处重拼 transport。
 12. **错误→状态码是三个策略，不是一个**（`httpapi/response.go`）：`nodeErrorStatus`（类型驱动，`respondNodeError` 靠它额外带 `existing_node_id`）、`subscriptionErrorStatus`（消息驱动，未识别 → 500）、`tagErrorStatus`（消息驱动，未识别 → 400）。它们**故意不一致**：同样是"节点不存在"，tag 域是 400（请求体点了不存在的节点）、订阅域是 404，且 `tag_handlers_test.go` 钉住了这个 400。调用方必须显式点名自己用哪个策略——`errorToStatus(err)` 这种统一分发器今天写不对，因为两个域只能靠"谁调用的"区分，错误的类型和文案都区分不出来。同理 `httpapi/response.go` 的 `pathID`（400）与 `pathIDOrNotFound`（公开 `/sub/*` 用 404，避免探测 ID 形态）不可互换。
 13. **不要为"减少 handler 样板"引入泛型 `handle[Req, Resp]` 包装**：实测 14 个解码请求体的 handler 各自带 3–19 个错误分支，包装只省掉最外层的 decode/serialize，分支一个不少，缩短量为 0；最贴近该形状的 `handleReload` 还会因丢掉 `respondNodeError` 的 `existing_node_id` 而行为变化。真正有效的是 `pathID` / `requireStore` / 三个域状态函数。若 httpapi 拆分时要重提，从这次测量出发，不要从想法出发。
+14. **订阅刷新写路径必须窄写**：失败 / 304 只能调 `RecordSubscriptionFailure` / `RecordSubscriptionNotModified`，用户编辑只能调 `UpdateSubscriptionSettings`。刷新耗时可达分钟级，任何"读整行再写回"都会把期间的用户编辑或已提交的 `last_success` / `etag` 静默回滚（旧的 `UpdateSubscription` 因此已从接口删除）。提交阶段的 `created/updated` 由 `CommitSnapshot` 按 `identity_hash` 局部查询算出，不要再为了统计做全表 `ListNodes`。

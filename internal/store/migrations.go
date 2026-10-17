@@ -517,6 +517,18 @@ CREATE INDEX idx_api_keys_created ON api_keys(id);`,
 			Description: "index node_timeline.created_at for time-window cleanup",
 			Up:          `CREATE INDEX idx_timeline_created_at ON node_timeline(created_at);`,
 		},
+		{
+			Version:     22,
+			Description: "track subscription node freshness for stale-member pruning",
+			Up: `
+ALTER TABLE subscription_nodes ADD COLUMN missed_refreshes INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE subscription_nodes ADD COLUMN last_seen_at TEXT NOT NULL DEFAULT '';
+UPDATE subscription_nodes SET last_seen_at=COALESCE(
+    (SELECT s.last_success FROM subscriptions s WHERE s.id=subscription_nodes.subscription_id), '')
+WHERE last_seen_at='';
+CREATE INDEX idx_subscription_nodes_missed ON subscription_nodes(subscription_id, missed_refreshes);
+`,
+		},
 	}
 }
 

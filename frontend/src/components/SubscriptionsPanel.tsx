@@ -51,11 +51,22 @@ function maskToken(token: string): string {
 export default function SubscriptionsPanel() {
   const queryClient = useQueryClient()
 
-  const { data: subData, isLoading: subLoading } = useQuery({ queryKey: ['subscriptions'], queryFn: listSubscriptions })
-  const { data: status, isLoading: statusLoading } = useQuery({ queryKey: ['subscriptionStatus'], queryFn: fetchSubscriptionStatus })
+  const { data: status, isLoading: statusLoading } = useQuery({
+    queryKey: ['subscriptionStatus'],
+    queryFn: fetchSubscriptionStatus,
+    // A create/update or manual refresh runs server-side after the response, so
+    // poll while anything is syncing and stop as soon as it settles.
+    refetchInterval: (query) => (query.state.data?.is_refreshing ? 2000 : false),
+  })
+  const { data: subData, isLoading: subLoading } = useQuery({
+    queryKey: ['subscriptions'],
+    queryFn: listSubscriptions,
+    refetchInterval: status?.is_refreshing ? 2000 : false,
+  })
 
   const subscriptions = subData?.subscriptions || []
   const loading = subLoading || statusLoading
+  const refreshingIds = new Set(status?.refreshing_ids ?? [])
 
   const [action, setAction] = useState<string | null>(null)
   const [newName, setNewName] = useState('')
@@ -176,7 +187,7 @@ export default function SubscriptionsPanel() {
 
   const addSubscription = async () => {
     if (!newName.trim() || !newUrl.trim()) return
-    if (await runAction('create', () => createSubscription(payloadFor(newName, newUrl, newFormat, newUserAgent)), '订阅已添加')) {
+    if (await runAction('create', () => createSubscription(payloadFor(newName, newUrl, newFormat, newUserAgent)), '订阅已添加，正在同步')) {
       setNewName('')
       setNewUrl('')
       setNewFormat('auto')
@@ -194,13 +205,17 @@ export default function SubscriptionsPanel() {
 
   const saveSubscription = async () => {
     if (!editing || !editName.trim() || !editUrl.trim()) return
-    if (await runAction(`edit-${editing.id}`, () => updateSubscription(editing.id, payloadFor(editName, editUrl, editFormat, editUserAgent, editing)), '订阅已更新')) setEditing(null)
+    // Repointing at another upstream drops the old members, so say so.
+    const urlChanged = editing.url.trim() !== editUrl.trim()
+    const message = urlChanged ? '订阅已更新，旧节点已清空并重新同步' : '订阅已更新，正在同步'
+    if (await runAction(`edit-${editing.id}`, () => updateSubscription(editing.id, payloadFor(editName, editUrl, editFormat, editUserAgent, editing)), message)) setEditing(null)
   }
 
   const enabledCount = subscriptions.filter((subscription) => subscription.enabled).length
   const nodeCount = subscriptions.reduce((total, subscription) => total + subscription.node_count, 0)
   const errorCount = subscriptions.filter((subscription) => subscription.last_error).length
   const busy = action !== null || status?.is_refreshing
+  const isRefreshingRow = (subscription: Subscription) => refreshingIds.has(subscription.id)
 
   if (loading) return <div className="flex h-64 items-center justify-center"><span className="loading loading-spinner loading-lg text-primary" /></div>
 
@@ -208,7 +223,7 @@ export default function SubscriptionsPanel() {
     <PageLayout>
       <PageHeader
         title="订阅管理"
-        description="增量同步订阅源；旧节点不会因链接或上游内容变化而丢失"
+        description="增量同步订阅源；上游连续 2 次未出现的节点会被移除，修改订阅地址会清空旧节点"
         icon={<Rss className="h-5 w-5" />}
         actions={<button className="btn btn-primary btn-sm gap-2 shadow-sm lg:btn-md" disabled={busy || subscriptions.length === 0} onClick={() => void runAction('refresh-all', refreshSubscription, '全部订阅刷新完成')} title="刷新全部订阅" aria-label="刷新全部订阅">
             {action === 'refresh-all' || status?.is_refreshing ? <span className="loading loading-spinner loading-sm" /> : null}
@@ -229,7 +244,7 @@ export default function SubscriptionsPanel() {
 
         <section className={cn(surfaceClass, "p-5 lg:p-6")}>
           <div className="mb-5 flex flex-wrap items-center justify-between gap-3 border-b border-base-200 pb-4">
-            <div><h3 className="text-lg font-bold">添加订阅源</h3><p className="mt-0.5 text-xs text-base-content/50">填写名称和订阅地址，添加后会立即同步</p></div>
+            <div><h3 className="text-lg font-bold">添加订阅源</h3><p className="mt-0.5 text-xs text-base-content/50">填写名称和订阅地址，添加后会立即在后台同步</p></div>
             <span className="badge badge-ghost">{subscriptions.length} 个订阅源</span>
           </div>
           <div className="grid items-end gap-4 lg:grid-cols-2">
@@ -242,7 +257,7 @@ export default function SubscriptionsPanel() {
         </section>
 
         <section className={cn(surfaceClass, "overflow-hidden")}>
-          <div className="flex items-center justify-between border-b border-base-200 px-5 py-4 lg:px-6"><div><h3 className="text-lg font-bold">订阅源列表</h3><p className="mt-0.5 text-xs text-base-content/50">刷新采用增量合并，缺失节点将继续保留</p></div><span className="badge badge-ghost">{subscriptions.length} 项</span></div>
+          <div className="flex items-center justify-between border-b border-base-200 px-5 py-4 lg:px-6"><div><h3 className="text-lg font-bold">订阅源列表</h3><p className="mt-0.5 text-xs text-base-content/50">刷新采用增量合并，上游连续 2 次未出现的节点才会被移除</p></div><span className="badge badge-ghost">{subscriptions.length} 项</span></div>
           {subscriptions.length ? <div className="space-y-3 p-4 lg:p-6">{subscriptions.map((subscription) => (
             <article key={subscription.id} className={cn(`rounded-xl border bg-base-200/30 p-4`, subscription.enabled ? 'border-base-300' : 'border-base-200 opacity-70')}>
               {editing?.id === subscription.id ? (
@@ -255,7 +270,7 @@ export default function SubscriptionsPanel() {
                 </div>
               ) : (
                 <div className="flex flex-col gap-4 lg:flex-row lg:items-center">
-                  <div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><strong>{subscription.name}</strong><span className={cn("badge badge-sm", subscription.enabled ? 'badge-success' : 'badge-ghost')}>{subscription.enabled ? '已启用' : '已禁用'}</span><span className="badge badge-outline badge-sm">{subscription.node_count} 节点</span><span className="badge badge-ghost badge-sm">{subscriptionFormatLabel(subscription.format)}</span>{subscription.user_agent && <span className="badge badge-ghost badge-sm font-mono">UA: {subscription.user_agent}</span>}</div><code className="mt-1 block break-all text-xs text-base-content/55">{subscription.url}</code><div className="mt-2 flex flex-wrap gap-x-4 text-xs text-base-content/55"><span>最近成功：{subscription.last_success && !subscription.last_success.startsWith('0001-') ? new Date(subscription.last_success).toLocaleString() : '尚未成功'}</span>{subscription.last_error && <span className="break-all text-error">错误：{subscription.last_error}</span>}</div></div>
+                  <div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><strong>{subscription.name}</strong><span className={cn("badge badge-sm", subscription.enabled ? 'badge-success' : 'badge-ghost')}>{subscription.enabled ? '已启用' : '已禁用'}</span>{isRefreshingRow(subscription) && <span className="badge badge-info badge-sm gap-1"><span className="loading loading-spinner loading-xs" />同步中</span>}<span className="badge badge-outline badge-sm">{subscription.node_count} 节点</span><span className="badge badge-ghost badge-sm">{subscriptionFormatLabel(subscription.format)}</span>{subscription.user_agent && <span className="badge badge-ghost badge-sm font-mono">UA: {subscription.user_agent}</span>}</div><code className="mt-1 block break-all text-xs text-base-content/55">{subscription.url}</code><div className="mt-2 flex flex-wrap gap-x-4 text-xs text-base-content/55"><span>最近成功：{subscription.last_success && !subscription.last_success.startsWith('0001-') ? new Date(subscription.last_success).toLocaleString() : '尚未成功'}</span>{subscription.last_error && <span className="break-all text-error">错误：{subscription.last_error}</span>}</div></div>
                   <div className="flex flex-wrap gap-2 lg:justify-end"><button className="btn btn-ghost btn-sm" disabled={busy} onClick={() => startEditing(subscription)}>编辑</button><button className="btn btn-ghost btn-sm" disabled={busy} onClick={() => void runAction(`toggle-${subscription.id}`, () => toggleSubscription(subscription.id, !subscription.enabled), subscription.enabled ? '订阅已禁用' : '订阅已启用')}>{action === `toggle-${subscription.id}` && <span className="loading loading-spinner loading-xs" />}{subscription.enabled ? '禁用' : '启用'}</button><button className="btn btn-ghost btn-sm" disabled={busy} onClick={() => void runAction(`refresh-${subscription.id}`, () => refreshOneSubscription(subscription.id), `${subscription.name} 刷新完成`)}>{action === `refresh-${subscription.id}` && <span className="loading loading-spinner loading-xs" />}刷新</button><button className="btn btn-ghost btn-sm text-primary" disabled={busy || (subscription.enabled && enabledCount === 1)} onClick={() => void runAction(`activate-${subscription.id}`, () => activateSubscription(subscription.id), `已独占启用 ${subscription.name}`)}>独占启用</button><button className="btn btn-ghost btn-sm text-error" disabled={busy} onClick={() => setDeleteTarget(subscription)}>删除</button></div>
                 </div>
               )}

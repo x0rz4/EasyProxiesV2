@@ -2,6 +2,7 @@ package subscription
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 
 	"easy_proxies/internal/boxmgr"
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/controlplane"
 	"easy_proxies/internal/group"
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/store"
@@ -36,7 +38,7 @@ func TestFetchSubscriptionUsesSelectedFormatAndUserAgent(t *testing.T) {
 	mgr := New(&config.Config{}, nil, WithHTTPClient(server.Client()))
 	defer mgr.Stop()
 	sub := &store.Subscription{URL: server.URL, Format: config.SubscriptionFormatClash, UserAgent: "provider-client/1.0"}
-	nodes, _, _, _, err := mgr.fetchSubscription(context.Background(), sub, time.Second)
+	nodes, _, _, _, _, err := mgr.fetchSubscription(context.Background(), sub, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,6 +59,47 @@ func TestSubscriptionDefaultUserAgents(t *testing.T) {
 			t.Fatalf("format %q user-agent=%q, want %q", format, got, want)
 		}
 	}
+}
+
+// waitFor polls a condition instead of sleeping for a fixed duration. Locking
+// assertions are inherently timing-based once creates/updates refresh in the
+// background, and a bounded poll keeps the test deterministic without tying it
+// to an arbitrary delay.
+func waitFor(t *testing.T, what string, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !condition() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// refreshOneEventually retries while a create/update-triggered background
+// refresh still holds the single refresh slot.
+func refreshOneEventually(t *testing.T, mgr *Manager, id int64) error {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		err := mgr.RefreshOne(context.Background(), id)
+		if !errors.Is(err, controlplane.ErrRefreshInProgress) {
+			return err
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("refresh stayed busy")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func subscriptionNodeCount(t *testing.T, mgr *Manager, id int64) int {
+	t.Helper()
+	nodes, err := mgr.Nodes(context.Background(), id)
+	if err != nil {
+		t.Fatalf("list subscription %d nodes: %v", id, err)
+	}
+	return len(nodes)
 }
 
 func (m *recordingRuntimeManager) ReloadWithPortMap(cfg *config.Config, _ map[string]uint16) error {
@@ -134,9 +177,11 @@ func TestRefreshNowKeepsFailedMembershipAndCommitsSuccessfulSubscription(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := mgr.RefreshOne(context.Background(), a.ID); err != nil {
-		t.Fatal(err)
-	}
+	// Create refreshes in the background; wait for both so the manual refresh
+	// below is not rejected by the single refresh slot.
+	waitFor(t, "A and B initial snapshots", func() bool {
+		return subscriptionNodeCount(t, mgr, a.ID) == 1 && subscriptionNodeCount(t, mgr, b.ID) == 1
+	})
 	fail = true
 	if err := mgr.RefreshNow(); err == nil {
 		t.Fatal("expected partial refresh error")
@@ -156,15 +201,18 @@ func TestRefreshNowKeepsFailedMembershipAndCommitsSuccessfulSubscription(t *test
 	}
 }
 
-func TestChangedSubscriptionURLMergesOldAndNewNodes(t *testing.T) {
+func TestChangedSubscriptionURLClearsOldMembership(t *testing.T) {
+	var empty atomic.Bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/old":
 			_, _ = w.Write([]byte("http://a.example:80#A\nhttp://b.example:80#B"))
 		case "/new":
+			if empty.Load() {
+				_, _ = w.Write([]byte("\n"))
+				return
+			}
 			_, _ = w.Write([]byte("http://b.example:80#B\nhttp://c.example:80#C"))
-		case "/empty":
-			_, _ = w.Write([]byte("\n"))
 		default:
 			http.NotFound(w, r)
 		}
@@ -184,7 +232,7 @@ func TestChangedSubscriptionURLMergesOldAndNewNodes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := mgr.RefreshOne(context.Background(), sub.ID); err != nil {
+	if err := refreshOneEventually(t, mgr, sub.ID); err != nil {
 		t.Fatal(err)
 	}
 	updated, err := mgr.Update(context.Background(), sub.ID, store.Subscription{Name: "changing", URL: server.URL + "/new", Enabled: true,
@@ -192,32 +240,40 @@ func TestChangedSubscriptionURLMergesOldAndNewNodes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := mgr.RefreshOne(context.Background(), updated.ID); err != nil {
-		t.Fatal(err)
-	}
+	// Repointing a subscription at a different upstream must drop the old
+	// members instead of merging two unrelated node sets. Update also kicks off
+	// the refresh, so wait for the new snapshot to land.
+	waitFor(t, "new upstream snapshot", func() bool { return subscriptionNodeCount(t, mgr, sub.ID) == 2 })
 	members, err := mgr.Nodes(context.Background(), sub.ID)
-	if err != nil || len(members) != 3 {
-		t.Fatalf("merged members=%+v err=%v", members, err)
+	if err != nil {
+		t.Fatal(err)
 	}
 	byURI := make(map[string]store.SubscriptionNode, len(members))
 	for _, member := range members {
 		byURI[member.Node.URI] = member
 	}
-	for _, uri := range []string{"http://a.example:80#A", "http://b.example:80#B", "http://c.example:80#C"} {
+	for _, uri := range []string{"http://b.example:80#B", "http://c.example:80#C"} {
 		if _, ok := byURI[uri]; !ok {
 			t.Fatalf("node %q missing after URL change: %+v", uri, members)
 		}
 	}
-	updated.URL = server.URL + "/empty"
-	if _, err := mgr.Update(context.Background(), updated.ID, *updated); err != nil {
-		t.Fatal(err)
+	if _, ok := byURI["http://a.example:80#A"]; ok {
+		t.Fatalf("old upstream node survived the URL change: %+v", members)
 	}
-	if err := mgr.RefreshOne(context.Background(), updated.ID); err == nil {
+	if old, _ := db.GetNodeByURI(context.Background(), "http://a.example:80#A"); old != nil {
+		t.Fatalf("old exclusive node was not deleted: %+v", old)
+	}
+	// An empty provider response is a failure, not a signal to wipe members.
+	empty.Store(true)
+	if err := refreshOneEventually(t, mgr, sub.ID); err == nil {
 		t.Fatal("empty subscription refresh unexpectedly succeeded")
 	}
 	afterEmpty, err := mgr.Nodes(context.Background(), sub.ID)
-	if err != nil || len(afterEmpty) != 3 {
+	if err != nil || len(afterEmpty) != 2 {
 		t.Fatalf("empty refresh changed members=%+v err=%v", afterEmpty, err)
+	}
+	if current, _ := mgr.Get(context.Background(), sub.ID); current.URL != updated.URL || current.LastError == "" {
+		t.Fatalf("failed refresh metadata=%+v", current)
 	}
 }
 
@@ -245,9 +301,7 @@ func TestRefreshDiffReusesUniqueProviderNodeName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := mgr.RefreshOne(context.Background(), sub.ID); err != nil {
-		t.Fatal(err)
-	}
+	waitFor(t, "initial snapshot", func() bool { return subscriptionNodeCount(t, mgr, sub.ID) == 1 })
 	first, err := mgr.Nodes(context.Background(), sub.ID)
 	if err != nil || len(first) != 1 {
 		t.Fatalf("first members=%+v err=%v", first, err)
@@ -264,6 +318,11 @@ func TestRefreshDiffReusesUniqueProviderNodeName(t *testing.T) {
 	}
 	if second[0].Node.ID != firstID || second[0].Node.URI != "http://new-user:new-pass@new.example:8080#lite-家庭宽带-香港hgc" {
 		t.Fatalf("logical refresh did not reuse the node: first=%+v second=%+v", first[0].Node, second[0].Node)
+	}
+	// The create-triggered background refresh also accrued counters, so assert on
+	// the manual refresh's own contribution instead of the global totals.
+	if err := mgr.RefreshOne(context.Background(), sub.ID); err != nil {
+		t.Fatal(err)
 	}
 	status := mgr.Status()
 	if status.Created != 0 || status.Updated != 1 {
@@ -290,7 +349,7 @@ func TestRefreshRehydratesPersistedGroupMembershipBeforeReload(t *testing.T) {
 		t.Fatal(err)
 	}
 	oldInput := store.SubscriptionNodeInput{URI: "http://bound.example:80#bound", Name: "bound", Enabled: true}
-	if err := db.CommitSnapshot(ctx, sub.ID, []store.SubscriptionNodeInput{oldInput}, store.SubscriptionSnapshot{
+	if _, err := db.CommitSnapshot(ctx, sub.ID, []store.SubscriptionNodeInput{oldInput}, store.SubscriptionSnapshot{
 		Attempt: time.Now().UTC(), Success: time.Now().UTC(),
 	}); err != nil {
 		t.Fatal(err)
@@ -316,7 +375,7 @@ func TestRefreshRehydratesPersistedGroupMembershipBeforeReload(t *testing.T) {
 	runtime := &recordingRuntimeManager{}
 	mgr := New(cfg, runtime, WithStore(db), WithHTTPClient(server.Client()))
 	defer mgr.Stop()
-	if err := mgr.RefreshOne(ctx, sub.ID); err != nil {
+	if err := refreshOneEventually(t, mgr, sub.ID); err != nil {
 		t.Fatal(err)
 	}
 	if runtime.config == nil || len(runtime.config.Groups) != 1 {
@@ -363,7 +422,7 @@ func TestRefreshKeepsBoundGroupRuntimeListening(t *testing.T) {
 		t.Fatal(err)
 	}
 	boundInput := store.SubscriptionNodeInput{URI: "http://127.0.0.1:65530#bound", Name: "bound", Enabled: true}
-	if err := db.CommitSnapshot(ctx, sub.ID, []store.SubscriptionNodeInput{boundInput}, store.SubscriptionSnapshot{
+	if _, err := db.CommitSnapshot(ctx, sub.ID, []store.SubscriptionNodeInput{boundInput}, store.SubscriptionSnapshot{
 		Attempt: time.Now().UTC(), Success: time.Now().UTC(),
 	}); err != nil {
 		t.Fatal(err)
@@ -401,7 +460,7 @@ func TestRefreshKeepsBoundGroupRuntimeListening(t *testing.T) {
 	staleCfg.Groups = nil
 	mgr := New(staleCfg, boxManager, WithStore(db), WithHTTPClient(server.Client()))
 	defer mgr.Stop()
-	if err := mgr.RefreshOne(ctx, sub.ID); err != nil {
+	if err := refreshOneEventually(t, mgr, sub.ID); err != nil {
 		t.Fatal(err)
 	}
 	if status := boxManager.GroupRuntimeStatus(groupPool.ID); status.Status != "ready" {
@@ -437,6 +496,246 @@ func assertRuntimePortListening(t *testing.T, port uint16) {
 	_ = connection.Close()
 }
 
+func TestCreateRefreshesInBackground(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "create-refresh.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	cfg := &config.Config{}
+	cfg.SubscriptionRefresh.Interval = time.Hour
+	cfg.SubscriptionRefresh.Timeout = time.Second
+	// Auto refresh stays disabled: the create-triggered fetch must not depend on
+	// the global switch.
+	cfg.SubscriptionRefresh.Enabled = false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("http://created.example:80#created"))
+	}))
+	defer server.Close()
+	mgr := New(cfg, nil, WithStore(db), WithHTTPClient(server.Client()))
+	defer mgr.Stop()
+
+	sub, err := mgr.Create(ctx, store.Subscription{Name: "fresh", URL: server.URL, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "create-triggered snapshot", func() bool { return subscriptionNodeCount(t, mgr, sub.ID) == 1 })
+	stored, err := mgr.Get(ctx, sub.ID)
+	if err != nil || stored.LastSuccess.IsZero() || stored.NodeCount != 1 {
+		t.Fatalf("snapshot after create=%+v err=%v", stored, err)
+	}
+
+	// A subscription created disabled must not fetch.
+	disabled, err := mgr.Create(ctx, store.Subscription{Name: "off", URL: server.URL + "/off", Enabled: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if count := subscriptionNodeCount(t, mgr, disabled.ID); count != 0 {
+		t.Fatalf("disabled subscription fetched %d nodes", count)
+	}
+}
+
+func TestRefreshFailureDoesNotClobberConcurrentSettings(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "lost-update.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
+		http.Error(w, "upstream down", http.StatusBadGateway)
+	}))
+	defer server.Close()
+	cfg := &config.Config{}
+	cfg.SubscriptionRefresh.Interval = time.Hour
+	cfg.SubscriptionRefresh.Timeout = 5 * time.Second
+	mgr := New(cfg, nil, WithStore(db), WithHTTPClient(server.Client()))
+	defer mgr.Stop()
+
+	sub, err := mgr.Create(ctx, store.Subscription{Name: "before", URL: server.URL, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered: // the create-triggered fetch is now blocked in the handler
+	case <-time.After(10 * time.Second):
+		t.Fatal("fetch never reached the upstream")
+	}
+	// The user edits the row while the fetch is still in flight.
+	if _, err := mgr.Update(ctx, sub.ID, store.Subscription{Name: "after", URL: server.URL + "/edited", Enabled: true,
+		RefreshIntervalSeconds: 1200, RefreshTimeoutSeconds: 9}); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	waitFor(t, "failure recorded", func() bool {
+		current, getErr := mgr.Get(ctx, sub.ID)
+		return getErr == nil && current.LastError != "" && !mgr.Status().IsRefreshing
+	})
+	time.Sleep(50 * time.Millisecond) // let the queued post-update refresh drain
+	current, err := mgr.Get(ctx, sub.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Name != "after" || current.URL != server.URL+"/edited" || current.RefreshIntervalSeconds != 1200 {
+		t.Fatalf("failure write reverted concurrent edits: %+v", current)
+	}
+}
+
+func TestRefreshDueFetchesConcurrently(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "parallel.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var inFlight, peak atomic.Int32
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		current := inFlight.Add(1)
+		for {
+			seen := peak.Load()
+			if current <= seen || peak.CompareAndSwap(seen, current) {
+				break
+			}
+		}
+		<-release
+		inFlight.Add(-1)
+		_, _ = w.Write([]byte("http://" + strings.TrimPrefix(r.URL.Path, "/") + ".example:80#n"))
+	}))
+	defer server.Close()
+	cfg := &config.Config{}
+	cfg.SubscriptionRefresh.Interval = time.Hour
+	cfg.SubscriptionRefresh.Timeout = 5 * time.Second
+	mgr := New(cfg, nil, WithStore(db), WithHTTPClient(server.Client()))
+	defer mgr.Stop()
+
+	ids := make([]int64, 0, 3)
+	for _, name := range []string{"one", "two", "three"} {
+		// Create them disabled so no background fetch races with RefreshNow, then
+		// flip the flag through the store (the manager's SetEnabled would itself
+		// trigger a refresh).
+		sub, createErr := mgr.Create(ctx, store.Subscription{Name: name, URL: server.URL + "/" + name, Enabled: false})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		if enableErr := db.SetSubscriptionEnabled(ctx, sub.ID, true); enableErr != nil {
+			t.Fatal(enableErr)
+		}
+		ids = append(ids, sub.ID)
+	}
+	done := make(chan error, 1)
+	go func() { done <- mgr.RefreshNow() }()
+	// Three downloads must overlap before any of them is allowed to finish.
+	deadline := time.Now().Add(10 * time.Second)
+	for peak.Load() < 3 {
+		if time.Now().After(deadline) {
+			close(release)
+			t.Fatalf("fetches did not overlap, peak=%d", peak.Load())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids {
+		if count := subscriptionNodeCount(t, mgr, id); count != 1 {
+			t.Fatalf("subscription %d committed %d nodes", id, count)
+		}
+	}
+}
+
+func TestRefreshOneReportsRefreshingStatus(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "refreshing.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
+		_, _ = w.Write([]byte("http://status.example:80#n"))
+	}))
+	defer server.Close()
+	cfg := &config.Config{}
+	cfg.SubscriptionRefresh.Interval = time.Hour
+	cfg.SubscriptionRefresh.Timeout = 5 * time.Second
+	mgr := New(cfg, nil, WithStore(db), WithHTTPClient(server.Client()))
+	defer mgr.Stop()
+
+	sub, err := mgr.Create(ctx, store.Subscription{Name: "busy", URL: server.URL, Enabled: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- mgr.RefreshOne(ctx, sub.ID) }()
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("refresh never started")
+	}
+	status := mgr.Status()
+	if !status.IsRefreshing || len(status.RefreshingIDs) != 1 || status.RefreshingIDs[0] != sub.ID {
+		t.Fatalf("status while refreshing=%+v", status)
+	}
+	if err := mgr.RefreshOne(ctx, sub.ID); !errors.Is(err, controlplane.ErrRefreshInProgress) {
+		t.Fatalf("second refresh error=%v", err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	status = mgr.Status()
+	if status.IsRefreshing || len(status.RefreshingIDs) != 0 || status.LastRefresh.IsZero() || status.RefreshCount != 1 {
+		t.Fatalf("status after refresh=%+v", status)
+	}
+}
+
+func TestFetchKeepsStoredLastModifiedWhenUpstreamOmitsIt(t *testing.T) {
+	var mode atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if mode.Load() == 0 {
+			w.Header().Set("ETag", `"first"`)
+			w.Header().Set("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+		} else {
+			w.Header().Set("ETag", `"second"`)
+		}
+		_, _ = w.Write([]byte("http://lm.example:80#n"))
+	}))
+	defer server.Close()
+	mgr := New(&config.Config{}, nil, WithHTTPClient(server.Client()))
+	defer mgr.Stop()
+	sub := &store.Subscription{URL: server.URL}
+	_, _, etag, lastModified, notModified, err := mgr.fetchSubscription(context.Background(), sub, time.Second)
+	if err != nil || notModified || etag != `"first"` || lastModified == "" {
+		t.Fatalf("first fetch etag=%q last-modified=%q err=%v", etag, lastModified, err)
+	}
+	sub.ETag, sub.LastModified = etag, lastModified
+	mode.Store(1)
+	_, _, etag, lastModified, _, err = mgr.fetchSubscription(context.Background(), sub, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if etag != `"second"` || lastModified != sub.LastModified {
+		t.Fatalf("validator fallback lost Last-Modified: etag=%q last-modified=%q", etag, lastModified)
+	}
+}
+
 func TestHealingRefreshHonorsPersistedCooldownAndBusyGate(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(filepath.Join(t.TempDir(), "healing-refresh.db"))
@@ -456,12 +755,21 @@ func TestHealingRefreshHonorsPersistedCooldownAndBusyGate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := mgr.RefreshForHealing(ctx, sub.ID); err == nil {
-		t.Fatal("expected upstream failure")
+	// Create's background fetch may already have recorded the attempt and the
+	// cooldown; wait for the refresh slot before driving the healer directly.
+	waitFor(t, "background refresh to finish", func() bool {
+		persisted, getErr := db.GetSubscription(ctx, sub.ID)
+		return getErr == nil && !persisted.LastAttempt.IsZero() && !mgr.Status().IsRefreshing
+	})
+	if _, deferred := mgr.RefreshForHealing(ctx, sub.ID).(*group.DeferredHealing); !deferred {
+		t.Fatal("healer ignored the cooldown recorded by the create refresh")
 	}
 	first := requests.Load()
 	if first == 0 {
 		t.Fatal("missing first request")
+	}
+	if !mgr.Status().HasSubscriptions {
+		t.Fatal("status lost the subscription")
 	}
 	persisted, err := db.GetSubscription(ctx, sub.ID)
 	if err != nil || persisted.LastAttempt.IsZero() {

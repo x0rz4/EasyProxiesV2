@@ -27,6 +27,8 @@ func TestSubscriptionErrorStatus(t *testing.T) {
 		{"required field", fmt.Errorf("必须提供 URI"), http.StatusBadRequest},
 		{"invalid", fmt.Errorf("invalid port"), http.StatusBadRequest},
 		{"unique", fmt.Errorf("name must be unique"), http.StatusBadRequest},
+		{"refresh busy", controlplane.ErrRefreshInProgress, http.StatusConflict},
+		{"refresh busy wrapped", fmt.Errorf("refresh: %w", controlplane.ErrRefreshInProgress), http.StatusConflict},
 		{"unclassified", fmt.Errorf("数据库锁超时"), http.StatusInternalServerError},
 	} {
 		t.Run(test.name, func(t *testing.T) {

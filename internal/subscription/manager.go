@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +19,8 @@ import (
 	"easy_proxies/internal/controlplane"
 	"easy_proxies/internal/group"
 	"easy_proxies/internal/store"
+
+	"golang.org/x/sync/errgroup"
 )
 
 var ErrNotFound = errors.New("订阅不存在")
@@ -28,11 +31,27 @@ type Logger interface {
 	Errorf(format string, args ...any)
 }
 
+// staleNodeMissLimit is how many consecutive snapshots may omit a member before
+// it is removed. Two tolerates one truncated provider response while still
+// retiring nodes that were genuinely delisted.
+const staleNodeMissLimit = 2
+
+// fetchConcurrency bounds parallel downloads during one refresh pass. Commits
+// stay serial because SQLite has a single writer connection.
+const fetchConcurrency = 3
+
 type Option func(*Manager)
 
 func WithLogger(l Logger) Option           { return func(m *Manager) { m.logger = l } }
 func WithStore(s store.Store) Option       { return func(m *Manager) { m.store = s } }
 func WithHTTPClient(c *http.Client) Option { return func(m *Manager) { m.httpClient = c } }
+
+// WithRefreshObserver registers a notification for every successfully committed
+// snapshot, whoever triggered it (create, manual refresh, timer). The runtime
+// uses it to re-derive auto tags for nodes that appeared or disappeared.
+func WithRefreshObserver(notify func()) Option {
+	return func(m *Manager) { m.refreshObserver = notify }
+}
 
 var _ boxmgr.ConfigUpdateListener = (*Manager)(nil)
 var _ controlplane.SubscriptionRefresher = (*Manager)(nil)
@@ -53,6 +72,11 @@ type Manager struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 	refreshMu  sync.Mutex
+	// refreshing tracks in-flight downloads by subscription ID. It is the only
+	// source of IsRefreshing, so a single refresh reports itself the same way a
+	// full pass does. Guarded by mu.
+	refreshing      map[int64]struct{}
+	refreshObserver func()
 }
 
 func New(cfg *config.Config, boxMgr runtimeManager, opts ...Option) *Manager {
@@ -64,8 +88,11 @@ func New(cfg *config.Config, boxMgr runtimeManager, opts ...Option) *Manager {
 		IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 10 * time.Second,
 		ExpectContinueTimeout: time.Second, ResponseHeaderTimeout: 10 * time.Second,
 	}
+	// No client-wide timeout: each request carries the subscription's own
+	// deadline. A 60s client cap silently overrode any larger per-sub timeout.
 	m := &Manager{baseCfg: cfg, boxMgr: boxMgr, ctx: ctx, cancel: cancel,
-		httpClient: &http.Client{Transport: transport, Timeout: 60 * time.Second}}
+		refreshing: make(map[int64]struct{}),
+		httpClient: &http.Client{Transport: transport}}
 	for _, opt := range opts {
 		opt(m)
 	}
@@ -200,6 +227,12 @@ func (m *Manager) Create(ctx context.Context, sub store.Subscription) (*store.Su
 	if err := m.reconcileRuntime(ctx); err != nil {
 		return nil, err
 	}
+	// A freshly added subscription has no members until it is fetched. Trigger
+	// that now rather than waiting up to a minute (or forever, when the global
+	// auto-refresh switch is off).
+	if sub.Enabled {
+		m.refreshInBackground(sub.ID)
+	}
 	return &sub, nil
 }
 
@@ -208,22 +241,54 @@ func (m *Manager) Update(ctx context.Context, id int64, input store.Subscription
 	if err != nil {
 		return nil, err
 	}
-	current.Name, current.URL, current.Enabled = input.Name, input.URL, input.Enabled
-	current.Format, current.UserAgent = input.Format, input.UserAgent
-	current.RefreshIntervalSeconds = input.RefreshIntervalSeconds
-	current.RefreshTimeoutSeconds = input.RefreshTimeoutSeconds
-	current.SortOrder = input.SortOrder
-	applyDefaults(current, m.defaults)
-	if err := validateSubscription(current); err != nil {
+	settings := store.SubscriptionSettings{
+		Name:                   input.Name,
+		URL:                    input.URL,
+		Format:                 input.Format,
+		UserAgent:              input.UserAgent,
+		Enabled:                input.Enabled,
+		RefreshIntervalSeconds: input.RefreshIntervalSeconds,
+		RefreshTimeoutSeconds:  input.RefreshTimeoutSeconds,
+		SortOrder:              input.SortOrder,
+	}
+	if err := applySettingsDefaults(&settings, m.defaults); err != nil {
 		return nil, err
 	}
-	if err := m.store.UpdateSubscription(ctx, current); err != nil {
+	if err := validateSettings(&settings); err != nil {
 		return nil, err
+	}
+	urlChanged := strings.TrimSpace(current.URL) != settings.URL
+	if err := m.store.UpdateSubscriptionSettings(ctx, id, settings); err != nil {
+		return nil, err
+	}
+	if urlChanged {
+		// Pointing the subscription at another provider makes every existing
+		// member an artifact of the old upstream. Clear them instead of merging
+		// two unrelated node sets together.
+		if err := m.store.ResetSubscriptionNodes(ctx, id); err != nil {
+			return nil, err
+		}
 	}
 	if err := m.reconcileRuntime(ctx); err != nil {
 		return nil, err
 	}
-	return current, nil
+	if settings.Enabled {
+		m.refreshInBackground(id)
+	}
+	return m.Get(ctx, id)
+}
+
+// refreshInBackground queues one subscription behind any in-flight refresh. The
+// caller returns immediately; the fetch uses the manager context so shutdown
+// cancels it.
+func (m *Manager) refreshInBackground(id int64) {
+	go func() {
+		m.refreshMu.Lock()
+		defer m.refreshMu.Unlock()
+		if err := m.refreshOneLocked(m.ctx, id, false); err != nil {
+			m.logger.Warnf("background refresh subscription %d failed: %v", id, err)
+		}
+	}()
 }
 
 func (m *Manager) Delete(ctx context.Context, id int64) error {
@@ -237,13 +302,22 @@ func (m *Manager) Delete(ctx context.Context, id int64) error {
 }
 
 func (m *Manager) SetEnabled(ctx context.Context, id int64, enabled bool) error {
-	if _, err := m.Get(ctx, id); err != nil {
+	sub, err := m.Get(ctx, id)
+	if err != nil {
 		return err
 	}
 	if err := m.store.SetSubscriptionEnabled(ctx, id, enabled); err != nil {
 		return err
 	}
-	return m.reconcileRuntime(ctx)
+	if err := m.reconcileRuntime(ctx); err != nil {
+		return err
+	}
+	// Re-enabling a subscription that never produced a snapshot should show
+	// nodes without waiting for the timer.
+	if enabled && sub.LastSuccess.IsZero() {
+		m.refreshInBackground(id)
+	}
+	return nil
 }
 
 func (m *Manager) ActivateExclusive(ctx context.Context, id int64) error {
@@ -278,26 +352,55 @@ func applyDefaults(sub *store.Subscription, defaults func() (int, int)) {
 	}
 }
 
+func applySettingsDefaults(settings *store.SubscriptionSettings, defaults func() (int, int)) error {
+	interval, timeout := defaults()
+	settings.Name, settings.URL = strings.TrimSpace(settings.Name), strings.TrimSpace(settings.URL)
+	settings.UserAgent = strings.TrimSpace(settings.UserAgent)
+	if format, err := config.NormalizeSubscriptionFormat(settings.Format); err == nil {
+		settings.Format = format
+	}
+	if settings.RefreshIntervalSeconds <= 0 {
+		settings.RefreshIntervalSeconds = interval
+	}
+	if settings.RefreshTimeoutSeconds <= 0 {
+		settings.RefreshTimeoutSeconds = timeout
+	}
+	return nil
+}
+
 func validateSubscription(sub *store.Subscription) error {
-	if strings.TrimSpace(sub.Name) == "" {
+	settings := store.SubscriptionSettings{
+		Name: sub.Name, URL: sub.URL, Format: sub.Format, UserAgent: sub.UserAgent,
+		Enabled: sub.Enabled, RefreshIntervalSeconds: sub.RefreshIntervalSeconds,
+		RefreshTimeoutSeconds: sub.RefreshTimeoutSeconds, SortOrder: sub.SortOrder,
+	}
+	if err := validateSettings(&settings); err != nil {
+		return err
+	}
+	sub.Format = settings.Format
+	return nil
+}
+
+func validateSettings(settings *store.SubscriptionSettings) error {
+	if strings.TrimSpace(settings.Name) == "" {
 		return errors.New("订阅名称不能为空")
 	}
-	u, err := url.ParseRequestURI(strings.TrimSpace(sub.URL))
+	u, err := url.ParseRequestURI(strings.TrimSpace(settings.URL))
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
 		return errors.New("订阅 URL 必须是有效的 http/https URL")
 	}
-	if sub.RefreshIntervalSeconds <= 0 {
+	if settings.RefreshIntervalSeconds <= 0 {
 		return errors.New("刷新间隔必须大于 0")
 	}
-	if sub.RefreshTimeoutSeconds <= 0 {
+	if settings.RefreshTimeoutSeconds <= 0 {
 		return errors.New("刷新超时必须大于 0")
 	}
-	format, err := config.NormalizeSubscriptionFormat(sub.Format)
+	format, err := config.NormalizeSubscriptionFormat(settings.Format)
 	if err != nil {
 		return err
 	}
-	sub.Format = format
-	if len(sub.UserAgent) > 512 || strings.ContainsAny(sub.UserAgent, "\r\n") {
+	settings.Format = format
+	if len(settings.UserAgent) > 512 || strings.ContainsAny(settings.UserAgent, "\r\n") {
 		return errors.New("订阅 User-Agent 无效")
 	}
 	return nil
@@ -316,13 +419,18 @@ func (m *Manager) refreshOne(ctx context.Context, id int64, healing bool) error 
 		if healing {
 			return &group.DeferredHealing{Reason: "subscription refresh already running", Until: time.Now().Add(time.Minute)}
 		}
-		return errors.New("刷新正在进行")
+		return controlplane.ErrRefreshInProgress
 	}
 	defer m.refreshMu.Unlock()
-	m.mu.Lock()
-	m.status.Parsed, m.status.Created, m.status.Updated = 0, 0, 0
-	m.status.DuplicatesSkipped, m.status.Invalid = 0, 0
-	m.mu.Unlock()
+	return m.refreshOneLocked(ctx, id, healing)
+}
+
+// refreshOneLocked runs one subscription refresh; the caller holds refreshMu.
+func (m *Manager) refreshOneLocked(ctx context.Context, id int64, healing bool) error {
+	if err := m.ctx.Err(); err != nil {
+		return err
+	}
+	m.resetRunCounters()
 	sub, err := m.Get(ctx, id)
 	if err != nil {
 		return err
@@ -340,17 +448,19 @@ func (m *Manager) refreshOne(ctx context.Context, id int64, healing bool) error 
 			return err
 		}
 	}
+	m.beginRefreshing(id)
+	defer m.endRefreshing(id)
 	err = m.refreshSubscription(ctx, sub)
-	reconcileErr := m.reconcileRuntime(ctx)
+	m.recordRunResult(err)
 	if err != nil {
 		return err
 	}
-	return reconcileErr
+	return m.reconcileRuntime(ctx)
 }
 
 func (m *Manager) RefreshNow() error {
 	if !m.refreshMu.TryLock() {
-		return errors.New("刷新正在进行")
+		return controlplane.ErrRefreshInProgress
 	}
 	defer m.refreshMu.Unlock()
 	return m.refreshDue(m.ctx, false)
@@ -365,13 +475,8 @@ func (m *Manager) refreshDue(ctx context.Context, dueOnly bool) error {
 		return errors.New("没有配置订阅链接")
 	}
 	now := time.Now().UTC()
-	m.mu.Lock()
-	m.status.IsRefreshing = true
-	m.status.Parsed, m.status.Created, m.status.Updated = 0, 0, 0
-	m.status.DuplicatesSkipped, m.status.Invalid = 0, 0
-	m.mu.Unlock()
-	defer func() { m.mu.Lock(); m.status.IsRefreshing = false; m.status.RefreshCount++; m.mu.Unlock() }()
-	var errs []error
+	m.resetRunCounters()
+	var pending []*store.Subscription
 	for i := range subs {
 		sub := &subs[i]
 		if !sub.Enabled {
@@ -380,73 +485,139 @@ func (m *Manager) refreshDue(ctx context.Context, dueOnly bool) error {
 		if dueOnly && !sub.LastAttempt.IsZero() && now.Before(sub.LastAttempt.Add(time.Duration(sub.RefreshIntervalSeconds)*time.Second)) {
 			continue
 		}
-		if err := m.refreshSubscription(ctx, sub); err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", sub.Name, err))
-			m.logger.Warnf("refresh subscription %d failed: %v", sub.ID, err)
+		pending = append(pending, sub)
+	}
+
+	// Fetch in parallel — one slow provider should not hold up the rest — but
+	// commit strictly in order afterwards. Commits share the single SQLite
+	// writer and the run counters, and reconcile must see the final state.
+	fetched := make([]fetchedSubscription, len(pending))
+	groupFetch := new(errgroup.Group)
+	groupFetch.SetLimit(fetchConcurrency)
+	for i := range pending {
+		i := i
+		groupFetch.Go(func() error {
+			sub := pending[i]
+			m.beginRefreshing(sub.ID)
+			fetched[i] = m.fetchFor(ctx, sub)
+			m.endRefreshing(sub.ID)
+			return nil
+		})
+	}
+	_ = groupFetch.Wait()
+
+	var errs []error
+	changed := false
+	for i, sub := range pending {
+		removed, commitErr := m.commitFetched(ctx, sub, fetched[i])
+		if commitErr != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", sub.Name, commitErr))
+			m.logger.Warnf("refresh subscription %d failed: %v", sub.ID, commitErr)
+			continue
+		}
+		changed = changed || removed
+	}
+	if changed {
+		if err := m.reconcileRuntime(ctx); err != nil {
+			errs = append(errs, err)
 		}
 	}
-	if err := m.reconcileRuntime(ctx); err != nil {
-		errs = append(errs, err)
-	}
 	joined := errors.Join(errs...)
+	m.recordRunResult(joined)
+	return joined
+}
+
+func (m *Manager) resetRunCounters() {
 	m.mu.Lock()
-	m.status.LastRefresh = now
-	if joined != nil {
-		m.status.LastError = joined.Error()
+	m.status.Parsed, m.status.Created, m.status.Updated = 0, 0, 0
+	m.status.DuplicatesSkipped, m.status.Invalid = 0, 0
+	m.mu.Unlock()
+}
+
+// recordRunResult publishes the outcome of a refresh run, whether it covered one
+// subscription or all of them.
+func (m *Manager) recordRunResult(err error) {
+	m.mu.Lock()
+	m.status.LastRefresh = time.Now().UTC()
+	m.status.RefreshCount++
+	if err != nil {
+		m.status.LastError = err.Error()
 	} else {
 		m.status.LastError = ""
 	}
 	m.mu.Unlock()
-	return joined
 }
 
-// errSubscriptionNotModified signals a 304 response. The caller skips the
-// entire downstream chain (parse, snapshot commit, double full-node listing)
-// because nothing can have changed.
-var errSubscriptionNotModified = errors.New("订阅内容未变化（304）")
+func (m *Manager) beginRefreshing(id int64) {
+	m.mu.Lock()
+	m.refreshing[id] = struct{}{}
+	m.status.IsRefreshing = true
+	m.mu.Unlock()
+}
 
-func (m *Manager) refreshSubscription(ctx context.Context, sub *store.Subscription) error {
-	attempt := time.Now().UTC()
+func (m *Manager) endRefreshing(id int64) {
+	m.mu.Lock()
+	delete(m.refreshing, id)
+	m.status.IsRefreshing = len(m.refreshing) > 0
+	m.mu.Unlock()
+}
+
+// fetchedSubscription is one completed download, before anything is written.
+// Splitting fetch from commit lets a refresh pass overlap the network work while
+// keeping every database mutation serial.
+type fetchedSubscription struct {
+	nodes        []config.NodeConfig
+	parseIssues  []string
+	etag         string
+	lastModified string
+	notModified  bool
+	err          error
+}
+
+func (m *Manager) fetchFor(ctx context.Context, sub *store.Subscription) fetchedSubscription {
 	timeout := time.Duration(sub.RefreshTimeoutSeconds) * time.Second
 	if timeout <= 0 {
 		_, seconds := m.defaults()
 		timeout = time.Duration(seconds) * time.Second
 	}
-	nodes, parseIssues, etag, lastModified, err := m.fetchSubscription(ctx, sub, timeout)
-	if errors.Is(err, errSubscriptionNotModified) {
-		// Keep the stored ETag/Last-Modified; nothing else to do. LastSuccess
-		// stays untouched — the evidence is the stored snapshot, not a new
-		// download.
-		m.mu.Lock()
-		m.status.LastError = ""
-		m.mu.Unlock()
-		sub.LastAttempt, sub.LastError = attempt, ""
-		if updateErr := m.store.UpdateSubscription(ctx, sub); updateErr != nil {
-			m.logger.Warnf("record 304 for subscription %d: %v", sub.ID, updateErr)
-		}
-		return nil
-	}
-	if err == nil && len(nodes) == 0 {
-		err = errors.New("订阅未返回有效节点")
-	}
+	nodes, parseIssues, etag, lastModified, notModified, err := m.fetchSubscription(ctx, sub, timeout)
+	return fetchedSubscription{nodes: nodes, parseIssues: parseIssues, etag: etag,
+		lastModified: lastModified, notModified: notModified, err: err}
+}
+
+// commitFetched persists one fetch result. It returns whether a successful
+// snapshot changed the node set (which requires a runtime reconcile).
+func (m *Manager) commitFetched(ctx context.Context, sub *store.Subscription, fetched fetchedSubscription) (bool, error) {
+	attempt := time.Now().UTC()
 	// Rows the parser dropped are not fatal, but they silently shrink the node
 	// list; log them so the operator can see the gap.
-	for _, issue := range parseIssues {
+	for _, issue := range fetched.parseIssues {
 		m.logger.Warnf("subscription %d parse issue: %s", sub.ID, issue)
 	}
-	if err != nil {
+	if fetched.err == nil && !fetched.notModified && len(fetched.nodes) == 0 {
+		// An empty response is a provider failure, not a signal to delete the
+		// current members. Report it and leave the stored snapshot alone.
+		fetched.err = errors.New("订阅未返回有效节点")
+	}
+	if fetched.err != nil {
 		m.mu.Lock()
 		m.status.Invalid++
 		m.mu.Unlock()
-		sub.LastAttempt, sub.LastError = attempt, err.Error()
-		if updateErr := m.store.UpdateSubscription(ctx, sub); updateErr != nil {
-			return errors.Join(err, updateErr)
+		if err := m.store.RecordSubscriptionFailure(ctx, sub.ID, attempt, fetched.err.Error()); err != nil {
+			return false, errors.Join(fetched.err, err)
 		}
-		return err
+		return false, fetched.err
 	}
-	inputs := make([]store.SubscriptionNodeInput, 0, len(nodes))
-	seen := make(map[string]struct{}, len(nodes))
-	for i, n := range nodes {
+	if fetched.notModified {
+		// Keep the stored validators and snapshot; only the attempt moves.
+		if err := m.store.RecordSubscriptionNotModified(ctx, sub.ID, attempt); err != nil {
+			m.logger.Warnf("record 304 for subscription %d: %v", sub.ID, err)
+		}
+		return false, nil
+	}
+	inputs := make([]store.SubscriptionNodeInput, 0, len(fetched.nodes))
+	seen := make(map[string]struct{}, len(fetched.nodes))
+	for i, n := range fetched.nodes {
 		uri := strings.TrimSpace(n.URI)
 		identityKey := n.IdentityHash
 		if identityKey == "" {
@@ -462,85 +633,42 @@ func (m *Manager) refreshSubscription(ctx context.Context, sub *store.Subscripti
 			Username: n.Username, Password: n.Password, Enabled: true,
 			IdentityHash: n.IdentityHash, CanonicalJSON: n.CanonicalJSON, LogicalName: logicalName})
 	}
-	existingNodes, listErr := m.store.ListNodes(ctx, store.NodeFilter{})
-	if listErr != nil {
-		return listErr
-	}
-	existingIdentities := make(map[string]struct{}, len(existingNodes))
-	for _, existing := range existingNodes {
-		existingIdentities[existing.IdentityHash] = struct{}{}
-	}
 	m.mu.Lock()
-	m.status.Parsed += len(nodes)
-	m.status.DuplicatesSkipped += len(nodes) - len(inputs)
+	m.status.Parsed += len(fetched.nodes)
+	m.status.DuplicatesSkipped += len(fetched.nodes) - len(inputs)
 	m.mu.Unlock()
-	if err := m.store.CommitSnapshot(ctx, sub.ID, inputs, store.SubscriptionSnapshot{
-		Attempt: attempt, Success: time.Now().UTC(), ETag: etag, LastModified: lastModified,
-	}); err != nil {
-		return err
-	}
-	// Count a logical in-place replacement as an update rather than a newly
-	// created node. This keeps refresh statistics aligned with the diff that was
-	// actually committed.
-	afterNodes, err := m.store.ListNodes(ctx, store.NodeFilter{})
+	commit, err := m.store.CommitSnapshot(ctx, sub.ID, inputs, store.SubscriptionSnapshot{
+		Attempt: attempt, Success: time.Now().UTC(), ETag: fetched.etag,
+		LastModified: fetched.lastModified, RemoveAfterMisses: staleNodeMissLimit,
+	})
 	if err != nil {
-		// The snapshot is already committed. A secondary statistics read must
-		// not turn a successful refresh into a reported failure or suppress the
-		// runtime reconciliation that follows it.
-		m.logger.Warnf("count committed subscription %d diff: %v", sub.ID, err)
-		created, updated := 0, 0
-		for _, input := range inputs {
-			if _, existed := existingIdentities[input.IdentityHash]; existed {
-				updated++
-			} else {
-				created++
-			}
-		}
-		m.mu.Lock()
-		m.status.Created += created
-		m.status.Updated += updated
-		m.mu.Unlock()
-		return nil
-	}
-	beforeIDs := make(map[int64]struct{}, len(existingNodes))
-	for _, existing := range existingNodes {
-		beforeIDs[existing.ID] = struct{}{}
-	}
-	afterByIdentity := make(map[string]int64, len(afterNodes))
-	for _, node := range afterNodes {
-		afterByIdentity[node.IdentityHash] = node.ID
-	}
-	created, updated := 0, 0
-	for _, input := range inputs {
-		if _, existed := existingIdentities[input.IdentityHash]; existed {
-			updated++
-			continue
-		}
-		if nodeID := afterByIdentity[input.IdentityHash]; nodeID != 0 {
-			if _, reused := beforeIDs[nodeID]; reused {
-				updated++
-				continue
-			}
-		}
-		created++
+		return false, err
 	}
 	m.mu.Lock()
-	m.status.Created += created
-	m.status.Updated += updated
+	m.status.Created += commit.Created
+	m.status.Updated += commit.Updated
 	m.mu.Unlock()
-	return nil
+	if m.refreshObserver != nil {
+		m.refreshObserver()
+	}
+	return commit.Created > 0 || commit.Updated > 0 || commit.Removed > 0, nil
 }
 
-func (m *Manager) fetchSubscription(parent context.Context, sub *store.Subscription, timeout time.Duration) ([]config.NodeConfig, []string, string, string, error) {
+func (m *Manager) refreshSubscription(ctx context.Context, sub *store.Subscription) error {
+	_, err := m.commitFetched(ctx, sub, m.fetchFor(ctx, sub))
+	return err
+}
+
+func (m *Manager) fetchSubscription(parent context.Context, sub *store.Subscription, timeout time.Duration) ([]config.NodeConfig, []string, string, string, bool, error) {
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sub.URL, nil)
 	if err != nil {
-		return nil, nil, "", "", fmt.Errorf("create request: %w", err)
+		return nil, nil, "", "", false, fmt.Errorf("create request: %w", err)
 	}
 	format, err := config.NormalizeSubscriptionFormat(sub.Format)
 	if err != nil {
-		return nil, nil, "", "", err
+		return nil, nil, "", "", false, err
 	}
 	userAgent := strings.TrimSpace(sub.UserAgent)
 	if userAgent == "" {
@@ -559,21 +687,21 @@ func (m *Manager) fetchSubscription(parent context.Context, sub *store.Subscript
 	}
 	resp, err := m.httpClient.Do(req)
 	if err != nil {
-		return nil, nil, "", "", fmt.Errorf("fetch: %w", err)
+		return nil, nil, "", "", false, fmt.Errorf("fetch: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotModified {
-		return nil, nil, "", "", errSubscriptionNotModified
+		return nil, nil, "", "", true, nil
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, nil, "", "", fmt.Errorf("status %d", resp.StatusCode)
+		return nil, nil, "", "", false, fmt.Errorf("status %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024+1))
 	if err != nil {
-		return nil, nil, "", "", fmt.Errorf("read body: %w", err)
+		return nil, nil, "", "", false, fmt.Errorf("read body: %w", err)
 	}
 	if len(body) > 10*1024*1024 {
-		return nil, nil, "", "", errors.New("subscription response exceeds 10MB")
+		return nil, nil, "", "", false, errors.New("subscription response exceeds 10MB")
 	}
 	nodes, parseIssues, err := config.ParseSubscriptionContentAsReport(string(body), format)
 	if err != nil {
@@ -582,13 +710,17 @@ func (m *Manager) fetchSubscription(parent context.Context, sub *store.Subscript
 			err = fmt.Errorf("解析订阅响应（Content-Type %s）: %w", contentType, err)
 		}
 	}
+	// Fall back per validator. Using the stored value only when *both* headers
+	// were missing erased a previously stored Last-Modified as soon as the
+	// upstream started sending an ETag alone.
 	etag, lastModified := resp.Header.Get("ETag"), resp.Header.Get("Last-Modified")
-	if etag == "" && lastModified == "" {
-		// Upstream did not return fresh validators; keep the stored ones so
-		// the next refresh can still be conditional.
-		etag, lastModified = sub.ETag, sub.LastModified
+	if etag == "" {
+		etag = sub.ETag
 	}
-	return nodes, parseIssues, etag, lastModified, err
+	if lastModified == "" {
+		lastModified = sub.LastModified
+	}
+	return nodes, parseIssues, etag, lastModified, false, err
 }
 
 func defaultSubscriptionUserAgent(format string) string {
@@ -699,6 +831,15 @@ func (m *Manager) Status() controlplane.SubscriptionStatus {
 	m.mu.RLock()
 	status := m.status
 	globalEnabled := m.baseCfg.SubscriptionRefresh.Enabled
+	status.IsRefreshing = len(m.refreshing) > 0
+	if len(m.refreshing) > 0 {
+		ids := make([]int64, 0, len(m.refreshing))
+		for id := range m.refreshing {
+			ids = append(ids, id)
+		}
+		slices.Sort(ids)
+		status.RefreshingIDs = ids
+	}
 	m.mu.RUnlock()
 	if subs, err := m.List(m.ctx); err == nil {
 		status.HasSubscriptions = len(subs) > 0

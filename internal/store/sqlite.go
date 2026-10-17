@@ -631,21 +631,42 @@ func (s *sqliteStore) CreateSubscription(ctx context.Context, subscription *Subs
 	return nil
 }
 
-func (s *sqliteStore) UpdateSubscription(ctx context.Context, subscription *Subscription) error {
-	if subscription.Format == "" {
-		subscription.Format = "auto"
+func (s *sqliteStore) UpdateSubscriptionSettings(ctx context.Context, id int64, settings SubscriptionSettings) error {
+	if settings.Format == "" {
+		settings.Format = "auto"
 	}
-	result, err := s.writeConn().ExecContext(ctx, `UPDATE subscriptions SET name=?, url=?, format=?, user_agent=?, enabled=?,
-		refresh_interval_seconds=?, refresh_timeout_seconds=?, sort_order=?, last_attempt=?,
-		last_success=?, last_error=?, node_count=?, etag=?, last_modified=?, updated_at=? WHERE id=?`,
-		subscription.Name, subscription.URL, subscription.Format, subscription.UserAgent, boolToInt(subscription.Enabled), subscription.RefreshIntervalSeconds,
-		subscription.RefreshTimeoutSeconds, subscription.SortOrder, formatTime(subscription.LastAttempt),
-		formatTime(subscription.LastSuccess), subscription.LastError, subscription.NodeCount, subscription.ETag,
-		subscription.LastModified, formatTime(time.Now().UTC()), subscription.ID)
+	// A new URL means the stored ETag/Last-Modified describe a different
+	// resource; sending them would make the first fetch after the edit wrong.
+	result, err := s.writeConn().ExecContext(ctx, `UPDATE subscriptions SET name=?, url=?, format=?, user_agent=?,
+		enabled=?, refresh_interval_seconds=?, refresh_timeout_seconds=?, sort_order=?,
+		etag=CASE WHEN url<>? THEN '' ELSE etag END,
+		last_modified=CASE WHEN url<>? THEN '' ELSE last_modified END,
+		updated_at=? WHERE id=?`,
+		settings.Name, settings.URL, settings.Format, settings.UserAgent, boolToInt(settings.Enabled),
+		settings.RefreshIntervalSeconds, settings.RefreshTimeoutSeconds, settings.SortOrder,
+		settings.URL, settings.URL, formatTime(time.Now().UTC()), id)
 	if err != nil {
-		return fmt.Errorf("update subscription %d: %w", subscription.ID, err)
+		return fmt.Errorf("update subscription %d: %w", id, err)
 	}
-	return requireAffected(result, fmt.Sprintf("subscription %d not found", subscription.ID))
+	return requireAffected(result, fmt.Sprintf("subscription %d not found", id))
+}
+
+func (s *sqliteStore) RecordSubscriptionFailure(ctx context.Context, id int64, attempt time.Time, message string) error {
+	result, err := s.writeConn().ExecContext(ctx, `UPDATE subscriptions SET last_attempt=?, last_error=?, updated_at=?
+		WHERE id=?`, formatTime(attempt), message, formatTime(time.Now().UTC()), id)
+	if err != nil {
+		return fmt.Errorf("record subscription %d failure: %w", id, err)
+	}
+	return requireAffected(result, fmt.Sprintf("subscription %d not found", id))
+}
+
+func (s *sqliteStore) RecordSubscriptionNotModified(ctx context.Context, id int64, attempt time.Time) error {
+	result, err := s.writeConn().ExecContext(ctx, `UPDATE subscriptions SET last_attempt=?, last_error='', updated_at=?
+		WHERE id=?`, formatTime(attempt), formatTime(time.Now().UTC()), id)
+	if err != nil {
+		return fmt.Errorf("record subscription %d not modified: %w", id, err)
+	}
+	return requireAffected(result, fmt.Sprintf("subscription %d not found", id))
 }
 
 func (s *sqliteStore) MarkSubscriptionAttempt(ctx context.Context, id int64, at time.Time) error {
@@ -744,7 +765,7 @@ func (s *sqliteStore) ActivateSubscriptionExclusive(ctx context.Context, id int6
 }
 
 func (s *sqliteStore) ListSubscriptionNodes(ctx context.Context, subscriptionID int64) ([]SubscriptionNode, error) {
-	rows, err := s.readConn().QueryContext(ctx, `SELECT sn.subscription_id, sn.position,
+	rows, err := s.readConn().QueryContext(ctx, `SELECT sn.subscription_id, sn.position, sn.missed_refreshes, sn.last_seen_at,
 		n.id, n.uri, n.name, n.source, n.port, n.username, n.password, n.region, n.country,
 		n.enabled, n.tags, n.identity_hash, n.canonical_json, n.created_at, n.updated_at
 		FROM subscription_nodes sn JOIN nodes n ON n.id=sn.node_id
@@ -757,14 +778,16 @@ func (s *sqliteStore) ListSubscriptionNodes(ctx context.Context, subscriptionID 
 	for rows.Next() {
 		var member SubscriptionNode
 		var enabled int
-		var tagsJSON, createdAt, updatedAt string
-		if err := rows.Scan(&member.SubscriptionID, &member.Position, &member.Node.ID, &member.Node.URI,
+		var tagsJSON, createdAt, updatedAt, lastSeenAt string
+		if err := rows.Scan(&member.SubscriptionID, &member.Position, &member.MissedRefreshes, &lastSeenAt,
+			&member.Node.ID, &member.Node.URI,
 			&member.Node.Name, &member.Node.Source, &member.Node.Port, &member.Node.Username,
 			&member.Node.Password, &member.Node.Region, &member.Node.Country, &enabled, &tagsJSON,
 			&member.Node.IdentityHash, &member.Node.CanonicalJSON, &createdAt, &updatedAt); err != nil {
 			return nil, err
 		}
 		member.Node.Enabled = enabled != 0
+		member.LastSeenAt = parseTime(lastSeenAt)
 		if tagsJSON != "" && tagsJSON != "[]" {
 			_ = json.Unmarshal([]byte(tagsJSON), &member.Node.Tags)
 		}
@@ -793,25 +816,347 @@ func (s *sqliteStore) ReplaceSubscriptionNodes(ctx context.Context, subscription
 	})
 }
 
-func (s *sqliteStore) CommitSnapshot(ctx context.Context, subscriptionID int64, nodes []SubscriptionNodeInput, snapshot SubscriptionSnapshot) error {
-	return s.runInTx(ctx, func(tx *sqliteStore) error {
+func (s *sqliteStore) CommitSnapshot(ctx context.Context, subscriptionID int64, nodes []SubscriptionNodeInput, snapshot SubscriptionSnapshot) (SubscriptionCommitResult, error) {
+	var commit SubscriptionCommitResult
+	err := s.runInTx(ctx, func(tx *sqliteStore) error {
+		before, err := tx.resolveSubscriptionIdentities(ctx, nodes)
+		if err != nil {
+			return err
+		}
+		// Node IDs already in this subscription, before the logical-name pass can
+		// rewrite a slot to the incoming identity.
+		beforeNodeIDs, err := tx.subscriptionMemberNodeIDs(ctx, subscriptionID)
+		if err != nil {
+			return err
+		}
+		identitiesBefore, err := tx.subscriptionMemberIdentities(ctx, subscriptionID)
+		if err != nil {
+			return err
+		}
 		if err := tx.mergeSubscriptionNodes(ctx, subscriptionID, nodes); err != nil {
 			return err
 		}
-		var nodeCount int
+		removed, err := tx.markMissingSubscriptionMembers(ctx, subscriptionID, len(nodes), snapshot.RemoveAfterMisses)
+		if err != nil {
+			return err
+		}
+		commit.Removed = removed
+		after, err := tx.resolveSubscriptionIdentities(ctx, nodes)
+		if err != nil {
+			return err
+		}
+		commit.Created, commit.Updated = countSnapshotDiff(nodes, before, after, identitiesBefore, beforeNodeIDs)
 		if err := tx.writeConn().QueryRowContext(ctx,
-			"SELECT COUNT(*) FROM subscription_nodes WHERE subscription_id=?", subscriptionID).Scan(&nodeCount); err != nil {
+			"SELECT COUNT(*) FROM subscription_nodes WHERE subscription_id=?", subscriptionID).Scan(&commit.NodeCount); err != nil {
 			return fmt.Errorf("count subscription %d nodes: %w", subscriptionID, err)
 		}
 		result, err := tx.writeConn().ExecContext(ctx, `UPDATE subscriptions SET last_attempt=?, last_success=?,
 			last_error=?, node_count=?, etag=?, last_modified=?, updated_at=? WHERE id=?`,
-			formatTime(snapshot.Attempt), formatTime(snapshot.Success), snapshot.Error, nodeCount, snapshot.ETag,
+			formatTime(snapshot.Attempt), formatTime(snapshot.Success), snapshot.Error, commit.NodeCount, snapshot.ETag,
 			snapshot.LastModified, formatTime(time.Now().UTC()), subscriptionID)
 		if err != nil {
 			return fmt.Errorf("commit subscription %d snapshot: %w", subscriptionID, err)
 		}
 		return requireAffected(result, fmt.Sprintf("subscription %d not found", subscriptionID))
 	})
+	if err != nil {
+		return SubscriptionCommitResult{}, err
+	}
+	return commit, nil
+}
+
+// resolveSubscriptionIdentities maps every incoming identity hash to the node ID
+// currently holding it. It answers the small set of identities the snapshot
+// touches instead of scanning the whole nodes table — previously a refresh ran
+// two full ListNodes calls only to tell creations from updates.
+func (s *sqliteStore) resolveSubscriptionIdentities(ctx context.Context, nodes []SubscriptionNodeInput) (map[string]int64, error) {
+	hashes := make([]string, 0, len(nodes))
+	seen := make(map[string]struct{}, len(nodes))
+	for i := range nodes {
+		prepareSubscriptionNodeIdentity(&nodes[i])
+		hash := nodes[i].IdentityHash
+		if hash == "" {
+			continue
+		}
+		if _, exists := seen[hash]; exists {
+			continue
+		}
+		seen[hash] = struct{}{}
+		hashes = append(hashes, hash)
+	}
+	resolved := make(map[string]int64, len(hashes))
+	for start := 0; start < len(hashes); start += 500 {
+		end := start + 500
+		if end > len(hashes) {
+			end = len(hashes)
+		}
+		batch := hashes[start:end]
+		query := "SELECT id, identity_hash FROM nodes WHERE identity_hash IN (" +
+			strings.Repeat("?,", len(batch)-1) + "?)"
+		args := make([]any, len(batch))
+		for i, hash := range batch {
+			args[i] = hash
+		}
+		rows, err := s.writeConn().QueryContext(ctx, query, args...)
+		if err != nil {
+			return nil, fmt.Errorf("resolve subscription identities: %w", err)
+		}
+		for rows.Next() {
+			var id int64
+			var hash string
+			if err := rows.Scan(&id, &hash); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan subscription identity: %w", err)
+			}
+			resolved[hash] = id
+		}
+		if err := rows.Close(); err != nil {
+			return nil, fmt.Errorf("finish subscription identity lookup: %w", err)
+		}
+	}
+	return resolved, nil
+}
+
+// subscriptionMemberIdentities returns the identity hashes this subscription
+// already owned before the merge.
+func (s *sqliteStore) subscriptionMemberIdentities(ctx context.Context, subscriptionID int64) (map[string]struct{}, error) {
+	rows, err := s.writeConn().QueryContext(ctx, `SELECT n.identity_hash FROM subscription_nodes sn
+		JOIN nodes n ON n.id=sn.node_id WHERE sn.subscription_id=?`, subscriptionID)
+	if err != nil {
+		return nil, fmt.Errorf("list subscription %d identities: %w", subscriptionID, err)
+	}
+	defer rows.Close()
+	identities := make(map[string]struct{})
+	for rows.Next() {
+		var hash string
+		if err := rows.Scan(&hash); err != nil {
+			return nil, fmt.Errorf("scan subscription %d identity: %w", subscriptionID, err)
+		}
+		if hash != "" {
+			identities[hash] = struct{}{}
+		}
+	}
+	return identities, rows.Err()
+}
+
+func (s *sqliteStore) subscriptionMemberNodeIDs(ctx context.Context, subscriptionID int64) (map[int64]struct{}, error) {
+	rows, err := s.writeConn().QueryContext(ctx,
+		"SELECT node_id FROM subscription_nodes WHERE subscription_id=?", subscriptionID)
+	if err != nil {
+		return nil, fmt.Errorf("list subscription %d member ids: %w", subscriptionID, err)
+	}
+	defer rows.Close()
+	ids := make(map[int64]struct{})
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan subscription %d member id: %w", subscriptionID, err)
+		}
+		ids[id] = struct{}{}
+	}
+	return ids, rows.Err()
+}
+
+// countSnapshotDiff classifies each incoming node using the identity holders
+// observed before and after the merge. An identity another node already carried
+// (anywhere in the store, or in this subscription's prior snapshot) is an
+// update; an identity that did not exist but landed on a node this subscription
+// already owned was reconciled in place by the logical-name pass, which is also
+// an update.
+func countSnapshotDiff(nodes []SubscriptionNodeInput, before, after map[string]int64, memberIdentities map[string]struct{}, beforeNodeIDs map[int64]struct{}) (created, updated int) {
+	seen := make(map[string]struct{}, len(nodes))
+	for i := range nodes {
+		hash := nodes[i].IdentityHash
+		if hash == "" {
+			continue
+		}
+		if _, duplicate := seen[hash]; duplicate {
+			continue
+		}
+		seen[hash] = struct{}{}
+		_, knownIdentity := before[hash]
+		_, ownIdentity := memberIdentities[hash]
+		if knownIdentity || ownIdentity {
+			updated++
+			continue
+		}
+		if id, resolved := after[hash]; resolved {
+			if _, reused := beforeNodeIDs[id]; reused {
+				updated++
+				continue
+			}
+		}
+		created++
+	}
+	return created, updated
+}
+
+// markMissingSubscriptionMembers ages every member the latest snapshot omitted.
+// mergeSubscriptionNodes shifted retained members by len(nodes), so a membership
+// position at or beyond that offset is exactly one that was not seen. With a
+// positive limit, members that reach it are removed together with the nodes that
+// belonged only to this subscription.
+func (s *sqliteStore) markMissingSubscriptionMembers(ctx context.Context, subscriptionID int64, snapshotSize, removeAfterMisses int) (int, error) {
+	if _, err := s.writeConn().ExecContext(ctx, `UPDATE subscription_nodes SET missed_refreshes=missed_refreshes+1
+		WHERE subscription_id=? AND position>=?`, subscriptionID, snapshotSize); err != nil {
+		return 0, fmt.Errorf("age missing subscription %d members: %w", subscriptionID, err)
+	}
+	if removeAfterMisses <= 0 {
+		return 0, nil
+	}
+	return s.pruneStaleSubscriptionMembers(ctx, subscriptionID, removeAfterMisses)
+}
+
+// pruneStaleSubscriptionMembers deletes memberships that reached the miss limit
+// and then deletes the nodes left without any membership, returning how many
+// nodes were removed. Group references are cleared first: SQLite foreign keys do
+// not cover the JSON id lists.
+func (s *sqliteStore) pruneStaleSubscriptionMembers(ctx context.Context, subscriptionID int64, removeAfterMisses int) (int, error) {
+	rows, err := s.writeConn().QueryContext(ctx, `SELECT node_id FROM subscription_nodes
+		WHERE subscription_id=? AND missed_refreshes>=?`, subscriptionID, removeAfterMisses)
+	if err != nil {
+		return 0, fmt.Errorf("list stale subscription %d members: %w", subscriptionID, err)
+	}
+	var nodeIDs []int64
+	for rows.Next() {
+		var nodeID int64
+		if err := rows.Scan(&nodeID); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("scan stale subscription %d member: %w", subscriptionID, err)
+		}
+		nodeIDs = append(nodeIDs, nodeID)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	if len(nodeIDs) == 0 {
+		return 0, nil
+	}
+	if _, err := s.writeConn().ExecContext(ctx, `DELETE FROM subscription_nodes
+		WHERE subscription_id=? AND missed_refreshes>=?`, subscriptionID, removeAfterMisses); err != nil {
+		return 0, fmt.Errorf("remove stale subscription %d members: %w", subscriptionID, err)
+	}
+	return s.deleteOrphanedSubscriptionNodes(ctx, nodeIDs)
+}
+
+// deleteOrphanedSubscriptionNodes removes subscription-owned nodes that no
+// longer belong to any subscription, after detaching them from group configs.
+// It returns the number of nodes deleted.
+func (s *sqliteStore) deleteOrphanedSubscriptionNodes(ctx context.Context, nodeIDs []int64) (int, error) {
+	removed := 0
+	for _, nodeID := range nodeIDs {
+		var orphan int
+		err := s.writeConn().QueryRowContext(ctx, `SELECT 1 FROM nodes n
+			WHERE n.id=? AND n.source=?
+			AND NOT EXISTS (SELECT 1 FROM subscription_nodes sn WHERE sn.node_id=n.id)`,
+			nodeID, NodeSourceSubscription).Scan(&orphan)
+		if err == sql.ErrNoRows {
+			continue
+		}
+		if err != nil {
+			return removed, fmt.Errorf("check orphaned subscription node %d: %w", nodeID, err)
+		}
+		if err := removeGroupReferences(ctx, s.writeConn(), nodeID); err != nil {
+			return removed, fmt.Errorf("detach node %d from groups: %w", nodeID, err)
+		}
+		if _, err := s.writeConn().ExecContext(ctx, "DELETE FROM nodes WHERE id=?", nodeID); err != nil {
+			return removed, fmt.Errorf("delete stale subscription node %d: %w", nodeID, err)
+		}
+		removed++
+	}
+	return removed, nil
+}
+
+func (s *sqliteStore) ResetSubscriptionNodes(ctx context.Context, subscriptionID int64) error {
+	return s.runInTx(ctx, func(tx *sqliteStore) error {
+		if err := tx.requireSubscription(ctx, subscriptionID); err != nil {
+			return err
+		}
+		rows, err := tx.writeConn().QueryContext(ctx,
+			"SELECT node_id FROM subscription_nodes WHERE subscription_id=?", subscriptionID)
+		if err != nil {
+			return fmt.Errorf("list subscription %d members: %w", subscriptionID, err)
+		}
+		var nodeIDs []int64
+		for rows.Next() {
+			var nodeID int64
+			if err := rows.Scan(&nodeID); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan subscription %d member: %w", subscriptionID, err)
+			}
+			nodeIDs = append(nodeIDs, nodeID)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if _, err := tx.writeConn().ExecContext(ctx,
+			"DELETE FROM subscription_nodes WHERE subscription_id=?", subscriptionID); err != nil {
+			return fmt.Errorf("clear subscription %d members: %w", subscriptionID, err)
+		}
+		if _, err := tx.deleteOrphanedSubscriptionNodes(ctx, nodeIDs); err != nil {
+			return err
+		}
+		result, err := tx.writeConn().ExecContext(ctx,
+			"UPDATE subscriptions SET node_count=0, updated_at=? WHERE id=?", formatTime(time.Now().UTC()), subscriptionID)
+		if err != nil {
+			return fmt.Errorf("reset subscription %d node count: %w", subscriptionID, err)
+		}
+		return requireAffected(result, fmt.Sprintf("subscription %d not found", subscriptionID))
+	})
+}
+
+// removeGroupReferences strips a deleted node from every group's explicit and
+// excluded id lists and clears a matching active pointer. Those lists live in
+// JSON columns, so ON DELETE CASCADE cannot maintain them.
+func removeGroupReferences(ctx context.Context, conn querier, nodeID int64) error {
+	rows, err := conn.QueryContext(ctx,
+		`SELECT id, explicit_node_ids_json, excluded_node_ids_json, current_active_node_id FROM group_pools`)
+	if err != nil {
+		return err
+	}
+	type groupRefs struct {
+		id                 int64
+		explicit, excluded string
+		current            int64
+	}
+	var updates []groupRefs
+	for rows.Next() {
+		var item groupRefs
+		if err := rows.Scan(&item.id, &item.explicit, &item.excluded, &item.current); err != nil {
+			rows.Close()
+			return err
+		}
+		item.explicit = removeNodeIDJSON(item.explicit, nodeID)
+		item.excluded = removeNodeIDJSON(item.excluded, nodeID)
+		if item.current == nodeID {
+			item.current = 0
+		}
+		updates = append(updates, item)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, item := range updates {
+		if _, err := conn.ExecContext(ctx,
+			`UPDATE group_pools SET explicit_node_ids_json=?, excluded_node_ids_json=?, current_active_node_id=? WHERE id=?`,
+			item.explicit, item.excluded, item.current, item.id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func removeNodeIDJSON(raw string, nodeID int64) string {
+	var ids []int64
+	_ = json.Unmarshal([]byte(raw), &ids)
+	kept := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if id != nodeID {
+			kept = append(kept, id)
+		}
+	}
+	encoded, _ := json.Marshal(kept)
+	return string(encoded)
 }
 
 func (s *sqliteStore) replaceSubscriptionNodes(ctx context.Context, subscriptionID int64, nodes []SubscriptionNodeInput) error {
@@ -1054,10 +1399,13 @@ func (s *sqliteStore) upsertSubscriptionNodes(ctx context.Context, subscriptionI
 		return fmt.Errorf("prepare subscription node upsert: %w", err)
 	}
 	defer nodeStmt.Close()
-	linkStmt, err := s.writeConn().PrepareContext(ctx, `INSERT INTO subscription_nodes (subscription_id, node_id, position)
-			SELECT ?, id, ? FROM nodes WHERE identity_hash=?
-			ON CONFLICT(subscription_id, node_id) DO UPDATE SET position=excluded.position
-			WHERE subscription_nodes.position<>excluded.position`)
+	linkStmt, err := s.writeConn().PrepareContext(ctx, `INSERT INTO subscription_nodes
+			(subscription_id, node_id, position, missed_refreshes, last_seen_at)
+			SELECT ?, id, ?, 0, ? FROM nodes WHERE identity_hash=?
+			ON CONFLICT(subscription_id, node_id) DO UPDATE SET position=excluded.position,
+			missed_refreshes=0, last_seen_at=excluded.last_seen_at
+			WHERE subscription_nodes.position<>excluded.position
+			OR subscription_nodes.missed_refreshes<>0 OR subscription_nodes.last_seen_at<>excluded.last_seen_at`)
 	if err != nil {
 		return fmt.Errorf("prepare subscription node link: %w", err)
 	}
@@ -1074,7 +1422,7 @@ func (s *sqliteStore) upsertSubscriptionNodes(ctx context.Context, subscriptionI
 			boolToInt(node.Enabled), node.IdentityHash, node.CanonicalJSON, now, now); err != nil {
 			return fmt.Errorf("upsert subscription node %q: %w", node.URI, err)
 		}
-		if _, err := linkStmt.ExecContext(ctx, subscriptionID, position, node.IdentityHash); err != nil {
+		if _, err := linkStmt.ExecContext(ctx, subscriptionID, position, now, node.IdentityHash); err != nil {
 			return fmt.Errorf("link subscription node %q: %w", node.URI, err)
 		}
 	}

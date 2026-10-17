@@ -106,6 +106,9 @@ func nodeErrorStatus(err error) int {
 // operator-facing Chinese text, so this stays message-driven until those errors
 // become typed. Unrecognized failures are 500.
 func subscriptionErrorStatus(err error) int {
+	if errors.Is(err, controlplane.ErrRefreshInProgress) {
+		return http.StatusConflict
+	}
 	message := strings.ToLower(err.Error())
 	if strings.Contains(message, "不存在") || strings.Contains(message, "not found") {
 		return http.StatusNotFound

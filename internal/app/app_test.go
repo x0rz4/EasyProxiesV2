@@ -79,7 +79,7 @@ func TestLoadNodesFromStoreHonorsDisabledSubscriptions(t *testing.T) {
 	if err := db.CreateSubscription(ctx, sub); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.CommitSnapshot(ctx, sub.ID, []store.SubscriptionNodeInput{{
+	if _, err := db.CommitSnapshot(ctx, sub.ID, []store.SubscriptionNodeInput{{
 		URI: "ss://disabled", Name: "disabled", Enabled: true,
 	}}, store.SubscriptionSnapshot{Attempt: time.Now(), Success: time.Now()}); err != nil {
 		t.Fatal(err)
@@ -150,7 +150,7 @@ func TestLoadNodesFromStoreAdoptsEstablishedOrphanSubscriptionNodes(t *testing.T
 	if err := db.CreateSubscription(ctx, sub); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.CommitSnapshot(ctx, sub.ID, []store.SubscriptionNodeInput{{URI: "ss://current", Name: "current", Enabled: true}},
+	if _, err := db.CommitSnapshot(ctx, sub.ID, []store.SubscriptionNodeInput{{URI: "ss://current", Name: "current", Enabled: true}},
 		store.SubscriptionSnapshot{Attempt: time.Now(), Success: time.Now()}); err != nil {
 		t.Fatal(err)
 	}

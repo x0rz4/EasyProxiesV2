@@ -41,6 +41,7 @@ func (s *Server) handleSubscriptionStatus(w http.ResponseWriter, r *http.Request
 		"last_error":         status.LastError,
 		"refresh_count":      status.RefreshCount,
 		"is_refreshing":      status.IsRefreshing,
+		"refreshing_ids":     status.RefreshingIDs,
 		"parsed":             status.Parsed,
 		"created":            status.Created,
 		"updated":            status.Updated,
