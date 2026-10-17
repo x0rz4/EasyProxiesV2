@@ -20,6 +20,46 @@ type NodeManager interface {
 	TriggerReload(ctx context.Context) error
 }
 
+// BatchNodeCreator is the optional bulk-write port. A runtime that implements it
+// takes one lock, validates the whole batch (including building each outbound
+// once) and writes it in one transaction; callers fall back to per-node
+// CreateNode when it is absent, which is what the lightweight test managers do.
+type BatchNodeCreator interface {
+	CreateNodes(ctx context.Context, nodes []config.NodeConfig, dryRun bool) (NodeBatchResult, error)
+}
+
+// NodeBatchResult is the per-row outcome of a batch creation.
+//
+// Planned holds the normalized rows that were (or, for a dry run, would be)
+// written. Created is the subset that actually reached the store. Failed rows
+// carry a reason suitable for the import report.
+type NodeBatchResult struct {
+	Planned []config.NodeConfig `json:"planned,omitempty"`
+	Created []config.NodeConfig `json:"created,omitempty"`
+	Failed  []NodeCreateFailure `json:"failed,omitempty"`
+}
+
+// NodeCreateFailure describes one row the batch refused to create. Err keeps
+// the typed cause so the HTTP layer can apply the same status mapping it uses
+// for single-node creates; Reason is the operator-facing text.
+type NodeCreateFailure struct {
+	Index  int    `json:"index"`
+	Name   string `json:"name,omitempty"`
+	URI    string `json:"uri,omitempty"`
+	Reason string `json:"reason"`
+	Err    error  `json:"-"`
+}
+
+// IDNodeManager is the optional ID-addressed CRUD port. Node names are not
+// unique (two subscriptions may ship the same display name), so the management
+// UI addresses nodes by ID; the name-based methods stay as a compatibility
+// layer for callers that only have a name.
+type IDNodeManager interface {
+	UpdateNodeByID(ctx context.Context, id int64, node config.NodeConfig) (config.NodeConfig, error)
+	DeleteNodeByID(ctx context.Context, id int64) error
+	SetNodeEnabledByID(ctx context.Context, id int64, enabled bool) error
+}
+
 type GroupRuntimeStatus struct {
 	Status string `json:"runtime_status"`
 	Error  string `json:"runtime_error,omitempty"`

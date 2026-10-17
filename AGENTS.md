@@ -39,7 +39,7 @@ install.sh                    Linux Docker / 二进制安装及更新入口
 
 ---
 
-## 3. Module Map（`internal/`，29 个包）
+## 3. Module Map（`internal/`，30 个包）
 
 ### 装配与基础
 
@@ -51,6 +51,7 @@ install.sh                    Linux Docker / 二进制安装及更新入口
 | `jsonx` | JSON 编解码统一出口（Sonic + `MarshalCanonical`） | `Marshal` / `Unmarshal` / `MarshalCanonical` |
 | `noderesult` | 检测结果负载的**唯一**定义（叶子包，不 import 本项目任何包）：`Quality`（ipquality）/ `Service`+`IPInfo`+`Unlock`（unlock）。`store` 嵌入这些类型加元数据字段，`unlock`/`ipquality` 用 `type` 别名指回来，因此检测结果落库/出 API 不需要逐字段转换 | `noderesult.Quality` / `Unlock` / `Service` / `IPInfo` |
 | `netx` | 经节点 outbound 拨号的 HTTP 客户端/transport 的**唯一**构造点（叶子包，不 import 本项目任何包）。各消费方的差异（超时、TLS 校验、连接复用、重定向）变成显式 `Options`，而不是在每处重拼 `http.Transport` | `NewClient(dial, Options)` / `NewTransport(dial, Options)`、`CloseIdleConnections` |
+| `runtimenodes` | **运行时节点集合的唯一组装点**：enabled 的非订阅节点 + 经由 enabled 订阅可达的 enabled 节点，按 identity 去重。启动、订阅 reconcile 与 `TriggerReload` 共用 | `Load(ctx, store)` / `Convert` / `IdentityKey` |
 
 ### 数据面（代理运行）
 
@@ -136,6 +137,8 @@ nodedetect / unlock / ipquality / geoip → netx（叶子，拨号 http.Client �
 
 ### 4.4 配置热重载的三条路径（`boxmgr`）
 
+三条路径要重建的**节点集合只有一个来源**：`runtimenodes.Load`（enabled 非订阅节点 + enabled 订阅可达节点，按 identity 去重）。`config.yaml` 内联节点按 `NodeKey` 优先并回填库内元数据，匹配不到的才追加。**不要**在任一路径里另写过滤（历史 bug：`TriggerReload` 只过滤 `enabled`，导致停用订阅的节点在任意节点增删后被拉回运行时）。
+
 1. **冷启动** `Start`：base box + 每个启用分组一个独立 box。
 2. **增量** `reloadNodesIncrementally`：节点 URI 未变则复用旧 tag/outbound，变更节点用新 generation 生成新 tag → `pool.CreateMember` → `PrepareUpdate`/`Commit` → 旧成员异步排空。仅在"未启用 multi-port 且未启用 GeoIP 且其余配置一致"时可用。
 3. **全量蓝绿** `reload`：`waitForConnectionsToDrain` → 关旧 box → 等待端口释放 → 用 `generation+1` 重建全部 → `SweepStaleNodes`。
@@ -214,7 +217,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 
 ## 8. Database & Config Conventions
 
-- **migration 只追加**：`internal/store/migrations.go` 的列表按 `Version` 递增、只允许在末尾新增（每个 migration 独立事务，`schema_migrations` 记录已应用版本）。新列必须带 `NOT NULL DEFAULT`，保证升级行为不变。当前最新为 v22（v22 为 `subscription_nodes` 增加 `missed_refreshes` / `last_seen_at`）。
+- **migration 只追加**：`internal/store/migrations.go` 的列表按 `Version` 递增、只允许在末尾新增（每个 migration 独立事务，`schema_migrations` 记录已应用版本）。新列必须带 `NOT NULL DEFAULT`，保证升级行为不变。当前最新为 v23（v23 仅为 `nodes.name` 建普通索引；名称**故意不唯一**）。
 - 表结构变更后需同步 `sqlite.go` 的列常量 / `scan*` / `INSERT` / `UPDATE`；改 `store.GroupPool` 还要同步 `config.GroupPoolConfig` + `boxmgr` 的双向转换与相等性判断（否则热重载判定不到变化）。
 - `nodes.tags` **只是 `node_tags` 的只读投影**（由 `refreshNodeTagProjection` 重写）；改标签必须走 store 的 tag API（`SetManualNodeTags` / `ReplaceAutoNodeTags`），旁路写入会被下次重算覆盖。
 - 配置优先级：**store（数据库）优先于 `config.yaml`**；启动时 `loadNodesFromStore` / `loadGroupsFromStore` / `loadTagNamesFromStore` 会用库里的数据覆盖配置中的对应字段。`yaml:"-"` 的字段即"只来自 store"。
@@ -255,4 +258,5 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 11. **经节点拨号的 HTTP 客户端一律走 `netx`，且 `DialFunc` 不允许为 nil**：`netx` 造的是**裸** `http.Transport`（这是刻意的：每个消费者只要它声明的那几个字段）。因此 `nil` 拨号不等于"用标准库默认值"——那样会静默丢掉 `http.DefaultTransport` 的 HTTP/2、代理环境变量与共享空闲连接池。主机本地（不经节点）的请求，例如 `IPAPIClient` 的批量查询，应直接用 `&http.Client{Timeout: ...}`，不要经过 `netx`。新增消费者时把差异写成显式 `Options`，不要在调用处重拼 transport。
 12. **错误→状态码是三个策略，不是一个**（`httpapi/response.go`）：`nodeErrorStatus`（类型驱动，`respondNodeError` 靠它额外带 `existing_node_id`）、`subscriptionErrorStatus`（消息驱动，未识别 → 500）、`tagErrorStatus`（消息驱动，未识别 → 400）。它们**故意不一致**：同样是"节点不存在"，tag 域是 400（请求体点了不存在的节点）、订阅域是 404，且 `tag_handlers_test.go` 钉住了这个 400。调用方必须显式点名自己用哪个策略——`errorToStatus(err)` 这种统一分发器今天写不对，因为两个域只能靠"谁调用的"区分，错误的类型和文案都区分不出来。同理 `httpapi/response.go` 的 `pathID`（400）与 `pathIDOrNotFound`（公开 `/sub/*` 用 404，避免探测 ID 形态）不可互换。
 13. **不要为"减少 handler 样板"引入泛型 `handle[Req, Resp]` 包装**：实测 14 个解码请求体的 handler 各自带 3–19 个错误分支，包装只省掉最外层的 decode/serialize，分支一个不少，缩短量为 0；最贴近该形状的 `handleReload` 还会因丢掉 `respondNodeError` 的 `existing_node_id` 而行为变化。真正有效的是 `pathID` / `requireStore` / 三个域状态函数。若 httpapi 拆分时要重提，从这次测量出发，不要从想法出发。
-14. **订阅刷新写路径必须窄写**：失败 / 304 只能调 `RecordSubscriptionFailure` / `RecordSubscriptionNotModified`，用户编辑只能调 `UpdateSubscriptionSettings`。刷新耗时可达分钟级，任何"读整行再写回"都会把期间的用户编辑或已提交的 `last_success` / `etag` 静默回滚（旧的 `UpdateSubscription` 因此已从接口删除）。提交阶段的 `created/updated` 由 `CommitSnapshot` 按 `identity_hash` 局部查询算出，不要再为了统计做全表 `ListNodes`。
+14. **运行时节点集合只能由 `runtimenodes.Load` 决定**：启动（`app.loadNodesFromStore`）、订阅 reconcile（`subscription.reconcileRuntime`）与手动重载（`boxmgr.TriggerReload`）必须走同一个函数。任何"只按 `enabled` 过滤"的本地版本都会让停用订阅（或被独占激活挤掉）的节点在节点增删 / 导入 / 设置保存后重新进入运行时。`TriggerReload` 读取 store 失败时必须返回错误，不得降级成"只有内联节点"的半套配置。
+15. **订阅刷新写路径必须窄写**：失败 / 304 只能调 `RecordSubscriptionFailure` / `RecordSubscriptionNotModified`，用户编辑只能调 `UpdateSubscriptionSettings`。刷新耗时可达分钟级，任何"读整行再写回"都会把期间的用户编辑或已提交的 `last_success` / `etag` 静默回滚（旧的 `UpdateSubscription` 因此已从接口删除）。提交阶段的 `created/updated` 由 `CommitSnapshot` 按 `identity_hash` 局部查询算出，不要再为了统计做全表 `ListNodes`。

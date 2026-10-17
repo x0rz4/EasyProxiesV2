@@ -529,6 +529,15 @@ WHERE last_seen_at='';
 CREATE INDEX idx_subscription_nodes_missed ON subscription_nodes(subscription_id, missed_refreshes);
 `,
 		},
+		{
+			Version:     23,
+			Description: "index node names for name-addressed operations",
+			// Names stay non-unique on purpose: two subscriptions may ship the
+			// same display name, and subscription logical-name reconciliation
+			// scopes uniqueness per subscription. The index only makes
+			// GetNodeByName a lookup instead of a table scan.
+			Up: `CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);`,
+		},
 	}
 }
 

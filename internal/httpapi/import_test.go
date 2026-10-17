@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -149,5 +151,128 @@ func TestImportReportsLineLevelIssues(t *testing.T) {
 	issue := payload.Issues[0]
 	if issue.Line != 2 || issue.Kind != "unsupported_protocol" || !strings.Contains(issue.Message, "不支持的协议") {
 		t.Fatalf("issue=%+v", issue)
+	}
+}
+
+// 预览不能写库、不能触发重载，但必须给出"将新增多少"。
+func TestImportDryRunDoesNotCreateOrReload(t *testing.T) {
+	manager := &importNodeManager{}
+	server := &Server{nodeMgr: manager}
+	body, _ := json.Marshal(map[string]any{
+		"content": "http://user:pass@a.example:8080\nhttp://user:pass@b.example:8080",
+		"dry_run": true,
+	})
+	response := httptest.NewRecorder()
+	server.handleImport(response, httptest.NewRequest(http.MethodPost, "/api/import", bytes.NewReader(body)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		WouldCreate int  `json:"would_create"`
+		Created     int  `json:"created"`
+		Imported    int  `json:"imported"`
+		DryRun      bool `json:"dry_run"`
+		Reloaded    bool `json:"reloaded"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if !payload.DryRun || payload.WouldCreate != 2 || payload.Created != 0 || payload.Imported != 0 {
+		t.Fatalf("payload=%+v", payload)
+	}
+	if payload.Reloaded {
+		t.Fatal("dry run reported a reload")
+	}
+	if len(manager.created) != 0 {
+		t.Fatalf("dry run created %d nodes", len(manager.created))
+	}
+	if manager.reloads.Load() != 0 {
+		t.Fatalf("dry run reloaded %d times", manager.reloads.Load())
+	}
+}
+
+// 报告里的 invalid 只统计解析问题；写库失败单独计入 failed。
+func TestImportSeparatesParseIssuesFromCreateFailures(t *testing.T) {
+	manager := &failingCreateNodeManager{}
+	server := &Server{nodeMgr: manager}
+	body, _ := json.Marshal(map[string]string{
+		"content": "http://user:pass@a.example:8080\nssr://unsupported",
+	})
+	response := httptest.NewRecorder()
+	server.handleImport(response, httptest.NewRequest(http.MethodPost, "/api/import", bytes.NewReader(body)))
+	var payload struct {
+		Invalid int      `json:"invalid"`
+		Failed  int      `json:"failed"`
+		Errors  []string `json:"errors"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Invalid != 1 || payload.Failed != 1 {
+		t.Fatalf("payload=%+v", payload)
+	}
+}
+
+type failingCreateNodeManager struct {
+	reloadNodeManager
+}
+
+func (m *failingCreateNodeManager) CreateNode(_ context.Context, node config.NodeConfig) (config.NodeConfig, error) {
+	return config.NodeConfig{}, errors.New("build failed")
+}
+
+// 不支持批量能力的 runtime 继续逐条创建，行为不变。
+func TestBatchCreateFallsBackWithoutBatchCapability(t *testing.T) {
+	manager := &importNodeManager{}
+	server := &Server{nodeMgr: manager}
+	body, _ := json.Marshal(map[string]any{
+		"nodes": []map[string]string{{"name": "one", "uri": "http://user:pass@one.example:8080"}},
+	})
+	response := httptest.NewRecorder()
+	server.handleConfigNodesBatchCreate(response, httptest.NewRequest(http.MethodPost, "/api/nodes/config/batch", bytes.NewReader(body)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if len(manager.created) != 1 || manager.created[0].Name != "one" {
+		t.Fatalf("created=%+v", manager.created)
+	}
+}
+
+// 单节点路由改用 decodeJSON 后，未知字段必须被拒绝。
+func TestNodeRoutesRejectUnknownFields(t *testing.T) {
+	manager := &reloadNodeManager{}
+	server := &Server{nodeMgr: manager, logger: log.Default()}
+	request := httptest.NewRequest(http.MethodPost, "/api/nodes/config",
+		strings.NewReader(`{"name":"a","uri":"socks5://127.0.0.1:1080","surprise":true}`))
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+// A fallback runtime has no build dry run, so a dry-run batch must still
+// write nothing and must not report a reload.
+func TestBatchCreateDryRunWithoutBatchCapabilityWritesNothing(t *testing.T) {
+	manager := &importNodeManager{}
+	server := &Server{nodeMgr: manager}
+	body, _ := json.Marshal(map[string]any{
+		"nodes":   []map[string]string{{"name": "one", "uri": "http://user:pass@one.example:8080"}},
+		"dry_run": true,
+	})
+	response := httptest.NewRecorder()
+	server.handleConfigNodesBatchCreate(response, httptest.NewRequest(http.MethodPost, "/api/nodes/config/batch", bytes.NewReader(body)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if len(manager.created) != 0 {
+		t.Fatalf("dry run created %+v", manager.created)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["dry_run"] != true || payload["imported"].(float64) != 0 || payload["reloaded"] != false {
+		t.Fatalf("payload=%v", payload)
 	}
 }

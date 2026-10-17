@@ -676,37 +676,39 @@ export async function createConfigNode(payload: ConfigNodePayload): Promise<Conf
   })
 }
 
-export async function updateConfigNode(name: string, payload: ConfigNodePayload): Promise<ConfigNodeMutationResponse> {
-  return request<ConfigNodeMutationResponse>(`/api/nodes/config/${encodeURIComponent(name)}`, {
+// Node names are not unique in the store (two subscriptions may ship the same
+// display name), so mutations address the stable node ID.
+export async function updateConfigNode(id: number, payload: ConfigNodePayload): Promise<ConfigNodeMutationResponse> {
+  return request<ConfigNodeMutationResponse>(`/api/nodes/config/id/${id}`, {
     method: 'PUT',
     body: JSON.stringify(payload),
   })
 }
 
-export async function deleteConfigNode(name: string): Promise<ConfigNodeMutationResponse> {
-  return request<ConfigNodeMutationResponse>(`/api/nodes/config/${encodeURIComponent(name)}`, {
+export async function deleteConfigNode(id: number): Promise<ConfigNodeMutationResponse> {
+  return request<ConfigNodeMutationResponse>(`/api/nodes/config/id/${id}`, {
     method: 'DELETE',
   })
 }
 
-export async function toggleConfigNode(name: string, enabled: boolean): Promise<ConfigNodeMutationResponse> {
-  return request<ConfigNodeMutationResponse>(`/api/nodes/config/${encodeURIComponent(name)}`, {
+export async function toggleConfigNode(id: number, enabled: boolean): Promise<ConfigNodeMutationResponse> {
+  return request<ConfigNodeMutationResponse>(`/api/nodes/config/id/${id}`, {
     method: 'PATCH',
     body: JSON.stringify({ enabled }),
   })
 }
 
-export async function batchToggleConfigNodes(names: string[], enabled: boolean): Promise<{ message: string; success: number; total: number; errors?: string[] }> {
+export async function batchToggleConfigNodes(ids: number[], enabled: boolean): Promise<{ message: string; success: number; total: number; errors?: string[] }> {
   return request('/api/nodes/config/batch-toggle', {
     method: 'POST',
-    body: JSON.stringify({ names, enabled }),
+    body: JSON.stringify({ ids, enabled }),
   })
 }
 
-export async function batchDeleteConfigNodes(names: string[]): Promise<{ message: string; success: number; total: number; errors?: string[] }> {
+export async function batchDeleteConfigNodes(ids: number[]): Promise<{ message: string; success: number; total: number; errors?: string[] }> {
   return request('/api/nodes/config/batch-delete', {
     method: 'POST',
-    body: JSON.stringify({ names }),
+    body: JSON.stringify({ ids }),
   })
 }
 
@@ -866,16 +868,19 @@ export interface ImportNodesResult {
   created: number
   duplicates_skipped: number
   invalid: number
+  failed?: number
+  would_create?: number
+  dry_run?: boolean
   duplicate_groups?: Array<{ existing_node: string; incoming_node: string }>
   endpoint_collisions?: Array<{ endpoint: string; existing_nodes: string[]; incoming_node: string }>
   errors?: string[]
   issues?: ImportIssue[]
 }
 
-export async function importNodes(content: string): Promise<ImportNodesResult> {
+export async function importNodes(content: string, options?: { dryRun?: boolean }): Promise<ImportNodesResult> {
   return request('/api/import', {
     method: 'POST',
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({ content, dry_run: options?.dryRun ?? false }),
   })
 }
 import type { GroupPreview, NodeFacets, NodeFilterSpec, NodeViewPage, NodeViewResult, SavedNodeFilter } from '../types/nodeView'

@@ -200,23 +200,23 @@ export default function ManagePanel() {
 
   // Modal state
   const [modalOpen, setModalOpen] = useState(false)
-  const [editingNode, setEditingNode] = useState<string | null>(null)
+  const [editingNode, setEditingNode] = useState<number | null>(null)
   const [form, setForm] = useState<ConfigNodePayload>(emptyPayload)
   const [formError, setFormError] = useState('')
   const [submitting, setSubmitting] = useState(false)
 
   // Delete confirm
-  const [deleteTarget, setDeleteTarget] = useState<string | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<{ id: number; name: string } | null>(null)
   const [deleting, setDeleting] = useState(false)
 
   // Toggle state
-  const [toggling, setToggling] = useState<string | null>(null)
+  const [toggling, setToggling] = useState<number | null>(null)
 
   // Probe state
   const [probingTag, setProbingTag] = useState<string | null>(null)
 
   // Batch selection
-  const [selectedNodes, setSelectedNodes] = useState<Set<string>>(new Set())
+  const [selectedNodes, setSelectedNodes] = useState<Set<number>>(new Set())
   const [batchProcessing, setBatchProcessing] = useState(false)
   const [batchDeleteConfirm, setBatchDeleteConfirm] = useState(false)
   const [batchProbeProgress, setBatchProbeProgress] = useState<{ current: number; total: number } | null>(null)
@@ -232,6 +232,8 @@ export default function ManagePanel() {
   const [importing, setImporting] = useState(false)
   const [importError, setImportError] = useState('')
   const [importResult, setImportResult] = useState<ImportNodesResult | null>(null)
+  const [importPreview, setImportPreview] = useState<ImportNodesResult | null>(null)
+  const [previewing, setPreviewing] = useState(false)
 
   // ---- Merge config + monitor data ----
 
@@ -316,11 +318,11 @@ export default function ManagePanel() {
     })
   }, [mergedNodes, nodeFilter.query.data])
   // Selection survives pagination. Batch actions use every selected existing node.
-  const visibleSelectedNames = useMemo(
-    () => mergedNodes.filter(node => selectedNodes.has(node.name)).map(node => node.name),
+  const visibleSelectedIDs = useMemo(
+    () => mergedNodes.filter(node => node.id !== undefined && selectedNodes.has(node.id)).map(node => node.id as number),
     [mergedNodes, selectedNodes],
   )
-  const pageSelectedCount = sortedNodes.filter(node => selectedNodes.has(node.name)).length
+  const pageSelectedCount = sortedNodes.filter(node => node.id !== undefined && selectedNodes.has(node.id)).length
 
   // ---- Handlers ----
 
@@ -337,7 +339,13 @@ export default function ManagePanel() {
   }
 
   const openEditModal = (node: MergedNode) => {
-    setEditingNode(node.name)
+    // Without an ID the update route has nothing stable to address; editing
+    // would fall through to the create path and duplicate the node.
+    if (node.id === undefined) {
+      toast.error('该节点缺少 ID，无法编辑')
+      return
+    }
+    setEditingNode(node.id)
     setForm({
       name: node.name,
       uri: node.uri,
@@ -357,7 +365,7 @@ export default function ManagePanel() {
     setSubmitting(true)
     setFormError('')
     try {
-      if (editingNode) {
+      if (editingNode !== null) {
         const res = await updateConfigNode(editingNode, form)
         if (res.reload_error) {
           toast.warning(`${res.message || '节点已更新'}，但自动重载失败：${res.reload_error}`)
@@ -389,7 +397,7 @@ export default function ManagePanel() {
     if (!deleteTarget) return
     setDeleting(true)
     try {
-      const res = await deleteConfigNode(deleteTarget)
+      const res = await deleteConfigNode(deleteTarget.id)
       if (res.reload_error) {
         toast.warning(`${res.message || '节点已删除'}，但自动重载失败：${res.reload_error}`)
         setNeedReload(true)
@@ -408,10 +416,11 @@ export default function ManagePanel() {
   }
 
   const handleToggle = async (node: MergedNode) => {
+    if (node.id === undefined) return
     const newEnabled = !!node.disabled
-    setToggling(node.name)
+    setToggling(node.id)
     try {
-      const res = await toggleConfigNode(node.name, newEnabled)
+      const res = await toggleConfigNode(node.id, newEnabled)
       toast.success(res.message || (newEnabled ? '节点已启用' : '节点已禁用'))
       queryClient.invalidateQueries({ queryKey: ['configNodes'] })
       void queryClient.invalidateQueries({ queryKey: ['nodeQuery'] })
@@ -447,28 +456,28 @@ export default function ManagePanel() {
 
   // ---- Batch ----
 
-  const toggleSelectNode = (name: string) => {
+  const toggleSelectNode = (id: number) => {
     setSelectedNodes(prev => {
       const next = new Set(prev)
-      if (next.has(name)) next.delete(name)
-      else next.add(name)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
       return next
     })
   }
 
   const toggleSelectAll = () => {
     if (pageSelectedCount === sortedNodes.length) {
-      setSelectedNodes(current => { const next = new Set(current); for (const node of sortedNodes) next.delete(node.name); return next })
+      setSelectedNodes(current => { const next = new Set(current); for (const node of sortedNodes) if (node.id !== undefined) next.delete(node.id); return next })
     } else {
-      setSelectedNodes(current => new Set([...current, ...sortedNodes.map(n => n.name)]))
+      setSelectedNodes(current => new Set([...current, ...sortedNodes.flatMap(n => n.id === undefined ? [] : [n.id])]))
     }
   }
 
   const handleBatchToggle = async (enabled: boolean) => {
-    if (visibleSelectedNames.length === 0) return
+    if (visibleSelectedIDs.length === 0) return
     setBatchProcessing(true)
     try {
-      const res = await batchToggleConfigNodes(visibleSelectedNames, enabled)
+      const res = await batchToggleConfigNodes(visibleSelectedIDs, enabled)
       toast.success(res.message || '批量操作完成')
       setSelectedNodes(new Set())
       queryClient.invalidateQueries({ queryKey: ['configNodes'] })
@@ -482,7 +491,7 @@ export default function ManagePanel() {
   }
 
   const handleBatchProbe = async () => {
-    const nodesToProbe = mergedNodes.filter(n => selectedNodes.has(n.name) && !n.disabled && n.tag)
+    const nodesToProbe = mergedNodes.filter(n => n.id !== undefined && selectedNodes.has(n.id) && !n.disabled && n.tag)
     if (nodesToProbe.length === 0) {
       toast.error('所选节点中没有可探测的节点（已禁用或无运行时标识的节点将被跳过）')
       return
@@ -520,11 +529,11 @@ export default function ManagePanel() {
   }
 
   const handleBatchDelete = async () => {
-    if (visibleSelectedNames.length === 0) return
+    if (visibleSelectedIDs.length === 0) return
     setBatchProcessing(true)
     setBatchDeleteConfirm(false)
     try {
-      const res = await batchDeleteConfigNodes(visibleSelectedNames)
+      const res = await batchDeleteConfigNodes(visibleSelectedIDs)
       toast.success(res.message || '批量删除完成')
       setSelectedNodes(new Set())
       queryClient.invalidateQueries({ queryKey: ['configNodes'] })
@@ -543,6 +552,7 @@ export default function ManagePanel() {
     setImportContent('')
     setImportError('')
     setImportResult(null)
+    setImportPreview(null)
     setImportModalOpen(true)
   }
 
@@ -558,11 +568,32 @@ export default function ManagePanel() {
     e.target.value = ''
   }
 
+  // Preview runs the same parse/de-duplicate/build-dry-run pipeline on the
+  // server with dry_run, so the counts match what the real import will do.
+  const handleImportPreview = async () => {
+    if (!importContent.trim()) { setImportError('请输入节点 URI'); return }
+    setPreviewing(true)
+    setImportError('')
+    setImportPreview(null)
+    try {
+      const res = await importNodes(importContent, { dryRun: true })
+      setImportPreview(res)
+      if (res.failed) {
+        toast.warning(`预览：${res.would_create ?? 0} 个可导入，${res.failed} 个构建失败`)
+      }
+    } catch (err) {
+      setImportError(err instanceof Error ? err.message : '预览失败')
+    } finally {
+      setPreviewing(false)
+    }
+  }
+
   const handleImport = async () => {
     if (!importContent.trim()) { setImportError('请输入节点 URI'); return }
     setImporting(true)
     setImportError('')
     setImportResult(null)
+    setImportPreview(null)
     try {
       const res = await importNodes(importContent)
       setImportResult(res)
@@ -639,8 +670,8 @@ export default function ManagePanel() {
     )
   }
 
-  const importIssueList: ImportIssue[] = importResult?.issues
-    ?? (importResult?.errors ?? []).map(message => ({ kind: 'parse', message }))
+  const importIssueList: ImportIssue[] = (importResult ?? importPreview)?.issues
+    ?? ((importResult ?? importPreview)?.errors ?? []).map(message => ({ kind: 'parse', message }))
 
   const thClass = "font-semibold cursor-pointer select-none hover:text-primary transition-colors"
 
@@ -706,12 +737,12 @@ export default function ManagePanel() {
       </label>
 
       {/* Batch action bar */}
-      <div className={`overflow-hidden transition-all duration-300 ${visibleSelectedNames.length > 0 ? 'max-h-48 opacity-100 sm:max-h-24' : 'max-h-0 opacity-0'}`}>
+      <div className={`overflow-hidden transition-all duration-300 ${visibleSelectedIDs.length > 0 ? 'max-h-48 opacity-100 sm:max-h-24' : 'max-h-0 opacity-0'}`}>
         <div className="flex flex-col gap-3 px-5 py-4 bg-primary/5 border border-primary/20 rounded-2xl shadow-inner relative">
           <div className="absolute left-0 top-0 bottom-0 w-1.5 bg-primary rounded-l-2xl"></div>
           <div className="flex items-center gap-4 flex-wrap">
             <span className="text-base font-medium text-base-content/80 flex items-center gap-2">
-              <span className="badge badge-primary badge-md font-bold">{visibleSelectedNames.length}</span> 项已选择（跨页）
+              <span className="badge badge-primary badge-md font-bold">{visibleSelectedIDs.length}</span> 项已选择（跨页）
             </span>
             <div className="flex gap-2 ml-auto flex-wrap">
               <button
@@ -834,15 +865,15 @@ export default function ManagePanel() {
                       transition-colors border-b border-base-200/50 last:border-none group
                       ${node.runtimeStatus === 'disabled' ? 'opacity-50 grayscale-[0.5]' : ''}
                       ${node.runtimeStatus === 'blacklisted' ? 'opacity-80' : ''}
-                      ${selectedNodes.has(node.name) ? 'bg-primary/5' : 'hover:bg-base-200/40'}
+                      ${node.id !== undefined && selectedNodes.has(node.id) ? 'bg-primary/5' : 'hover:bg-base-200/40'}
                     `}
                   >
                     <td className="w-8">
                       <input
                         type="checkbox"
                         className="checkbox checkbox-sm"
-                        checked={selectedNodes.has(node.name)}
-                        onChange={() => toggleSelectNode(node.name)}
+                        checked={node.id !== undefined && selectedNodes.has(node.id)}
+                        onChange={() => node.id !== undefined && toggleSelectNode(node.id)}
                       />
                     </td>
                     <td>
@@ -897,10 +928,10 @@ export default function ManagePanel() {
                         <button
                           className={`btn btn-sm btn-square btn-ghost ${node.disabled ? 'text-success hover:bg-success/10' : 'text-warning hover:bg-warning/10'}`}
                           onClick={() => handleToggle(node)}
-                          disabled={toggling === node.name}
+                          disabled={node.id !== undefined && toggling === node.id}
                           title={node.disabled ? '启用该节点' : '禁用该节点'}
                         >
-                          {toggling === node.name
+                          {node.id !== undefined && toggling === node.id
                             ? <span className="loading loading-spinner loading-xs"></span>
                             : node.disabled
                                 ? <Check className="h-4 w-4" />
@@ -918,7 +949,7 @@ export default function ManagePanel() {
                         {/* Delete */}
                         <button
                           className="btn btn-sm btn-square btn-ghost text-error hover:bg-error/10"
-                          onClick={() => setDeleteTarget(node.name)}
+                          onClick={() => node.id !== undefined && setDeleteTarget({ id: node.id, name: node.name })}
                           title="删除节点"
                         >
                           <Trash2 className="h-4 w-4" />
@@ -945,7 +976,7 @@ export default function ManagePanel() {
         <div className="modal modal-open">
           <div className="modal-box">
             <h3 className="font-bold text-xl mb-4">
-              {editingNode ? `编辑节点: ${editingNode}` : '添加节点'}
+              {editingNode !== null ? `编辑节点: ${mergedNodes.find(node => node.id === editingNode)?.name ?? `#${editingNode}`}` : '添加节点'}
             </h3>
             <form onSubmit={handleSubmit}>
               {formError && (
@@ -957,7 +988,7 @@ export default function ManagePanel() {
                   type="text" className="input input-sm w-full" placeholder="节点名称"
                   value={form.name}
                   onChange={(e) => setForm(f => ({ ...f, name: e.target.value }))}
-                  disabled={!!editingNode}
+                  disabled={editingNode !== null}
                 />
               </fieldset>
               <fieldset className="fieldset mb-3">
@@ -999,7 +1030,7 @@ export default function ManagePanel() {
               <div className="modal-action">
                 <button type="button" className="btn btn-ghost" onClick={() => setModalOpen(false)}>取消</button>
                 <button type="submit" className="btn btn-primary" disabled={submitting}>
-                  {submitting ? <span className="loading loading-spinner loading-xs"></span> : (editingNode ? '更新' : '添加')}
+                  {submitting ? <span className="loading loading-spinner loading-xs"></span> : (editingNode !== null ? '更新' : '添加')}
                 </button>
               </div>
             </form>
@@ -1027,6 +1058,7 @@ export default function ManagePanel() {
                     <span className="badge badge-sm badge-success">新增 {importResult.created}</span>
                     {importResult.duplicates_skipped > 0 && <span className="badge badge-sm badge-warning">重复跳过 {importResult.duplicates_skipped}</span>}
                     {importResult.invalid > 0 && <span className="badge badge-sm badge-error">无效 {importResult.invalid}</span>}
+                    {(importResult.failed ?? 0) > 0 && <span className="badge badge-sm badge-error badge-outline">构建/写入失败 {importResult.failed}</span>}
                   </div>
                   {importResult.duplicate_groups && importResult.duplicate_groups.length > 0 && (
                     <details className="mt-2">
@@ -1057,6 +1089,20 @@ export default function ManagePanel() {
                 </div>
               </div>
             )}
+            {importPreview && (
+              <div className="alert alert-info mb-3 py-2 text-sm">
+                <div>
+                  <span>{importPreview.message}</span>
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    <span className="badge badge-sm badge-outline">解析 {importPreview.parsed}</span>
+                    <span className="badge badge-sm badge-success">将新增 {importPreview.would_create ?? 0}</span>
+                    {importPreview.duplicates_skipped > 0 && <span className="badge badge-sm badge-warning">重复跳过 {importPreview.duplicates_skipped}</span>}
+                    {importPreview.invalid > 0 && <span className="badge badge-sm badge-error">无效 {importPreview.invalid}</span>}
+                    {(importPreview.failed ?? 0) > 0 && <span className="badge badge-sm badge-error badge-outline">构建失败 {importPreview.failed}</span>}
+                  </div>
+                </div>
+              </div>
+            )}
             <p className="text-sm text-base-content/60 mb-3">
               支持代理 URI、Markdown 链接、Clash YAML、Sing-box JSON/JSONC 及最多两层 Base64 订阅内容。
               系统按协议、端点、认证、TLS 和传输配置进行语义去重；同 IP/端口但配置不同的节点会保留并提示。
@@ -1081,7 +1127,10 @@ export default function ManagePanel() {
               <button type="button" className="btn btn-ghost" onClick={() => setImportModalOpen(false)}>
                 {importResult?.imported ? '完成' : '取消'}
               </button>
-              <button type="button" className="btn btn-primary" onClick={handleImport} disabled={importing || !importContent.trim()}>
+              <button type="button" className="btn btn-ghost" onClick={handleImportPreview} disabled={previewing || importing || !importContent.trim()}>
+                {previewing ? <span className="loading loading-spinner loading-xs"></span> : '预览'}
+              </button>
+              <button type="button" className="btn btn-primary" onClick={handleImport} disabled={importing || previewing || !importContent.trim()}>
                 {importing ? <span className="loading loading-spinner loading-xs"></span> : '导入'}
               </button>
             </div>
@@ -1098,7 +1147,7 @@ export default function ManagePanel() {
           <div className="modal-box max-w-sm">
             <h3 className="font-bold text-lg mb-2">确认删除</h3>
             <p className="text-base-content/70">
-              确定要删除节点 <strong>{deleteTarget}</strong> 吗？此操作不可撤销。
+              确定要删除节点 <strong>{deleteTarget.name}</strong> 吗？此操作不可撤销。
             </p>
             <div className="modal-action">
               <button className="btn btn-ghost" onClick={() => setDeleteTarget(null)} disabled={deleting}>取消</button>
@@ -1119,12 +1168,12 @@ export default function ManagePanel() {
           <div className="modal-box max-w-sm">
             <h3 className="font-bold text-lg mb-2">确认批量删除</h3>
             <p className="text-base-content/70">
-              确定要删除选中的 <strong>{visibleSelectedNames.length}</strong> 个节点吗？此操作不可撤销。
+              确定要删除选中的 <strong>{visibleSelectedIDs.length}</strong> 个节点吗？此操作不可撤销。
             </p>
             <div className="modal-action">
               <button className="btn btn-ghost" onClick={() => setBatchDeleteConfirm(false)} disabled={batchProcessing}>取消</button>
               <button className="btn btn-error" onClick={handleBatchDelete} disabled={batchProcessing}>
-                {batchProcessing ? <span className="loading loading-spinner loading-xs"></span> : `删除 ${visibleSelectedNames.length} 个节点`}
+                {batchProcessing ? <span className="loading loading-spinner loading-xs"></span> : `删除 ${visibleSelectedIDs.length} 个节点`}
               </button>
             </div>
           </div>

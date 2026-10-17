@@ -18,6 +18,7 @@ import (
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/controlplane"
 	"easy_proxies/internal/group"
+	"easy_proxies/internal/runtimenodes"
 	"easy_proxies/internal/store"
 
 	"golang.org/x/sync/errgroup"
@@ -751,40 +752,9 @@ func (m *Manager) reconcileRuntime(ctx context.Context) error {
 	if m.store == nil || m.boxMgr == nil {
 		return nil
 	}
-	regular, err := m.store.ListNodes(ctx, store.NodeFilter{})
+	all, err := runtimenodes.Load(ctx, m.store)
 	if err != nil {
-		return fmt.Errorf("list runtime nodes: %w", err)
-	}
-	subscriptionNodes, err := m.store.ListEffectiveSubscriptionNodes(ctx)
-	if err != nil {
-		return fmt.Errorf("list effective subscription nodes: %w", err)
-	}
-	seen := make(map[string]struct{}, len(regular)+len(subscriptionNodes))
-	all := make([]config.NodeConfig, 0, len(regular)+len(subscriptionNodes))
-	appendNode := func(n store.Node) {
-		uri := strings.TrimSpace(n.URI)
-		if !n.Enabled || uri == "" {
-			return
-		}
-		identityKey := n.IdentityHash
-		if identityKey == "" {
-			identityKey = uri
-		}
-		if _, ok := seen[identityKey]; ok {
-			return
-		}
-		seen[identityKey] = struct{}{}
-		all = append(all, config.NodeConfig{ID: n.ID, Name: n.Name, URI: uri, Port: n.Port,
-			Username: n.Username, Password: n.Password, Source: config.NodeSource(n.Source),
-			Region: n.Region, Country: n.Country, IdentityHash: n.IdentityHash, CanonicalJSON: n.CanonicalJSON})
-	}
-	for _, n := range regular {
-		if n.Source != store.NodeSourceSubscription {
-			appendNode(n)
-		}
-	}
-	for _, n := range subscriptionNodes {
-		appendNode(n)
+		return err
 	}
 	m.mu.RLock()
 	newCfg := m.baseCfg.Clone()

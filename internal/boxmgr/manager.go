@@ -25,6 +25,7 @@ import (
 	"easy_proxies/internal/netx"
 	"easy_proxies/internal/nodecodec"
 	"easy_proxies/internal/outbound/pool"
+	"easy_proxies/internal/runtimenodes"
 	"easy_proxies/internal/runtimetag"
 	"easy_proxies/internal/store"
 
@@ -36,6 +37,8 @@ import (
 
 // Ensure Manager implements controlplane.NodeManager.
 var _ controlplane.NodeManager = (*Manager)(nil)
+var _ controlplane.BatchNodeCreator = (*Manager)(nil)
+var _ controlplane.IDNodeManager = (*Manager)(nil)
 var _ controlplane.GroupRuntimeManager = (*Manager)(nil)
 
 const (
@@ -2136,15 +2139,194 @@ func (m *Manager) CreateNode(ctx context.Context, node config.NodeConfig) (confi
 	return normalized, nil
 }
 
+// CreateNodes creates a batch of manual nodes. It takes the manager lock once,
+// then per row:
+//
+//   - normalizes the name/port against in-memory AND stored names, so a node
+//     that is currently disabled (hence absent from m.cfg.Nodes) still blocks
+//     its name;
+//   - dry-runs builder.BuildNodeOutbound, so a node that can never be dialled
+//     is refused with the builder's reason instead of being stored and then
+//     silently skipped by the next runtime build;
+//   - writes the survivors in one store transaction.
+//
+// dryRun returns the normalized plan plus the failures without writing.
+func (m *Manager) CreateNodes(ctx context.Context, nodes []config.NodeConfig, dryRun bool) (controlplane.NodeBatchResult, error) {
+	var result controlplane.NodeBatchResult
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.cfg == nil {
+		return result, errConfigUnavailable
+	}
+
+	reserved := make(map[string]struct{}, len(m.cfg.Nodes)+len(nodes))
+	for _, node := range m.cfg.Nodes {
+		reserved[node.Name] = struct{}{}
+	}
+	if m.store != nil {
+		identities, err := m.store.ListNodeIdentities(ctx)
+		if err != nil {
+			return result, fmt.Errorf("list stored node names: %w", err)
+		}
+		for _, identity := range identities {
+			reserved[identity.Name] = struct{}{}
+		}
+	}
+
+	// prepareNodeLocked allocates ports against m.cfg.Nodes only; rows prepared
+	// earlier in this batch are not there yet, so the batch tracks its own
+	// reservations to keep two new nodes from sharing a listener port.
+	usedPorts := make(map[uint16]struct{}, len(m.cfg.Nodes)+len(nodes))
+	for _, node := range m.cfg.Nodes {
+		if node.Port > 0 {
+			usedPorts[node.Port] = struct{}{}
+		}
+	}
+
+	prepared := make([]config.NodeConfig, 0, len(nodes))
+	storeNodes := make([]*store.Node, 0, len(nodes))
+	for index, node := range nodes {
+		normalized, err := m.prepareNodeLocked(node, "")
+		if err != nil {
+			result.Failed = append(result.Failed, nodeCreateFailure(index, node, err))
+			continue
+		}
+		if m.cfg.MultiPort.Enabled {
+			if _, taken := usedPorts[normalized.Port]; taken {
+				normalized.Port = m.nextUnreservedPortLocked(usedPorts)
+			}
+			usedPorts[normalized.Port] = struct{}{}
+		}
+		// prepareNodeLocked checks the in-memory set, which excludes disabled
+		// nodes. The reserved set is the store-wide truth.
+		if _, taken := reserved[normalized.Name]; taken {
+			result.Failed = append(result.Failed, nodeCreateFailure(index, normalized,
+				fmt.Errorf("%w: 节点 %s 已存在", controlplane.ErrNodeConflict, normalized.Name)))
+			continue
+		}
+		if err := m.validateNodeBuildLocked(normalized); err != nil {
+			result.Failed = append(result.Failed, nodeCreateFailure(index, normalized, err))
+			continue
+		}
+		normalized.Source = config.NodeSourceManual
+		reserved[normalized.Name] = struct{}{}
+		prepared = append(prepared, normalized)
+		storeNodes = append(storeNodes, &store.Node{
+			URI:      normalized.URI,
+			Name:     normalized.Name,
+			Source:   string(normalized.Source),
+			Port:     normalized.Port,
+			Username: normalized.Username,
+			Password: normalized.Password,
+			Enabled:  true,
+		})
+	}
+	result.Planned = prepared
+	if dryRun || len(prepared) == 0 {
+		return result, nil
+	}
+
+	if m.store != nil {
+		outcomes, err := m.store.CreateNodes(ctx, storeNodes)
+		if err != nil {
+			return controlplane.NodeBatchResult{}, fmt.Errorf("save batch to store: %w", err)
+		}
+		created := make([]config.NodeConfig, 0, len(prepared))
+		for _, outcome := range outcomes {
+			// outcomes is index-aligned with prepared (one entry per submitted
+			// row), and store.CreateNodes always sets Outcome.Index.
+			switch {
+			case outcome.Created:
+				createdNode := prepared[outcome.Index]
+				createdNode.ID = outcome.ID
+				m.cfg.Nodes = append(m.cfg.Nodes, createdNode)
+				created = append(created, createdNode)
+			case outcome.Duplicate:
+				result.Failed = append(result.Failed, nodeCreateFailure(outcome.Index, prepared[outcome.Index],
+					&controlplane.NodeDuplicateError{ExistingID: outcome.ExistingID, ExistingName: outcome.ExistingName}))
+			}
+		}
+		result.Created = created
+		return result, nil
+	}
+
+	// No store: the in-memory config is the only destination.
+	for _, node := range prepared {
+		m.cfg.Nodes = append(m.cfg.Nodes, node)
+	}
+	result.Created = prepared
+	return result, nil
+}
+
+// nextUnreservedPortLocked mirrors nextAvailablePortLocked but consults the
+// caller's reservation set instead of the published config.
+func (m *Manager) nextUnreservedPortLocked(used map[uint16]struct{}) uint16 {
+	base := m.cfg.MultiPort.BasePort
+	if base == 0 {
+		base = 24000
+	}
+	port := base
+	for i := 0; i < 1<<16; i++ {
+		if _, taken := used[port]; !taken && port != 0 {
+			return port
+		}
+		port++
+		if port == 0 {
+			port = 1
+		}
+	}
+	return base
+}
+
+func nodeCreateFailure(index int, node config.NodeConfig, err error) controlplane.NodeCreateFailure {
+	return controlplane.NodeCreateFailure{Index: index, Name: node.Name, URI: node.URI, Reason: err.Error(), Err: err}
+}
+
+// validateNodeBuildLocked builds the outbound once to prove the node can run at
+// all. The builder is the same code the runtime uses, so this is not a
+// heuristic: whatever fails here would be logged and skipped during the next
+// reload, leaving a node in the database that never listens.
+func (m *Manager) validateNodeBuildLocked(node config.NodeConfig) error {
+	tag, err := runtimetag.Format(node.NodeKey(), runtimetag.InitialVersion)
+	if err != nil {
+		return fmt.Errorf("%w: %v", controlplane.ErrInvalidNode, err)
+	}
+	if _, err := builder.BuildNodeOutbound(tag, node, m.cfg.SkipCertVerify); err != nil {
+		return fmt.Errorf("%w: 无法构建出站: %v", controlplane.ErrInvalidNode, err)
+	}
+	return nil
+}
+
 // UpdateNode updates an existing node by name and persists to the Store.
+//
+// Names are not unique in the store (two subscriptions may ship the same
+// display name), so the name path resolves to one ID first and then shares the
+// ID implementation. Use UpdateNodeByID when the caller already has one.
 func (m *Manager) UpdateNode(ctx context.Context, name string, node config.NodeConfig) (config.NodeConfig, error) {
+	id, err := m.nodeIDByName(ctx, name)
+	if err != nil {
+		return config.NodeConfig{}, err
+	}
+	return m.UpdateNodeByID(ctx, id, node)
+}
+
+// UpdateNodeByID updates a node addressed by its stable ID. Unlike the name
+// path this also reaches nodes that are currently disabled and therefore hold
+// no entry in the runtime config.
+func (m *Manager) UpdateNodeByID(ctx context.Context, id int64, node config.NodeConfig) (config.NodeConfig, error) {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
 			return config.NodeConfig{}, err
 		}
 	}
 
-	name = strings.TrimSpace(name)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -2152,60 +2334,91 @@ func (m *Manager) UpdateNode(ctx context.Context, name string, node config.NodeC
 		return config.NodeConfig{}, errConfigUnavailable
 	}
 
-	idx := m.nodeIndexLocked(name)
-	if idx == -1 {
-		return config.NodeConfig{}, controlplane.ErrNodeNotFound
-	}
-
-	normalized, err := m.prepareNodeLocked(node, name)
-	if err != nil {
-		return config.NodeConfig{}, err
-	}
-
-	// Preserve the original source
-	normalized.Source = m.cfg.Nodes[idx].Source
-
-	// Persist to Store if available
+	runtimeIdx := m.nodeIndexByIDLocked(id)
+	var persisted *store.Node
 	if m.store != nil {
-		existing, err := m.store.GetNodeByName(ctx, name)
+		var err error
+		persisted, err = m.store.GetNode(ctx, id)
 		if err != nil {
 			return config.NodeConfig{}, fmt.Errorf("lookup in store: %w", err)
 		}
-		if existing != nil {
-			identity, identityErr := nodecodec.ParseURI(normalized.URI)
-			if identityErr != nil {
-				return config.NodeConfig{}, fmt.Errorf("%w: %v", controlplane.ErrInvalidNode, identityErr)
-			}
-			if duplicate, lookupErr := m.store.GetNodeByIdentity(ctx, identity.Hash); lookupErr != nil {
-				return config.NodeConfig{}, fmt.Errorf("lookup node identity: %w", lookupErr)
-			} else if duplicate != nil && duplicate.ID != existing.ID {
-				return config.NodeConfig{}, &controlplane.NodeDuplicateError{ExistingID: duplicate.ID, ExistingName: duplicate.Name}
-			}
-			existing.URI = normalized.URI
-			existing.Name = normalized.Name
-			existing.Port = normalized.Port
-			existing.Username = normalized.Username
-			existing.Password = normalized.Password
-			if err := m.store.UpdateNode(ctx, existing); err != nil {
-				return config.NodeConfig{}, fmt.Errorf("update in store: %w", err)
-			}
+		if persisted == nil {
+			return config.NodeConfig{}, controlplane.ErrNodeNotFound
+		}
+	} else if runtimeIdx == -1 {
+		return config.NodeConfig{}, controlplane.ErrNodeNotFound
+	}
+
+	previousName := ""
+	previousSource := config.NodeSourceManual
+	if persisted != nil {
+		previousName, previousSource = persisted.Name, config.NodeSource(persisted.Source)
+	} else {
+		previousName, previousSource = m.cfg.Nodes[runtimeIdx].Name, m.cfg.Nodes[runtimeIdx].Source
+	}
+
+	normalized, err := m.prepareNodeLocked(node, previousName)
+	if err != nil {
+		return config.NodeConfig{}, err
+	}
+	normalized.ID = id
+	normalized.Source = previousSource
+	if normalized.Name != previousName {
+		// prepareNodeLocked only knows the runtime config. Disabled nodes are
+		// absent from it, so a rename must also check the store.
+		taken, err := m.nodeNameTakenLocked(ctx, normalized.Name, id)
+		if err != nil {
+			return config.NodeConfig{}, err
+		}
+		if taken {
+			return config.NodeConfig{}, fmt.Errorf("%w: 节点 %s 已存在", controlplane.ErrNodeConflict, normalized.Name)
 		}
 	}
 
-	m.cfg.Nodes[idx] = normalized
+	if persisted != nil {
+		identity, identityErr := nodecodec.ParseURI(normalized.URI)
+		if identityErr != nil {
+			return config.NodeConfig{}, fmt.Errorf("%w: %v", controlplane.ErrInvalidNode, identityErr)
+		}
+		if duplicate, lookupErr := m.store.GetNodeByIdentity(ctx, identity.Hash); lookupErr != nil {
+			return config.NodeConfig{}, fmt.Errorf("lookup node identity: %w", lookupErr)
+		} else if duplicate != nil && duplicate.ID != id {
+			return config.NodeConfig{}, &controlplane.NodeDuplicateError{ExistingID: duplicate.ID, ExistingName: duplicate.Name}
+		}
+		persisted.URI = normalized.URI
+		persisted.Name = normalized.Name
+		persisted.Port = normalized.Port
+		persisted.Username = normalized.Username
+		persisted.Password = normalized.Password
+		if err := m.store.UpdateNode(ctx, persisted); err != nil {
+			return config.NodeConfig{}, fmt.Errorf("update in store: %w", err)
+		}
+	}
+
+	if runtimeIdx != -1 {
+		m.cfg.Nodes[runtimeIdx] = normalized
+	}
 	return normalized, nil
 }
 
 // SetNodeEnabled enables or disables a node by name.
 // This only updates the store; a reload is needed for changes to take effect.
 func (m *Manager) SetNodeEnabled(ctx context.Context, name string, enabled bool) error {
+	id, err := m.nodeIDByName(ctx, name)
+	if err != nil {
+		return err
+	}
+	return m.SetNodeEnabledByID(ctx, id, enabled)
+}
+
+// SetNodeEnabledByID enables or disables a node addressed by its stable ID.
+func (m *Manager) SetNodeEnabledByID(ctx context.Context, id int64, enabled bool) error {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 	}
 
-	name = strings.TrimSpace(name)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -2213,9 +2426,8 @@ func (m *Manager) SetNodeEnabled(ctx context.Context, name string, enabled bool)
 		return errConfigUnavailable
 	}
 
-	// Update in Store
 	if m.store != nil {
-		existing, err := m.store.GetNodeByName(ctx, name)
+		existing, err := m.store.GetNode(ctx, id)
 		if err != nil {
 			return fmt.Errorf("lookup in store: %w", err)
 		}
@@ -2226,18 +2438,13 @@ func (m *Manager) SetNodeEnabled(ctx context.Context, name string, enabled bool)
 		if err := m.store.UpdateNode(ctx, existing); err != nil {
 			return fmt.Errorf("update in store: %w", err)
 		}
-	} else {
-		// No store — just check the node exists in config
-		idx := m.nodeIndexLocked(name)
-		if idx == -1 {
-			return controlplane.ErrNodeNotFound
-		}
+	} else if m.nodeIndexByIDLocked(id) == -1 {
+		return controlplane.ErrNodeNotFound
 	}
 
 	// If disabling, remove from active config nodes
 	if !enabled {
-		idx := m.nodeIndexLocked(name)
-		if idx != -1 {
+		if idx := m.nodeIndexByIDLocked(id); idx != -1 {
 			m.cfg.Nodes = append(m.cfg.Nodes[:idx], m.cfg.Nodes[idx+1:]...)
 		}
 	}
@@ -2247,13 +2454,21 @@ func (m *Manager) SetNodeEnabled(ctx context.Context, name string, enabled bool)
 
 // DeleteNode removes a node by name and deletes it from the Store.
 func (m *Manager) DeleteNode(ctx context.Context, name string) error {
+	id, err := m.nodeIDByName(ctx, name)
+	if err != nil {
+		return err
+	}
+	return m.DeleteNodeByID(ctx, id)
+}
+
+// DeleteNodeByID removes a node addressed by its stable ID.
+func (m *Manager) DeleteNodeByID(ctx context.Context, id int64) error {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 	}
 
-	name = strings.TrimSpace(name)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -2264,23 +2479,20 @@ func (m *Manager) DeleteNode(ctx context.Context, name string) error {
 	// The active config only carries enabled nodes (disabling a node removes its
 	// entry), so it must not decide whether a node exists. The Store is the
 	// source of truth here, mirroring SetNodeEnabled.
-	idx := m.nodeIndexLocked(name)
+	idx := m.nodeIndexByIDLocked(id)
 	if m.store == nil && idx == -1 {
 		return controlplane.ErrNodeNotFound
 	}
 
 	if m.store != nil {
-		existing, err := m.store.GetNodeByName(ctx, name)
+		existing, err := m.store.GetNode(ctx, id)
 		if err != nil {
 			return fmt.Errorf("lookup in store: %w", err)
 		}
 		if existing == nil {
-			// Nodes that only live in the in-memory config (never persisted)
-			// are still removable; anything unknown is a real 404.
-			if idx == -1 {
-				return controlplane.ErrNodeNotFound
-			}
-		} else if err := m.store.DeleteNode(ctx, existing.ID); err != nil {
+			return controlplane.ErrNodeNotFound
+		}
+		if err := m.store.DeleteNode(ctx, id); err != nil {
 			return fmt.Errorf("delete from store: %w", err)
 		}
 	}
@@ -2289,6 +2501,69 @@ func (m *Manager) DeleteNode(ctx context.Context, name string) error {
 		m.cfg.Nodes = append(m.cfg.Nodes[:idx], m.cfg.Nodes[idx+1:]...)
 	}
 	return nil
+}
+
+// nodeIDByName resolves a name-addressed operation to the node's stable ID. The
+// store is authoritative because the runtime config omits disabled nodes.
+func (m *Manager) nodeIDByName(ctx context.Context, name string) (int64, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return 0, controlplane.ErrNodeNotFound
+	}
+	if m.store != nil {
+		existing, err := m.store.GetNodeByName(ctx, name)
+		if err != nil {
+			return 0, fmt.Errorf("lookup in store: %w", err)
+		}
+		if existing == nil {
+			return 0, controlplane.ErrNodeNotFound
+		}
+		return existing.ID, nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.cfg == nil {
+		return 0, errConfigUnavailable
+	}
+	if idx := m.nodeIndexLocked(name); idx != -1 {
+		return m.cfg.Nodes[idx].ID, nil
+	}
+	return 0, controlplane.ErrNodeNotFound
+}
+
+// nodeNameTakenLocked reports whether any node other than excludeID carries the
+// name, consulting both the runtime config and the store.
+func (m *Manager) nodeNameTakenLocked(ctx context.Context, name string, excludeID int64) (bool, error) {
+	for _, node := range m.cfg.Nodes {
+		if node.Name == name && node.ID != excludeID {
+			return true, nil
+		}
+	}
+	if m.store == nil {
+		return false, nil
+	}
+	identities, err := m.store.ListNodeIdentities(ctx)
+	if err != nil {
+		return false, fmt.Errorf("list stored node names: %w", err)
+	}
+	for _, identity := range identities {
+		if identity.Name == name && identity.ID != excludeID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (m *Manager) nodeIndexByIDLocked(id int64) int {
+	if id <= 0 {
+		return -1
+	}
+	for idx, node := range m.cfg.Nodes {
+		if node.ID == id {
+			return idx
+		}
+	}
+	return -1
 }
 
 // TriggerReload reloads the sing-box instance by re-reading config from disk
@@ -2301,10 +2576,11 @@ func (m *Manager) TriggerReload(ctx context.Context) error {
 	}
 
 	m.mu.RLock()
-	portMap := m.cfg.BuildPortMap() // Preserve existing port assignments
+	portMap := map[string]uint16{}
 	oldBasePort := m.lastAppliedBasePort
 	cfgPath := ""
 	if m.cfg != nil {
+		portMap = m.cfg.BuildPortMap() // Preserve existing port assignments
 		cfgPath = m.cfg.FilePath()
 	}
 	m.mu.RUnlock()
@@ -2346,57 +2622,41 @@ func (m *Manager) TriggerReload(ctx context.Context) error {
 		return fmt.Errorf("database_path 不能通过热重载变更（当前 %s，配置 %s）；请重启进程", currentDBPath, newCfg.DatabasePath)
 	}
 
-	// Merge inline nodes (from config.yaml) with store nodes (subscription + manual).
-	// Inline nodes take priority; store nodes are added if their URI is not already present.
+	// Merge inline nodes (from config.yaml) with the store-backed runtime set.
+	// Inline connection settings take priority; the runtime set is the single
+	// source of truth for which stored nodes may run (see internal/runtimenodes).
 	if m.store != nil {
-		storeNodes, err := m.store.ListNodes(ctx, store.NodeFilter{})
+		runtimeNodes, err := runtimenodes.Load(ctx, m.store)
 		if err != nil {
-			m.logger.Warnf("failed to list nodes from store during reload: %v", err)
-		} else if len(storeNodes) > 0 {
-			// Build set of URIs already present from inline nodes
-			inlineURIs := make(map[string]int, len(newCfg.Nodes))
-			for idx, n := range newCfg.Nodes {
-				inlineURIs[n.NodeKey()] = idx
-			}
-
-			// Merge store nodes, skipping duplicates and disabled nodes
-			for _, n := range storeNodes {
-				if !n.Enabled {
-					continue
-				}
-				identityKey := n.IdentityHash
-				if identityKey == "" {
-					identityKey = n.URI
-				}
-				if idx, exists := inlineURIs[identityKey]; exists {
-					// Inline connection settings take priority, while SQLite owns the
-					// stable identity and discovered region metadata used by groups.
-					newCfg.Nodes[idx].ID = n.ID
-					newCfg.Nodes[idx].Tags = append([]string(nil), n.Tags...)
-					if newCfg.Nodes[idx].Region == "" {
-						newCfg.Nodes[idx].Region = n.Region
-					}
-					if newCfg.Nodes[idx].Country == "" {
-						newCfg.Nodes[idx].Country = n.Country
-					}
-					continue
-				}
-				newCfg.Nodes = append(newCfg.Nodes, config.NodeConfig{
-					ID:           n.ID,
-					Name:         n.Name,
-					URI:          n.URI,
-					Port:         n.Port,
-					Username:     n.Username,
-					Password:     n.Password,
-					Source:       config.NodeSource(n.Source),
-					Region:       n.Region,
-					Country:      n.Country,
-					Tags:         append([]string(nil), n.Tags...),
-					IdentityHash: n.IdentityHash, CanonicalJSON: n.CanonicalJSON,
-				})
-			}
-			m.logger.Infof("merged nodes for reload: %d inline + store nodes = %d total", len(inlineURIs), len(newCfg.Nodes))
+			// A partial config would silently take every stored node offline, so a
+			// failed read aborts the reload instead of degrading.
+			return fmt.Errorf("load runtime nodes for reload: %w", err)
 		}
+		inlineNodes := make(map[string]int, len(newCfg.Nodes))
+		for idx, n := range newCfg.Nodes {
+			inlineNodes[n.NodeKey()] = idx
+		}
+		for _, n := range runtimeNodes {
+			// NodeKey matches how the inline map is keyed: stored identity hash
+			// when known, otherwise the hash parsed from the URI.
+			identityKey := n.NodeKey()
+			if idx, exists := inlineNodes[identityKey]; exists {
+				// Inline connection settings take priority, while SQLite owns the
+				// stable identity and discovered region metadata used by groups.
+				newCfg.Nodes[idx].ID = n.ID
+				newCfg.Nodes[idx].Tags = append([]string(nil), n.Tags...)
+				if newCfg.Nodes[idx].Region == "" {
+					newCfg.Nodes[idx].Region = n.Region
+				}
+				if newCfg.Nodes[idx].Country == "" {
+					newCfg.Nodes[idx].Country = n.Country
+				}
+				continue
+			}
+			newCfg.Nodes = append(newCfg.Nodes, n)
+		}
+		m.logger.Infof("merged nodes for reload: %d inline + %d store nodes = %d total",
+			len(inlineNodes), len(runtimeNodes), len(newCfg.Nodes))
 		groups, err := m.store.ListGroupPools(ctx)
 		if err != nil {
 			m.logger.Warnf("failed to list group pools during reload: %v", err)

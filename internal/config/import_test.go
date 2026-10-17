@@ -287,3 +287,65 @@ func TestParseClashReportsUnsupportedTypesWhenNoneAreUsable(t *testing.T) {
 		t.Fatalf("error=%v", err)
 	}
 }
+
+// Clash 文档里有节点被跳过时，只要还有节点成功，过去会把 issues 全部丢弃。
+// 这里钉住新的行为：成功的节点照常返回，被跳过的节点逐条带行号上报。
+func TestParseImportContentReportReportsClashSkippedRows(t *testing.T) {
+	content := `proxies:
+  - { name: ok-node, type: http, server: proxy.example, port: 8080 }
+  - { name: tuic-node, type: tuic, server: tuic.example, port: 443 }
+  - { name: wg-node, type: wireguard, server: wg.example, port: 51820 }
+`
+	nodes, issues, err := ParseImportContentReport(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 1 || nodes[0].Name != "ok-node" {
+		t.Fatalf("nodes=%+v", nodes)
+	}
+	if len(issues) != 2 {
+		t.Fatalf("issues=%v", issues)
+	}
+	for i, want := range []string{"第 3 行", "第 4 行"} {
+		if !strings.Contains(issues[i], want) {
+			t.Fatalf("issues[%d]=%q, want %s", i, issues[i], want)
+		}
+	}
+}
+
+func TestParseSubscriptionContentAsReportReportsClashSkippedRows(t *testing.T) {
+	content := `proxies:
+  - { name: ok-node, type: http, server: proxy.example, port: 8080 }
+  - { name: tuic-node, type: tuic, server: tuic.example, port: 443 }
+`
+	nodes, issues, err := ParseSubscriptionContentAsReport(content, SubscriptionFormatClash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 1 || len(issues) != 1 || !strings.Contains(issues[0], "tuic-node") {
+		t.Fatalf("nodes=%+v issues=%v", nodes, issues)
+	}
+}
+
+// 大文档里被跳过太多时折叠成一行，避免导入报告被淹没。
+func TestParseClashIssuesAreCollapsedWhenNumerous(t *testing.T) {
+	var builder strings.Builder
+	builder.WriteString("proxies:\n")
+	builder.WriteString("  - { name: ok-node, type: http, server: proxy.example, port: 8080 }\n")
+	for i := 0; i < maxClashIssues+5; i++ {
+		builder.WriteString("  - { name: bad-node, type: tuic, server: tuic.example, port: 443 }\n")
+	}
+	nodes, issues, err := ParseImportContentReport(builder.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("nodes=%+v", nodes)
+	}
+	if len(issues) != maxClashIssues+1 {
+		t.Fatalf("issues=%d, want %d", len(issues), maxClashIssues+1)
+	}
+	if !strings.Contains(issues[len(issues)-1], "另有") {
+		t.Fatalf("last issue=%q", issues[len(issues)-1])
+	}
+}

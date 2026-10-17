@@ -46,6 +46,16 @@ type Store interface {
 	// CreateNode inserts a new node and returns its assigned ID.
 	CreateNode(ctx context.Context, node *Node) error
 
+	// CreateNodes inserts a batch in one transaction. A row that collides on
+	// identity_hash or uri is reported as a duplicate instead of aborting the
+	// batch; any other failure rolls the whole batch back.
+	CreateNodes(ctx context.Context, nodes []*Node) ([]NodeCreateOutcome, error)
+
+	// ListNodeIdentities returns the identity-relevant columns of every node
+	// without tags, stats or subscription joins. Callers de-duplicating a large
+	// incoming batch use it instead of ListManagedNodes.
+	ListNodeIdentities(ctx context.Context) ([]NodeIdentity, error)
+
 	// UpdateNode updates an existing node by ID.
 	UpdateNode(ctx context.Context, node *Node) error
 	// UpdateNodeLocation is an explicit manual override. Automated callers use
@@ -312,6 +322,27 @@ type Node struct {
 	CanonicalJSON string    `json:"-"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+// NodeCreateOutcome reports what happened to one row of a CreateNodes batch.
+// A duplicate row is not an error: the batch keeps going and the caller turns
+// the outcome into a per-row message.
+type NodeCreateOutcome struct {
+	Index        int   `json:"index"`
+	Created      bool  `json:"created"`
+	Duplicate    bool  `json:"duplicate"`
+	ID           int64 `json:"id,omitempty"`
+	ExistingID   int64 `json:"existing_id,omitempty"`
+	ExistingName string `json:"existing_name,omitempty"`
+}
+
+// NodeIdentity is the identity-relevant view of a stored node, used by import
+// de-duplication so it does not have to load tags and subscription joins.
+type NodeIdentity struct {
+	ID           int64  `json:"id"`
+	Name         string `json:"name"`
+	URI          string `json:"uri"`
+	IdentityHash string `json:"identity_hash"`
 }
 
 // ManagedNode is the node-management view of a node and its enabled subscriptions.

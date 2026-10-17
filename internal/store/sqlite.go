@@ -281,8 +281,15 @@ func (s *sqliteStore) GetNodeByIdentity(ctx context.Context, identityHash string
 }
 
 func (s *sqliteStore) GetNodeByName(ctx context.Context, name string) (*Node, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, nil
+	}
+	// Names are not unique: two subscriptions may legitimately ship the same
+	// display name. Pick the oldest row so operator actions are deterministic
+	// instead of landing on whichever row the planner returned first.
 	row := s.readConn().QueryRowContext(ctx,
-		"SELECT id, uri, name, source, port, username, password, region, country, enabled, tags, identity_hash, canonical_json, created_at, updated_at FROM nodes WHERE name = ?", name)
+		"SELECT id, uri, name, source, port, username, password, region, country, enabled, tags, identity_hash, canonical_json, created_at, updated_at FROM nodes WHERE name = ? ORDER BY id LIMIT 1", name)
 	return scanNode(row)
 }
 
@@ -290,6 +297,58 @@ func (s *sqliteStore) CreateNode(ctx context.Context, node *Node) error {
 	if err := populateNodeIdentity(node, true); err != nil {
 		return err
 	}
+	return s.runInTx(ctx, func(tx *sqliteStore) error {
+		return tx.createNode(ctx, node)
+	})
+}
+
+// CreateNodes inserts a batch in a single transaction. Identity and URI
+// collisions are reported per row so one stale entry cannot abort an import;
+// every other failure rolls the batch back.
+func (s *sqliteStore) CreateNodes(ctx context.Context, nodes []*Node) ([]NodeCreateOutcome, error) {
+	outcomes := make([]NodeCreateOutcome, len(nodes))
+	if len(nodes) == 0 {
+		return outcomes, nil
+	}
+	for index, node := range nodes {
+		if err := populateNodeIdentity(node, true); err != nil {
+			return nil, fmt.Errorf("prepare node %d: %w", index, err)
+		}
+		outcomes[index].Index = index
+	}
+	err := s.runInTx(ctx, func(tx *sqliteStore) error {
+		for index, node := range nodes {
+			err := tx.createNode(ctx, node)
+			switch {
+			case err == nil:
+				outcomes[index].Created = true
+				outcomes[index].ID = node.ID
+				continue
+			case isDuplicateNodeError(err):
+				existing, lookupErr := tx.existingNodeConflict(ctx, node)
+				if lookupErr != nil {
+					return lookupErr
+				}
+				outcomes[index].Duplicate = true
+				outcomes[index].ExistingID = existing.ID
+				outcomes[index].ExistingName = existing.Name
+				continue
+			default:
+				return fmt.Errorf("create node %q: %w", node.Name, err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return outcomes, nil
+}
+
+// createNode inserts one row plus its stats row and manual tag assignments.
+// Callers wrapping it in a transaction get all-or-nothing semantics; the single
+// node path relies on runInTx for that.
+func (s *sqliteStore) createNode(ctx context.Context, node *Node) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	if node.CreatedAt.IsZero() {
 		node.CreatedAt = time.Now().UTC()
@@ -327,16 +386,64 @@ func (s *sqliteStore) CreateNode(ctx context.Context, node *Node) error {
 	node.ID = id
 
 	// Create initial stats row
-	_, err = s.writeConn().ExecContext(ctx,
-		"INSERT OR IGNORE INTO node_stats (node_id) VALUES (?)", id)
-	if err != nil {
+	if _, err := s.writeConn().ExecContext(ctx,
+		"INSERT OR IGNORE INTO node_stats (node_id) VALUES (?)", id); err != nil {
 		return fmt.Errorf("create initial node stats: %w", err)
 	}
 
 	// Materialize the tags written above as real manual assignments. nodes.tags
 	// is only a projection of node_tags, so tags that exist nowhere else would
 	// be erased by the first recompute.
-	return s.materializeManualNodeTags(ctx, node.ID, node.Tags)
+	return s.materializeManualNodeTags(ctx, id, node.Tags)
+}
+
+func isDuplicateNodeError(err error) bool {
+	message := err.Error()
+	return strings.Contains(message, "UNIQUE constraint failed: nodes.identity_hash") ||
+		strings.Contains(message, "UNIQUE constraint failed: nodes.uri")
+}
+
+// existingNodeConflict resolves the row a duplicate insert collided with, so the
+// caller can name it instead of just saying "duplicate".
+func (s *sqliteStore) existingNodeConflict(ctx context.Context, node *Node) (*Node, error) {
+	if node.IdentityHash != "" {
+		if existing, err := s.getNodeWith(ctx, "identity_hash", node.IdentityHash); err == nil && existing != nil {
+			return existing, nil
+		}
+	}
+	existing, err := s.getNodeWith(ctx, "uri", node.URI)
+	if err != nil {
+		return nil, err
+	}
+	if existing == nil {
+		return &Node{}, nil
+	}
+	return existing, nil
+}
+
+// getNodeWith looks a node up by one of the unique columns (columns are fixed
+// internal identifiers, never caller input).
+func (s *sqliteStore) getNodeWith(ctx context.Context, column, value string) (*Node, error) {
+	row := s.writeConn().QueryRowContext(ctx,
+		"SELECT id, uri, name, source, port, username, password, region, country, enabled, tags, identity_hash, canonical_json, created_at, updated_at FROM nodes WHERE "+column+" = ? ORDER BY id LIMIT 1", value)
+	return scanNode(row)
+}
+
+func (s *sqliteStore) ListNodeIdentities(ctx context.Context) ([]NodeIdentity, error) {
+	rows, err := s.readConn().QueryContext(ctx, "SELECT id, name, uri, identity_hash FROM nodes ORDER BY id")
+	if err != nil {
+		return nil, fmt.Errorf("list node identities: %w", err)
+	}
+	defer rows.Close()
+	var result []NodeIdentity
+	for rows.Next() {
+		var identity NodeIdentity
+		if err := rows.Scan(&identity.ID, &identity.Name, &identity.URI, &identity.IdentityHash); err != nil {
+			return nil, fmt.Errorf("scan node identity: %w", err)
+		}
+		result = append(result, identity)
+	}
+	return result, rows.Err()
 }
 
 // materializeManualNodeTags turns tag names into manual assignments, creating

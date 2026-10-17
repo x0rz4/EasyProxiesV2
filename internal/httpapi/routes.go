@@ -73,8 +73,14 @@ func (s *Server) routes() http.Handler {
 	// —— 配置节点 CRUD ——
 	authenticated("GET /api/nodes/config", s.handleConfigNodesList)
 	authenticated("POST /api/nodes/config", s.handleConfigNodesCreate)
+	authenticated("POST /api/nodes/config/batch", s.handleConfigNodesBatchCreate)
 	authenticated("POST /api/nodes/config/batch-toggle", s.handleConfigNodesBatchToggle)
 	authenticated("POST /api/nodes/config/batch-delete", s.handleConfigNodesBatchDelete)
+	// ID-addressed routes: names are not unique in the store, so the UI edits
+	// and deletes by the stable node ID.
+	authenticated("PUT /api/nodes/config/id/{id}", s.handleConfigNodeUpdateByID)
+	authenticated("PATCH /api/nodes/config/id/{id}", s.handleConfigNodeToggleByID)
+	authenticated("DELETE /api/nodes/config/id/{id}", s.handleConfigNodeDeleteByID)
 	authenticated("PUT /api/nodes/config/{name}", s.handleConfigNodeUpdate)
 	authenticated("PATCH /api/nodes/config/{name}", s.handleConfigNodeToggle)
 	authenticated("DELETE /api/nodes/config/{name}", s.handleConfigNodeDelete)

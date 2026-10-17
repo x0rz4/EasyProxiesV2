@@ -19,6 +19,7 @@ import (
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/nodecodec"
 	"easy_proxies/internal/nodetag"
+	"easy_proxies/internal/runtimenodes"
 	"easy_proxies/internal/store"
 	"easy_proxies/internal/subscription"
 )
@@ -381,48 +382,14 @@ func loadNodesFromStore(ctx context.Context, cfg *config.Config, s store.Store) 
 		return nil
 	}
 
-	// Convert enabled non-subscription and effective subscription nodes.
-	var configNodes []config.NodeConfig
-	seen := make(map[string]struct{}, len(nodes)+len(effectiveSubscriptionNodes))
-	for _, n := range nodes {
-		if !n.Enabled || n.Source == store.NodeSourceSubscription {
-			continue
-		}
-		identityKey := n.IdentityHash
-		if identityKey == "" {
-			identityKey = n.URI
-		}
-		if _, ok := seen[identityKey]; ok {
-			continue
-		}
-		seen[identityKey] = struct{}{}
-		configNodes = append(configNodes, config.NodeConfig{
-			ID:           n.ID,
-			Name:         n.Name,
-			URI:          n.URI,
-			Port:         n.Port,
-			Username:     n.Username,
-			Password:     n.Password,
-			Source:       config.NodeSource(n.Source),
-			Region:       n.Region,
-			Country:      n.Country,
-			Tags:         append([]string(nil), n.Tags...),
-			IdentityHash: n.IdentityHash, CanonicalJSON: n.CanonicalJSON,
-		})
-	}
-	for _, n := range effectiveSubscriptionNodes {
-		identityKey := n.IdentityHash
-		if identityKey == "" {
-			identityKey = n.URI
-		}
-		if _, ok := seen[identityKey]; ok {
-			continue
-		}
-		seen[identityKey] = struct{}{}
-		configNodes = append(configNodes, config.NodeConfig{ID: n.ID, Name: n.Name, URI: n.URI, Port: n.Port,
-			Username: n.Username, Password: n.Password, Source: config.NodeSourceSubscription,
-			Region: n.Region, Country: n.Country, Tags: append([]string(nil), n.Tags...),
-			IdentityHash: n.IdentityHash, CanonicalJSON: n.CanonicalJSON})
+	// The runtime set is owned by runtimenodes: enabled non-subscription rows
+	// plus the rows reachable through an enabled subscription membership. The
+	// two lists read above are still needed for the startup-only decisions
+	// (orphan adoption and the legacy bootstrap), but the conversion itself has
+	// exactly one implementation.
+	configNodes, err := runtimenodes.Load(ctx, s)
+	if err != nil {
+		return fmt.Errorf("load runtime nodes from store: %w", err)
 	}
 
 	// Always replace cfg.Nodes when the DB is non-empty, including all-disabled state.

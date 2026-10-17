@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"mime"
@@ -13,6 +14,7 @@ import (
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/controlplane"
 	"easy_proxies/internal/nodecodec"
+	"easy_proxies/internal/store"
 )
 
 // handleExport 导出库内全部节点的原始代理 URI（如 trojan://、vless:// 等），每行一个。
@@ -111,6 +113,9 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxImportRequestBytes)
 	var req struct {
 		Content string `json:"content"` // 节点配置文本（URI / Clash YAML / Base64 均可）
+		// DryRun reports what the import would do without writing anything or
+		// reloading, so the UI can preview a large paste before committing it.
+		DryRun bool `json:"dry_run"`
 	}
 	if err := decodeJSONBody(r, &req); err != nil {
 		var oversized *http.MaxBytesError
@@ -137,26 +142,44 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"error": fmt.Sprintf("解析导入内容失败: %v", err)})
 		return
 	}
-	existingNodes, err := s.nodeMgr.ListConfigNodes(r.Context(), nil)
-	if err != nil {
-		s.respondNodeError(w, err)
-		return
-	}
-	usedNames := make(map[string]struct{}, len(existingNodes)+len(parsedNodes))
-	usedIdentities := make(map[string]controlplane.ManagedNodeConfig, len(existingNodes)+len(parsedNodes))
-	endpointIdentities := make(map[string]map[string]string, len(existingNodes)+len(parsedNodes))
-	for _, existing := range existingNodes {
-		usedNames[strings.TrimSpace(existing.Name)] = struct{}{}
-		if identity, identityErr := nodecodec.ParseURI(existing.URI); identityErr == nil {
-			usedIdentities[identity.Hash] = existing
-			if endpointIdentities[identity.EndpointKey] == nil {
-				endpointIdentities[identity.EndpointKey] = map[string]string{}
-			}
-			endpointIdentities[identity.EndpointKey][identity.Hash] = existing.Name
+	// Only the identity columns are needed to de-duplicate; loading the full
+	// management view also joins tags and subscription memberships for rows the
+	// import may immediately skip.
+	var existingIdentities []store.NodeIdentity
+	if s.store != nil {
+		existingIdentities, err = s.store.ListNodeIdentities(r.Context())
+		if err != nil {
+			s.respondNodeError(w, err)
+			return
+		}
+	} else {
+		existingNodes, listErr := s.nodeMgr.ListConfigNodes(r.Context(), nil)
+		if listErr != nil {
+			s.respondNodeError(w, listErr)
+			return
+		}
+		for _, existing := range existingNodes {
+			existingIdentities = append(existingIdentities, store.NodeIdentity{
+				ID: existing.ID, Name: existing.Name, URI: existing.URI,
+			})
 		}
 	}
+	usedNames := make(map[string]struct{}, len(existingIdentities)+len(parsedNodes))
+	usedIdentities := make(map[string]string, len(existingIdentities)+len(parsedNodes))
+	endpointIdentities := make(map[string]map[string]string, len(existingIdentities)+len(parsedNodes))
+	for _, existing := range existingIdentities {
+		usedNames[strings.TrimSpace(existing.Name)] = struct{}{}
+		identity, identityErr := nodecodec.ParseURI(existing.URI)
+		if identityErr != nil {
+			continue
+		}
+		usedIdentities[identity.Hash] = existing.Name
+		if endpointIdentities[identity.EndpointKey] == nil {
+			endpointIdentities[identity.EndpointKey] = map[string]string{}
+		}
+		endpointIdentities[identity.EndpointKey][identity.Hash] = existing.Name
+	}
 
-	var imported int
 	var duplicatesSkipped int
 	issues := make([]ImportIssue, 0, len(parseIssues))
 	for _, message := range parseIssues {
@@ -165,6 +188,9 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 	var duplicateGroups []map[string]any
 	var endpointCollisions []map[string]any
 	generatedNameIndex := 1
+	candidates := make([]config.NodeConfig, 0, len(parsedNodes))
+	candidateIdentities := make([]string, 0, len(parsedNodes))
+	candidateEndpoints := make([]string, 0, len(parsedNodes))
 
 	for i := range parsedNodes {
 		node := parsedNodes[i]
@@ -178,18 +204,14 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 			issues = append(issues, ImportIssue{Kind: "invalid_uri", Message: fmt.Sprintf("无效的代理 URI: %v", identityErr), URI: truncateStr(node.URI, 60)})
 			continue
 		}
-		if existing, duplicate := usedIdentities[identity.Hash]; duplicate {
+		if existingName, duplicate := usedIdentities[identity.Hash]; duplicate {
 			duplicatesSkipped++
-			duplicateGroups = append(duplicateGroups, map[string]any{"existing_node": existing.Name, "incoming_node": node.Name})
+			duplicateGroups = append(duplicateGroups, map[string]any{"existing_node": existingName, "incoming_node": node.Name})
 			continue
 		}
-		if identities := endpointIdentities[identity.EndpointKey]; len(identities) > 0 {
-			var names []string
-			for _, existingName := range identities {
-				names = append(names, existingName)
-			}
-			sort.Strings(names)
-			endpointCollisions = append(endpointCollisions, map[string]any{"endpoint": identity.EndpointKey, "existing_nodes": names, "incoming_node": node.Name})
+		if !config.IsProxyURI(node.URI) {
+			issues = append(issues, ImportIssue{Kind: "invalid_uri", Message: "无法识别的代理 URI", URI: truncateStr(node.URI, 60)})
+			continue
 		}
 
 		// 名称：优先用解析结果，其次从 URI fragment 提取，最后生成唯一名称。
@@ -217,22 +239,43 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		usedNames[name] = struct{}{}
 		node.Name = name
 
-		if !config.IsProxyURI(node.URI) {
-			issues = append(issues, ImportIssue{Kind: "invalid_uri", Message: "无法识别的代理 URI", URI: truncateStr(node.URI, 60)})
-			continue
+		if identities := endpointIdentities[identity.EndpointKey]; len(identities) > 0 {
+			var names []string
+			for _, existingName := range identities {
+				names = append(names, existingName)
+			}
+			sort.Strings(names)
+			endpointCollisions = append(endpointCollisions, map[string]any{"endpoint": identity.EndpointKey, "existing_nodes": names, "incoming_node": node.Name})
 		}
 
-		if _, err := s.nodeMgr.CreateNode(r.Context(), node); err != nil {
-			issues = append(issues, ImportIssue{Kind: "create_failed", Message: fmt.Sprintf("添加节点 %q 失败: %v", name, err), URI: truncateStr(node.URI, 60)})
+		candidates = append(candidates, node)
+		candidateIdentities = append(candidateIdentities, identity.Hash)
+		candidateEndpoints = append(candidateEndpoints, identity.EndpointKey)
+		// Reserve the identity so a later row in the same paste is treated as a
+		// duplicate of this one instead of being created twice.
+		usedIdentities[identity.Hash] = name
+	}
+
+	created, failures, imported, dryRun := s.createImportedNodes(r.Context(), candidates, req.DryRun)
+	for _, failure := range failures {
+		issues = append(issues, ImportIssue{
+			Kind:    "create_failed",
+			Message: fmt.Sprintf("添加节点 %q 失败: %s", failure.Name, failure.Reason),
+			URI:     truncateStr(failure.URI, 60),
+		})
+	}
+	// Rows that were not created do not hold their identity or endpoint, so a
+	// later paste can still introduce them.
+	createdNames := make(map[string]struct{}, len(created))
+	for _, node := range created {
+		createdNames[node.Name] = struct{}{}
+	}
+	for index, node := range candidates {
+		if _, ok := createdNames[node.Name]; ok {
 			continue
 		}
-		imported++
-		created := controlplane.ManagedNodeConfig{Name: node.Name, URI: node.URI}
-		usedIdentities[identity.Hash] = created
-		if endpointIdentities[identity.EndpointKey] == nil {
-			endpointIdentities[identity.EndpointKey] = map[string]string{}
-		}
-		endpointIdentities[identity.EndpointKey][identity.Hash] = node.Name
+		delete(usedIdentities, candidateIdentities[index])
+		delete(endpointIdentities[candidateEndpoints[index]], candidateIdentities[index])
 	}
 
 	result := map[string]any{
@@ -241,9 +284,17 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		"parsed":             len(parsedNodes),
 		"created":            imported,
 		"duplicates_skipped": duplicatesSkipped,
-		"invalid":            len(issues),
+		"invalid":            len(issues) - len(failures),
+		"failed":             len(failures),
 	}
-	if imported > 0 {
+	if dryRun {
+		result["dry_run"] = true
+		result["would_create"] = imported
+		result["created"] = 0
+		result["imported"] = 0
+		result["message"] = fmt.Sprintf("预览：将新增 %d 个节点，跳过 %d 个重复项", imported, duplicatesSkipped)
+	}
+	if imported > 0 && !dryRun {
 		s.enqueueRetagAll()
 		// Publish the imported nodes once; the existing scheduler performs their
 		// initial probes after the runtime snapshot becomes visible.
@@ -273,6 +324,52 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		result["issues"] = issues
 	}
 	writeJSON(w, result)
+}
+
+// createImportedNodes writes the import candidates, preferring the runtime's
+// batch path: one lock, one transaction and a build dry run per row. Runtimes
+// that do not implement controlplane.BatchNodeCreator (the lightweight test
+// managers) fall back to one CreateNode per row, preserving the old contract.
+//
+// It returns the created rows, the per-row failures, the created count and
+// whether the call was a dry run.
+func (s *Server) createImportedNodes(ctx context.Context, candidates []config.NodeConfig, dryRun bool) ([]config.NodeConfig, []controlplane.NodeCreateFailure, int, bool) {
+	if len(candidates) == 0 {
+		return nil, nil, 0, dryRun
+	}
+	if batch, ok := s.nodeMgr.(controlplane.BatchNodeCreator); ok {
+		result, err := batch.CreateNodes(ctx, candidates, dryRun)
+		if err != nil {
+			// A whole-batch failure is not per-row; report every row as failed so
+			// the caller's issues list stays truthful.
+			failures := make([]controlplane.NodeCreateFailure, 0, len(candidates))
+			for index, node := range candidates {
+				failures = append(failures, controlplane.NodeCreateFailure{Index: index, Name: node.Name, URI: node.URI, Reason: err.Error(), Err: err})
+			}
+			return nil, failures, 0, dryRun
+		}
+		if dryRun {
+			return nil, result.Failed, len(result.Planned), true
+		}
+		return result.Created, result.Failed, len(result.Created), false
+	}
+
+	if dryRun {
+		// The fallback runtime has no build dry run, so the best preview is the
+		// de-duplicated candidate list itself — never a write.
+		return nil, nil, len(candidates), true
+	}
+	var created []config.NodeConfig
+	var failures []controlplane.NodeCreateFailure
+	for index, node := range candidates {
+		createdNode, err := s.nodeMgr.CreateNode(ctx, node)
+		if err != nil {
+			failures = append(failures, controlplane.NodeCreateFailure{Index: index, Name: node.Name, URI: node.URI, Reason: err.Error(), Err: err})
+			continue
+		}
+		created = append(created, createdNode)
+	}
+	return created, failures, len(created), false
 }
 
 func uniqueImportedNodeName(base string, used map[string]struct{}) string {

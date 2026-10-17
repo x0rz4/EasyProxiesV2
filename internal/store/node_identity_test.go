@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -195,5 +196,114 @@ func TestIdentityReconcileMigratesNodeTags(t *testing.T) {
 		if !found {
 			t.Fatalf("projection = %v, missing %q", merged.Tags, name)
 		}
+	}
+}
+
+func TestCreateNodesReportsDuplicateRowsAndKeepsBatch(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "batch.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	existing := &Node{URI: "http://user:pass@existing.example:8080", Name: "existing", Source: NodeSourceManual, Enabled: true}
+	if err := db.CreateNode(ctx, existing); err != nil {
+		t.Fatal(err)
+	}
+
+	batch := []*Node{
+		{URI: "http://user:pass@new-one.example:8080", Name: "new-one", Source: NodeSourceManual, Enabled: true},
+		{URI: "http://user:pass@existing.example:8080#same-identity", Name: "duplicate", Source: NodeSourceManual, Enabled: true},
+		{URI: "http://user:pass@new-two.example:8080", Name: "new-two", Source: NodeSourceManual, Enabled: true},
+	}
+	outcomes, err := db.CreateNodes(ctx, batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(outcomes) != 3 {
+		t.Fatalf("outcomes=%+v", outcomes)
+	}
+	if !outcomes[0].Created || outcomes[0].ID == 0 {
+		t.Fatalf("row 0 outcome=%+v", outcomes[0])
+	}
+	if !outcomes[1].Duplicate || outcomes[1].ExistingID != existing.ID || outcomes[1].ExistingName != "existing" {
+		t.Fatalf("row 1 outcome=%+v", outcomes[1])
+	}
+	if !outcomes[2].Created {
+		t.Fatalf("row 2 outcome=%+v", outcomes[2])
+	}
+	nodes, err := db.ListNodes(ctx, NodeFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 3 {
+		t.Fatalf("stored nodes=%d, want 3", len(nodes))
+	}
+}
+
+func TestListNodeIdentitiesReturnsEveryRow(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "identities.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	created := &Node{URI: "http://user:pass@example.com:8080", Name: "one", Source: NodeSourceManual, Enabled: true}
+	if err := db.CreateNode(ctx, created); err != nil {
+		t.Fatal(err)
+	}
+	identities, err := db.ListNodeIdentities(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(identities) != 1 || identities[0].ID != created.ID || identities[0].IdentityHash == "" {
+		t.Fatalf("identities=%+v", identities)
+	}
+}
+
+func TestGetNodeByNamePicksOldestRow(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "same-name.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	first := &Node{URI: "http://user:pass@one.example:8080", Name: "shared", Source: NodeSourceSubscription, Enabled: true}
+	second := &Node{URI: "http://user:pass@two.example:8080", Name: "shared", Source: NodeSourceSubscription, Enabled: true}
+	for _, node := range []*Node{first, second} {
+		if err := db.CreateNode(ctx, node); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := db.GetNodeByName(ctx, "shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.ID != first.ID {
+		t.Fatalf("GetNodeByName = %+v, want oldest row %d", got, first.ID)
+	}
+	if empty, err := db.GetNodeByName(ctx, "  "); err != nil || empty != nil {
+		t.Fatalf("blank name lookup = %+v, %v", empty, err)
+	}
+}
+
+// TestMigrationAddsNodeNameIndex pins migration 23: name-addressed lookups must
+// use an index, and the index must not be UNIQUE (subscription names may repeat).
+func TestMigrationAddsNodeNameIndex(t *testing.T) {
+	db := openRawDB(t, filepath.Join(t.TempDir(), "index.db"))
+	if err := Migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	var sqlText string
+	if err := db.QueryRow(
+		"SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_nodes_name'").Scan(&sqlText); err != nil {
+		t.Fatalf("idx_nodes_name missing: %v", err)
+	}
+	if strings.Contains(strings.ToUpper(sqlText), "UNIQUE") {
+		t.Fatalf("idx_nodes_name must not be unique: %s", sqlText)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO nodes (uri, name) VALUES ('ss://a@127.0.0.1:1','dup'), ('ss://b@127.0.0.1:2','dup')`); err != nil {
+		t.Fatalf("duplicate names must be allowed: %v", err)
 	}
 }

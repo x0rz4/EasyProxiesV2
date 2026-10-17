@@ -995,12 +995,13 @@ func ParseSubscriptionContentAsReport(content, format string) ([]NodeConfig, []s
 	case SubscriptionFormatClash:
 		if looksLikeInlineYAML(content) {
 			content = wrapAsClashProxiesDoc(content)
-		} else if !hasTopLevelProxiesKey(content) {
+		}
+		nodes, issues, recognized, err := parseClashDocument(content)
+		if !recognized && err == nil {
 			return nil, nil, errors.New("Clash/Mihomo 响应中未找到顶层 proxies 数组")
 		}
-		nodes, err := parseClashYAML(content)
 		nodes, err = requireSubscriptionNodes(nodes, err)
-		return nodes, nil, err
+		return nodes, issues, err
 	case SubscriptionFormatBase64:
 		decoded, ok := tryBase64Decode(content)
 		if !ok {
@@ -1059,6 +1060,16 @@ func parseContent(content string, depth int) ([]NodeConfig, error) {
 // parseContentReport is parseContent plus the per-line issues collected while
 // parsing, so callers can tell the user which rows were dropped and why.
 func parseContentReport(content string, depth int) ([]NodeConfig, []string, error) {
+	return parseContentReportWith(content, depth, true)
+}
+
+// parseContentReportWithoutJSON skips the sing-box JSON sniff for documents the
+// caller has already tried.
+func parseContentReportWithoutJSON(content string) ([]NodeConfig, []string, error) {
+	return parseContentReportWith(content, 0, false)
+}
+
+func parseContentReportWith(content string, depth int, tryJSON bool) ([]NodeConfig, []string, error) {
 	content = strings.TrimSpace(strings.TrimPrefix(content, "\ufeff"))
 	if len(content) > maxDecodedContentBytes {
 		return nil, nil, errors.New("节点内容超过 10MB 限制")
@@ -1069,18 +1080,19 @@ func parseContentReport(content string, depth int) ([]NodeConfig, []string, erro
 	if looksLikeHTML(content) {
 		return nil, nil, errors.New("订阅地址返回了 HTML 页面，请检查链接、鉴权参数或请求 User-Agent")
 	}
-	if strings.HasPrefix(content, "{") {
+	if tryJSON && strings.HasPrefix(content, "{") {
 		if nodes, recognized, issues, err := parseSingBoxJSON(content); recognized {
 			return nodes, issues, err
 		}
 	}
-	if hasTopLevelProxiesKey(content) {
-		nodes, err := parseClashYAML(content)
-		return nodes, nil, err
+	if nodes, issues, recognized, err := parseClashDocument(content); recognized {
+		return nodes, issues, err
 	}
 	if looksLikeInlineYAML(content) {
-		nodes, err := parseClashYAML(wrapAsClashProxiesDoc(content))
-		return nodes, nil, err
+		nodes, issues, recognized, err := parseClashDocument(wrapAsClashProxiesDoc(content))
+		if recognized {
+			return nodes, issues, err
+		}
 	}
 	if depth < 2 {
 		if decoded, ok := tryBase64Decode(content); ok {
@@ -1107,8 +1119,19 @@ func ParseImportContentReport(content string) ([]NodeConfig, []string, error) {
 			nodes, err = requireImportedNodes(nodes, err)
 			return nodes, issues, err
 		}
+		// The JSON sniff already ran, so do not make parseContentReport try the
+		// same document again.
+		return parseNonJSONImportContent(trimmed)
 	}
 	nodes, issues, err := parseContentReport(trimmed, 0)
+	nodes, err = requireImportedNodes(nodes, err)
+	return nodes, issues, err
+}
+
+// parseNonJSONImportContent is parseContentReport without the sing-box JSON
+// attempt, for documents the caller has already tested.
+func parseNonJSONImportContent(content string) ([]NodeConfig, []string, error) {
+	nodes, issues, err := parseContentReportWithoutJSON(content)
 	nodes, err = requireImportedNodes(nodes, err)
 	return nodes, issues, err
 }
@@ -1375,11 +1398,6 @@ func IsProxyURI(s string) bool {
 	return false
 }
 
-// clashConfig represents a minimal Clash configuration for parsing proxies.
-type clashConfig struct {
-	Proxies []nodecodec.ClashProxy `yaml:"proxies"`
-}
-
 // singBoxIssue renders a conversion cause in the importer's own language. The
 // codec reports causes, not prose, so the wording stays here with the rest of
 // the user-facing import messages.
@@ -1447,16 +1465,52 @@ func parseSingBoxJSON(content string) ([]NodeConfig, bool, []string, error) {
 	return nodes, true, issues, nil
 }
 
-// parseClashYAML parses Clash YAML format and converts to NodeConfig
-func parseClashYAML(content string) ([]NodeConfig, error) {
-	var clash clashConfig
-	if err := yaml.Unmarshal([]byte(content), &clash); err != nil {
-		return nil, fmt.Errorf("parse clash yaml: %w", err)
+// maxClashIssues bounds how many per-row Clash problems are reported before the
+// rest are folded into one summary line.
+const maxClashIssues = 20
+
+// parseClashDocument parses a Clash/Mihomo document exactly once and reports
+// every proxy row it had to drop. The document is inspected structurally so the
+// parser can both decide whether a top-level `proxies` sequence exists and keep
+// the line number of each entry — a plain struct unmarshal provides neither,
+// and used to force a second full parse just to detect the key.
+//
+// recognized is false when the document has no top-level `proxies` sequence at
+// all, which lets callers fall through to other formats instead of treating the
+// absence as a parse failure.
+func parseClashDocument(content string) (nodes []NodeConfig, issues []string, recognized bool, err error) {
+	var document yaml.Node
+	if unmarshalErr := yaml.Unmarshal([]byte(content), &document); unmarshalErr != nil {
+		// Malformed YAML that still declares a top-level proxies key is a Clash
+		// document with a syntax error, not some other format.
+		if hasTopLevelProxiesKey(content) {
+			return nil, nil, true, fmt.Errorf("parse clash yaml: %w", unmarshalErr)
+		}
+		return nil, nil, false, nil
+	}
+	var proxies *yaml.Node
+	if len(document.Content) > 0 && document.Content[0].Kind == yaml.MappingNode {
+		root := document.Content[0]
+		for i := 0; i+1 < len(root.Content); i += 2 {
+			if root.Content[i].Value == "proxies" && root.Content[i+1].Kind == yaml.SequenceNode {
+				proxies = root.Content[i+1]
+				break
+			}
+		}
+	}
+	if proxies == nil {
+		return nil, nil, false, nil
+	}
+	if len(proxies.Content) == 0 {
+		return nil, nil, true, errors.New("Clash/Mihomo YAML 的 proxies 数组为空")
 	}
 
-	var nodes []NodeConfig
-	var issues []string
-	for _, proxy := range clash.Proxies {
+	for _, entry := range proxies.Content {
+		var proxy nodecodec.ClashProxy
+		if decodeErr := entry.Decode(&proxy); decodeErr != nil {
+			issues = append(issues, fmt.Sprintf("第 %d 行: 无法解析节点: %v", entry.Line, decodeErr))
+			continue
+		}
 		label := strings.TrimSpace(proxy.Name)
 		if label == "" {
 			label = "未命名节点"
@@ -1464,33 +1518,40 @@ func parseClashYAML(content string) ([]NodeConfig, error) {
 		// Clash entry → Spec → link. Going through Spec keeps the renderer and
 		// the parser in lockstep: the old hand-written formatters emitted only
 		// the fields they knew about and dropped vmess alterId and cipher.
-		spec, err := nodecodec.FromClashProxy(proxy)
-		if err != nil {
-			if errors.Is(err, nodecodec.ErrUnsupportedProtocol) {
-				issues = append(issues, fmt.Sprintf("%s: 不支持 type=%q", label, proxy.Type))
+		spec, convertErr := nodecodec.FromClashProxy(proxy)
+		if convertErr != nil {
+			if errors.Is(convertErr, nodecodec.ErrUnsupportedProtocol) {
+				issues = append(issues, fmt.Sprintf("第 %d 行: %s: 不支持 type=%q", entry.Line, label, proxy.Type))
 				continue
 			}
-			issues = append(issues, fmt.Sprintf("%s (%s): %v", label, proxy.Type, err))
+			issues = append(issues, fmt.Sprintf("第 %d 行: %s (%s): %v", entry.Line, label, proxy.Type, convertErr))
 			continue
 		}
 		spec.Name = proxy.Name
 		node := NodeConfig{Name: proxy.Name, URI: spec.ToURI()}
 		if err := enrichNodeIdentity(&node); err != nil {
-			issues = append(issues, fmt.Sprintf("%s (%s): %v", label, proxy.Type, err))
+			issues = append(issues, fmt.Sprintf("第 %d 行: %s (%s): %v", entry.Line, label, proxy.Type, err))
 			continue
 		}
 		nodes = append(nodes, node)
 	}
 	if len(nodes) == 0 {
-		if len(clash.Proxies) == 0 {
-			return nil, errors.New("Clash/Mihomo YAML 的 proxies 数组为空")
-		}
 		if len(issues) > 5 {
 			issues = append(issues[:5], fmt.Sprintf("另有 %d 个节点无法解析", len(issues)-5))
 		}
-		return nil, fmt.Errorf("Clash/Mihomo YAML 中没有可用节点: %s", strings.Join(issues, "; "))
+		return nil, issues, true, fmt.Errorf("Clash/Mihomo YAML 中没有可用节点: %s", strings.Join(issues, "; "))
 	}
-	return nodes, nil
+	return nodes, collapseClashIssues(issues), true, nil
+}
+
+// collapseClashIssues keeps a pasted document with hundreds of unsupported rows
+// from turning the import report into an unreadable wall.
+func collapseClashIssues(issues []string) []string {
+	if len(issues) <= maxClashIssues {
+		return issues
+	}
+	collapsed := append([]string(nil), issues[:maxClashIssues]...)
+	return append(collapsed, fmt.Sprintf("另有 %d 个节点无法解析", len(issues)-maxClashIssues))
 }
 
 // RLock acquires a read lock on the config.

@@ -102,11 +102,11 @@ export default function NodeMaintenancePanel() {
   }
 
   const handleDelete = async () => {
-    const names = selectedVisible.map((node) => node.name)
-    if (names.length === 0) return
+    const ids = selectedVisible.map((node) => node.id)
+    if (ids.length === 0) return
     setDeleting(true)
     try {
-      const result = await batchDeleteConfigNodes(names)
+      const result = await batchDeleteConfigNodes(ids)
       if (result.errors?.length) {
         toast.warning(`${result.message}，${result.errors.length} 个删除失败`, {
           description: result.errors.slice(0, 3).join('；'),
