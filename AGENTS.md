@@ -69,7 +69,7 @@ install.sh                    Linux Docker / 二进制安装及更新入口
 | 包 | 职责 |
 | --- | --- |
 | `monitor` | **运行时**：节点运行态注册表（`entry` + `nodeRegistry`）、健康探测 actor（`probe_scheduler`）、健康事件 hub（`health_event_hub`）、健康结果投影（`health_applier`）、流量采样；`ports.go` 定义消费方接口 `NodeManager` / `GroupRuntimeManager` / `GroupMembershipManager` / `SubscriptionRefresher` 与领域错误，`tag_providers.go` 定义标签事实提供者。**不含任何 HTTP、路由、Session 或 DTO**（已迁至 `httpapi`）。**只依赖接口，不 import `boxmgr`/`outbound/pool`**（反向才是允许的：`boxmgr`、`pool`、`subscription` 都 import 它并实现上述接口）。 |
-| `controlplane` | **领域服务与跨层契约**：`Auth`（会话、登录限流、API Key 凭据，密码经回调读取，`Now` 可注入）；`NodeManager` / `GroupRuntimeManager` / `GroupMembershipManager` / `GroupRuntimeStatus` / `SubscriptionRefresher` / `SubscriptionStatus` / `ManagedNodeConfig` 与领域错误（`ErrNodeNotFound` 等、`NodeDuplicateError`）。**只依赖 `config` / `store`**，不 import `monitor` 或 `httpapi`；`boxmgr` / `subscription` 实现它，`httpapi` 消费它。其余领域 Service 将按 Phase 2 逐步迁入。 |
+| `controlplane` | **领域服务与跨层契约**：`Auth`（会话、登录限流、API Key 凭据）、`Settings`（配置读写、校验、持久化、ApplyPlan，是**所有**配置写入者的唯一序列化点）；`NodeManager` / `GroupRuntimeManager` / `GroupMembershipManager` / `GroupRuntimeStatus` / `SubscriptionRefresher` / `SubscriptionStatus` / `ManagedNodeConfig` 与领域错误（`ErrNodeNotFound` 等、`NodeDuplicateError`）。**只依赖 `config` / `store`**，不 import `monitor` 或 `httpapi`；`boxmgr` / `subscription` 实现它，`httpapi` 消费它。其余领域 Service 将按 Phase 2 逐步迁入。 |
 | `httpapi` | **管理面 HTTP 层**：`Server` 生命周期、路由表、全部 handler 与 DTO、响应管线（`pathID` / `requireStore` / 三个域状态函数）、会话认证、SSE、静态资源与 `//go:embed assets/*`。它 import `monitor` 读运行时状态、直连 `store` 做持久化；`monitor` **不**反向 import 它。`boxmgr` 持有 `*httpapi.Server` 并经 `MonitorServer()` 暴露给 `app`。 |
 
 ### 事实与标签

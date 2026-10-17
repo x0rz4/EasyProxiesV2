@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/controlplane"
 	"easy_proxies/internal/monitor"
 )
 
@@ -42,10 +43,10 @@ func TestSettingsEntrySwitchRoundTrip(t *testing.T) {
 	}
 	invalidRequest := request
 	invalidRequest.ManagementProbeTarget = "ftp://example.com/check"
-	if _, err := server.updateAllSettings(t.Context(), invalidRequest); err == nil {
+	if _, err := server.settingsService().UpdateAllSettings(t.Context(), allSettingsRequestOf(invalidRequest)); err == nil {
 		t.Fatal("settings API accepted an invalid probe target")
 	}
-	if _, err := server.updateAllSettings(t.Context(), request); err != nil {
+	if _, err := server.settingsService().UpdateAllSettings(t.Context(), allSettingsRequestOf(request)); err != nil {
 		t.Fatal(err)
 	}
 	got := server.getAllSettings()
@@ -98,7 +99,7 @@ func TestSettingsApplyPlan(t *testing.T) {
 			old := testSettingsConfig()
 			updated := old.Clone()
 			tt.change(updated)
-			plan := settingsApplyPlan(old, updated)
+			plan := controlplane.ApplyPlanForTest(old, updated)
 			if plan.NeedReload != tt.needReload || plan.NeedRestart != tt.needRestart {
 				t.Fatalf("plan=%+v, want reload=%v restart=%v", plan, tt.needReload, tt.needRestart)
 			}

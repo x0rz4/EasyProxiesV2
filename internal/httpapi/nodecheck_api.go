@@ -99,17 +99,13 @@ func (s *Server) handleNodeCheckSettingsUpdate(w http.ResponseWriter, r *http.Re
 		writeAPIError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	s.configMutationMu.Lock()
-	defer s.configMutationMu.Unlock()
-	snapshot := source.Snapshot()
-	old := snapshot.Management.NodeCheck
-	source.Lock()
-	source.Management.NodeCheck = value
-	source.Unlock()
-	if err := source.SaveSettings(); err != nil {
-		source.Lock()
-		source.Management.NodeCheck = old
-		source.Unlock()
+	// Route through the settings service so this write shares the config
+	// mutex with the other settings forms; otherwise two concurrent writes
+	// could each save a stale document over the other.
+	if _, err := s.settingsService().Mutate(r.Context(), func(updated *config.Config) error {
+		updated.Management.NodeCheck = value
+		return nil
+	}); err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "保存检测设置失败: "+err.Error())
 		return
 	}

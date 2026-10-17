@@ -2,7 +2,7 @@
 
 > 状态：独立设计提案。文中 `internal/httpapi` / `internal/controlplane` 为目标结构，不代表当前已存在。大型代理池路线采用责任分层，先硬化现有边界，再按证据决定是否迁移包；参见 [分层设计](changes/scale-proxy-pool/design.md)。
 >
-> **PR1 已完成（包内拆分 + 路由拉直）**，见 §11。**PR2 已完成（HTTP 层迁到 `internal/httpapi`，含 `assets` 与 11 处构建路径引用）**，见 §13。**Phase 1 已完成（§14）**；**Phase 2 首个领域 Auth/Session 已完成（§15）**。其余领域 Service 与 §6 的"HTTP 生命周期移到 `app.Run`"尚未开始，属 Phase 2 后续与 Phase 4。
+> **PR1 已完成（包内拆分 + 路由拉直）**，见 §11。**PR2 已完成（HTTP 层迁到 `internal/httpapi`，含 `assets` 与 11 处构建路径引用）**，见 §13。**Phase 1 已完成（§14）**；**Phase 2 的 Auth/Session（§15）与 Settings（§16）已完成**。其余领域 Service 与 §6 的"HTTP 生命周期移到 `app.Run`"尚未开始，属 Phase 2 后续与 Phase 4。
 
 ## 1. 背景
 
@@ -12,8 +12,8 @@
 
 | 项 | `internal/httpapi` | `internal/monitor` | `internal/controlplane` |
 | --- | --- | --- | --- |
-| 非测试代码 | 7,737 行 / 22 个文件 | 3,270 行 / 9 个文件 | 571 行 / 2 个文件 |
-| 测试 | 4,245 行 / 23 个文件 / 94 个 `TestXxx` | 1,520 行 / 7 个文件 / 45 个 `TestXxx` | 352 行 / 14 个用例 |
+| 非测试代码 | 7,615 行 / 22 个文件 | 3,270 行 / 9 个文件 | 1,313 行 / 3 个文件 |
+| 测试 | 4,274 行 / 23 个文件 / 94 个 `TestXxx` | 1,520 行 / 7 个文件 / 45 个 `TestXxx` | 668 行 / 25 个用例 |
 | 最大文件 | `server_groups.go` 1,068 行 | `manager.go` | `ports.go` |
 | import 的 internal 包 | 20 个 | 8 个 | 2 个（`config` / `store`） |
 
@@ -163,7 +163,8 @@ Server 结构、全部 handler、DTO、`assets` 及 11 处构建路径引用（D
 ### Phase 2：领域 Service（PR3+ 按领域逐个 PR）
 
 - ✅ Auth/Session → `controlplane.Auth`（见 §15）。
-- ⬜ 依次迁移 Settings、Nodes、Subscriptions、Diagnostics/Streams、Groups、GeoIP、Import/Export。
+- ✅ Settings → `controlplane.Settings`（见 §16）。
+- ⬜ 依次迁移 Nodes、Subscriptions、Diagnostics/Streams、Groups、GeoIP、Import/Export。
 - 每迁移一个领域，将相关测试改为 Service 单元测试并保持 `go test ./...` 通过。
 - Groups 保留当前操作锁、并发端口分配和 runtime 失败后的数据库回滚语义。
 
@@ -484,3 +485,44 @@ go build -tags "with_utls ... with_gvisor"   # 通过，71 MB
 | 新增服务测试 | 14 个 |
 
 **版本**：`2.1.9 → 2.1.10`（按 AGENTS.md §9，patch 位达到 10 后继续按整数递增，不进位）。
+
+## 16. Phase 2 / PR4 完成记录（Settings 领域）
+
+**范围**：把配置文档的读取、校验、持久化、发布与热应用从 `internal/httpapi` 抽到 `internal/controlplane/settings.go`。这是 Phase 2 最宽的一个领域——`cfgSrc` 被 8 个文件读取。
+
+**服务边界**
+
+`controlplane.Settings` 拥有三条写路径（通用设置、探测设置、订阅自动刷新）与一条通用变更入口，以及 ApplyPlan（reload / restart / applied / pending）的分类。它不认识 HTTP：不产生状态码，不拼响应。
+
+**四个设计点**
+
+1. **配置对象的所有权用回调表达**。配置每次保存都会整体替换（`cfgSrc = updated`），所以 `Config func() *config.Config` + `Commit func(*config.Config)` 比持有指针更能表达"当前是谁"。HTTP 层的 `publishConfig` 负责同时刷新 `s.cfg` 里那几个镜像字段。
+2. **`Mutate` 统一了所有配置写者**。原实现里通用设置和探测设置用 `s.configMutationMu`，而 node-check 设置用同一把锁；抽服务后如果各走各的锁，两个设置页面并发保存会互相覆盖。现在 `Mutate(ctx, fn)` 让 node-check 也走服务的同一把互斥量，并且只在 `SaveSettings` 成功后才提交。
+3. **校验必须针对"生效值"而不是原始零值**。订阅刷新设置里空时长表示"保留原值"，若直接校验 `0s` 会把省略字段误判为非法。服务先合成生效值再校验——这个顺序是行为契约，测试 `TestUpdateSubscriptionRefreshKeepsOmittedDurations` 钉住了它。
+4. **探测目标解析与策略归一不复制**。这两条规则属于运行时（`monitor.ParseProbeTarget`、`monitor.NormalizeStartupAvailabilityPolicy`），而 `controlplane` 不允许 import `monitor`。通过 `ValidateProbeTarget` / `NormalizeAvailability` 注入回调，规则仍只有一份。
+
+**类型适配**：`controlplane.ProbePolicy` 与 `monitor.ProbePolicy` 同构但不同型。`httpapi` 里的 `runtimeApplier` 是两者唯一的交汇点，避免让 `monitor` 反向依赖 `controlplane`。
+
+**测试迁移**
+
+- 新增 `internal/controlplane/settings_test.go`（11 个用例）：快照隔离、无配置时的 `ErrConfigUnavailable`、拒绝时不写文件、持久化与发布、通用表单不覆盖自动刷新与订阅列表、省略时长保持原值、负值拒绝、reload 失败可见、监听变更要求重启、`Mutate` 失败不提交、ApplyPlan 分类表。
+- 原 `settings_test.go` / `subscription_refresh_settings_test.go` 保留为 HTTP 层契约测试，只改调用点。畸形时长仍从 HTTP 入口打，因为那是解析器的职责，不是服务的。
+
+**验证**
+
+```bash
+go build ./... && go vet ./...     # 干净
+go test ./... -count=1             # 27 个包全绿
+gofmt -l <changed>                 # 干净
+go build -tags "with_utls ... with_gvisor"   # 通过，71 MB
+```
+
+`golang.org/x/net` 仍为 `v0.50.0`。
+
+| 指标 | 数值 |
+| --- | --- |
+| `controlplane` | 3 个产品文件 / 1,313 行 + 668 行测试（含共用的 ports.go） |
+| `httpapi/server_settings.go` | 726 → 500 行 |
+| 新增服务测试 | 11 个用例 |
+
+**版本**：`2.1.10 → 2.1.11`。

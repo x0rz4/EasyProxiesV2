@@ -67,9 +67,14 @@ type Server struct {
 	authMu sync.Mutex
 	auth   *controlplane.Auth
 
+	// settings owns the config document: validation, persistence and the
+	// hot-apply plan. Like auth it is built lazily because tests assemble
+	// Server as a literal.
+	settingsMu sync.Mutex
+	settings   *controlplane.Settings
+
 	// Concurrency control
 	probeSem            *semaphore.Weighted
-	configMutationMu    sync.Mutex
 	groupMutationMu     sync.Mutex
 	groupOperationLocks sync.Map // map[int64]*sync.Mutex
 
@@ -388,4 +393,114 @@ func (s *Server) authService() *controlplane.Auth {
 		})
 	}
 	return s.auth
+}
+
+// settingsService returns the settings domain, building it on first use. It
+// reads and writes the config through the callbacks below so the object can be
+// replaced wholesale on every save without rebinding the service.
+func (s *Server) settingsService() *controlplane.Settings {
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
+	if s.settings == nil {
+		s.settings = controlplane.NewSettings(controlplane.SettingsOptions{
+			Logger:                s.logger,
+			Config:                s.persistableConfig,
+			Commit:                s.publishConfig,
+			Runtime:               runtimeApplierOf(s.mgr),
+			Reloader:              reloaderOf(s.nodeMgr),
+			Subs:                  s.subRefresher,
+			SubStore:              storeAsRefreshStore(s.store),
+			ValidateProbeTarget:   validateProbeTarget,
+			NormalizeAvailability: monitor.NormalizeStartupAvailabilityPolicy,
+		})
+	}
+	return s.settings
+}
+
+// persistableConfig returns the config object settings are written to.
+func (s *Server) persistableConfig() *config.Config {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfgSrc
+}
+
+// publishConfig installs a freshly saved config and refreshes the local
+// runtime view the HTTP layer reads directly.
+func (s *Server) publishConfig(cfg *config.Config) {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	s.cfgSrc = cfg
+	if cfg == nil {
+		return
+	}
+	cfg.RLock()
+	defer cfg.RUnlock()
+	s.cfg.ExternalIP = cfg.ExternalIP
+	s.cfg.ProbeTarget = cfg.Management.ProbeTarget
+	s.cfg.StartupAvailabilityPolicy = cfg.Management.StartupAvailabilityPolicy
+	s.cfg.SkipCertVerify = cfg.SkipCertVerify
+	s.cfg.Password = cfg.Management.Password
+}
+
+// validateProbeTarget wraps the runtime parser so the settings service can
+// reject a bad target without importing monitor.
+func validateProbeTarget(target string) error {
+	_, err := monitor.ParseProbeTarget(target)
+	return err
+}
+
+// reloaderOf adapts the node manager to the settings service's reload port.
+// A manager that cannot reload leaves the trigger nil, which makes the service
+// report the change as pending rather than silently claiming success.
+func reloaderOf(nodeMgr controlplane.NodeManager) controlplane.ReloadTrigger {
+	if nodeMgr == nil {
+		return nil
+	}
+	return nodeMgr
+}
+
+// runtimeApplier adapts *monitor.Manager to the settings service's port. The
+// service defines its own ProbePolicy so it does not import monitor; this
+// adapter is the single place the two shapes meet.
+type runtimeApplier struct{ mgr *monitor.Manager }
+
+func (r runtimeApplier) SetStartupAvailabilityPolicy(policy string) {
+	r.mgr.SetStartupAvailabilityPolicy(policy)
+}
+
+func (r runtimeApplier) SetHealthCheckInterval(interval time.Duration) {
+	r.mgr.SetHealthCheckInterval(interval)
+}
+
+func (r runtimeApplier) UpdateProbeTarget(target string) error {
+	return r.mgr.UpdateProbeTarget(target)
+}
+
+func (r runtimeApplier) UpdateProbePolicy(policy controlplane.ProbePolicy) {
+	r.mgr.UpdateProbePolicy(monitor.ProbePolicy{
+		Concurrency:     policy.Concurrency,
+		StartupTimeout:  policy.StartupTimeout,
+		RoutineTimeout:  policy.RoutineTimeout,
+		DialTimeout:     policy.DialTimeout,
+		ResponseTimeout: policy.ResponseTimeout,
+		RoutineRetries:  policy.RoutineRetries,
+	})
+}
+
+// runtimeApplierOf returns a settings port for the manager, or nil when there
+// is no manager (which makes the service skip hot-apply entirely).
+func runtimeApplierOf(mgr *monitor.Manager) controlplane.RuntimeApplier {
+	if mgr == nil {
+		return nil
+	}
+	return runtimeApplier{mgr: mgr}
+}
+
+// storeAsRefreshStore adapts the store to the narrow fan-out port. A nil store
+// yields a nil port so the service skips the fan-out entirely.
+func storeAsRefreshStore(st store.Store) controlplane.SubscriptionRefreshStore {
+	if st == nil {
+		return nil
+	}
+	return st.(controlplane.SubscriptionRefreshStore)
 }
