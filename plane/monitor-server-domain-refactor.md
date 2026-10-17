@@ -2,26 +2,28 @@
 
 > 状态：独立设计提案。文中 `internal/httpapi` / `internal/controlplane` 为目标结构，不代表当前已存在。大型代理池路线采用责任分层，先硬化现有边界，再按证据决定是否迁移包；参见 [分层设计](changes/scale-proxy-pool/design.md)。
 >
-> **PR1 已完成（包内拆分 + 路由拉直）**，见 §11。本文档 §3–§6 描述的目标结构（新建 `httpapi` / `controlplane` 包、搬迁 `assets`、HTTP 生命周期移到 `app.Run`）**尚未开始**，仍是 PR2+ 的内容。
+> **PR1 已完成（包内拆分 + 路由拉直）**，见 §11。**PR2 已完成（HTTP 层迁到 `internal/httpapi`，含 `assets` 与 11 处构建路径引用）**，见 §13。本文档 §3.2 的 `internal/controlplane` 与 §6 的"HTTP 生命周期移到 `app.Run`"**尚未开始**，仍是 Phase 1–4 的内容。
 
 ## 1. 背景
 
 `internal/monitor/server.go` 曾集中承载全部 HTTP 路由以及认证、设置、节点管理、探测、解锁检测、订阅、分组、GeoIP、SSE、JSON 编解码和数据库访问。代码可以运行，但 HTTP 协议、业务编排、运行时控制与持久化耦合，导致后续增加缓存、限流或读写连接分离时难以限定改动范围。
 
-**当前规模**（PR1 落地后，`internal/monitor`）：
+**当前规模**（PR2 落地后）：
 
-| 项 | 数值 |
-| --- | --- |
-| `server.go` | **510 行**（PR1 前 4,261 行），只剩 embed、外部类型、`NewServer`、`SetX`、`Start`/`Shutdown` |
-| 包内非测试代码 | 11,324 行 / 31 个文件 |
-| 包内测试 | 29 个文件 / 5,716 行 / 139 个 `TestXxx`（另有 18 处 `t.Run` 子用例），已含 Phase 0 契约 |
-| 路由注册 | 100 条（`routes.go`，一行一路由） |
-| 契约用例覆盖 | 103 条（`routes_contract_test.go`，含错方法/未知路径） |
-| import 的 internal 包 | 18 个 |
+| 项 | `internal/httpapi` | `internal/monitor` |
+| --- | --- | --- |
+| 非测试代码 | 7,975 行 / 22 个文件 | 3,385 行 / 10 个文件 |
+| 测试 | 4,249 行 / 23 个文件 / 94 个 `TestXxx` | 1,520 行 / 7 个文件 / 45 个 `TestXxx` |
+| 最大文件 | `server_groups.go` 1,068 行 | `manager.go` |
+| import 的 internal 包 | 19 个 | 8 个 |
 
-按领域切分后的文件：`server_auth` 493 / `server_settings` 725 / `server_nodes` 320 / `server_nodeview` 678 / `server_import` 295 / `server_subscriptions` 230 / `server_groups` 1,067 / `server_geoip` 113 / `server_static` 36。运行态文件（`manager.go`、`node_registry.go`、`probe_scheduler.go`、`health_event_hub.go`、`nodecheck.go` 等）**未改动**。
+`httpapi/server.go` **405 行**（PR1 时 510 行），只剩 embed、外部类型、`NewServer`、`SetX`、`Start`/`Shutdown`；路由注册 100 条（`routes.go`，一行一路由），契约用例覆盖含错方法与未知路径。
+
+`internal/monitor` 现在只保留运行态：`manager.go`、`node_registry.go`、`probe_scheduler.go`、`health_event_hub.go`、`health_applier.go`、`speedtest.go`、`concurrency.go`、`context.go`，加上 PR2 新增的两个支撑文件 `ports.go`（消费方接口与领域错误的归位点，见下）与 `tag_providers.go`（`TagUnlockFactProviders` / `TagIPQualityFactProviders` / `NewTagFactRegistry`，被 `app` 与 `httpapi` 共用）。
 
 > `writeJSON` / `decodeJSON` / `writeAPIError` 并入既有的 `response.go`（而不是新建 `server_response.go`）：并行提交已把该文件建成"HTTP 响应管线"的落点（`pathID` / `requireStore` / 三个域状态函数），再开一个名字几乎相同的文件只会让人分不清该往哪加。计划里的 `server_response.go` 因此取消。
+
+> `ports.go` 的由来：`NodeManager` / `GroupRuntimeManager` / `GroupMembershipManager` / `SubscriptionRefresher` 这些**消费方定义**的接口，实现方是 `boxmgr` 与 `subscription`，但 HTTP 层也要引用它们。它们留在 `monitor` 而不是随 HTTP 层搬走，`boxmgr` 才不必 import 一个 HTTP 包来实现运行时接口——这保住了 §1 的分层方向（`httpapi → controlplane → Store / Runtime ports`，今天还是 `httpapi → monitor`）。
 
 本次改造采用三层依赖方向：
 
@@ -83,6 +85,8 @@ Handler 只允许执行方法校验、参数解析、Service 调用和 HTTP 输�
 
 前端产物迁到 `internal/httpapi/assets/`，并同步 Dockerfile、两个 GitHub Actions 工作流、README 与 AGENTS 中的输出路径。
 
+> **PR2 落地情况**：本节的搬迁目标已全部达成（§13）。实际文件名沿用了 PR1 的 `server_<域>.go` 前缀，没有改叫 `handlers_*.go` / `dto_*.go`——PR1 刚把 `server.go` 拆成这批文件，搬迁时再改一遍名字会让 diff 与 `git log --follow` 都失去意义。`dto` 也仍是与 handler 同文件的既有习惯，未单开文件。Handler 直接调用 `store` / `monitor.Manager` 的收敛属于 §3.2 的 controlplane 议题，由 Phase 2–3 处理。
+
 ## 4. 领域契约
 
 controlplane 在消费端定义窄接口，现有 SQLite Store 可同时满足多个接口：
@@ -136,9 +140,11 @@ boxmgr 删除 `monitorServer` 字段、`MonitorServer()` 和对 Server Setter �
 
 在 `internal/monitor` **包内**按领域拆文件，并删除 `action string` 二次分发。不新建包、不搬 `assets`、不改 HTTP 生命周期。这一步确立的文件边界就是后续搬迁的边界。
 
-### PR2：HTTP 层整体迁到 `internal/httpapi`
+### PR2：HTTP 层整体迁到 `internal/httpapi`（✅ 已完成，见 §13）
 
-Server 结构、全部 handler、DTO、`assets` 及 11 处构建路径引用（Dockerfile、`vite.config.ts`、2 个 workflow、README、AGENTS、.gitignore），HTTP 生命周期从 `boxmgr.MonitorServer()` 移到 `app.Run`。PR1 拉直后的路由表可原样复用。
+Server 结构、全部 handler、DTO、`assets` 及 11 处构建路径引用（Dockerfile、`vite.config.ts`、2 个 workflow、README、AGENTS、.gitignore）已全部迁移。
+
+**范围收窄（实测调整）**：原计划把"HTTP 生命周期从 `boxmgr.MonitorServer()` 移到 `app.Run`"也放进 PR2。实测发现该步骤的收益与本 PR 的搬迁目标**无关**——生命周期装配是 §6 的独立议题（"所有依赖就绪后才开放监听"），把它绑进来会让一个纯搬迁 PR 同时改启动顺序，违反 §10 的"单个 PR 过大"控制。故本 PR **只搬不装配**：`boxmgr` 仍持有 `*httpapi.Server` 并调用 `httpapi.NewServer`，HTTP 生命周期迁移留到 Phase 4。
 
 ### Phase 0：冻结契约（进行中）
 
@@ -218,6 +224,17 @@ Server 结构、全部 handler、DTO、`assets` 及 11 处构建路径引用（D
 6. ✅ `internal/boxmgr` / `internal/subscription` / `internal/app` 的 diff 为空。
 7. ✅ `git status` 不含 `internal/monitor/assets/` 的路径变更。
 8. ✅ `gofmt` / `go vet` 干净；生产 tags 构建通过。
+
+**PR2 判据**（已全部满足，详见 §13）：
+
+1. ✅ HTTP 层（Server、全部 handler、DTO、路由、响应管线、`assets`）整体位于 `internal/httpapi`；`internal/monitor` 只剩运行态。
+2. ✅ `grep -rn "internal/httpapi" internal/monitor/*.go` 无输出（无环）。
+3. ✅ 11 处构建路径引用全部指向 `internal/httpapi/assets/`，`.gitignore` 规则同步（产物仍不入库）。
+4. ✅ 路由、JSON 形状、SSE 事件、状态码与错误文案零变化——无产品逻辑改动，纯搬迁。
+5. ✅ `go build ./...` / `go test ./... -count=1`（27 包）/ `go vet ./...` 全绿；生产 tags 构建通过。
+6. ✅ 跨包只新增 6 个产品符号 + 2 个测试口子，每个都有不可替代的理由（§13 表）。
+7. ⬜ `go test -race`（本机无 gcc/CGO）与手动冒烟留给 CI。
+8. ⬜ HTTP 生命周期**未**迁移到 `app.Run`，按 §7 的范围收窄留到 Phase 4。
 
 ## 10. 风险与控制
 
@@ -305,3 +322,72 @@ go build -tags "with_utls with_quic with_grpc with_wireguard with_gvisor" \
 **踩到的坑（值得记录）**：首版 fixture 走 `config.LoadForReload` + `geoip.database_path: ""`，以为能构造"未配置"场景。实际 `applyDefaults` 会给空路径填 `GeoLite2-Country.mmdb`，于是该用例**真的发起了下载**，跑了 124 秒并返回 500。改成直接构造 `&config.Config{}` 并把 `GeoIP.DatabasePath` 设为空，用例从 124s 降到 0.00s。教训：涉及网络路径的"早退"断言，必须确认 fixture 真的落在那条分支上——慢，就是没落上。
 
 **版本**：`2.1.6 → 2.1.7`。
+
+## 13. PR2 完成记录
+
+**范围**：把 HTTP 层从 `internal/monitor` 整体迁到新包 `internal/httpapi`。纯搬迁——不改路由、不改 DTO 字段、不改状态码、不改错误文案、不改装配顺序。
+
+**搬迁结果**
+
+| | 迁到 `internal/httpapi` | 留在 `internal/monitor` |
+| --- | --- | --- |
+| 产品文件 | 22 个 / 7,975 行 | 10 个 / 3,385 行 |
+| 测试文件 | 23 个 / 4,249 行 / 94 用例 | 7 个 / 1,520 行 / 45 用例 |
+
+按 `git mv` 搬迁，保留文件历史。`assets/` 目录同步从 `internal/monitor/assets/` 移到 `internal/httpapi/assets/`，并更新 11 处引用：`Dockerfile`、`frontend/vite.config.ts`、`.github/workflows/build-and-release.yml`（2 处）、`.github/workflows/docker-publish.yml`、`.gitignore`、`.tools/binary-workflow-header.txt`（2 处）、`README.md`、`AGENTS.md`（2 处）。`.gitignore` 的忽略规则一并改到新路径——**产物不入库的前提不能因为搬家而失效**。
+
+**边界与依赖方向**
+
+`internal/monitor` **不 import** `internal/httpapi`（已验证零命中），所以不存在环。反向只有一处：`boxmgr` 现在 import `httpapi`，4 处使用（`monitorServer` 字段类型、`MonitorServer()` 返回类型、局部 `serverToStart`、`httpapi.NewServer` 调用）。`internal/app` **不 import** `httpapi`——它经 `boxMgr.MonitorServer()` 拿到 `*httpapi.Server` 后只调 `Start`/`Shutdown`；app 对 `monitor` 的 3 处引用（`monitor.Config`、`monitor.NewTagFactRegistry`、`monitor.TagUnlockFactProviders`）都是运行时符号，未受影响。
+
+**为跨包而新开的口子（6 个符号 + 2 个文件）**
+
+搬迁必然要把 `httpapi` 用到的包内符号导出。逐一说明为什么是这个口子而不是别的：
+
+| 符号 | 原形态 | 导出理由 |
+| --- | --- | --- |
+| `monitor.EffectiveProbeConcurrency` | `effectiveProbeConcurrency` | `/api/operations/probe-status` 要按同一口径估算并发与轮次；重算一份必然与运行时漂移 |
+| `monitor.NormalizeStartupAvailabilityPolicy` | `normalizeStartupAvailabilityPolicy` | 设置页写入前要按运行时同一规则归一，否则存进去的值与生效值不同 |
+| `monitor.ParseProbeTarget` | `parseProbeTarget` | 设置校验必须与运行时解析同一个目标 |
+| `monitor.InitialProbeRetryDelay` | `initialProbeRetryDelay` | 出现在 `probe-status` 的耗时估算公式里，是与运行时的共享常量 |
+| `monitor.CollectLimited` / `monitor.RunLimited` | `collectLimited` / `runLimited` | 泛型并发原语，HTTP 批处理（探活/解锁/检测）与运行时探测共用同一套上限语义 |
+| `monitor.NewTagFactRegistry` / `TagUnlockFactProviders` / `TagIPQualityFactProviders` | 在 `tag_schema.go` | 本来 `httpapi` 的标签路由要用，但 `app` 也要用（装配标签服务）。**没有跟着 HTTP 层搬走**，否则 `app` 就得为了拿事实提供者去 import 一个 HTTP 包。新开 `tag_providers.go` 安放 |
+
+**测试用到的两个新口子**（不是为搬而搬，是测试真正需要、但包边界挡住了）：
+
+- `Manager.PublishHealthResult`（原 `publishHealthResult`）：跨包后测试无法再访问未导出方法。它对外的语义是"通过探针路径使用的同一个 FIFO 投递事件"，`health_boundaries_test.go` 需要它作为**顺序屏障**——发布一个 `SnapshotOnly` 标记，只有在此前发布的事件的回调全部跑完后才会被观察到，从而不靠 sleep 就能断言"诊断不产生健康事件"。文档注释已写明它同时是投递口，不只是排序口（成功事件会真的驱动分组恢复）。
+- `Manager.BeginProbeLease` / `EndProbeLease`（原 `beginTagProbe` / `endTagProbe`）：`NewManager` 就启动调度 goroutine，每 tag 的租约是真实并发原语（占住它，调度器就跳过该 tag）。`operations_test.go` 用它把节点钉在初始收敛队列里，才能断言 `probe-status` 的 `queued` 深度。
+
+这两个都是**把已有的真实机制暴露出来**，而不是为测试新造钩子；`monitor` 包内的 `health_events_test.go` 与 `probe_scheduler_test.go` 改用同一组导出名，未新增重复实现。
+
+**ports.go**：`NodeManager` / `GroupRuntimeManager` / `GroupMembershipManager` / `SubscriptionRefresher` / `SubscriptionStatus` / `ManagedNodeConfig` / 哨兵错误（`ErrNodeNotFound` 等）/ `NodeDuplicateError` 从 `server.go` 拆出到此文件，**留在 `monitor`**。这些是消费方定义的接口，实现方是 `boxmgr` / `subscription`；它们若跟着 HTTP 层走，`boxmgr` 就要 import 一个 HTTP 包来实现运行时接口，依赖方向当场反转。
+
+**未搬迁的两处（有意）**
+
+- **HTTP 生命周期**仍由 `boxmgr` 持有（`httpapi.NewServer` / `MonitorServer()`），未移到 `app.Run`。理由见 §7 PR2 的范围收窄说明。
+- **`tag_schema.go` 与 `tag_handlers.go` 的划分**：标签的 HTTP 面（handler、DTO、路由分发）随 HTTP 层搬走，成为 `httpapi/tag_handlers.go` + `httpapi/tag_schema.go`；但事实提供者与注册表工厂留在 `monitor/tag_providers.go`。两者同名不同职责，阅读时注意。
+
+**过程中踩到的坑**
+
+1. **迁移期批量加包名前缀的正则伤了自身**：把 `monitor.` 前缀批量加到搬迁文件上时，正则也命中了结构体字面量的字段名（`monitor.Config{monitor.ProbeTarget: ...}`）、本包内新声明的方法接收者（`func (m *serialGroupRuntimeManager) monitor.GroupRuntimeStatus(...)`）以及局部类型声明。这些逐条手工回退。**教训：跨包搬迁的前缀改写必须按"调用位置"而不是"文本出现"来做**，`gofmt`/`go vet` 能抓到它们，但要在一次编译里全部暴露出来（用 `go test -run XXX_NONE` 一次性收齐）而不是一个个修。
+2. **`tag_schema.go` 拆分时丢掉文件头**：脚本从 `type tagSchemaLimits` 开始写 `rest`，导致新文件没有 `package` 声明与 import 块，报 `expected 'package', found 'type'`。补回完整头部。
+3. **测试 helper 不能跨包 import**：Go 的 `_test.go` 符号对其他包不可见。`health_boundaries_test.go` 拆出一半到 `httpapi` 后，原先复用的 `newPersistentHealthFixture` 拿不到，只能在 `httpapi` 内联一份 `newHealthFixture`；`monitor` 侧保留 5 个不需要 HTTP 层的用例。导出测试夹具会把测试代码打进生产二进制，不做。
+
+**验证命令与结果**
+
+```bash
+go build ./...                       # OK
+go test ./... -count=1               # 27 个包全绿（含 httpapi 20.2s / monitor 4.9s）
+go vet ./...                         # 全模块零输出
+gofmt -l <changed>                   # 干净（CRLF 用 tr -d '\r' 预处理后检查，7 个文件曾被 gofmt 判定不合格，均为空行/import 排序/结构体对齐/缺尾换行，已格式化）
+go build -tags "with_utls with_quic with_grpc with_wireguard with_gvisor" \
+  -o /tmp/ep ./cmd/easy_proxies      # 通过（GOPROXY=https://goproxy.cn），71 MB
+```
+
+`-mod=mod` 会顺手把 `golang.org/x/text` 从 indirect 挪到 direct，构建后已 `git checkout -- go.mod` 还原；`golang.org/x/net` 仍钉在 `v0.50.0`（AGENTS.md §10.10）。
+
+**未覆盖**：`go test -race` 本地跑不了（本机无 gcc/CGO），留给 CI。
+
+**版本**：`2.1.7 → 2.1.8`。
+
+**观察到的既有 flake（非本次引入）**：全量 `go test ./...` 首轮时 `internal/nodetag` 的 `TestQueueSweepsAndSurvivesFailures` 失败一次（`a failed recompute must be reported: [nodetag: 自动标签重算失败: 数据库忙]`）。该包在本次改动中**零修改**（`git status --internal/nodetag/` 为空）；用例用 20ms sweep 间隔并要求至少两条日志，在整仓测试争抢 CPU 时会少记一条。单独 `-count=20` 与重跑全量均通过。属于需要放宽时间假设的既有问题，不在本 PR 修（避免把 flake 修复混进纯搬迁）。

@@ -19,6 +19,7 @@ import (
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/group"
 	"easy_proxies/internal/groupmember"
+	"easy_proxies/internal/httpapi"
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/netx"
 	"easy_proxies/internal/nodecodec"
@@ -74,7 +75,7 @@ type Manager struct {
 
 	currentBox    *box.Box
 	monitorMgr    *monitor.Manager
-	monitorServer *monitor.Server
+	monitorServer *httpapi.Server
 	cfg           *config.Config
 	monitorCfg    monitor.Config
 	store         store.Store
@@ -1072,7 +1073,7 @@ func (m *Manager) MonitorManager() *monitor.Manager {
 }
 
 // MonitorServer returns the monitor HTTP server.
-func (m *Manager) MonitorServer() *monitor.Server {
+func (m *Manager) MonitorServer() *httpapi.Server {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.monitorServer
@@ -1917,10 +1918,10 @@ func (m *Manager) ensureMonitor(ctx context.Context) error {
 	monitorMgr.SetProbeStore(m.store)
 	m.monitorMgr = monitorMgr
 
-	var serverToStart *monitor.Server
+	var serverToStart *httpapi.Server
 	if m.monitorCfg.Enabled {
 		if m.monitorServer == nil {
-			serverToStart = monitor.NewServer(m.monitorCfg, monitorMgr, log.Default())
+			serverToStart = httpapi.NewServer(m.monitorCfg, monitorMgr, log.Default())
 			serverToStart.SetConfig(m.cfg)
 			serverToStart.SetStore(m.store)
 			m.monitorServer = serverToStart

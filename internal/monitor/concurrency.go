@@ -6,7 +6,7 @@ import "golang.org/x/sync/errgroup"
 // returns results as tasks finish. Submission happens on a coordinator
 // goroutine so callers can consume streaming results while SetLimit applies
 // backpressure to the remaining work.
-func collectLimited[T, R any](limit int, values []T, run func(T) R) <-chan R {
+func CollectLimited[T, R any](limit int, values []T, run func(T) R) <-chan R {
 	results := make(chan R, len(values))
 	if len(values) == 0 {
 		close(results)
@@ -36,7 +36,7 @@ func collectLimited[T, R any](limit int, values []T, run func(T) R) <-chan R {
 }
 
 // runLimited is the side-effect-only form of collectLimited.
-func runLimited[T any](limit int, values []T, run func(T)) {
+func RunLimited[T any](limit int, values []T, run func(T)) {
 	if len(values) == 0 {
 		return
 	}

@@ -51,7 +51,7 @@ const (
 
 var ErrProbeRoundInProgress = errors.New("probe round already in progress")
 
-const initialProbeRetryDelay = 500 * time.Millisecond
+const InitialProbeRetryDelay = 500 * time.Millisecond
 
 type ProbePolicy struct {
 	Concurrency     int           `json:"probe_concurrency"`
@@ -154,7 +154,7 @@ func autoProbeConcurrency(nodeCount int) int {
 	return workerLimit
 }
 
-func effectiveProbeConcurrency(configured, nodeCount int) int {
+func EffectiveProbeConcurrency(configured, nodeCount int) int {
 	workerLimit := configured
 	if workerLimit <= 0 {
 		workerLimit = autoProbeConcurrency(nodeCount)
@@ -404,7 +404,7 @@ func NewManager(cfg Config) (*Manager, error) {
 	}
 	m.SetStartupAvailabilityPolicy(cfg.StartupAvailabilityPolicy)
 	if strings.TrimSpace(cfg.ProbeTarget) != "" {
-		target, err := parseProbeTarget(cfg.ProbeTarget)
+		target, err := ParseProbeTarget(cfg.ProbeTarget)
 		if err != nil {
 			cancel()
 			return nil, err
@@ -420,7 +420,7 @@ func NewManager(cfg Config) (*Manager, error) {
 	return m, nil
 }
 
-func normalizeStartupAvailabilityPolicy(policy string) string {
+func NormalizeStartupAvailabilityPolicy(policy string) string {
 	if strings.EqualFold(strings.TrimSpace(policy), StartupAvailabilityStrict) {
 		return StartupAvailabilityStrict
 	}
@@ -428,7 +428,7 @@ func normalizeStartupAvailabilityPolicy(policy string) string {
 }
 
 func (m *Manager) SetStartupAvailabilityPolicy(policy string) {
-	normalized := normalizeStartupAvailabilityPolicy(policy)
+	normalized := NormalizeStartupAvailabilityPolicy(policy)
 	m.availabilityMu.Lock()
 	changed := m.startupAvailabilityPolicy != "" && m.startupAvailabilityPolicy != normalized
 	m.startupAvailabilityPolicy = normalized
@@ -873,7 +873,7 @@ func (m *Manager) SetProbeTarget(target string) error {
 		m.probeScheduler.reschedulePeriodic()
 		return nil
 	}
-	parsed, err := parseProbeTarget(target)
+	parsed, err := ParseProbeTarget(target)
 	if err != nil {
 		return err
 	}
@@ -887,7 +887,7 @@ func (m *Manager) SetProbeTarget(target string) error {
 	return nil
 }
 
-func parseProbeTarget(raw string) (ProbeTarget, error) {
+func ParseProbeTarget(raw string) (ProbeTarget, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return ProbeTarget{}, errors.New("probe target is empty")
@@ -1118,10 +1118,10 @@ func (m *Manager) Probe(ctx context.Context, tag string) (time.Duration, error) 
 	if probe == nil {
 		return 0, errors.New("probe not available for this node")
 	}
-	if !m.beginTagProbe(tag) {
+	if !m.BeginProbeLease(tag) {
 		return 0, errors.New("probe already in progress for this node")
 	}
-	defer m.endTagProbe(tag)
+	defer m.EndProbeLease(tag)
 	policy := m.ProbePolicy()
 	probeCtx, cancel := context.WithTimeout(ctx, policy.RoutineTimeout)
 	defer cancel()
@@ -1168,11 +1168,19 @@ func entryRuntimeTag(e *entry) string {
 	return tag
 }
 
-func (m *Manager) beginTagProbe(tag string) bool {
+// BeginProbeLease reserves the per-tag probe lease and reports whether it was
+// free. While a lease is held the scheduler skips that tag, so the lease is how
+// a caller claims exclusive right to probe a node. It is exported for callers
+// that need to hold a node out of the automatic rounds — most notably the HTTP
+// layer observing initial-convergence queue depth without letting the round
+// drain it. Release with EndProbeLease; a lease that is never released wedges
+// automatic probing for that tag.
+func (m *Manager) BeginProbeLease(tag string) bool {
 	return m.probeScheduler.beginTagProbe(tag)
 }
 
-func (m *Manager) endTagProbe(tag string) {
+// EndProbeLease releases a lease taken by BeginProbeLease.
+func (m *Manager) EndProbeLease(tag string) {
 	m.probeScheduler.endTagProbe(tag)
 }
 
@@ -1209,7 +1217,7 @@ func (m *Manager) projectHealthResult(e *entry, latency time.Duration, probeErr 
 	if probeErr != nil {
 		event.Error = probeErr.Error()
 	}
-	m.publishHealthResult(event)
+	m.PublishHealthResult(event)
 }
 
 // MarkAvailableWithoutProbe preserves the no-target behavior for in-memory
@@ -1414,7 +1422,14 @@ func (m *Manager) SubscribeHealthResultsFor(tags []string, nodeIDs []int64, call
 	return m.healthEvents.subscribe(tags, nodeIDs, false, callback)
 }
 
-func (m *Manager) publishHealthResult(event HealthResultEvent) {
+// PublishHealthResult delivers event to every health-result subscriber through
+// the same FIFO the probe path uses. Exported because out-of-package consumers
+// (the HTTP layer) need to act as a barrier over that FIFO: a SnapshotOnly
+// marker published here is only observed after the callbacks for everything
+// published before it have already run. Use it for ordering, not to inject
+// health facts — a success event delivered here drives group recovery exactly
+// like a probe result.
+func (m *Manager) PublishHealthResult(event HealthResultEvent) {
 	m.healthEvents.publish(event)
 }
 

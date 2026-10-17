@@ -13,7 +13,7 @@ func TestCollectLimitedBoundsConcurrencyAndReturnsEveryResult(t *testing.T) {
 		values[index] = index
 	}
 	var active, maximum atomic.Int64
-	results := collectLimited(3, values, func(value int) int {
+	results := CollectLimited(3, values, func(value int) int {
 		current := active.Add(1)
 		for {
 			previous := maximum.Load()
@@ -52,7 +52,7 @@ func TestRunLimitedNormalizesInvalidAndOversizedLimits(t *testing.T) {
 	}{{"invalid", 0, 1}, {"oversized", 10, 2}} {
 		t.Run(test.name, func(t *testing.T) {
 			var active, maximum atomic.Int64
-			runLimited(test.limit, []int{1, 2}, func(int) {
+			RunLimited(test.limit, []int{1, 2}, func(int) {
 				current := active.Add(1)
 				for {
 					previous := maximum.Load()
@@ -71,7 +71,7 @@ func TestRunLimitedNormalizesInvalidAndOversizedLimits(t *testing.T) {
 }
 
 func TestCollectLimitedEmptyInputClosesImmediately(t *testing.T) {
-	if _, ok := <-collectLimited[int, int](4, nil, func(value int) int { return value }); ok {
+	if _, ok := <-CollectLimited[int, int](4, nil, func(value int) int { return value }); ok {
 		t.Fatal("empty result channel remained open")
 	}
 }

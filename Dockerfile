@@ -19,7 +19,7 @@ ARG GOPROXY=https://goproxy.cn,https://goproxy.io,direct
 RUN go env -w GOPROXY=${GOPROXY} && go mod download
 COPY . .
 # Copy frontend build output into the embed directory
-COPY --from=frontend /frontend-dist/ ./internal/monitor/assets/
+COPY --from=frontend /frontend-dist/ ./internal/httpapi/assets/
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -tags "with_utls with_quic with_grpc with_wireguard with_gvisor" -o easy-proxies ./cmd/easy_proxies
 
 # ── Stage 3: Runtime ───────────────────────────────────────────

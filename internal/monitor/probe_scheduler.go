@@ -352,7 +352,7 @@ func (s *probeScheduler) run() {
 			if event.done {
 				if active.startup && active.attempt == 1 && len(active.retry) > 0 {
 					if active.ctx.Err() == nil {
-						retryTimer = time.NewTimer(initialProbeRetryDelay)
+						retryTimer = time.NewTimer(InitialProbeRetryDelay)
 						retryC = retryTimer.C
 						continue
 					}
@@ -484,9 +484,9 @@ func (s *probeScheduler) startActiveRound(active *activeProbeRound) {
 }
 
 func (s *probeScheduler) launchInitialWave(active *activeProbeRound, items []probeWorkItem, attempt int, commitFailure bool) {
-	limit := effectiveProbeConcurrency(active.policy.Concurrency, len(items))
+	limit := EffectiveProbeConcurrency(active.policy.Concurrency, len(items))
 	go func(roundID uint64) {
-		results := collectLimited(limit, items, func(item probeWorkItem) ProbeBatchResult {
+		results := CollectLimited(limit, items, func(item probeWorkItem) ProbeBatchResult {
 			return s.probeInitialAttempt(active.ctx, item, active.policy, attempt, commitFailure)
 		})
 		for result := range results {
@@ -499,9 +499,9 @@ func (s *probeScheduler) launchInitialWave(active *activeProbeRound, items []pro
 }
 
 func (s *probeScheduler) launchRoutineWave(active *activeProbeRound, items []probeWorkItem) {
-	limit := effectiveProbeConcurrency(active.policy.Concurrency, len(items))
+	limit := EffectiveProbeConcurrency(active.policy.Concurrency, len(items))
 	go func(roundID uint64) {
-		results := collectLimited(limit, items, func(item probeWorkItem) ProbeBatchResult {
+		results := CollectLimited(limit, items, func(item probeWorkItem) ProbeBatchResult {
 			return s.probeRoutineItem(active.ctx, item, active.policy)
 		})
 		for result := range results {

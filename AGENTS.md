@@ -28,7 +28,7 @@ EasyProxiesV2 是一个基于 [sing-box](https://github.com/SagerNet/sing-box)�
 cmd/easy_proxies/main.go      入口：加载 config → app.Run
 internal/                     全部后端包（见 §3）
 frontend/src/                 React 源码（components/ api/ types/ utils/）
-internal/monitor/assets/      前端构建产物，被 //go:embed assets/* 内嵌（gitignore，禁止手改）
+internal/httpapi/assets/      前端构建产物，被 //go:embed assets/* 内嵌（gitignore，禁止手改）
 plane/README.md               文档入口：当前规格 specs/、变更计划 changes/、专题与历史记录
 config.example.yaml           配置模板（复制为 config.yaml 使用；config.yaml 不入库）
 Dockerfile / Dockerfile.ci    本地全量构建 / CI 只带产物的运行时镜像
@@ -152,15 +152,15 @@ go test ./...
 # 前端
 cd frontend && npm ci
 cd frontend && npm run dev                     # Vite 开发服务器
-cd frontend && npm run lint && npm run build    # ESLint + tsc -b + vite build（产物直接落到 internal/monitor/assets）
-cd frontend && npx vite build                   # 只刷新内嵌产物（vite.config.ts 已指向 ../internal/monitor/assets）
+cd frontend && npm run lint && npm run build    # ESLint + tsc -b + vite build（产物直接落到 internal/httpapi/assets）
+cd frontend && npx vite build                   # 只刷新内嵌产物（vite.config.ts 已指向 ../internal/httpapi/assets）
 
 # 容器
 docker compose up -d --build
 ```
 
-**构建顺序陷阱**：`internal/monitor/server.go` 有 `//go:embed assets/*`，**没有前端产物时 `go build ./...` 必然失败**（`pattern assets/*: no matching files found`）。
-先跑前端构建；若只想验证纯后端改动，可临时放一个占位 `internal/monitor/assets/index.html`，**验完必须删掉**（否则会打出 stub UI 的二进制）。
+**构建顺序陷阱**：`internal/httpapi/server.go` 有 `//go:embed assets/*`，**没有前端产物时 `go build ./...` 必然失败**（`pattern assets/*: no matching files found`）。
+先跑前端构建；若只想验证纯后端改动，可临时放一个占位 `internal/httpapi/assets/index.html`，**验完必须删掉**（否则会打出 stub UI 的二进制）。
 
 **交叉编译 Linux**（与 Dockerfile / CI 一致）：
 

@@ -62,7 +62,7 @@ func TestHealthResultsDispatchOnlyToMatchingSubscriptions(t *testing.T) {
 	defer unsubscribeUnrelated()
 
 	// Matching both indexes must still invoke the subscription exactly once.
-	mgr.publishHealthResult(HealthResultEvent{Tag: "node-a", NodeID: 7, Success: true})
+	mgr.PublishHealthResult(HealthResultEvent{Tag: "node-a", NodeID: 7, Success: true})
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) && (global.Load() != 1 || matching.Load() != 1) {
 		time.Sleep(time.Millisecond)
@@ -70,7 +70,7 @@ func TestHealthResultsDispatchOnlyToMatchingSubscriptions(t *testing.T) {
 	if global.Load() != 1 || matching.Load() != 1 || unrelated.Load() != 0 {
 		t.Fatalf("first dispatch: global=%d matching=%d unrelated=%d", global.Load(), matching.Load(), unrelated.Load())
 	}
-	mgr.publishHealthResult(HealthResultEvent{Tag: "node-c", NodeID: 9, Success: true})
+	mgr.PublishHealthResult(HealthResultEvent{Tag: "node-c", NodeID: 9, Success: true})
 	deadline = time.Now().Add(time.Second)
 	for time.Now().Before(deadline) && global.Load() != 2 {
 		time.Sleep(time.Millisecond)

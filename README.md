@@ -242,7 +242,7 @@ docker compose up -d --build
 - `cmd/easy_proxies/`: Go 程序入口
 - `frontend/`: 前端源码
 - `internal/`: 后端核心模块
-- `internal/monitor/assets/`: 前端构建产物（会被 Go embed）
+- `internal/httpapi/assets/`: 前端构建产物（会被 Go embed）
 - `.github/workflows/build-and-release.yml`: 自动构建与发布流程
 
 ---

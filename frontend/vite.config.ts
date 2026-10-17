@@ -9,7 +9,7 @@ export default defineConfig({
     react()
   ],
   build: {
-    outDir: '../internal/monitor/assets',
+    outDir: '../internal/httpapi/assets',
     emptyOutDir: true,
   },
 })

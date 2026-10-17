@@ -11,7 +11,7 @@ import (
 	"easy_proxies/internal/store"
 )
 
-func newPersistentHealthFixture(t *testing.T) (*Manager, store.Store, *store.Node) {
+func NewPersistentHealthFixture(t *testing.T) (*Manager, store.Store, *store.Node) {
 	t.Helper()
 	db, err := store.Open(filepath.Join(t.TempDir(), "health.db"))
 	if err != nil {
@@ -33,7 +33,7 @@ func newPersistentHealthFixture(t *testing.T) (*Manager, store.Store, *store.Nod
 }
 
 func TestPersistentHealthProjectionIsIdempotent(t *testing.T) {
-	mgr, db, node := newPersistentHealthFixture(t)
+	mgr, db, node := NewPersistentHealthFixture(t)
 	handle := mgr.HandleForNodeID(node.ID)
 	handle.SetProbe(func(context.Context) (time.Duration, error) { return 17 * time.Millisecond, nil })
 	if _, err := mgr.Probe(context.Background(), "health@v1"); err != nil {
@@ -70,7 +70,7 @@ func TestPersistentHealthProjectionIsIdempotent(t *testing.T) {
 }
 
 func TestHealthResultCannotCrossIdentityReplacement(t *testing.T) {
-	mgr, db, node := newPersistentHealthFixture(t)
+	mgr, db, node := NewPersistentHealthFixture(t)
 	mgr.HandleForNodeID(node.ID).SetProbe(func(context.Context) (time.Duration, error) {
 		node.URI = "http://127.0.0.2:12345"
 		return time.Millisecond, db.UpdateNode(context.Background(), node)

@@ -20,10 +20,10 @@ func TestProbeConcurrencyFormula(t *testing.T) {
 			t.Fatalf("autoProbeConcurrency(%d) = %d, want %d", test.nodes, got, test.want)
 		}
 	}
-	if got := effectiveProbeConcurrency(17, 1000); got != 17 {
+	if got := EffectiveProbeConcurrency(17, 1000); got != 17 {
 		t.Fatalf("explicit concurrency = %d, want 17", got)
 	}
-	if got := effectiveProbeConcurrency(64, 12); got != 12 {
+	if got := EffectiveProbeConcurrency(64, 12); got != 12 {
 		t.Fatalf("concurrency was not capped to node count: %d", got)
 	}
 }
@@ -164,7 +164,7 @@ func TestStartupProbeRetriesOnceAfterBackoff(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if attempts.Load() != 2 || summary.Failed != 1 || time.Since(started) != initialProbeRetryDelay {
+		if attempts.Load() != 2 || summary.Failed != 1 || time.Since(started) != InitialProbeRetryDelay {
 			t.Fatalf("attempts=%d elapsed=%v summary=%+v", attempts.Load(), time.Since(started), summary)
 		}
 		snapshot := mgr.SnapshotForTag("startup-node")
@@ -543,7 +543,7 @@ func TestInitialConvergenceRetriesBusyTagAfterLeaseRelease(t *testing.T) {
 		calls.Add(1)
 		return time.Millisecond, nil
 	})
-	if !mgr.beginTagProbe("busy-initial") {
+	if !mgr.BeginProbeLease("busy-initial") {
 		t.Fatal("failed to reserve test tag")
 	}
 	mgr.RequestProbeTagsOnce([]string{"busy-initial"})
@@ -551,7 +551,7 @@ func TestInitialConvergenceRetriesBusyTagAfterLeaseRelease(t *testing.T) {
 	if calls.Load() != 0 || mgr.InitialProbeStatus().Queued != 1 {
 		t.Fatalf("busy tag did not remain queued: calls=%d status=%+v", calls.Load(), mgr.InitialProbeStatus())
 	}
-	mgr.endTagProbe("busy-initial")
+	mgr.EndProbeLease("busy-initial")
 	waitForInitialConvergence(t, mgr)
 	if calls.Load() != 1 {
 		t.Fatalf("busy tag calls = %d, want 1", calls.Load())
@@ -592,7 +592,7 @@ func TestInitialProbeAttemptsUseIndependentTimeouts(t *testing.T) {
 		if runErr != nil {
 			t.Fatal(runErr)
 		}
-		wantElapsed := 2*attemptTimeout + initialProbeRetryDelay
+		wantElapsed := 2*attemptTimeout + InitialProbeRetryDelay
 		if attempts.Load() != 2 || summary.Failed != 1 || time.Since(started) != wantElapsed {
 			t.Fatalf("attempts=%d elapsed=%v want=%v summary=%+v", attempts.Load(), time.Since(started), wantElapsed, summary)
 		}
@@ -727,10 +727,10 @@ func TestCancellingStartupRoundDuringBackoffReturnsPromptly(t *testing.T) {
 	if attempts.Load() != 1 {
 		t.Fatalf("attempts after cancellation = %d, want 1", attempts.Load())
 	}
-	if !mgr.beginTagProbe("cancel-backoff") {
+	if !mgr.BeginProbeLease("cancel-backoff") {
 		t.Fatal("probe lease was not released after cancelling retry delay")
 	}
-	mgr.endTagProbe("cancel-backoff")
+	mgr.EndProbeLease("cancel-backoff")
 }
 
 func TestInitialProbeBackoffDoesNotOccupyWorker(t *testing.T) {
@@ -803,8 +803,8 @@ func TestStoppingInitialConvergenceReleasesLeaseWithoutMarkingFailure(t *testing
 	deadline := time.Now().Add(time.Second)
 	released := false
 	for time.Now().Before(deadline) {
-		if mgr.beginTagProbe("cancel-initial") {
-			mgr.endTagProbe("cancel-initial")
+		if mgr.BeginProbeLease("cancel-initial") {
+			mgr.EndProbeLease("cancel-initial")
 			released = true
 			break
 		}
@@ -836,13 +836,13 @@ func TestProbeBatchRuntimeTagMigrationReleasesOldLeaseAndSkipsOldResult(t *testi
 		return time.Millisecond, nil
 	}
 	handle.SetProbe(oldProbe)
-	if !mgr.beginTagProbe("node@v1") {
+	if !mgr.BeginProbeLease("node@v1") {
 		t.Fatal("failed to reserve old runtime tag")
 	}
 	done := make(chan ProbeBatchResult, 1)
 	go func() {
 		result := mgr.probeScheduler.probeRoutineItem(t.Context(), probeWorkItem{entry: handle.ref, tag: "node@v1", name: "old", probe: oldProbe}, ProbePolicy{RoutineTimeout: time.Second, DialTimeout: time.Second, ResponseTimeout: time.Second})
-		mgr.endTagProbe("node@v1")
+		mgr.EndProbeLease("node@v1")
 		done <- result
 	}()
 	<-probeStarted
@@ -859,10 +859,10 @@ func TestProbeBatchRuntimeTagMigrationReleasesOldLeaseAndSkipsOldResult(t *testi
 	if snapshot := mgr.SnapshotForTag("node@v2"); snapshot == nil || snapshot.InitialCheckDone {
 		t.Fatalf("old generation result leaked into v2: %+v", snapshot)
 	}
-	if !mgr.beginTagProbe("node@v1") {
+	if !mgr.BeginProbeLease("node@v1") {
 		t.Fatal("old runtime tag lease was not released")
 	}
-	mgr.endTagProbe("node@v1")
+	mgr.EndProbeLease("node@v1")
 	mgr.RequestProbeTagsOnce([]string{"node@v2"})
 	waitForInitialConvergence(t, mgr)
 	if newCalls.Load() != 1 {
