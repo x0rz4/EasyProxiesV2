@@ -10,27 +10,27 @@ import (
 	"testing"
 
 	"easy_proxies/internal/config"
-	"easy_proxies/internal/monitor"
+	"easy_proxies/internal/controlplane"
 )
 
 type importNodeManager struct {
 	reloadNodeManager
-	existing []monitor.ManagedNodeConfig
+	existing []controlplane.ManagedNodeConfig
 	created  []config.NodeConfig
 }
 
-func (m *importNodeManager) ListConfigNodes(context.Context, *int64) ([]monitor.ManagedNodeConfig, error) {
-	return append([]monitor.ManagedNodeConfig(nil), m.existing...), nil
+func (m *importNodeManager) ListConfigNodes(context.Context, *int64) ([]controlplane.ManagedNodeConfig, error) {
+	return append([]controlplane.ManagedNodeConfig(nil), m.existing...), nil
 }
 
 func (m *importNodeManager) CreateNode(_ context.Context, node config.NodeConfig) (config.NodeConfig, error) {
 	m.created = append(m.created, node)
-	m.existing = append(m.existing, monitor.ManagedNodeConfig{Name: node.Name, URI: node.URI})
+	m.existing = append(m.existing, controlplane.ManagedNodeConfig{Name: node.Name, URI: node.URI})
 	return node, nil
 }
 
 func TestImportHTTPProxyGeneratesUniqueNames(t *testing.T) {
-	manager := &importNodeManager{existing: []monitor.ManagedNodeConfig{{Name: "imported-1", URI: "http://existing.example:80"}}}
+	manager := &importNodeManager{existing: []controlplane.ManagedNodeConfig{{Name: "imported-1", URI: "http://existing.example:80"}}}
 	server := &Server{nodeMgr: manager}
 	content := "[proxy](http://mscaei8ikxp4:rr62tghfcit1twh@104.207.47.150:3129)\nhttp://other:secret@198.51.100.9:8080"
 	body, err := json.Marshal(map[string]string{"content": content})
@@ -64,7 +64,7 @@ func TestImportHTTPProxyGeneratesUniqueNames(t *testing.T) {
 }
 
 func TestImportSuffixesExplicitDuplicateNameAndSkipsDuplicateIdentity(t *testing.T) {
-	manager := &importNodeManager{existing: []monitor.ManagedNodeConfig{{Name: "proxy", URI: "http://existing.example:80"}}}
+	manager := &importNodeManager{existing: []controlplane.ManagedNodeConfig{{Name: "proxy", URI: "http://existing.example:80"}}}
 	server := &Server{nodeMgr: manager}
 	content := "http://new.example:80#proxy\nhttp://EXISTING.example#different-name"
 	body, _ := json.Marshal(map[string]string{"content": content})
@@ -86,7 +86,7 @@ func TestImportSuffixesExplicitDuplicateNameAndSkipsDuplicateIdentity(t *testing
 func TestNodeDuplicateErrorReturnsConflictWithExistingID(t *testing.T) {
 	server := &Server{}
 	response := httptest.NewRecorder()
-	server.respondNodeError(response, &monitor.NodeDuplicateError{ExistingID: 42, ExistingName: "existing"})
+	server.respondNodeError(response, &controlplane.NodeDuplicateError{ExistingID: 42, ExistingName: "existing"})
 	if response.Code != http.StatusConflict {
 		t.Fatalf("status=%d", response.Code)
 	}

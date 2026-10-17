@@ -7,8 +7,8 @@ import (
 	"strconv"
 
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/controlplane"
 	json "easy_proxies/internal/jsonx"
-	"easy_proxies/internal/monitor"
 )
 
 // nodePayload is the JSON request body for node CRUD operations.
@@ -311,7 +311,7 @@ func (s *Server) respondNodeError(w http.ResponseWriter, err error) {
 	// fields a duplicate-node conflict has to carry back to the client.
 	status := nodeErrorStatus(err)
 	payload := map[string]any{"error": err.Error()}
-	var duplicate *monitor.NodeDuplicateError
+	var duplicate *controlplane.NodeDuplicateError
 	if errors.As(err, &duplicate) {
 		payload["existing_node_id"] = duplicate.ExistingID
 		payload["existing_node_name"] = duplicate.ExistingName

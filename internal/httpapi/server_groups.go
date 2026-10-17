@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/controlplane"
 	"easy_proxies/internal/group"
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/nodecodec"
@@ -189,7 +190,7 @@ func (s *Server) handleGroupActivate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	activateErr := error(nil)
-	if runtimeManager, ok := s.nodeMgr.(monitor.GroupRuntimeManager); ok {
+	if runtimeManager, ok := s.nodeMgr.(controlplane.GroupRuntimeManager); ok {
 		activateErr = runtimeManager.ActivateGroupMember(r.Context(), groupID, nodeID)
 	} else {
 		activateErr = group.ActivateMember(groupID, nodeID)
@@ -470,7 +471,7 @@ func (s *Server) writeGroupList(w http.ResponseWriter, r *http.Request) {
 	responses := make([]groupPoolResponse, 0, len(groups))
 	for _, group := range groups {
 		response := groupPoolResponse{GroupPool: group, Members: []groupMemberResponse{}}
-		if runtimeManager, ok := s.nodeMgr.(monitor.GroupRuntimeManager); ok {
+		if runtimeManager, ok := s.nodeMgr.(controlplane.GroupRuntimeManager); ok {
 			runtimeStatus := runtimeManager.GroupRuntimeStatus(group.ID)
 			response.RuntimeStatus, response.RuntimeError = runtimeStatus.Status, runtimeStatus.Error
 		} else if !group.Enabled {
@@ -1018,7 +1019,7 @@ func (s *Server) reloadAfterGroupMutation(ctx context.Context) string {
 }
 
 func (s *Server) applyGroupRuntimeMutation(ctx context.Context, before, after *store.GroupPool) string {
-	if runtimeManager, ok := s.nodeMgr.(monitor.GroupRuntimeManager); ok {
+	if runtimeManager, ok := s.nodeMgr.(controlplane.GroupRuntimeManager); ok {
 		if err := runtimeManager.ApplyGroupRuntime(ctx, before, after); err != nil {
 			return err.Error()
 		}

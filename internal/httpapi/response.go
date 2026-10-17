@@ -8,8 +8,8 @@ import (
 	"strconv"
 	"strings"
 
+	"easy_proxies/internal/controlplane"
 	json "easy_proxies/internal/jsonx"
-	"easy_proxies/internal/monitor"
 )
 
 // This file centralizes the HTTP response plumbing that handlers otherwise
@@ -37,7 +37,7 @@ import (
 // decode a body carry 3–19 error branches of their own, so the wrapper strips
 // only the outer decode/serialize pair and every branch stays. The shape it
 // fits best, handleReload, cannot use it without losing the existing_node_id
-// fields respondNodeError attaches on monitor.ErrNodeConflict. Reintroducing it for the
+// fields respondNodeError attaches on controlplane.ErrNodeConflict. Reintroducing it for the
 // planned httpapi split should start from that measurement, not from the idea.
 
 // pathID reads a path parameter that must parse as a positive int64, writing a
@@ -89,13 +89,13 @@ func (s *Server) requireStore(w http.ResponseWriter, message string) bool {
 // what lets respondNodeError also carry extra response fields (existing_node_id
 // and friends) rather than just a status.
 func nodeErrorStatus(err error) int {
-	var duplicate *monitor.NodeDuplicateError
+	var duplicate *controlplane.NodeDuplicateError
 	switch {
-	case errors.Is(err, monitor.ErrNodeNotFound):
+	case errors.Is(err, controlplane.ErrNodeNotFound):
 		return http.StatusNotFound
 	case errors.As(err, &duplicate):
 		return http.StatusConflict
-	case errors.Is(err, monitor.ErrNodeConflict), errors.Is(err, monitor.ErrInvalidNode):
+	case errors.Is(err, controlplane.ErrNodeConflict), errors.Is(err, controlplane.ErrInvalidNode):
 		return http.StatusBadRequest
 	default:
 		return http.StatusInternalServerError

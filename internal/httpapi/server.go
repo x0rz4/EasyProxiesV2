@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/controlplane"
 	"easy_proxies/internal/geoip"
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/nodetag"
@@ -89,8 +90,8 @@ type Server struct {
 	// Lifecycle
 	done chan struct{} // closed on Shutdown to stop background goroutines
 
-	subRefresher   monitor.SubscriptionRefresher
-	nodeMgr        monitor.NodeManager
+	subRefresher   controlplane.SubscriptionRefresher
+	nodeMgr        controlplane.NodeManager
 	geoLookup      *geoip.Lookup // optional, used by unlock checks for IP purity
 	geoLookupMu    sync.Mutex    // protects lazy open/reload of geoLookup
 	geoLookupPath  string        // path the cached geoLookup was opened from
@@ -192,14 +193,14 @@ func collectUnlockBatch(
 }
 
 // SetSubscriptionRefresher sets the subscription refresher for API endpoints.
-func (s *Server) SetSubscriptionRefresher(sr monitor.SubscriptionRefresher) {
+func (s *Server) SetSubscriptionRefresher(sr controlplane.SubscriptionRefresher) {
 	if s != nil {
 		s.subRefresher = sr
 	}
 }
 
 // SetNodeManager enables config-node CRUD endpoints.
-func (s *Server) SetNodeManager(nm monitor.NodeManager) {
+func (s *Server) SetNodeManager(nm controlplane.NodeManager) {
 	if s != nil {
 		s.nodeMgr = nm
 	}
@@ -337,7 +338,7 @@ func (s *Server) refreshGroupMembership(changedNodeIDs []int64) error {
 	if s == nil || len(changedNodeIDs) == 0 || s.nodeMgr == nil {
 		return nil
 	}
-	if membershipMgr, ok := s.nodeMgr.(monitor.GroupMembershipManager); ok {
+	if membershipMgr, ok := s.nodeMgr.(controlplane.GroupMembershipManager); ok {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		return membershipMgr.ApplyGroupMembershipChanges(ctx, changedNodeIDs)

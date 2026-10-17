@@ -15,8 +15,8 @@ import (
 
 	"easy_proxies/internal/boxmgr"
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/controlplane"
 	"easy_proxies/internal/group"
-	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/store"
 )
 
@@ -35,7 +35,7 @@ func WithStore(s store.Store) Option       { return func(m *Manager) { m.store =
 func WithHTTPClient(c *http.Client) Option { return func(m *Manager) { m.httpClient = c } }
 
 var _ boxmgr.ConfigUpdateListener = (*Manager)(nil)
-var _ monitor.SubscriptionRefresher = (*Manager)(nil)
+var _ controlplane.SubscriptionRefresher = (*Manager)(nil)
 
 type runtimeManager interface {
 	ReloadWithPortMap(newCfg *config.Config, portMap map[string]uint16) error
@@ -49,7 +49,7 @@ type Manager struct {
 	logger     Logger
 	httpClient *http.Client
 	store      store.Store
-	status     monitor.SubscriptionStatus
+	status     controlplane.SubscriptionStatus
 	ctx        context.Context
 	cancel     context.CancelFunc
 	refreshMu  sync.Mutex
@@ -695,7 +695,7 @@ func (m *Manager) refreshLoop() {
 	}
 }
 
-func (m *Manager) Status() monitor.SubscriptionStatus {
+func (m *Manager) Status() controlplane.SubscriptionStatus {
 	m.mu.RLock()
 	status := m.status
 	globalEnabled := m.baseCfg.SubscriptionRefresh.Enabled

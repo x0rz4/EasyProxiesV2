@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/controlplane"
 	"easy_proxies/internal/group"
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/store"
@@ -446,8 +447,8 @@ func (m *serialGroupRuntimeManager) ActivateGroupMember(context.Context, int64, 
 	return nil
 }
 
-func (m *serialGroupRuntimeManager) GroupRuntimeStatus(int64) monitor.GroupRuntimeStatus {
-	return monitor.GroupRuntimeStatus{Status: "ready"}
+func (m *serialGroupRuntimeManager) GroupRuntimeStatus(int64) controlplane.GroupRuntimeStatus {
+	return controlplane.GroupRuntimeStatus{Status: "ready"}
 }
 
 func TestConcurrentGroupExclusionMutationsAreSerialized(t *testing.T) {
@@ -534,8 +535,8 @@ func (m *isolatedGroupRuntimeManager) ActivateGroupMember(context.Context, int64
 	return nil
 }
 
-func (m *isolatedGroupRuntimeManager) GroupRuntimeStatus(int64) monitor.GroupRuntimeStatus {
-	return monitor.GroupRuntimeStatus{Status: "ready"}
+func (m *isolatedGroupRuntimeManager) GroupRuntimeStatus(int64) controlplane.GroupRuntimeStatus {
+	return controlplane.GroupRuntimeStatus{Status: "ready"}
 }
 
 func TestUpdateGroupUsesIsolatedRuntimeWithoutGlobalReload(t *testing.T) {

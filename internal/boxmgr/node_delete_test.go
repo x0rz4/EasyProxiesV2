@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/controlplane"
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/store"
 )
@@ -40,7 +41,7 @@ func TestDeleteNodeRemovesPersistedNodeAbsentFromActiveConfig(t *testing.T) {
 	}
 
 	// The store remains the source of truth: unknown names are still a 404.
-	if err := manager.DeleteNode(ctx, "ghost-node"); !errors.Is(err, monitor.ErrNodeNotFound) {
+	if err := manager.DeleteNode(ctx, "ghost-node"); !errors.Is(err, controlplane.ErrNodeNotFound) {
 		t.Fatalf("unknown node error=%v, want ErrNodeNotFound", err)
 	}
 }

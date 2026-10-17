@@ -47,7 +47,7 @@ plane/
 | L1 探测 | [健康探测运行时](health-probe-runtime-architecture.md) | Scheduler / Registry / EventHub 现状与新规模化边界 |
 | L2 容量 | [分组容量自愈](group-healing.md) | 已实现主路径及操作手册，不重新实现 Healer |
 | L3 生命周期 | [增量热重载](incremental-hot-reload.md)、[多端口与混合模式](Multi-port-Hybrid.md) | 关注 PrepareUpdate/Commit、代际和连接排空 |
-| L4 控制面 | [monitor 领域分层提案](monitor-server-domain-refactor.md) | **PR1（包内拆分 + 路由拉直，§11）与 PR2（HTTP 层迁到 `internal/httpapi`，§13）均已完成**；`internal/controlplane` 与 HTTP 生命周期迁到 `app.Run` 仍是提案 |
+| L4 控制面 | [monitor 领域分层提案](monitor-server-domain-refactor.md) | **PR1（§11）、PR2（§13）、Phase 1（`internal/controlplane` 建立，§14）均已完成**；领域 Service 与 HTTP 生命周期迁到 `app.Run` 仍是提案 |
 | 性能专题 | [并发与内存](architecture-concurrency-memory-optimization.md)、[依赖与性能](dependency-performance-optimization.md) | 作为方案背景，实施前重新核对代码 |
 | 历史与证据 | [节点视图验收记录](nodeview-validation.md)、[早期计划](panle1.md) | 记录当时环境和结果，不代表当前 CI 或规模认证 |
 

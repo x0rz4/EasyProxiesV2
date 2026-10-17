@@ -7,21 +7,21 @@ import (
 	"strings"
 	"testing"
 
-	"easy_proxies/internal/monitor"
+	"easy_proxies/internal/controlplane"
 )
 
 type exportNodeManager struct {
 	reloadNodeManager
-	nodes []monitor.ManagedNodeConfig
+	nodes []controlplane.ManagedNodeConfig
 }
 
-func (m *exportNodeManager) ListConfigNodes(context.Context, *int64) ([]monitor.ManagedNodeConfig, error) {
-	return append([]monitor.ManagedNodeConfig(nil), m.nodes...), nil
+func (m *exportNodeManager) ListConfigNodes(context.Context, *int64) ([]controlplane.ManagedNodeConfig, error) {
+	return append([]controlplane.ManagedNodeConfig(nil), m.nodes...), nil
 }
 
 // 导出范围必须覆盖库内全部节点（含禁用），并与列表页口径一致。
 func TestExportIncludesEveryConfiguredNode(t *testing.T) {
-	manager := &exportNodeManager{nodes: []monitor.ManagedNodeConfig{
+	manager := &exportNodeManager{nodes: []controlplane.ManagedNodeConfig{
 		{ID: 3, Name: "zeta", URI: "trojan://pw@zeta.example:443"},
 		{ID: 1, Name: "alpha", URI: "http://alpha.example:80"},
 		{ID: 2, Name: "beta", URI: "http://beta.example:80", Disabled: true},

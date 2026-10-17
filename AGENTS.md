@@ -39,7 +39,7 @@ install.sh                    Linux Docker / 二进制安装及更新入口
 
 ---
 
-## 3. Module Map（`internal/`，28 个包）
+## 3. Module Map（`internal/`，29 个包）
 
 ### 装配与基础
 
@@ -69,6 +69,7 @@ install.sh                    Linux Docker / 二进制安装及更新入口
 | 包 | 职责 |
 | --- | --- |
 | `monitor` | **运行时**：节点运行态注册表（`entry` + `nodeRegistry`）、健康探测 actor（`probe_scheduler`）、健康事件 hub（`health_event_hub`）、健康结果投影（`health_applier`）、流量采样；`ports.go` 定义消费方接口 `NodeManager` / `GroupRuntimeManager` / `GroupMembershipManager` / `SubscriptionRefresher` 与领域错误，`tag_providers.go` 定义标签事实提供者。**不含任何 HTTP、路由、Session 或 DTO**（已迁至 `httpapi`）。**只依赖接口，不 import `boxmgr`/`outbound/pool`**（反向才是允许的：`boxmgr`、`pool`、`subscription` 都 import 它并实现上述接口）。 |
+| `controlplane` | **跨层契约**：`NodeManager` / `GroupRuntimeManager` / `GroupMembershipManager` / `GroupRuntimeStatus` / `SubscriptionRefresher` / `SubscriptionStatus` / `ManagedNodeConfig` 与领域错误（`ErrNodeNotFound` 等、`NodeDuplicateError`）。**只依赖 `config` / `store`**，不 import `monitor` 或 `httpapi`；`boxmgr` / `subscription` 实现它，`httpapi` 消费它。领域 Service 将逐步迁入此包。 |
 | `httpapi` | **管理面 HTTP 层**：`Server` 生命周期、路由表、全部 handler 与 DTO、响应管线（`pathID` / `requireStore` / 三个域状态函数）、会话认证、SSE、静态资源与 `//go:embed assets/*`。它 import `monitor` 读运行时状态、直连 `store` 做持久化；`monitor` **不**反向 import 它。`boxmgr` 持有 `*httpapi.Server` 并经 `MonitorServer()` 暴露给 `app`。 |
 
 ### 事实与标签
@@ -97,7 +98,8 @@ main → app → boxmgr ──→ builder ──→ config/store/groupmember/run
               ├──→ outbound/pool ──→ monitor（延迟/黑名单/健康事件）+ group（状态机）
               ├──→ group
               └──→ httpapi（持有 Server 并在内部启动；app 经 MonitorServer() 调 Start/Shutdown）
-httpapi → monitor / store / config（单向；monitor 从不 import httpapi）
+httpapi → monitor / controlplane / store / config（单向；monitor 从不 import httpapi）
+boxmgr / subscription → controlplane（实现其接口）；controlplane → config / store（叶子之上）
 app → nodetag ←(事实)→ nodefacts        monitor 是 unlock/ipquality 与 nodefacts 的桥接层
 subscription → boxmgr（经 interface）
 store / unlock / ipquality → noderesult（叶子，检测结果类型的唯一来源）

@@ -17,6 +17,7 @@ import (
 
 	"easy_proxies/internal/builder"
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/controlplane"
 	"easy_proxies/internal/group"
 	"easy_proxies/internal/groupmember"
 	"easy_proxies/internal/httpapi"
@@ -33,9 +34,9 @@ import (
 	"github.com/sagernet/sing/common"
 )
 
-// Ensure Manager implements monitor.NodeManager.
-var _ monitor.NodeManager = (*Manager)(nil)
-var _ monitor.GroupRuntimeManager = (*Manager)(nil)
+// Ensure Manager implements controlplane.NodeManager.
+var _ controlplane.NodeManager = (*Manager)(nil)
+var _ controlplane.GroupRuntimeManager = (*Manager)(nil)
 
 const (
 	defaultDrainTimeout       = 10 * time.Second
@@ -110,7 +111,7 @@ type groupRuntimeSlot struct {
 	gate               chan struct{}
 	box                *box.Box
 	mu                 sync.RWMutex
-	state              monitor.GroupRuntimeStatus
+	state              controlplane.GroupRuntimeStatus
 	appliedFingerprint string
 	members            map[string]runtimeNode
 	retiring           map[string]*groupRetirement
@@ -1085,7 +1086,7 @@ func (m *Manager) groupSlot(groupID int64) *groupRuntimeSlot {
 	if slot := m.groupSlots[groupID]; slot != nil {
 		return slot
 	}
-	slot := &groupRuntimeSlot{gate: make(chan struct{}, 1), state: monitor.GroupRuntimeStatus{Status: "stopped"},
+	slot := &groupRuntimeSlot{gate: make(chan struct{}, 1), state: controlplane.GroupRuntimeStatus{Status: "stopped"},
 		members: make(map[string]runtimeNode), retiring: make(map[string]*groupRetirement)}
 	slot.gate <- struct{}{}
 	m.groupSlots[groupID] = slot
@@ -1112,11 +1113,11 @@ func (m *Manager) setGroupRuntimeStatus(groupID int64, status, runtimeError stri
 	}
 	slot := m.groupSlot(groupID)
 	slot.mu.Lock()
-	slot.state = monitor.GroupRuntimeStatus{Status: status, Error: runtimeError}
+	slot.state = controlplane.GroupRuntimeStatus{Status: status, Error: runtimeError}
 	slot.mu.Unlock()
 }
 
-func (m *Manager) GroupRuntimeStatus(groupID int64) monitor.GroupRuntimeStatus {
+func (m *Manager) GroupRuntimeStatus(groupID int64) controlplane.GroupRuntimeStatus {
 	slot := m.groupSlot(groupID)
 	slot.mu.RLock()
 	defer slot.mu.RUnlock()
@@ -1149,7 +1150,7 @@ func (m *Manager) startInitialGroup(ctx context.Context, groupID int64) error {
 	}
 	slot.mu.Lock()
 	slot.box = instance
-	slot.state = monitor.GroupRuntimeStatus{Status: "ready"}
+	slot.state = controlplane.GroupRuntimeStatus{Status: "ready"}
 	if groupCfg, ok := groupConfigByID(cfg, groupID); ok {
 		slot.members = groupRuntimeNodesForConfig(cfg, groupCfg, m.runtimeGeneration, instance)
 		slot.appliedFingerprint = groupAppliedFingerprint(cfg, groupCfg)
@@ -1203,7 +1204,7 @@ func (m *Manager) applyGroupRuntime(ctx context.Context, before, after *store.Gr
 
 	slot.mu.Lock()
 	oldBox := slot.box
-	slot.state = monitor.GroupRuntimeStatus{Status: "reconfiguring"}
+	slot.state = controlplane.GroupRuntimeStatus{Status: "reconfiguring"}
 	slot.mu.Unlock()
 
 	if after == nil || !after.Enabled {
@@ -1223,7 +1224,7 @@ func (m *Manager) applyGroupRuntime(ctx context.Context, before, after *store.Gr
 		}
 		slot.mu.Lock()
 		slot.box = nil
-		slot.state = monitor.GroupRuntimeStatus{Status: "stopped"}
+		slot.state = controlplane.GroupRuntimeStatus{Status: "stopped"}
 		slot.mu.Unlock()
 		m.replaceCachedGroup(after)
 		return nil
@@ -1270,7 +1271,7 @@ func (m *Manager) applyGroupRuntime(ctx context.Context, before, after *store.Gr
 			}
 			slot.mu.Lock()
 			slot.box = nil
-			slot.state = monitor.GroupRuntimeStatus{Status: "error", Error: err.Error()}
+			slot.state = controlplane.GroupRuntimeStatus{Status: "error", Error: err.Error()}
 			slot.mu.Unlock()
 			m.replaceCachedGroup(after)
 			return err
@@ -1292,7 +1293,7 @@ func (m *Manager) applyGroupRuntime(ctx context.Context, before, after *store.Gr
 		if mode == applyModeForceNoRollback {
 			slot.mu.Lock()
 			slot.box = nil
-			slot.state = monitor.GroupRuntimeStatus{Status: "error", Error: err.Error()}
+			slot.state = controlplane.GroupRuntimeStatus{Status: "error", Error: err.Error()}
 			slot.mu.Unlock()
 			m.replaceCachedGroup(after)
 			return fmt.Errorf("start new group runtime: %w", err)
@@ -1306,7 +1307,7 @@ func (m *Manager) applyGroupRuntime(ctx context.Context, before, after *store.Gr
 	}
 	slot.mu.Lock()
 	slot.box = newBox
-	slot.state = monitor.GroupRuntimeStatus{Status: "ready"}
+	slot.state = controlplane.GroupRuntimeStatus{Status: "ready"}
 	slot.members = groupRuntimeNodesForConfig(candidateCfg, candidateGroup, m.runtimeGeneration, newBox)
 	slot.appliedFingerprint = fingerprint
 	slot.mu.Unlock()
@@ -1462,7 +1463,7 @@ func (m *Manager) applyGroupRuntimeIncremental(cfg *config.Config, groupCfg conf
 	slot.mu.Lock()
 	slot.members = next
 	slot.appliedFingerprint = fingerprint
-	slot.state = monitor.GroupRuntimeStatus{Status: "ready"}
+	slot.state = controlplane.GroupRuntimeStatus{Status: "ready"}
 	for _, retired := range retiredMembers {
 		ticket := &groupRetirement{cancel: make(chan struct{}), member: retired, version: version}
 		for _, item := range previous {
@@ -1534,7 +1535,7 @@ func (m *Manager) restoreGroupBox(ctx context.Context, slot *groupRuntimeSlot, p
 	if previous == nil || !previous.Enabled {
 		slot.mu.Lock()
 		slot.box = nil
-		slot.state = monitor.GroupRuntimeStatus{Status: "stopped"}
+		slot.state = controlplane.GroupRuntimeStatus{Status: "stopped"}
 		slot.mu.Unlock()
 		return nil
 	}
@@ -1554,7 +1555,7 @@ func (m *Manager) restoreGroupBox(ctx context.Context, slot *groupRuntimeSlot, p
 	}
 	slot.mu.Lock()
 	slot.box = instance
-	slot.state = monitor.GroupRuntimeStatus{Status: "ready"}
+	slot.state = controlplane.GroupRuntimeStatus{Status: "ready"}
 	slot.mu.Unlock()
 	return nil
 }
@@ -1994,7 +1995,7 @@ var errConfigUnavailable = errors.New("config is not initialized")
 // and also includes disabled nodes that are not in the active config.
 // Port numbers are taken from the active config (m.cfg.Nodes) since they
 // are dynamically assigned by NormalizeWithPortMap and may not be in the Store.
-func (m *Manager) ListConfigNodes(ctx context.Context, subscriptionID *int64) ([]monitor.ManagedNodeConfig, error) {
+func (m *Manager) ListConfigNodes(ctx context.Context, subscriptionID *int64) ([]controlplane.ManagedNodeConfig, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -2004,7 +2005,7 @@ func (m *Manager) ListConfigNodes(ctx context.Context, subscriptionID *int64) ([
 
 	// If no store, just return active nodes
 	if m.store == nil {
-		result := make([]monitor.ManagedNodeConfig, 0, len(m.cfg.Nodes))
+		result := make([]controlplane.ManagedNodeConfig, 0, len(m.cfg.Nodes))
 		for _, node := range m.cfg.Nodes {
 			result = append(result, managedNodeConfig(node, nil))
 		}
@@ -2026,7 +2027,7 @@ func (m *Manager) ListConfigNodes(ctx context.Context, subscriptionID *int64) ([
 	if err != nil {
 		// Fallback to config nodes if store fails
 		m.logger.Warnf("failed to list nodes from store: %v, falling back to config", err)
-		result := make([]monitor.ManagedNodeConfig, 0, len(m.cfg.Nodes))
+		result := make([]controlplane.ManagedNodeConfig, 0, len(m.cfg.Nodes))
 		for _, node := range m.cfg.Nodes {
 			result = append(result, managedNodeConfig(node, nil))
 		}
@@ -2035,7 +2036,7 @@ func (m *Manager) ListConfigNodes(ctx context.Context, subscriptionID *int64) ([
 
 	// Build result from store nodes (preserves disabled status)
 	// Merge runtime port assignments from active config
-	result := make([]monitor.ManagedNodeConfig, 0, len(storeNodes))
+	result := make([]controlplane.ManagedNodeConfig, 0, len(storeNodes))
 	for _, n := range storeNodes {
 		port := n.Port
 		// Prefer runtime port from active config (dynamically assigned)
@@ -2050,7 +2051,7 @@ func (m *Manager) ListConfigNodes(ctx context.Context, subscriptionID *int64) ([
 		if runtimePort, ok := runtimePorts[identityKey]; ok && runtimePort > 0 {
 			port = runtimePort
 		}
-		result = append(result, monitor.ManagedNodeConfig{
+		result = append(result, controlplane.ManagedNodeConfig{
 			ID:              n.ID,
 			Name:            n.Name,
 			URI:             n.URI,
@@ -2069,11 +2070,11 @@ func (m *Manager) ListConfigNodes(ctx context.Context, subscriptionID *int64) ([
 	return result, nil
 }
 
-func managedNodeConfig(node config.NodeConfig, subscriptionIDs []int64) monitor.ManagedNodeConfig {
+func managedNodeConfig(node config.NodeConfig, subscriptionIDs []int64) controlplane.ManagedNodeConfig {
 	if subscriptionIDs == nil {
 		subscriptionIDs = []int64{}
 	}
-	return monitor.ManagedNodeConfig{ID: node.ID, Name: node.Name, URI: node.URI, Port: node.Port,
+	return controlplane.ManagedNodeConfig{ID: node.ID, Name: node.Name, URI: node.URI, Port: node.Port,
 		Username: node.Username, Password: node.Password, Region: node.Region, Country: node.Country,
 		Tags: node.Tags, Source: node.Source,
 		Disabled: node.Disabled, SubscriptionIDs: subscriptionIDs}
@@ -2106,12 +2107,12 @@ func (m *Manager) CreateNode(ctx context.Context, node config.NodeConfig) (confi
 	if m.store != nil {
 		identity, identityErr := nodecodec.ParseURI(normalized.URI)
 		if identityErr != nil {
-			return config.NodeConfig{}, fmt.Errorf("%w: %v", monitor.ErrInvalidNode, identityErr)
+			return config.NodeConfig{}, fmt.Errorf("%w: %v", controlplane.ErrInvalidNode, identityErr)
 		}
 		if existing, lookupErr := m.store.GetNodeByIdentity(ctx, identity.Hash); lookupErr != nil {
 			return config.NodeConfig{}, fmt.Errorf("lookup node identity: %w", lookupErr)
 		} else if existing != nil {
-			return config.NodeConfig{}, &monitor.NodeDuplicateError{ExistingID: existing.ID, ExistingName: existing.Name}
+			return config.NodeConfig{}, &controlplane.NodeDuplicateError{ExistingID: existing.ID, ExistingName: existing.Name}
 		}
 		storeNode := &store.Node{
 			URI:      normalized.URI,
@@ -2124,7 +2125,7 @@ func (m *Manager) CreateNode(ctx context.Context, node config.NodeConfig) (confi
 		}
 		if err := m.store.CreateNode(ctx, storeNode); err != nil {
 			if existing, lookupErr := m.store.GetNodeByIdentity(ctx, identity.Hash); lookupErr == nil && existing != nil {
-				return config.NodeConfig{}, &monitor.NodeDuplicateError{ExistingID: existing.ID, ExistingName: existing.Name}
+				return config.NodeConfig{}, &controlplane.NodeDuplicateError{ExistingID: existing.ID, ExistingName: existing.Name}
 			}
 			return config.NodeConfig{}, fmt.Errorf("save to store: %w", err)
 		}
@@ -2153,7 +2154,7 @@ func (m *Manager) UpdateNode(ctx context.Context, name string, node config.NodeC
 
 	idx := m.nodeIndexLocked(name)
 	if idx == -1 {
-		return config.NodeConfig{}, monitor.ErrNodeNotFound
+		return config.NodeConfig{}, controlplane.ErrNodeNotFound
 	}
 
 	normalized, err := m.prepareNodeLocked(node, name)
@@ -2173,12 +2174,12 @@ func (m *Manager) UpdateNode(ctx context.Context, name string, node config.NodeC
 		if existing != nil {
 			identity, identityErr := nodecodec.ParseURI(normalized.URI)
 			if identityErr != nil {
-				return config.NodeConfig{}, fmt.Errorf("%w: %v", monitor.ErrInvalidNode, identityErr)
+				return config.NodeConfig{}, fmt.Errorf("%w: %v", controlplane.ErrInvalidNode, identityErr)
 			}
 			if duplicate, lookupErr := m.store.GetNodeByIdentity(ctx, identity.Hash); lookupErr != nil {
 				return config.NodeConfig{}, fmt.Errorf("lookup node identity: %w", lookupErr)
 			} else if duplicate != nil && duplicate.ID != existing.ID {
-				return config.NodeConfig{}, &monitor.NodeDuplicateError{ExistingID: duplicate.ID, ExistingName: duplicate.Name}
+				return config.NodeConfig{}, &controlplane.NodeDuplicateError{ExistingID: duplicate.ID, ExistingName: duplicate.Name}
 			}
 			existing.URI = normalized.URI
 			existing.Name = normalized.Name
@@ -2219,7 +2220,7 @@ func (m *Manager) SetNodeEnabled(ctx context.Context, name string, enabled bool)
 			return fmt.Errorf("lookup in store: %w", err)
 		}
 		if existing == nil {
-			return monitor.ErrNodeNotFound
+			return controlplane.ErrNodeNotFound
 		}
 		existing.Enabled = enabled
 		if err := m.store.UpdateNode(ctx, existing); err != nil {
@@ -2229,7 +2230,7 @@ func (m *Manager) SetNodeEnabled(ctx context.Context, name string, enabled bool)
 		// No store — just check the node exists in config
 		idx := m.nodeIndexLocked(name)
 		if idx == -1 {
-			return monitor.ErrNodeNotFound
+			return controlplane.ErrNodeNotFound
 		}
 	}
 
@@ -2265,7 +2266,7 @@ func (m *Manager) DeleteNode(ctx context.Context, name string) error {
 	// source of truth here, mirroring SetNodeEnabled.
 	idx := m.nodeIndexLocked(name)
 	if m.store == nil && idx == -1 {
-		return monitor.ErrNodeNotFound
+		return controlplane.ErrNodeNotFound
 	}
 
 	if m.store != nil {
@@ -2277,7 +2278,7 @@ func (m *Manager) DeleteNode(ctx context.Context, name string) error {
 			// Nodes that only live in the in-memory config (never persisted)
 			// are still removable; anything unknown is a real 404.
 			if idx == -1 {
-				return monitor.ErrNodeNotFound
+				return controlplane.ErrNodeNotFound
 			}
 		} else if err := m.store.DeleteNode(ctx, existing.ID); err != nil {
 			return fmt.Errorf("delete from store: %w", err)
@@ -2565,7 +2566,7 @@ func (m *Manager) closeAllGroupRuntimes(status, runtimeError string) error {
 			}
 			slot.box = nil
 		}
-		slot.state = monitor.GroupRuntimeStatus{Status: status, Error: runtimeError}
+		slot.state = controlplane.GroupRuntimeStatus{Status: status, Error: runtimeError}
 		slot.mu.Unlock()
 		releaseGroupSlot(slot)
 	}
@@ -2711,7 +2712,7 @@ func (m *Manager) prepareNodeLocked(node config.NodeConfig, currentName string) 
 	node.URI = strings.TrimSpace(node.URI)
 
 	if node.URI == "" {
-		return config.NodeConfig{}, fmt.Errorf("%w: URI 不能为空", monitor.ErrInvalidNode)
+		return config.NodeConfig{}, fmt.Errorf("%w: URI 不能为空", controlplane.ErrInvalidNode)
 	}
 
 	// Extract name from URI fragment (#name) if not provided
@@ -2734,7 +2735,7 @@ func (m *Manager) prepareNodeLocked(node config.NodeConfig, currentName string) 
 	// Check for name conflict (excluding current node when updating)
 	if idx := m.nodeIndexLocked(node.Name); idx != -1 {
 		if currentName == "" || m.cfg.Nodes[idx].Name != currentName {
-			return config.NodeConfig{}, fmt.Errorf("%w: 节点 %s 已存在", monitor.ErrNodeConflict, node.Name)
+			return config.NodeConfig{}, fmt.Errorf("%w: 节点 %s 已存在", controlplane.ErrNodeConflict, node.Name)
 		}
 	}
 
@@ -2743,7 +2744,7 @@ func (m *Manager) prepareNodeLocked(node config.NodeConfig, currentName string) 
 		if node.Port == 0 {
 			node.Port = m.nextAvailablePortLocked()
 		} else if m.portInUseLocked(node.Port, currentName) {
-			return config.NodeConfig{}, fmt.Errorf("%w: 端口 %d 已被占用", monitor.ErrNodeConflict, node.Port)
+			return config.NodeConfig{}, fmt.Errorf("%w: 端口 %d 已被占用", controlplane.ErrNodeConflict, node.Port)
 		}
 		if node.Username == "" {
 			node.Username = m.cfg.MultiPort.Username

@@ -2,7 +2,7 @@
 
 > 状态：独立设计提案。文中 `internal/httpapi` / `internal/controlplane` 为目标结构，不代表当前已存在。大型代理池路线采用责任分层，先硬化现有边界，再按证据决定是否迁移包；参见 [分层设计](changes/scale-proxy-pool/design.md)。
 >
-> **PR1 已完成（包内拆分 + 路由拉直）**，见 §11。**PR2 已完成（HTTP 层迁到 `internal/httpapi`，含 `assets` 与 11 处构建路径引用）**，见 §13。本文档 §3.2 的 `internal/controlplane` 与 §6 的"HTTP 生命周期移到 `app.Run`"**尚未开始**，仍是 Phase 1–4 的内容。
+> **PR1 已完成（包内拆分 + 路由拉直）**，见 §11。**PR2 已完成（HTTP 层迁到 `internal/httpapi`，含 `assets` 与 11 处构建路径引用）**，见 §13。**Phase 1 已完成（`internal/controlplane` 建立，ports 迁入）**，见 §14。§3.2 的领域 Service 与 §6 的"HTTP 生命周期移到 `app.Run`"**尚未开始**，属 Phase 2–4。
 
 ## 1. 背景
 
@@ -10,12 +10,12 @@
 
 **当前规模**（PR2 落地后）：
 
-| 项 | `internal/httpapi` | `internal/monitor` |
-| --- | --- | --- |
-| 非测试代码 | 7,975 行 / 22 个文件 | 3,385 行 / 10 个文件 |
-| 测试 | 4,249 行 / 23 个文件 / 94 个 `TestXxx` | 1,520 行 / 7 个文件 / 45 个 `TestXxx` |
-| 最大文件 | `server_groups.go` 1,068 行 | `manager.go` |
-| import 的 internal 包 | 19 个 | 8 个 |
+| 项 | `internal/httpapi` | `internal/monitor` | `internal/controlplane` |
+| --- | --- | --- | --- |
+| 非测试代码 | 7,975 行 / 22 个文件 | 3,270 行 / 9 个文件 | 115 行 / 1 个文件 |
+| 测试 | 4,249 行 / 23 个文件 / 94 个 `TestXxx` | 1,520 行 / 7 个文件 / 45 个 `TestXxx` | 无（Phase 2 起） |
+| 最大文件 | `server_groups.go` 1,068 行 | `manager.go` | `ports.go` |
+| import 的 internal 包 | 20 个 | 8 个 | 2 个（`config` / `store`） |
 
 `httpapi/server.go` **405 行**（PR1 时 510 行），只剩 embed、外部类型、`NewServer`、`SetX`、`Start`/`Shutdown`；路由注册 100 条（`routes.go`，一行一路由），契约用例覆盖含错方法与未知路径。
 
@@ -23,7 +23,7 @@
 
 > `writeJSON` / `decodeJSON` / `writeAPIError` 并入既有的 `response.go`（而不是新建 `server_response.go`）：并行提交已把该文件建成"HTTP 响应管线"的落点（`pathID` / `requireStore` / 三个域状态函数），再开一个名字几乎相同的文件只会让人分不清该往哪加。计划里的 `server_response.go` 因此取消。
 
-> `ports.go` 的由来：`NodeManager` / `GroupRuntimeManager` / `GroupMembershipManager` / `SubscriptionRefresher` 这些**消费方定义**的接口，实现方是 `boxmgr` 与 `subscription`，但 HTTP 层也要引用它们。它们留在 `monitor` 而不是随 HTTP 层搬走，`boxmgr` 才不必 import 一个 HTTP 包来实现运行时接口——这保住了 §1 的分层方向（`httpapi → controlplane → Store / Runtime ports`，今天还是 `httpapi → monitor`）。
+> `ports.go` 已于 Phase 1 迁出到 `internal/controlplane`（§14）；以下记录的是 PR2 当时的取舍：`NodeManager` / `GroupRuntimeManager` / `GroupMembershipManager` / `SubscriptionRefresher` 这些**消费方定义**的接口，实现方是 `boxmgr` 与 `subscription`，但 HTTP 层也要引用它们。它们留在 `monitor` 而不是随 HTTP 层搬走，`boxmgr` 才不必 import 一个 HTTP 包来实现运行时接口——这保住了 §1 的分层方向（`httpapi → controlplane → Store / Runtime ports`，今天还是 `httpapi → monitor`）。
 
 本次改造采用三层依赖方向：
 
@@ -154,11 +154,11 @@ Server 结构、全部 handler、DTO、`assets` 及 11 处构建路径引用（D
 - ✅ 既有覆盖（无需新增）：`/api/nodes/probe-all`、`/api/nodes/unlock-all` 的 start→progress→complete 序列（`operations_test.go`）；`/api/debug/stream` 的初始帧（`server_timeout_test.go`）；auth/settings/nodes/groups/subscriptions 的响应断言分散在各 `*_test.go`。
 - ⬜ 取消语义：SSE 客户端断开后生产协程退出（`test -race` 下验证，本地无 gcc 留给 CI）。
 
-### Phase 1：模型与 ports
+### Phase 1：模型与 ports（✅ 已完成，见 §14）
 
-- 新建 controlplane 模型、领域错误和窄接口。
-- 增加 monitor adapter。
-- 将 boxmgr 和 subscription 对 `monitor` API 类型的引用迁到 controlplane。
+- ✅ 新建 `internal/controlplane`（仅依赖 `config` / `store`），`ports.go` 迁入。
+- ✅ 将 boxmgr 和 subscription 对 `monitor` API 类型的引用迁到 controlplane（`monitor` 包内对 ports 零引用，无环）。
+- ⬜ monitor adapter：随 Phase 2 各领域 Service 一起做——当前没有需要适配的类型，提前建 adapter 只会是空壳。
 
 ### Phase 2：领域 Service（PR3+ 按领域逐个 PR）
 
@@ -391,3 +391,52 @@ go build -tags "with_utls with_quic with_grpc with_wireguard with_gvisor" \
 **版本**：`2.1.7 → 2.1.8`。
 
 **观察到的既有 flake（非本次引入）**：全量 `go test ./...` 首轮时 `internal/nodetag` 的 `TestQueueSweepsAndSurvivesFailures` 失败一次（`a failed recompute must be reported: [nodetag: 自动标签重算失败: 数据库忙]`）。该包在本次改动中**零修改**（`git status --internal/nodetag/` 为空）；用例用 20ms sweep 间隔并要求至少两条日志，在整仓测试争抢 CPU 时会少记一条。单独 `-count=20` 与重跑全量均通过。属于需要放宽时间假设的既有问题，不在本 PR 修（避免把 flake 修复混进纯搬迁）。
+
+## 14. Phase 1 完成记录（模型与 ports）
+
+**范围**：把 `internal/monitor/ports.go` 整体迁到新建的 `internal/controlplane`。这是 §7 Phase 1 的第一步，也是后续每个领域 Service 的落点。
+
+**为什么这 9 个符号本来就该独立成包**
+
+迁移前先做了一次归属验证：`ports.go` 里的全部符号（`NodeManager`、`GroupRuntimeManager`、`GroupMembershipManager`、`GroupRuntimeStatus`、`SubscriptionRefresher`、`SubscriptionStatus`、`ManagedNodeConfig`、`NodeDuplicateError`、三个哨兵错误）在 `internal/monitor` 包内**零引用**。它们不是 monitor 的实现细节，而是"由 boxmgr / subscription 实现、由 HTTP 层消费"的契约——放在 monitor 里只是因为 PR2 搬迁时需要一个不产生循环依赖的临时落点。Phase 1 把它们放到自己的包，`monitor` 从此只被实现方和消费方引用，不再承载契约。
+
+**依赖方向**
+
+```text
+controlplane → config / store        （叶子之上，不 import monitor、不 import httpapi）
+boxmgr       → controlplane → ...     （实现 NodeManager / GroupRuntimeManager / GroupMembershipManager）
+subscription → controlplane → ...     （实现 SubscriptionRefresher）
+httpapi      → controlplane → ...     （消费上述接口）
+monitor      ×  controlplane          （零引用，无环）
+```
+
+`controlplane` 只依赖 `config` 与 `store`，与 §3.2 的"接口不自带实现"一致。
+
+**改动面**
+
+| 包 | 改动 |
+| --- | --- |
+| `internal/controlplane`（新） | `ports.go` 由 `git mv` 迁入，仅改 package 声明 |
+| `internal/httpapi` | 10 个文件、32 处符号改指向 `controlplane`（`server.go` 5、`response.go` 5、`server_groups.go` 3、`server_import.go` 2、`server_nodes.go` 1、测试 16） |
+| `internal/boxmgr` | `manager.go` 37 处 + 2 个测试文件 |
+| `internal/subscription` | `manager.go` 5 处；`monitor` import 因此变为未使用并删除 |
+
+**没做的事（有意）**：没有同时把 `monitor.Config` / `monitor.Manager` / `monitor.Snapshot` 等运行时类型也搬过去。它们是运行时真值，且 `boxmgr` 直接持有 `*monitor.Manager`；搬到 controlplane 会制造 `boxmgr → controlplane → monitor` 与运行时类型之间的无谓耦合。Phase 1 只搬"契约"，不搬"实现"。
+
+**验证**
+
+```bash
+go build ./...                      # OK
+go vet ./...                        # 零输出
+go test ./... -count=1              # 26 个有测试的包全绿（新增 controlplane，无测试文件）
+gofmt -l <changed>                  # 干净
+go build -tags "with_utls ... with_gvisor"  # 通过，71 MB
+```
+
+`golang.org/x/net` 仍钉在 `v0.50.0`；`-mod=mod` 造成的 `go.mod` 变动已还原。
+
+**包数**：`internal/` 28 → 29。
+
+**版本**：`2.1.8 → 2.1.9`。
+
+**下一步**：Phase 2 首个领域——Auth/Session 迁入 `controlplane`。该域无跨组件编排（只碰 `store` 与配置密码），依赖面最小，适合先验证 Service 形态。

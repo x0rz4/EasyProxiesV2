@@ -11,12 +11,12 @@ import (
 	"testing"
 
 	"easy_proxies/internal/config"
-	"easy_proxies/internal/monitor"
+	"easy_proxies/internal/controlplane"
 )
 
 type reloadNodeManager struct{ reloads atomic.Int32 }
 
-func (m *reloadNodeManager) ListConfigNodes(context.Context, *int64) ([]monitor.ManagedNodeConfig, error) {
+func (m *reloadNodeManager) ListConfigNodes(context.Context, *int64) ([]controlplane.ManagedNodeConfig, error) {
 	return nil, nil
 }
 func (m *reloadNodeManager) CreateNode(_ context.Context, node config.NodeConfig) (config.NodeConfig, error) {

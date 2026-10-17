@@ -11,7 +11,7 @@ import (
 	"strings"
 
 	"easy_proxies/internal/config"
-	"easy_proxies/internal/monitor"
+	"easy_proxies/internal/controlplane"
 	"easy_proxies/internal/nodecodec"
 )
 
@@ -143,7 +143,7 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	usedNames := make(map[string]struct{}, len(existingNodes)+len(parsedNodes))
-	usedIdentities := make(map[string]monitor.ManagedNodeConfig, len(existingNodes)+len(parsedNodes))
+	usedIdentities := make(map[string]controlplane.ManagedNodeConfig, len(existingNodes)+len(parsedNodes))
 	endpointIdentities := make(map[string]map[string]string, len(existingNodes)+len(parsedNodes))
 	for _, existing := range existingNodes {
 		usedNames[strings.TrimSpace(existing.Name)] = struct{}{}
@@ -227,7 +227,7 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		imported++
-		created := monitor.ManagedNodeConfig{Name: node.Name, URI: node.URI}
+		created := controlplane.ManagedNodeConfig{Name: node.Name, URI: node.URI}
 		usedIdentities[identity.Hash] = created
 		if endpointIdentities[identity.EndpointKey] == nil {
 			endpointIdentities[identity.EndpointKey] = map[string]string{}

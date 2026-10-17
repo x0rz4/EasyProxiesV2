@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"easy_proxies/internal/monitor"
+	"easy_proxies/internal/controlplane"
 )
 
 // The three error→status policies live together in response.go, which makes it
@@ -67,11 +67,11 @@ func TestNodeErrorStatus(t *testing.T) {
 		err  error
 		want int
 	}{
-		{"not found", monitor.ErrNodeNotFound, http.StatusNotFound},
-		{"conflict", monitor.ErrNodeConflict, http.StatusBadRequest},
-		{"invalid", monitor.ErrInvalidNode, http.StatusBadRequest},
-		{"duplicate", &monitor.NodeDuplicateError{ExistingID: 42, ExistingName: "dup"}, http.StatusConflict},
-		{"wrapped not found", fmt.Errorf("lookup: %w", monitor.ErrNodeNotFound), http.StatusNotFound},
+		{"not found", controlplane.ErrNodeNotFound, http.StatusNotFound},
+		{"conflict", controlplane.ErrNodeConflict, http.StatusBadRequest},
+		{"invalid", controlplane.ErrInvalidNode, http.StatusBadRequest},
+		{"duplicate", &controlplane.NodeDuplicateError{ExistingID: 42, ExistingName: "dup"}, http.StatusConflict},
+		{"wrapped not found", fmt.Errorf("lookup: %w", controlplane.ErrNodeNotFound), http.StatusNotFound},
 		{"unclassified", errors.New("boom"), http.StatusInternalServerError},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -96,7 +96,7 @@ func TestTagAndSubscriptionDomainsDisagreeOnMissingNode(t *testing.T) {
 	}
 	// And neither is the node domain's answer.
 	if got := nodeErrorStatus(err); got != http.StatusInternalServerError {
-		t.Errorf("node domain = %d, want 500 (the error is not typed as monitor.ErrNodeNotFound)", got)
+		t.Errorf("node domain = %d, want 500 (the error is not typed as controlplane.ErrNodeNotFound)", got)
 	}
 }
 
@@ -105,7 +105,7 @@ func TestTagAndSubscriptionDomainsDisagreeOnMissingNode(t *testing.T) {
 func TestRespondNodeErrorCarriesDuplicateDetails(t *testing.T) {
 	server := &Server{}
 	response := httptest.NewRecorder()
-	server.respondNodeError(response, &monitor.NodeDuplicateError{ExistingID: 42, ExistingName: "existing"})
+	server.respondNodeError(response, &controlplane.NodeDuplicateError{ExistingID: 42, ExistingName: "existing"})
 
 	if response.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409", response.Code)

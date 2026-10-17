@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"easy_proxies/internal/controlplane"
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/nodefacts"
 	"easy_proxies/internal/nodetag"
@@ -296,8 +297,8 @@ func (m *tagAPIRuntimeManager) ApplyGroupRuntime(_ context.Context, before, afte
 
 func (m *tagAPIRuntimeManager) ActivateGroupMember(context.Context, int64, int64) error { return nil }
 
-func (m *tagAPIRuntimeManager) GroupRuntimeStatus(int64) monitor.GroupRuntimeStatus {
-	return monitor.GroupRuntimeStatus{}
+func (m *tagAPIRuntimeManager) GroupRuntimeStatus(int64) controlplane.GroupRuntimeStatus {
+	return controlplane.GroupRuntimeStatus{}
 }
 
 func (m *tagAPIRuntimeManager) ApplyGroupMembershipChanges(_ context.Context, nodeIDs []int64) error {

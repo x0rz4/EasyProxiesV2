@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/controlplane"
 	"easy_proxies/internal/geoip"
 	"easy_proxies/internal/groupmember"
 	"easy_proxies/internal/monitor"
@@ -173,7 +174,7 @@ func TestListConfigNodesReturnsPersistedLocationForDisabledNodes(t *testing.T) {
 	if len(nodes) != 2 {
 		t.Fatalf("managed nodes = %d, want 2", len(nodes))
 	}
-	byName := make(map[string]monitor.ManagedNodeConfig, len(nodes))
+	byName := make(map[string]controlplane.ManagedNodeConfig, len(nodes))
 	for _, node := range nodes {
 		byName[node.Name] = node
 	}

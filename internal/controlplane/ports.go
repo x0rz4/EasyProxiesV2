@@ -1,4 +1,4 @@
-package monitor
+package controlplane
 
 import (
 	"context"

@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/controlplane"
 	"easy_proxies/internal/monitor"
 )
 
@@ -141,7 +142,7 @@ type pathValueNodeManager struct {
 	updatedName string
 }
 
-func (*pathValueNodeManager) ListConfigNodes(context.Context, *int64) ([]monitor.ManagedNodeConfig, error) {
+func (*pathValueNodeManager) ListConfigNodes(context.Context, *int64) ([]controlplane.ManagedNodeConfig, error) {
 	return nil, nil
 }
 func (*pathValueNodeManager) CreateNode(_ context.Context, node config.NodeConfig) (config.NodeConfig, error) {
