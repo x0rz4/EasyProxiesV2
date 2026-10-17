@@ -347,7 +347,7 @@ func (s *Server) handleGroupResetToken(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusNotFound, "分组不存在")
 		return
 	}
-	token, err := s.generateSessionToken()
+	token, err := controlplane.GenerateToken()
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "生成订阅 Token 失败")
 		return
@@ -806,7 +806,7 @@ func (s *Server) groupFromInput(ctx context.Context, input groupPoolInput, exist
 		subscriptionToken = existing.SubscriptionToken
 	}
 	if subscriptionToken == "" {
-		subscriptionToken, err = s.generateSessionToken()
+		subscriptionToken, err = controlplane.GenerateToken()
 		if err != nil {
 			return nil, nil, fmt.Errorf("生成订阅 Token: %w", err)
 		}

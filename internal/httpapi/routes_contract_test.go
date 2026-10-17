@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"io"
 	"log"
 	"net/http"
@@ -8,8 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
+	"easy_proxies/internal/controlplane"
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/store"
 )
@@ -165,19 +166,17 @@ func contractServer(t *testing.T) *Server {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	return &Server{
-		cfg:        monitor.Config{Password: "secret"},
-		store:      db,
-		logger:     log.New(io.Discard, "", 0),
-		sessions:   map[string]*Session{},
-		sessionTTL: time.Hour,
+		cfg:    monitor.Config{Password: "secret"},
+		store:  db,
+		logger: log.New(io.Discard, "", 0),
 	}
 }
 
 // newContractSession issues a session the way a successful login would, so the
 // tests below can reach handlers sitting behind withAuth.
-func newContractSession(t *testing.T, server *Server) (*Session, string) {
+func newContractSession(t *testing.T, server *Server) (*controlplane.Session, string) {
 	t.Helper()
-	session, err := server.createSession()
+	session, err := server.authService().CreateSession(context.Background())
 	if err != nil {
 		t.Fatalf("create session: %v", err)
 	}

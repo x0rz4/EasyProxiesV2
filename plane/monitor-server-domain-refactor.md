@@ -2,7 +2,7 @@
 
 > 状态：独立设计提案。文中 `internal/httpapi` / `internal/controlplane` 为目标结构，不代表当前已存在。大型代理池路线采用责任分层，先硬化现有边界，再按证据决定是否迁移包；参见 [分层设计](changes/scale-proxy-pool/design.md)。
 >
-> **PR1 已完成（包内拆分 + 路由拉直）**，见 §11。**PR2 已完成（HTTP 层迁到 `internal/httpapi`，含 `assets` 与 11 处构建路径引用）**，见 §13。**Phase 1 已完成（`internal/controlplane` 建立，ports 迁入）**，见 §14。§3.2 的领域 Service 与 §6 的"HTTP 生命周期移到 `app.Run`"**尚未开始**，属 Phase 2–4。
+> **PR1 已完成（包内拆分 + 路由拉直）**，见 §11。**PR2 已完成（HTTP 层迁到 `internal/httpapi`，含 `assets` 与 11 处构建路径引用）**，见 §13。**Phase 1 已完成（§14）**；**Phase 2 首个领域 Auth/Session 已完成（§15）**。其余领域 Service 与 §6 的"HTTP 生命周期移到 `app.Run`"尚未开始，属 Phase 2 后续与 Phase 4。
 
 ## 1. 背景
 
@@ -12,8 +12,8 @@
 
 | 项 | `internal/httpapi` | `internal/monitor` | `internal/controlplane` |
 | --- | --- | --- | --- |
-| 非测试代码 | 7,975 行 / 22 个文件 | 3,270 行 / 9 个文件 | 115 行 / 1 个文件 |
-| 测试 | 4,249 行 / 23 个文件 / 94 个 `TestXxx` | 1,520 行 / 7 个文件 / 45 个 `TestXxx` | 无（Phase 2 起） |
+| 非测试代码 | 7,737 行 / 22 个文件 | 3,270 行 / 9 个文件 | 571 行 / 2 个文件 |
+| 测试 | 4,245 行 / 23 个文件 / 94 个 `TestXxx` | 1,520 行 / 7 个文件 / 45 个 `TestXxx` | 352 行 / 14 个用例 |
 | 最大文件 | `server_groups.go` 1,068 行 | `manager.go` | `ports.go` |
 | import 的 internal 包 | 20 个 | 8 个 | 2 个（`config` / `store`） |
 
@@ -162,7 +162,8 @@ Server 结构、全部 handler、DTO、`assets` 及 11 处构建路径引用（D
 
 ### Phase 2：领域 Service（PR3+ 按领域逐个 PR）
 
-- 依次迁移 Auth/Session、Settings、Nodes、Subscriptions、Diagnostics/Streams、Groups、GeoIP、Import/Export。
+- ✅ Auth/Session → `controlplane.Auth`（见 §15）。
+- ⬜ 依次迁移 Settings、Nodes、Subscriptions、Diagnostics/Streams、Groups、GeoIP、Import/Export。
 - 每迁移一个领域，将相关测试改为 Service 单元测试并保持 `go test ./...` 通过。
 - Groups 保留当前操作锁、并发端口分配和 runtime 失败后的数据库回滚语义。
 
@@ -440,3 +441,46 @@ go build -tags "with_utls ... with_gvisor"  # 通过，71 MB
 **版本**：`2.1.8 → 2.1.9`。
 
 **下一步**：Phase 2 首个领域——Auth/Session 迁入 `controlplane`。该域无跨组件编排（只碰 `store` 与配置密码），依赖面最小，适合先验证 Service 形态。
+
+## 15. Phase 2 / PR3 完成记录（Auth/Session 领域）
+
+**范围**：把会话、登录限流与 API Key 凭据从 `internal/httpapi` 抽到 `internal/controlplane/auth.go`。HTTP handler 只保留状态码、文案与 Cookie 细节。
+
+**服务边界**
+
+`controlplane.Auth` 拥有：会话签发/校验/过期清理、内存会话表（上限 `MaxSessions`）、每来源登录失败窗口与锁定、API Key 的查询/创建/删除/使用记录、常量时间比较与 token 生成。它**不认识 `http.ResponseWriter`、不知道 401/400、不拼中文错误文案**。
+
+依赖只有 `store` 与一个 `Password func() string` 回调——密码由设置页在运行时改，回调保证只有一个真值来源，不需要在每次改密码时重建服务。
+
+**关键设计点**
+
+1. **锁定检查必须先于请求体解析**。原实现是「查锁定 → 解析 body → 校验密码」，若把两步并进 `Login()`，锁定来源发一个畸形 body 会从 401 变成 400，锁定状态就可被观测。因此拆成 `LoginAllowed`（先调）与 `Authenticate`（后调），handler 保持原顺序。
+2. **锁定的文案与错误密码完全同路**。`Authenticate` 不返回「已锁定」；`LoginAllowed` 返回 false 时 handler 走与密码错误相同的随机延迟 + `密码错误`。
+3. **已知/未知 API Key 回答一致**。`APIKeyByToken` 对未知与畸形都返回 `(nil, nil)`，由 handler 统一答 401，避免探测。
+4. **会话持久化失败只记日志**。内存副本仍能认证本进程，比让登录失败更好。
+5. **`Now` 可注入**。限流窗口与会话过期都不靠 sleep 测试。
+
+**跨包新增的导出符号**（`MaxLoginFailuresWithin` 等常量与 `Session` 类型）只服务于三个方面：handler 需要 cookie MaxAge（`SessionTTL()`）、测试需要失败预算常量、服务自身需要。锁定的内部状态（`loginFailureState`、会话表）没有导出。
+
+**为什么 `Auth` 是惰性构造**：仓库里 40+ 个测试用 `&Server{store: db, ...}` 字面量自建 Server。把服务做成 `NewServer` 的不变量会让这些测试全部失效。改由 `authService()` 首次使用时构造，并绑定当前 `store`。生产路径在 `NewServer` 里主动调一次，保证清理协程有对象可驱动。
+
+**测试迁移**：新增 `internal/controlplane/auth_test.go`（14 个用例，注入 `fakeClock`）。覆盖会话过期与驱逐、重启后从 store 恢复、过期会话从 store 删除、限流预算/窗口重置/锁定优先于密码、API Key 全生命周期与无 store 时的 `ErrStoreUnavailable`、`SecureCompare` 与 token 随机性。原有的 `public_api_test.go` 保留为 HTTP 层契约测试（状态码、文案、路由范围），只把 fixture 改为调用服务。
+
+**验证**
+
+```bash
+go build ./... && go vet ./...     # 干净
+go test ./... -count=1             # 27 个包全绿
+gofmt -l <changed>                 # 干净
+go build -tags "with_utls ... with_gvisor"   # 通过，71 MB
+```
+
+`golang.org/x/net` 仍为 `v0.50.0`。
+
+| 指标 | 数值 |
+| --- | --- |
+| `controlplane` | 2 个产品文件 / 571 行 + 352 行测试 |
+| `httpapi/server_auth.go` | 494 → 268 行（只剩 HTTP 语义） |
+| 新增服务测试 | 14 个 |
+
+**版本**：`2.1.9 → 2.1.10`（按 AGENTS.md §9，patch 位达到 10 后继续按整数递增，不进位）。

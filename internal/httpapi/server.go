@@ -24,13 +24,6 @@ import (
 //go:embed assets/*
 var embeddedFS embed.FS
 
-// Session represents a user session with expiration.
-type Session struct {
-	Token     string
-	CreatedAt time.Time
-	ExpiresAt time.Time
-}
-
 type ApplyPlan struct {
 	NeedReload  bool     `json:"need_reload"`
 	NeedRestart bool     `json:"need_restart"`
@@ -68,18 +61,11 @@ type Server struct {
 	logger *log.Logger
 	store  store.Store // 数据存储
 
-	// Session management
-	sessionMu  sync.RWMutex
-	sessions   map[string]*Session
-	sessionTTL time.Duration
-
-	// loginMu guards the failed-login rate limiter. Per-source windows are
-	// cheap: brute-forcing the management password is the one threat this
-	// endpoint faces, and a burst of failures from one source must not be able
-	// to grind through guesses unthrottled.
-	loginMu           sync.Mutex
-	loginFailures     map[string]*loginFailureState
-	loginFailuresLast time.Time
+	// auth owns sessions, the login rate limiter and API-key credentials. It
+	// holds no HTTP concepts, so the domain can be tested without a server.
+	// Built lazily by authService because tests assemble Server as a literal.
+	authMu sync.Mutex
+	auth   *controlplane.Auth
 
 	// Concurrency control
 	probeSem            *semaphore.Weighted
@@ -110,26 +96,6 @@ type RetagQueue interface {
 	EnqueueAll()
 }
 
-// Login rate limiting: maxLoginFailuresWithin wrong passwords from one source
-// inside loginFailureWindow lock that source out for loginLockout. The counter
-// decays by the window, so slow guessing stays throttled too.
-const (
-	maxLoginFailuresWithin = 8
-	loginFailureWindow     = 10 * time.Minute
-	loginLockout           = 5 * time.Minute
-
-	// maxSessions caps the in-memory session table. Every login inserts one,
-	// so without a cap a scripted login loop grows the map (and the SQLite
-	// sessions table) without bound.
-	maxSessions = 256
-)
-
-type loginFailureState struct {
-	count       int
-	firstSeen   time.Time
-	lockedUntil time.Time
-}
-
 // NewServer constructs a server; it can be nil when disabled.
 func NewServer(cfg monitor.Config, mgr *monitor.Manager, logger *log.Logger) *Server {
 	if !cfg.Enabled || mgr == nil {
@@ -140,15 +106,16 @@ func NewServer(cfg monitor.Config, mgr *monitor.Manager, logger *log.Logger) *Se
 	}
 
 	s := &Server{
-		cfg:           cfg,
-		mgr:           mgr,
-		logger:        logger,
-		sessions:      make(map[string]*Session),
-		sessionTTL:    24 * time.Hour,
-		loginFailures: make(map[string]*loginFailureState),
-		probeSem:      semaphore.NewWeighted(int64(batchOperationConcurrency())),
-		done:          make(chan struct{}),
+		cfg:      cfg,
+		mgr:      mgr,
+		logger:   logger,
+		probeSem: semaphore.NewWeighted(int64(batchOperationConcurrency())),
+		done:     make(chan struct{}),
 	}
+	// Build the auth domain eagerly so the session-cleanup goroutine below has
+	// something to drive. The password is read through the server, so a settings
+	// change takes effect without rebinding the service.
+	s.authService()
 
 	// Start session cleanup goroutine
 	go s.cleanupExpiredSessions()
@@ -284,6 +251,7 @@ func (s *Server) closeGeoipLookup() {
 func (s *Server) SetStore(st store.Store) {
 	if s != nil {
 		s.store = st
+		s.authService().SetStore(st)
 		if s.mgr != nil {
 			s.mgr.SetProbeStore(st)
 		}
@@ -403,4 +371,21 @@ func (s *Server) Shutdown(ctx context.Context) {
 		close(s.done)
 	}
 	_ = s.srv.Shutdown(ctx)
+}
+
+// authService returns the authentication domain, building it on first use.
+// Server is assembled as a struct literal in tests, so the service cannot be a
+// NewServer-only invariant; every auth path goes through here instead of
+// touching the field.
+func (s *Server) authService() *controlplane.Auth {
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	if s.auth == nil {
+		s.auth = controlplane.NewAuth(controlplane.AuthOptions{
+			Store:    s.store,
+			Logger:   s.logger,
+			Password: s.authPassword,
+		})
+	}
+	return s.auth
 }

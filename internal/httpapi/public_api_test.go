@@ -11,8 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
+	"easy_proxies/internal/controlplane"
 	"easy_proxies/internal/store"
 )
 
@@ -29,13 +29,8 @@ func newAPIKeyTestServer(t *testing.T) (*Server, *store.APIKey) {
 		t.Fatal(err)
 	}
 	return &Server{
-		store:    db,
-		logger:   log.New(io.Discard, "", 0),
-		sessions: map[string]*Session{},
-		// createSession stamps ExpiresAt from sessionTTL. A zero TTL makes every
-		// session expire the instant it is issued, so the session-based cases
-		// below would pass or fail depending on where the clock ticked.
-		sessionTTL: time.Hour,
+		store:  db,
+		logger: log.New(io.Discard, "", 0),
 	}, key
 }
 
@@ -164,7 +159,7 @@ func TestAPIKeyManagementRequiresSession(t *testing.T) {
 		t.Fatalf("GET /api/api-keys with an API key status=%d, want 401 (session required)", recorder.Code)
 	}
 
-	session, err := s.createSession()
+	session, err := s.authService().CreateSession(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +182,6 @@ func TestAPIKeyManagementRequiresSession(t *testing.T) {
 func TestLoginRateLimitLocksOutBursts(t *testing.T) {
 	s, _ := newAPIKeyTestServer(t)
 	s.cfg.Password = "secret"
-	s.sessionTTL = time.Hour
 	mux := s.routes()
 
 	post := func(password string) *httptest.ResponseRecorder {
@@ -200,7 +194,7 @@ func TestLoginRateLimitLocksOutBursts(t *testing.T) {
 		return recorder
 	}
 
-	for i := 0; i < maxLoginFailuresWithin; i++ {
+	for i := 0; i < controlplane.MaxLoginFailuresWithin; i++ {
 		if code := post("wrong").Code; code != http.StatusUnauthorized {
 			t.Fatalf("wrong password attempt %d status=%d, want 401", i+1, code)
 		}
