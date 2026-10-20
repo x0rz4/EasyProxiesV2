@@ -21,7 +21,6 @@ import (
 )
 
 const (
-	StatusUntested = "untested"
 	StatusSuccess  = "success"
 	StatusPartial  = "partial"
 	StatusFailed   = "failed"

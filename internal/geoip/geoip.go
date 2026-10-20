@@ -6,13 +6,10 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/netip"
-	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -21,15 +18,10 @@ import (
 	"github.com/oschwald/geoip2-golang/v2"
 )
 
-// Region codes
-const (
-	RegionJP    = "jp"
-	RegionKR    = "kr"
-	RegionUS    = "us"
-	RegionHK    = "hk"
-	RegionTW    = "tw"
-	RegionOther = "other"
-)
+// RegionOther is the bucket for nodes whose country could not be classified.
+// Country codes themselves are produced by noderegion.Normalize, so this
+// package deliberately declares no per-country constants.
+const RegionOther = "other"
 
 // Default GeoIP database download URLs. Keep these as direct upstream
 // addresses and do not route them through a third-party proxy mirror.
@@ -410,7 +402,7 @@ func (l *Lookup) Update() error {
 
 	// Download to temporary file
 	tempPath := l.path + ".update"
-	if err := downloadDatabase(tempPath); err != nil {
+	if err := fetchDatabase(tempPath); err != nil {
 		return fmt.Errorf("download failed: %w", err)
 	}
 	defer os.Remove(tempPath) // Clean up temp file
@@ -444,11 +436,6 @@ func (l *Lookup) Update() error {
 
 	log.Printf("✅ GeoIP database updated successfully")
 	return nil
-}
-
-// downloadDatabase downloads the GeoIP database to the specified path
-func downloadDatabase(filepath string) error {
-	return fetchDatabase(filepath)
 }
 
 // Close closes the GeoIP database and stops auto-update
@@ -521,91 +508,6 @@ func regionInfoFromCountry(record *geoip2.Country) RegionInfo {
 
 func unknownRegionInfo() RegionInfo {
 	return RegionInfo{}
-}
-
-// LookupURI extracts server from URI and returns region info
-func (l *Lookup) LookupURI(uri string) RegionInfo {
-	host := extractHostFromURI(uri)
-	if host == "" {
-		return RegionInfo{Code: RegionOther, Country: "Unknown", ISOCode: ""}
-	}
-
-	// Resolve hostname to IP if needed
-	ip := net.ParseIP(host)
-	if ip == nil {
-		// It's a hostname, try to resolve
-		ips, err := net.LookupIP(host)
-		if err != nil || len(ips) == 0 {
-			return RegionInfo{Code: RegionOther, Country: "Unknown", ISOCode: ""}
-		}
-		host = ips[0].String()
-	}
-
-	return l.LookupIP(host)
-}
-
-// extractHostFromURI extracts the host/IP from various proxy URI formats
-func extractHostFromURI(uri string) string {
-	// Handle different URI schemes
-	lowerURI := strings.ToLower(uri)
-
-	// Standard URL formats, including HTTP and SOCKS upstream proxies.
-	if strings.HasPrefix(lowerURI, "vmess://") ||
-		strings.HasPrefix(lowerURI, "vless://") ||
-		strings.HasPrefix(lowerURI, "trojan://") ||
-		strings.HasPrefix(lowerURI, "hysteria://") ||
-		strings.HasPrefix(lowerURI, "hysteria2://") ||
-		strings.HasPrefix(lowerURI, "hy2://") ||
-		strings.HasPrefix(lowerURI, "anytls://") ||
-		strings.HasPrefix(lowerURI, "http://") ||
-		strings.HasPrefix(lowerURI, "socks5://") {
-		// Standard URL format: scheme://user@host:port?params#fragment
-		parsed, err := url.Parse(uri)
-		if err != nil {
-			return ""
-		}
-		return parsed.Hostname()
-	}
-
-	if strings.HasPrefix(lowerURI, "ss://") {
-		// Shadowsocks format: ss://base64(method:password)@host:port#name
-		// or ss://base64@host:port#name
-		return extractSSHost(uri)
-	}
-
-	if strings.HasPrefix(lowerURI, "ssr://") {
-		// SSR format is base64 encoded
-		return extractSSRHost(uri)
-	}
-
-	return ""
-}
-
-func extractSSHost(uri string) string {
-	// Remove ss:// prefix
-	content := strings.TrimPrefix(uri, "ss://")
-
-	// Remove fragment (#name)
-	if idx := strings.Index(content, "#"); idx != -1 {
-		content = content[:idx]
-	}
-
-	// Check if it's the new format: base64@host:port
-	if atIdx := strings.LastIndex(content, "@"); atIdx != -1 {
-		hostPort := content[atIdx+1:]
-		if colonIdx := strings.LastIndex(hostPort, ":"); colonIdx != -1 {
-			return hostPort[:colonIdx]
-		}
-		return hostPort
-	}
-
-	// Old format: entire content is base64
-	return ""
-}
-
-func extractSSRHost(uri string) string {
-	// SSR is complex, skip for now - will be marked as "other"
-	return ""
 }
 
 // isoCodeToRegion maps an ISO 3166-1 alpha-2 country code to a region code.

@@ -279,9 +279,7 @@ func (s *Server) handleGroupRemoveMember(w http.ResponseWriter, r *http.Request)
 	}
 	reloadError := s.applyGroupRuntimeMutation(r.Context(), originalGroup, groupPool)
 	if reloadError != "" {
-		rolledBack := s.store.UpdateGroupPool(r.Context(), originalGroup) == nil
-		w.WriteHeader(http.StatusConflict)
-		writeJSON(w, map[string]any{"error": reloadError, "reloaded": false, "reload_error": reloadError, "rolled_back": rolledBack})
+		s.writeGroupReloadConflict(w, r, reloadError, originalGroup)
 		return
 	}
 	writeJSON(w, map[string]any{"message": "节点已从当前分组移除", "group_id": groupID, "node_id": nodeID,
@@ -325,9 +323,7 @@ func (s *Server) handleGroupRemoveExclusion(w http.ResponseWriter, r *http.Reque
 	}
 	reloadError := s.applyGroupRuntimeMutation(r.Context(), originalGroup, groupPool)
 	if reloadError != "" {
-		rolledBack := s.store.UpdateGroupPool(r.Context(), originalGroup) == nil
-		w.WriteHeader(http.StatusConflict)
-		writeJSON(w, map[string]any{"error": reloadError, "reloaded": false, "reload_error": reloadError, "rolled_back": rolledBack})
+		s.writeGroupReloadConflict(w, r, reloadError, originalGroup)
 		return
 	}
 	writeJSON(w, map[string]any{"message": "节点已取消排除", "group_id": groupID, "node_id": nodeID,
@@ -405,9 +401,7 @@ func (s *Server) handleGroupUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	reloadError := s.applyGroupRuntimeMutation(r.Context(), existing, updated)
 	if reloadError != "" {
-		rolledBack := s.store.UpdateGroupPool(r.Context(), existing) == nil
-		w.WriteHeader(http.StatusConflict)
-		writeJSON(w, map[string]any{"error": reloadError, "reloaded": false, "reload_error": reloadError, "rolled_back": rolledBack})
+		s.writeGroupReloadConflict(w, r, reloadError, existing)
 		return
 	}
 	writeJSON(w, map[string]any{"group": updated, "reloaded": reloadError == "", "reload_error": reloadError,
@@ -857,8 +851,8 @@ func (s *Server) groupTagFilterFromInput(ctx context.Context, input groupPoolInp
 		return nil, nil, "", errors.New("标签匹配方式只能是 any 或 all")
 	}
 
-	whitelist := normalizeTagIDs(whitelistInput)
-	blacklist := normalizeTagIDs(blacklistInput)
+	whitelist := normalizePositiveIDs(whitelistInput)
+	blacklist := normalizePositiveIDs(blacklistInput)
 	inWhitelist := make(map[int64]struct{}, len(whitelist))
 	for _, tagID := range whitelist {
 		inWhitelist[tagID] = struct{}{}
@@ -888,24 +882,6 @@ func (s *Server) groupTagFilterFromInput(ctx context.Context, input groupPoolInp
 		}
 	}
 	return whitelist, blacklist, match, nil
-}
-
-// normalizeTagIDs drops non-positive IDs and duplicates while keeping the order
-// the operator sent, which is the order the UI shows them back in.
-func normalizeTagIDs(tagIDs []int64) []int64 {
-	normalized := make([]int64, 0, len(tagIDs))
-	seen := make(map[int64]struct{}, len(tagIDs))
-	for _, tagID := range tagIDs {
-		if tagID <= 0 {
-			continue
-		}
-		if _, duplicate := seen[tagID]; duplicate {
-			continue
-		}
-		seen[tagID] = struct{}{}
-		normalized = append(normalized, tagID)
-	}
-	return normalized
 }
 
 func (s *Server) allocateGroupPort(ctx context.Context) (uint16, error) {
@@ -1006,6 +982,16 @@ func (s *Server) applyGroupRuntimeMutation(ctx context.Context, before, after *s
 		return ""
 	}
 	return s.reloadAfterGroupMutation(ctx)
+}
+
+// writeGroupReloadConflict answers a group mutation whose runtime rebuild
+// failed. The persisted row is rolled back to before so the database never
+// claims a topology the running box does not have; the response reports both
+// the reload error and whether that rollback landed.
+func (s *Server) writeGroupReloadConflict(w http.ResponseWriter, r *http.Request, reloadError string, before *store.GroupPool) {
+	rolledBack := s.store.UpdateGroupPool(r.Context(), before) == nil
+	w.WriteHeader(http.StatusConflict)
+	writeJSON(w, map[string]any{"error": reloadError, "reloaded": false, "reload_error": reloadError, "rolled_back": rolledBack})
 }
 
 func cloneGroupPool(groupPool *store.GroupPool) *store.GroupPool {

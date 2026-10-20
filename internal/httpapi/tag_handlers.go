@@ -952,6 +952,10 @@ func parseTagIDQuery(value string) ([]int64, error) {
 	return normalizePositiveIDs(ids), nil
 }
 
+// normalizePositiveIDs drops non-positive IDs and duplicates while keeping the
+// order the caller sent, which is the order the UI shows them back in. It backs
+// both node-ID and tag-ID lists, so group tag filters and tag rules agree on
+// what a "clean" list looks like.
 func normalizePositiveIDs(ids []int64) []int64 {
 	result := make([]int64, 0, len(ids))
 	seen := make(map[int64]struct{}, len(ids))

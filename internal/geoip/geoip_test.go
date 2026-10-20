@@ -146,7 +146,7 @@ func TestRegionInfoFromCountry(t *testing.T) {
 				ISOCode: "JP",
 				Names:   geoip2.Names{English: "Japan"},
 			}},
-			want: RegionInfo{Code: RegionJP, Country: "Japan", ISOCode: "JP"},
+			want: RegionInfo{Code: "jp", Country: "Japan", ISOCode: "JP"},
 		},
 		{
 			name: "ISO code fallback",
@@ -165,23 +165,6 @@ func TestRegionInfoFromCountry(t *testing.T) {
 				t.Fatalf("regionInfoFromCountry() = %+v, want %+v", got, tt.want)
 			}
 		})
-	}
-}
-
-func TestExtractHostFromURISupportsHTTPAndSOCKS5(t *testing.T) {
-	tests := []struct {
-		name string
-		uri  string
-		want string
-	}{
-		{name: "http", uri: "http://alice:secret@example.com:8080", want: "example.com"},
-		{name: "socks5", uri: "socks5://alice:secret@99.144.123.135:30350", want: "99.144.123.135"},
-	}
-
-	for _, tt := range tests {
-		if got := extractHostFromURI(tt.uri); got != tt.want {
-			t.Fatalf("%s: extractHostFromURI(%q) = %q, want %q", tt.name, tt.uri, got, tt.want)
-		}
 	}
 }
 
@@ -204,7 +187,7 @@ func TestIsoCodeToRegionIsCountryCode(t *testing.T) {
 
 func TestRegionNameShowsCountryCode(t *testing.T) {
 	// Well-known regions show friendly names.
-	if got := RegionName(RegionJP); got != "Japan" {
+	if got := RegionName("jp"); got != "Japan" {
 		t.Errorf("RegionName(jp) = %q, want Japan", got)
 	}
 	if got := RegionName("sg"); got != "Singapore" {

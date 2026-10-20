@@ -266,7 +266,6 @@ func ReducedIPQualityField(reduction, attribute string) string {
 const (
 	ReduceAny = "any"
 	ReduceAll = "all"
-	ReduceMax = "max"
 )
 
 // ProviderInfo names an unlock or IP quality provider for registry building.
