@@ -449,9 +449,12 @@ func TestCommitSnapshotPrunesNodesMissingFromConsecutiveSnapshots(t *testing.T) 
 		t.Fatal(err)
 	}
 	bNode, err := db.GetNodeByURI(ctx, b.URI)
+	if err != nil || bNode == nil {
+		t.Fatalf("node B: %+v err=%v", bNode, err)
+	}
 	aNode, err := db.GetNodeByURI(ctx, a.URI)
-	if err != nil || bNode == nil || aNode == nil {
-		t.Fatalf("nodes: A=%+v B=%+v err=%v", aNode, bNode, err)
+	if err != nil || aNode == nil {
+		t.Fatalf("node A: %+v err=%v", aNode, err)
 	}
 	group := &GroupPool{Name: "aging", BindAddress: "127.0.0.1", BindPort: 10188, Protocol: "mixed",
 		DispatchMode: "fixed", ExplicitNodeIDs: []int64{bNode.ID, aNode.ID}, ExcludedNodeIDs: []int64{bNode.ID},

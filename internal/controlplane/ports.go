@@ -151,7 +151,6 @@ type SubscriptionStatus struct {
 	RefreshCount      int       `json:"refresh_count"`
 	IsRefreshing      bool      `json:"is_refreshing"`
 	RefreshingIDs     []int64   `json:"refreshing_ids,omitempty"` // subscriptions fetching right now
-	NodesModified     bool      `json:"nodes_modified"` // True if nodes were modified since last refresh
 	Parsed            int       `json:"parsed"`
 	Created           int       `json:"created"`
 	Updated           int       `json:"updated"`

@@ -338,7 +338,7 @@ func (m *Manager) reload(newCfg *config.Config) error {
 	}
 	if oldBox != nil && incrementalReloadEligible(oldCfg, newCfg) {
 		m.mu.Unlock()
-		if err := m.reloadNodesIncrementally(ctx, oldBox, oldCfg, newCfg); err != nil {
+		if err := m.reloadNodesIncrementally(oldBox, oldCfg, newCfg); err != nil {
 			return err
 		}
 		groupErr := m.syncGroupRuntimesAfterBaseReload(ctx, oldCfg, newCfg)
@@ -776,10 +776,7 @@ func runtimeMemberMeta(cfg *config.Config, node config.NodeConfig) pool.MemberMe
 	return meta
 }
 
-func (m *Manager) reloadNodesIncrementally(ctx context.Context, instance *box.Box, oldCfg, newCfg *config.Config) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+func (m *Manager) reloadNodesIncrementally(instance *box.Box, oldCfg, newCfg *config.Config) error {
 	m.mu.RLock()
 	previous := make(map[string]runtimeNode, len(m.runtimeNodes))
 	for key, value := range m.runtimeNodes {
@@ -1821,41 +1818,6 @@ func (m *Manager) createBoxFromOptions(ctx context.Context, opts option.Options)
 	return instance, nil
 }
 
-// gracefulSwitch swaps the current box with a new one.
-func (m *Manager) gracefulSwitch(newBox *box.Box) error {
-	if newBox == nil {
-		return errors.New("new box is nil")
-	}
-
-	m.mu.Lock()
-	old := m.currentBox
-	m.currentBox = newBox
-	drainTimeout := m.drainTimeout
-	m.mu.Unlock()
-
-	if old != nil {
-		go m.drainOldBox(old, drainTimeout)
-	}
-
-	m.logger.Infof("switched to new instance, draining old for %s", drainTimeout)
-	return nil
-}
-
-// drainOldBox waits for drain timeout then closes the old box.
-func (m *Manager) drainOldBox(oldBox *box.Box, timeout time.Duration) {
-	if oldBox == nil {
-		return
-	}
-	if timeout > 0 {
-		time.Sleep(timeout)
-	}
-	if err := oldBox.Close(); err != nil {
-		m.logger.Errorf("failed to close old instance: %v", err)
-		return
-	}
-	m.logger.Infof("old instance closed after %s drain", timeout)
-}
-
 // waitForHealthCheck polls until enough nodes are available or timeout.
 func (m *Manager) waitForHealthCheck(timeout time.Duration) error {
 	m.mu.RLock()
@@ -2258,9 +2220,7 @@ func (m *Manager) CreateNodes(ctx context.Context, nodes []config.NodeConfig, dr
 	}
 
 	// No store: the in-memory config is the only destination.
-	for _, node := range prepared {
-		m.cfg.Nodes = append(m.cfg.Nodes, node)
-	}
+	m.cfg.Nodes = append(m.cfg.Nodes, prepared...)
 	result.Created = prepared
 	return result, nil
 }
@@ -2901,15 +2861,6 @@ func reassignConflictingPort(cfg *config.Config, conflictPort uint16) bool {
 		}
 	}
 	return false
-}
-
-func cloneNodes(nodes []config.NodeConfig) []config.NodeConfig {
-	if len(nodes) == 0 {
-		return []config.NodeConfig{} // Return empty slice, not nil, for proper JSON serialization
-	}
-	out := make([]config.NodeConfig, len(nodes))
-	copy(out, nodes)
-	return out
 }
 
 func (m *Manager) copyConfigLocked() *config.Config {

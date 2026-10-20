@@ -16,16 +16,13 @@ import type {
   Subscription,
   SubscriptionPayload,
   SubscriptionsResponse,
-  SubscriptionNodesResponse,
   SubscriptionActionResponse,
   SubscriptionRefreshResponse,
   ProbeSSEEvent,
   ProbeOperationsSettings,
   ProbeOperationsStatus,
   UnlockResult,
-  UnlockMetaResponse,
   UnlockResultsResponse,
-  UnlockSSEEvent,
   TrafficStreamEvent,
   DebugLogEvent,
   GeoipStatus,
@@ -335,14 +332,6 @@ export async function setNodeManualTags(nodeId: number, tagIds: number[]): Promi
   })
 }
 
-export async function batchUpdateNodeTags(body: {
-  node_ids: number[]
-  add_tag_ids: number[]
-  remove_tag_ids: number[]
-}): Promise<{ ok: boolean; node_ids: number[] }> {
-  return request('/api/tags/nodes/batch', { method: 'POST', body: JSON.stringify(body) })
-}
-
 export async function fetchTagMutexGroups(): Promise<{ mutex_groups: TagMutexGroup[] }> {
   return request('/api/tags/mutex-groups')
 }
@@ -375,10 +364,6 @@ export async function removeGroupMember(groupId: number, nodeId: number) {
   return request(`/api/groups/${groupId}/members/${nodeId}`, { method: 'DELETE' })
 }
 
-export async function unexcludeGroupMember(groupId: number, nodeId: number) {
-  return request(`/api/groups/${groupId}/exclusions/${nodeId}`, { method: 'DELETE' })
-}
-
 export async function resetGroupSubscriptionToken(groupId: number): Promise<{ message: string; token: string }> {
   return request(`/api/groups/${groupId}/subscription/reset-token`, { method: 'POST' })
 }
@@ -406,11 +391,6 @@ export async function unlockNode(tag: string): Promise<UnlockResult> {
 /** Fetch the last persisted unlock detection result for every node. */
 export async function fetchUnlockResults(): Promise<UnlockResultsResponse> {
   return request<UnlockResultsResponse>('/api/nodes/unlock-results')
-}
-
-/** Fetch registered unlock provider and status metadata. */
-export async function fetchUnlockMeta(): Promise<UnlockMetaResponse> {
-  return request<UnlockMetaResponse>('/api/nodes/unlock-meta')
 }
 
 /** Probe all nodes with SSE progress updates */
@@ -462,66 +442,6 @@ export function probeAllNodes(
           if (trimmed.startsWith('data: ')) {
             try {
               const data = JSON.parse(trimmed.slice(6)) as ProbeSSEEvent
-              onEvent(data)
-            } catch { /* skip malformed events */ }
-          }
-        }
-      }
-    } catch (err) {
-      if ((err as Error).name !== 'AbortError') {
-        onError?.(err as Error)
-      }
-    }
-  }
-
-  doFetch()
-  return controller
-}
-
-/** Unlock detection for all nodes with SSE progress updates. */
-export function unlockAllNodes(
-  onEvent: (event: UnlockSSEEvent) => void,
-  onError?: (error: Error) => void
-): AbortController {
-  const controller = new AbortController()
-
-  const doFetch = async () => {
-    try {
-      const headers: Record<string, string> = {}
-      if (authToken) {
-        headers['Authorization'] = `Bearer ${authToken}`
-      }
-
-      const res = await fetch('/api/nodes/unlock-all', {
-        method: 'POST',
-        headers,
-        credentials: 'include',
-        signal: controller.signal,
-      })
-
-      if (!res.ok) {
-        throw new ApiError(`解锁检测失败: HTTP ${res.status}`, res.status)
-      }
-
-      const reader = res.body?.getReader()
-      if (!reader) throw new Error('No response body')
-
-      const decoder = new TextDecoder()
-      let buffer = ''
-
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-
-        buffer += decoder.decode(value, { stream: true })
-        const lines = buffer.split('\n')
-        buffer = lines.pop() || ''
-
-        for (const line of lines) {
-          const trimmed = line.trim()
-          if (trimmed.startsWith('data: ')) {
-            try {
-              const data = JSON.parse(trimmed.slice(6)) as UnlockSSEEvent
               onEvent(data)
             } catch { /* skip malformed events */ }
           }
@@ -814,10 +734,6 @@ export async function activateSubscription(id: number): Promise<SubscriptionActi
 
 export async function refreshOneSubscription(id: number): Promise<SubscriptionActionResponse> {
   return request<SubscriptionActionResponse>(`/api/subscriptions/${id}/refresh`, { method: 'POST' })
-}
-
-export async function listSubscriptionNodes(id: number): Promise<SubscriptionNodesResponse> {
-  return request<SubscriptionNodesResponse>(`/api/subscriptions/${id}/nodes`)
 }
 
 // ---- Export API ----

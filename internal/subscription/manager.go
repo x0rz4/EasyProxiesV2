@@ -845,8 +845,6 @@ func (m *Manager) ApplyConfig(cfg *config.Config) {
 	m.baseCfg = cfg
 	m.mu.Unlock()
 }
-func (m *Manager) CheckNodesModified() bool { return false }
-func (m *Manager) MarkNodesModified()       { m.mu.Lock(); m.status.NodesModified = true; m.mu.Unlock() }
 
 func nodeName(name, uri string, index int) string {
 	name = strings.TrimSpace(name)

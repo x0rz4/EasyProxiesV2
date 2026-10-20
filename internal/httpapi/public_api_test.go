@@ -205,9 +205,8 @@ func TestLoginRateLimitLocksOutBursts(t *testing.T) {
 	}
 
 	// A different source is unaffected.
-	request := httptest.NewRequest(http.MethodPost, "/api/auth", nil)
 	body, _ := json.Marshal(map[string]string{"password": "secret"})
-	request = httptest.NewRequest(http.MethodPost, "/api/auth", bytes.NewReader(body))
+	request := httptest.NewRequest(http.MethodPost, "/api/auth", bytes.NewReader(body))
 	request.RemoteAddr = "198.51.100.7:5555"
 	recorder := httptest.NewRecorder()
 	mux.ServeHTTP(recorder, request)

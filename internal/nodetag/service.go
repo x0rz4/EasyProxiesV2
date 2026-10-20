@@ -63,24 +63,9 @@ func WithRegistry(registry *nodefacts.Registry) Option {
 	}
 }
 
-// WithLimits overrides the rule complexity limits.
-func WithLimits(limits nodefacts.Limits) Option {
-	return func(s *Service) { s.limits = limits }
-}
-
 // WithUnlockProviders sets the providers that get an unlock template.
 func WithUnlockProviders(providers []nodefacts.ProviderInfo) Option {
 	return func(s *Service) { s.unlockProviders = providers }
-}
-
-// WithClock overrides the clock used to age facts. Tests use it to make
-// max_age_seconds deterministic.
-func WithClock(now func() time.Time) Option {
-	return func(s *Service) {
-		if now != nil {
-			s.now = now
-		}
-	}
 }
 
 // WithMembershipNotifier registers a callback receiving the nodes whose visible

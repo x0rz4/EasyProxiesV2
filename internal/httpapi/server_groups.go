@@ -598,26 +598,6 @@ func (s *Server) groupNodeOptions(ctx context.Context, groups []store.GroupPool,
 	return options, nil
 }
 
-func (s *Server) selectableGroupNodeIDs(ctx context.Context) (map[int64]struct{}, error) {
-	monitorByTag := make(map[string]monitor.Snapshot)
-	if s.mgr != nil {
-		for _, snapshot := range s.mgr.Snapshot() {
-			monitorByTag[snapshot.Tag] = snapshot
-		}
-	}
-	options, err := s.groupNodeOptions(ctx, nil, monitorByTag)
-	if err != nil {
-		return nil, err
-	}
-	selectable := make(map[int64]struct{}, len(options))
-	for _, option := range options {
-		if option.Selectable {
-			selectable[option.ID] = struct{}{}
-		}
-	}
-	return selectable, nil
-}
-
 func (s *Server) groupFromInput(ctx context.Context, input groupPoolInput, existing *store.GroupPool) (*store.GroupPool, []int64, error) {
 	input.Name = strings.TrimSpace(input.Name)
 	if input.Name == "" {

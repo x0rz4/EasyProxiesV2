@@ -352,10 +352,6 @@ func LoadForReload(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-func (c *Config) normalize() error {
-	return c.normalizeInternal(false)
-}
-
 // applyDefaults sets default values for all config fields.
 // This is the single source of truth for defaults, used by both
 // normalizeInternal and NormalizeWithPortMap to avoid code duplication.
@@ -1357,36 +1353,6 @@ func unwrapProxyURILine(line string) string {
 	return line
 }
 
-// isBase64 checks if a string looks like base64 encoded content (optimized version)
-func isBase64(s string) bool {
-	// Remove whitespace
-	s = strings.TrimSpace(s)
-	if len(s) == 0 {
-		return false
-	}
-
-	// Remove newlines for checking
-	s = strings.ReplaceAll(s, "\n", "")
-	s = strings.ReplaceAll(s, "\r", "")
-
-	// Quick check: if it contains proxy URI schemes, it's not base64
-	if strings.Contains(s, "://") {
-		return false
-	}
-
-	// Check character set - base64 only contains A-Za-z0-9+/=
-	// This is much faster than trying to decode
-	for _, c := range s {
-		if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-			(c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=') {
-			return false
-		}
-	}
-
-	// Length must be multiple of 4 (with padding)
-	return len(s)%4 == 0
-}
-
 // IsProxyURI checks if a string is a valid proxy URI
 func IsProxyURI(s string) bool {
 	lower := strings.ToLower(strings.TrimSpace(s))
@@ -1458,7 +1424,7 @@ func parseSingBoxJSON(content string) ([]NodeConfig, bool, []string, error) {
 	}
 	if len(nodes) == 0 {
 		if len(issues) == 0 {
-			return nil, true, nil, errors.New("Sing-box JSON 中没有 outbounds")
+			return nil, true, nil, errors.New("sing-box JSON 中没有 outbounds")
 		}
 		return nil, true, issues, errors.New(strings.Join(issues, "; "))
 	}
@@ -1872,9 +1838,8 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 			if werr := os.WriteFile(path, data, perm); werr != nil {
 				return fmt.Errorf("rename temp file: %w", err)
 			}
-			if cerr := os.Remove(tmpPath); cerr != nil {
-				// best-effort cleanup
-			}
+			// Best-effort cleanup; a leftover temp file is harmless.
+			_ = os.Remove(tmpPath)
 			return nil
 		}
 		return fmt.Errorf("rename temp file: %w", err)

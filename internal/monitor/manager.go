@@ -540,16 +540,6 @@ func (m *Manager) RegisterGroupHealthScheduleByNodeID(groupID int64, nodeIDs []i
 	}
 }
 
-func (m *Manager) UnregisterGroupHealthSchedule(groupID int64) {
-	if groupID == 0 {
-		return
-	}
-	m.groupScheduleMu.Lock()
-	delete(m.groupSchedules, groupID)
-	m.groupScheduleMu.Unlock()
-	m.probeScheduler.reschedulePeriodic()
-}
-
 // probeDue reports whether a node's effective interval has elapsed. The caller
 // supplies nodeID so due-time calculation stays independent of the registry
 // and can operate on an immutable scheduling snapshot.
@@ -1471,12 +1461,6 @@ func (e *entry) setDialer(fn DialerFunc) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.dialer = fn
-}
-
-func (e *entry) recordProbeLatency(d time.Duration) {
-	e.mu.Lock()
-	e.lastProbe = d
-	e.mu.Unlock()
 }
 
 func (e *entry) updateTrafficSpeed(now time.Time) {

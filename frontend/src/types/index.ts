@@ -362,10 +362,6 @@ export interface AuthResponse {
   no_password?: boolean
 }
 
-export interface ErrorResponse {
-  error: string
-}
-
 // ---- Config Node CRUD types ----
 
 export interface ConfigNodePayload {
@@ -573,33 +569,8 @@ export interface SubscriptionPayload {
   sort_order: number
 }
 
-export interface SubscriptionNodeData {
-  id: number
-  uri: string
-  name: string
-  source: string
-  port: number
-  username?: string
-  password?: string
-  region?: string
-  country?: string
-  enabled: boolean
-  created_at: string
-  updated_at: string
-}
-
-export interface SubscriptionNode {
-  subscription_id: number
-  position: number
-  node: SubscriptionNodeData
-}
-
 export interface SubscriptionsResponse {
   subscriptions: Subscription[]
-}
-
-export interface SubscriptionNodesResponse {
-  nodes: SubscriptionNode[]
 }
 
 export interface SubscriptionActionResponse {
@@ -877,29 +848,6 @@ export interface UnlockServiceResult {
   detail?: string
 }
 
-export interface UnlockProviderMeta {
-  value: UnlockServiceResult['name'] | string
-  label: string
-  description?: string
-  category?: 'streaming' | 'ai' | 'social' | 'custom'
-  aliases?: string[]
-  order: number
-}
-
-export interface UnlockStatusMeta {
-  value: UnlockServiceResult['status'] | string
-  label: string
-  short_label?: string
-  description?: string
-  color?: string
-  severity?: string
-}
-
-export interface UnlockMetaResponse {
-  providers: UnlockProviderMeta[]
-  statuses: UnlockStatusMeta[]
-}
-
 // Native IP purity info for the node's exit IP.
 export interface UnlockIPInfo {
   ip: string
@@ -935,34 +883,6 @@ export interface UnlockResult {
 export interface UnlockResultsResponse {
   results: Record<string, UnlockResult>
 }
-
-// SSE events for the batch unlock-all stream.
-export interface UnlockSSEStart {
-  type: 'start'
-  total: number
-}
-
-export interface UnlockSSEProgress {
-  type: 'progress'
-  tag?: string
-  name?: string
-  status: 'success' | 'error'
-  error?: string
-  result?: UnlockResult
-  current: number
-  total: number
-  progress: number
-}
-
-export interface UnlockSSEComplete {
-  type: 'complete'
-  total: number
-  success: number
-  failed: number
-}
-
-export type UnlockSSEEvent = UnlockSSEStart | UnlockSSEProgress | UnlockSSEComplete
-
 
 // ---- SSE Traffic stream types ----
 

@@ -235,6 +235,58 @@ docker rm -f easy-proxies
 docker compose up -d --build
 ```
 
+## 🧭 架构速览：写路径与读路径
+
+一句话：**只有 `store` 落库，只有 `runtimenodes.Load` 决定谁能进 pool；健康与剔除只认两类证据——`health_probe` 的探测结果和成员的真实拨号失败。**
+
+```mermaid
+flowchart TB
+  subgraph WRITE["写路径 · 谁写什么"]
+    direction TB
+    N1["controlplane.Settings<br/>配置读写（唯一 Config.SaveSettings 调用方）"]
+    N2["controlplane.NodeManager ← boxmgr<br/>节点 CRUD / 导入 / 启停"]
+    N3["subscription.Manager<br/>CommitSnapshot / RecordSubscription*"]
+    N4["探测与手动检测 → probe.Applier<br/>事实 + 收据（单事务）"]
+    N5["nodetag.Service<br/>ReplaceAutoNodeTags（自动标签唯一写入方）"]
+    N6["group.Runtime → app.groupStatePersister<br/>成员态 / current（异步合并）"]
+    N7["app 统计 flush / healer 审计<br/>周期落库"]
+    N8["httpapi 管理面<br/>分组 / 标签定义、手工标签、人工恢复"]
+  end
+  CFG[/"config.yaml"/]
+  DB[("SQLite · store<br/>唯一持久化层")]
+  N1 --> CFG
+  N2 --> DB
+  N3 --> DB
+  N4 --> DB
+  N5 --> DB
+  N6 --> DB
+  N7 --> DB
+  N8 --> DB
+
+  subgraph EVENT["事件 · 谁发健康事件"]
+    HUB["HealthResultEvent<br/>按 tag / NodeID 定向投递"]
+  end
+  N4 -.->|"仅 health_probe → ProjectHealthOutcome"| HUB
+
+  subgraph READ["读路径 · 谁进 pool"]
+    direction TB
+    R1["runtimenodes.Load<br/>启动 / 订阅 reconcile / TriggerReload"] --> R2["boxmgr.CreateMember<br/>PrepareUpdate → Commit → 旧成员排空"]
+    R2 --> R3["pool 不可变快照<br/>数据面只做一次 atomic.Load"]
+  end
+  HUB --> R3
+  R3 --> R4["inbound → 选路 → 成员拨号"]
+  R4 -->|失败| R5["group.RecordFailure<br/>或共享黑名单"]
+  R5 -.->|"状态迁移 / 候选集重算<br/>不改变成员集合"| R3
+  R4 -->|成功| R6["EntryHandle.RecordSuccess<br/>延迟与流量回写（内存）"]
+```
+
+- **写路径**：SQLite 的唯一入口是 `store`；`config.yaml` 由 `controlplane.Settings` 串行写入，与数据库写入互不替代。订阅刷新按语义窄写（`CommitSnapshot`、`RecordSubscriptionFailure`、`RecordSubscriptionNotModified`、`MarkSubscriptionAttempt`），不做“读整行再写回”。
+- **健康事件**：`monitor` 联网前捕获身份快照 → `probe.Applier` 事务写入检测事实与探针收据 → `ProjectHealthOutcome` 更新运行态 → `HealthResultEvent` 定向投递到包含该节点的 pool。只有 `health_probe` 来源的自动测活会进入这条链；测速 / 解锁 / IP 质量等手动诊断共享同一事务，但**不发布健康事件**，也不参与剔除与恢复。`SnapshotOnly` 只是让 pool 重算候选集的屏障，不是新证据。人工“恢复成员”是独立管理命令（`ClearGroupNodeState` + `RestoreGroupMember`），同样会触发 `Recovered` 状态事件，但它不是测活收据。
+- **进 pool**：成员集合只能由 `runtimenodes.Load` 决定（启动、订阅 reconcile、`TriggerReload` 共用）。`boxmgr` 以两阶段提交 `PrepareUpdate` → `Commit` 发布快照；`ReconcileSilent` 的状态迁移要等新快照可见后才 `NotifyEvents`。健康结果与流量失败只影响候选 / current，不增删成员。
+- **读路径**：数据面每次连接只做一次 `atomic.Pointer.Load()` 取不可变快照，不持锁选路；控制面读运行态走 `monitor` 注册表，持久化列表直接读 `store`。
+
+更多模块职责与依赖方向见 [AGENTS.md](AGENTS.md)（§3 Module Map），运行时契约与写路径审计见 [plane/README.md](plane/README.md)。
+
 ## 📁 目录结构简述
 
 架构与大型代理池实施计划入口：[plane/README.md](plane/README.md)。其中分开维护当前行为规格、OpenSpec 风格变更提案/设计/任务/验收，以及运维手册和历史记录。

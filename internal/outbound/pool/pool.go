@@ -1187,18 +1187,6 @@ func (p *poolOutbound) listenPacketSelected(ctx context.Context, member *memberS
 	return member.outbound.ListenPacket(ctx, destination)
 }
 
-func (p *poolOutbound) pickMember(network string) (*memberState, error) {
-	snapshot, err := p.loadSnapshot()
-	if err != nil {
-		return nil, err
-	}
-	cursor, err := p.newAttemptCursor(snapshot, network)
-	if err != nil {
-		return nil, err
-	}
-	return cursor.next(), nil
-}
-
 type attemptCursor struct {
 	members []*MemberRef
 	start   int
@@ -1332,18 +1320,6 @@ func (p *poolOutbound) nextRandom() uint64 {
 			return next
 		}
 	}
-}
-
-func memberByTag(candidates []*memberState, tag string) *memberState {
-	if tag == "" {
-		return nil
-	}
-	for _, candidate := range candidates {
-		if candidate.tag == tag {
-			return candidate
-		}
-	}
-	return nil
 }
 
 func (p *poolOutbound) nextFixedIndex(snapshot *PoolSnapshot, candidates []*memberState, previous *MemberRef) int {
@@ -1677,10 +1653,6 @@ func (p *poolOutbound) wrapConnWithRelease(conn net.Conn, member *memberState, d
 			}
 		},
 	}
-}
-
-func (p *poolOutbound) wrapPacketConn(conn net.PacketConn, member *memberState, destination string) net.PacketConn {
-	return p.wrapPacketConnWithRelease(conn, member, destination, nil)
 }
 
 func (p *poolOutbound) wrapPacketConnWithRelease(conn net.PacketConn, member *memberState, destination string, snapshotRelease func()) net.PacketConn {

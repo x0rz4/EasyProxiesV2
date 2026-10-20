@@ -47,7 +47,7 @@ install.sh                    Linux Docker / 二进制安装及更新入口
 | --- | --- | --- |
 | `app` | 唯一的装配点：GeoIP 预热 → 开库 → 从 store 载入 nodes/groups/tags → 建 boxmgr → 建标签服务与重算队列 → 订阅管理器 → 统计落库 → 优雅退出 | `Run()`；`loadNodesFromStore` / `loadGroupsFromStore` / `loadTagNamesFromStore`；`groupStatePersister`（把 `GroupStateEvent` 落库） |
 | `config` | 配置结构与解析：YAML 加载/校验、节点 URI 与订阅内容解析（clash/v2ray/base64）、`NodeConfig.NodeKey()` | `Load` / `LoadForReload`（重载路径，允许部分字段变化）、`ParseSubscriptionContent`、`ParseImportContent` |
-| `store` | 唯一的持久化层（`Store` 接口 86 个方法）：nodes / subscriptions / stats / sessions / unlock / detection / group pools / tags | `Open()` 内部跑 `Migrate`；`migrations.go`、`sqlite.go`、`sqlite_tags.go`、`node_identity.go`、`migrate_legacy.go` |
+| `store` | 唯一的持久化层（`Store` 接口 101 个方法）：nodes / subscriptions / stats / sessions / unlock / detection / group pools / tags | `Open()` 内部跑 `Migrate`；`migrations.go`、`sqlite.go`、`sqlite_tags.go`、`node_identity.go` |
 | `jsonx` | JSON 编解码统一出口（Sonic + `MarshalCanonical`） | `Marshal` / `Unmarshal` / `MarshalCanonical` |
 | `noderesult` | 检测结果负载的**唯一**定义（叶子包，不 import 本项目任何包）：`Quality`（ipquality）/ `Service`+`IPInfo`+`Unlock`（unlock）。`store` 嵌入这些类型加元数据字段，`unlock`/`ipquality` 用 `type` 别名指回来，因此检测结果落库/出 API 不需要逐字段转换 | `noderesult.Quality` / `Unlock` / `Service` / `IPInfo` |
 | `netx` | 经节点 outbound 拨号的 HTTP 客户端/transport 的**唯一**构造点（叶子包，不 import 本项目任何包）。各消费方的差异（超时、TLS 校验、连接复用、重定向）变成显式 `Options`，而不是在每处重拼 `http.Transport` | `NewClient(dial, Options)` / `NewTransport(dial, Options)`、`CloseIdleConnections` |
@@ -87,7 +87,7 @@ install.sh                    Linux Docker / 二进制安装及更新入口
 | `nodedetect` | 手动触发的路由无关诊断：延迟 / 测速 / 出口 IP。**绝不发布健康事件** |
 | `unlock` | 流媒体与 AI 服务的解锁检测（netflix / disney+ / chatgpt / gemini / claude / youtube / bahamut / tiktok / amazon / reddit），`init()` 注册式。结果类型是 `noderesult` 的别名 |
 | `ipquality` | IP 质量 provider 适配（ippure / ip-api），每个 provider 结果独立、不做综合评分。结果类型是 `noderesult.Quality` 的别名 |
-| `geoip` | mmdb 下载/更新 + 地区查询；`router.go` 提供按地区的路由辅助 |
+| `geoip` | mmdb 下载/更新 + 地区查询（`AllRegions` / `RegionName` / `RegionEmoji` 供 builder 与标签 schema 复用） |
 | `subscription` | 上游订阅拉取与刷新、节点归属（membership）变更；实现 `monitor.SubscriptionRefresher` |
 | `subrender` | 把节点 URI 渲染成 Clash/Mihomo 订阅文档与入口代理（无运行时依赖，供 `/sub/*` 复用） |
 

@@ -12,7 +12,6 @@ import (
 
 	json "easy_proxies/internal/jsonx"
 	"easy_proxies/internal/monitor"
-	"easy_proxies/internal/nodecodec"
 	"easy_proxies/internal/nodedetect"
 	"easy_proxies/internal/noderesult"
 	"easy_proxies/internal/probe"
@@ -649,31 +648,4 @@ func (s *Server) persistUnlockResult(event probe.Result, result *unlock.Result) 
 		ResultJSON: resultJSON,
 	}
 	return s.applyMeasuredResult(event)
-}
-
-// nodeIDForSnapshot resolves a monitor monitor.Snapshot to its store node ID by URI,
-// falling back to the node name, reusing the resolution pattern used by
-// flushStatsToStore. Returns (0, false) when the node is not in the store.
-func (s *Server) nodeIDForSnapshot(snap monitor.Snapshot) (int64, bool) {
-	if snap.NodeID > 0 {
-		return snap.NodeID, true
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	if snap.URI != "" {
-		if n, err := s.store.GetNodeByURI(ctx, snap.URI); err == nil && n != nil && n.ID != 0 {
-			return n.ID, true
-		}
-		if identity, identityErr := nodecodec.ParseURI(snap.URI); identityErr == nil {
-			if n, err := s.store.GetNodeByIdentity(ctx, identity.Hash); err == nil && n != nil && n.ID != 0 {
-				return n.ID, true
-			}
-		}
-	}
-	if snap.Name != "" {
-		if n, err := s.store.GetNodeByName(ctx, snap.Name); err == nil && n != nil && n.ID != 0 {
-			return n.ID, true
-		}
-	}
-	return 0, false
 }

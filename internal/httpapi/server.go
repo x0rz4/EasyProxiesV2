@@ -24,28 +24,6 @@ import (
 //go:embed assets/*
 var embeddedFS embed.FS
 
-type ApplyPlan struct {
-	NeedReload  bool     `json:"need_reload"`
-	NeedRestart bool     `json:"need_restart"`
-	Applied     []string `json:"applied"`
-	Pending     []string `json:"pending"`
-}
-
-type SettingsUpdateResult struct {
-	Message     string   `json:"message"`
-	Saved       bool     `json:"saved"`
-	NeedReload  bool     `json:"need_reload"`
-	NeedRestart bool     `json:"need_restart"`
-	Reloaded    bool     `json:"reloaded"`
-	ReloadError string   `json:"reload_error,omitempty"`
-	Applied     []string `json:"applied"`
-	Pending     []string `json:"pending"`
-}
-
-type settingsValidationError struct{ err error }
-
-func (e settingsValidationError) Error() string { return e.err.Error() }
-
 const (
 	serverReadHeaderTimeout = 10 * time.Second
 	serverIdleTimeout       = 60 * time.Second

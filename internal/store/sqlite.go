@@ -586,14 +586,6 @@ func (s *sqliteStore) DeleteNode(ctx context.Context, id int64) error {
 	return nil
 }
 
-func (s *sqliteStore) DeleteNodesBySource(ctx context.Context, source string) (int64, error) {
-	result, err := s.writeConn().ExecContext(ctx, "DELETE FROM nodes WHERE source = ?", source)
-	if err != nil {
-		return 0, fmt.Errorf("delete nodes by source %q: %w", source, err)
-	}
-	return result.RowsAffected()
-}
-
 func (s *sqliteStore) BulkUpsertNodes(ctx context.Context, nodes []Node) error {
 	if len(nodes) == 0 {
 		return nil
@@ -1644,42 +1636,6 @@ func (s *sqliteStore) RecordFailure(ctx context.Context, nodeID int64, errMsg st
 	return err
 }
 
-func (s *sqliteStore) SetBlacklist(ctx context.Context, nodeID int64, until time.Time) error {
-	now := time.Now().UTC().Format(time.RFC3339)
-	_, err := s.writeConn().ExecContext(ctx,
-		`UPDATE node_stats SET
-		 blacklisted = 1,
-		 blacklisted_until = ?,
-		 failure_count = 0,
-		 updated_at = ?
-		 WHERE node_id = ?`,
-		formatTime(until), now, nodeID,
-	)
-	return err
-}
-
-func (s *sqliteStore) ClearBlacklist(ctx context.Context, nodeID int64) error {
-	now := time.Now().UTC().Format(time.RFC3339)
-	_, err := s.writeConn().ExecContext(ctx,
-		`UPDATE node_stats SET
-		 blacklisted = 0,
-		 blacklisted_until = '',
-		 updated_at = ?
-		 WHERE node_id = ?`,
-		now, nodeID,
-	)
-	return err
-}
-
-func (s *sqliteStore) ClearAllBlacklists(ctx context.Context) error {
-	now := time.Now().UTC().Format(time.RFC3339)
-	_, err := s.writeConn().ExecContext(ctx,
-		`UPDATE node_stats SET blacklisted = 0, blacklisted_until = '', updated_at = ? WHERE blacklisted = 1`,
-		now,
-	)
-	return err
-}
-
 func (s *sqliteStore) BatchUpdateStats(ctx context.Context, updates []StatsUpdate) error {
 	if len(updates) == 0 {
 		return nil
@@ -1794,53 +1750,6 @@ func (s *sqliteStore) listNodeStatsChunk(ctx context.Context, nodeIDs []int64) (
 }
 
 // ===================== Timeline =====================
-
-func (s *sqliteStore) AppendTimeline(ctx context.Context, nodeID int64, event TimelineEvent) error {
-	_, err := s.writeConn().ExecContext(ctx,
-		`INSERT INTO node_timeline (node_id, success, latency_ms, error, created_at)
-		 VALUES (?, ?, ?, ?, ?)`,
-		nodeID, boolToInt(event.Success), event.LatencyMs, event.Error,
-		time.Now().UTC().Format(time.RFC3339),
-	)
-	return err
-}
-
-func (s *sqliteStore) GetTimeline(ctx context.Context, nodeID int64, limit int) ([]TimelineEvent, error) {
-	if limit <= 0 {
-		limit = 20
-	}
-
-	rows, err := s.readConn().QueryContext(ctx,
-		`SELECT id, node_id, success, latency_ms, error, created_at
-		 FROM node_timeline WHERE node_id = ?
-		 ORDER BY id DESC LIMIT ?`,
-		nodeID, limit,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("get timeline for node %d: %w", nodeID, err)
-	}
-	defer rows.Close()
-
-	var events []TimelineEvent
-	for rows.Next() {
-		var evt TimelineEvent
-		var success int
-		var createdAtStr string
-		err := rows.Scan(&evt.ID, &evt.NodeID, &success, &evt.LatencyMs, &evt.Error, &createdAtStr)
-		if err != nil {
-			return nil, fmt.Errorf("scan timeline event: %w", err)
-		}
-		evt.Success = success != 0
-		evt.CreatedAt = parseTime(createdAtStr)
-		events = append(events, evt)
-	}
-
-	// Reverse to get chronological order
-	for i, j := 0, len(events)-1; i < j; i, j = i+1, j-1 {
-		events[i], events[j] = events[j], events[i]
-	}
-	return events, rows.Err()
-}
 
 // timelineRetentionWindow bounds node_timeline by age. Rows older than this
 // are deleted unconditionally; keepPerNode then only caps nodes that burst
@@ -2028,61 +1937,6 @@ func (s *sqliteStore) TouchAPIKey(ctx context.Context, id int64, usedAt time.Tim
 	_, err := s.writeConn().ExecContext(ctx,
 		"UPDATE api_keys SET last_used_at = ? WHERE id = ?",
 		usedAt.UTC().Format(time.RFC3339), id,
-	)
-	return err
-}
-
-// ===================== Subscription status =====================
-
-func (s *sqliteStore) GetSubscriptionStatus(ctx context.Context) (*SubscriptionStatus, error) {
-	row := s.readConn().QueryRowContext(ctx,
-		`SELECT last_refresh, next_refresh, node_count, last_error,
-		 refresh_count, is_refreshing, nodes_hash, updated_at
-		 FROM subscription_status WHERE id = 1`)
-
-	var status SubscriptionStatus
-	var lastRefreshStr, nextRefreshStr, updatedAtStr string
-	var isRefreshing int
-
-	err := row.Scan(
-		&lastRefreshStr, &nextRefreshStr, &status.NodeCount,
-		&status.LastError, &status.RefreshCount, &isRefreshing,
-		&status.NodesHash, &updatedAtStr,
-	)
-	if err == sql.ErrNoRows {
-		return &SubscriptionStatus{}, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("get subscription status: %w", err)
-	}
-
-	status.IsRefreshing = isRefreshing != 0
-	status.LastRefresh = parseTime(lastRefreshStr)
-	status.NextRefresh = parseTime(nextRefreshStr)
-	status.UpdatedAt = parseTime(updatedAtStr)
-
-	return &status, nil
-}
-
-func (s *sqliteStore) UpdateSubscriptionStatus(ctx context.Context, status *SubscriptionStatus) error {
-	now := time.Now().UTC().Format(time.RFC3339)
-	isRefreshing := 0
-	if status.IsRefreshing {
-		isRefreshing = 1
-	}
-
-	_, err := s.writeConn().ExecContext(ctx,
-		`INSERT INTO subscription_status (id, last_refresh, next_refresh, node_count, last_error,
-		 refresh_count, is_refreshing, nodes_hash, updated_at)
-		 VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(id) DO UPDATE SET
-		   last_refresh=excluded.last_refresh, next_refresh=excluded.next_refresh,
-		   node_count=excluded.node_count, last_error=excluded.last_error,
-		   refresh_count=excluded.refresh_count, is_refreshing=excluded.is_refreshing,
-		   nodes_hash=excluded.nodes_hash, updated_at=excluded.updated_at`,
-		formatTime(status.LastRefresh), formatTime(status.NextRefresh),
-		status.NodeCount, status.LastError, status.RefreshCount,
-		isRefreshing, status.NodesHash, now,
 	)
 	return err
 }

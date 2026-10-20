@@ -79,16 +79,13 @@ func TestCleanupTimelineDropsExpiredAndCapsPerNode(t *testing.T) {
 	}
 
 	// Newest rows must be the survivors: the cap trims from the oldest side.
-	events, err := db.GetTimeline(ctx, 1, 100)
-	if err != nil {
+	var oldest string
+	if err := sqlDB.writerDB.QueryRow(
+		`SELECT MIN(created_at) FROM node_timeline WHERE node_id = 1`,
+	).Scan(&oldest); err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 20 {
-		t.Fatalf("GetTimeline returned %d events, want 20", len(events))
-	}
-	for _, event := range events {
-		if event.CreatedAt.Before(time.Now().UTC().Add(-timelineRetentionWindow)) {
-			t.Fatalf("expired row survived: %+v", event)
-		}
+	if oldest != now {
+		t.Fatalf("oldest surviving row for node 1 is %q, want only fresh rows (%q)", oldest, now)
 	}
 }

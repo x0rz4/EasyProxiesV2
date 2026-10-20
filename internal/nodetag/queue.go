@@ -76,15 +76,6 @@ func WithSweepInterval(interval time.Duration) QueueOption {
 	}
 }
 
-// WithRecomputeTimeout bounds one recompute.
-func WithRecomputeTimeout(timeout time.Duration) QueueOption {
-	return func(q *Queue) {
-		if timeout > 0 {
-			q.timeout = timeout
-		}
-	}
-}
-
 // WithQueueBuffer sets the request buffer. A full buffer escalates to a full
 // recompute, so a small buffer costs work but never correctness.
 func WithQueueBuffer(size int) QueueOption {

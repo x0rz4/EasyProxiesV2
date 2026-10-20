@@ -69,10 +69,6 @@ type Store interface {
 	// DeleteNode removes a node by ID (cascading to stats/timeline).
 	DeleteNode(ctx context.Context, id int64) error
 
-	// DeleteNodesBySource removes all nodes with the given source.
-	// Returns the number of deleted rows.
-	DeleteNodesBySource(ctx context.Context, source string) (int64, error)
-
 	// BulkUpsertNodes inserts or updates nodes in a single transaction.
 	// Nodes are matched by URI for upsert logic.
 	BulkUpsertNodes(ctx context.Context, nodes []Node) error
@@ -132,15 +128,6 @@ type Store interface {
 	// RecordFailure increments failure count and records the error.
 	RecordFailure(ctx context.Context, nodeID int64, errMsg string) error
 
-	// SetBlacklist marks a node as blacklisted until the given time.
-	SetBlacklist(ctx context.Context, nodeID int64, until time.Time) error
-
-	// ClearBlacklist removes the blacklist flag for a node.
-	ClearBlacklist(ctx context.Context, nodeID int64) error
-
-	// ClearAllBlacklists removes all blacklist flags.
-	ClearAllBlacklists(ctx context.Context) error
-
 	// BatchUpdateStats applies multiple stat updates in a single transaction.
 	BatchUpdateStats(ctx context.Context, updates []StatsUpdate) error
 
@@ -148,12 +135,6 @@ type Store interface {
 	GetAllNodeStats(ctx context.Context) (map[int64]*NodeStats, error)
 
 	// --- Timeline ---
-
-	// AppendTimeline adds an event to a node's timeline.
-	AppendTimeline(ctx context.Context, nodeID int64, event TimelineEvent) error
-
-	// GetTimeline returns the most recent events for a node.
-	GetTimeline(ctx context.Context, nodeID int64, limit int) ([]TimelineEvent, error)
 
 	// CleanupTimeline removes old timeline events, keeping only the most recent per node.
 	CleanupTimeline(ctx context.Context, keepPerNode int) error
@@ -188,14 +169,6 @@ type Store interface {
 
 	// TouchAPIKey records the most recent successful use of a credential.
 	TouchAPIKey(ctx context.Context, id int64, usedAt time.Time) error
-
-	// --- Subscription status ---
-
-	// GetSubscriptionStatus returns the current subscription refresh status.
-	GetSubscriptionStatus(ctx context.Context) (*SubscriptionStatus, error)
-
-	// UpdateSubscriptionStatus creates or updates the subscription status.
-	UpdateSubscriptionStatus(ctx context.Context, status *SubscriptionStatus) error
 
 	// --- Unlock detection results ---
 
@@ -600,16 +573,6 @@ type StatsUpdate struct {
 	TotalDownloadBytes int64
 }
 
-// TimelineEvent represents a single usage event for debug tracking.
-type TimelineEvent struct {
-	ID        int64     `json:"id"`
-	NodeID    int64     `json:"node_id"`
-	Success   bool      `json:"success"`
-	LatencyMs int64     `json:"latency_ms"`
-	Error     string    `json:"error,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-}
-
 // Session represents a user authentication session.
 type Session struct {
 	Token     string    `json:"token"`
@@ -626,18 +589,6 @@ type APIKey struct {
 	Token      string    `json:"token"`
 	CreatedAt  time.Time `json:"created_at"`
 	LastUsedAt time.Time `json:"last_used_at"`
-}
-
-// SubscriptionStatus represents subscription refresh status.
-type SubscriptionStatus struct {
-	LastRefresh  time.Time `json:"last_refresh"`
-	NextRefresh  time.Time `json:"next_refresh"`
-	NodeCount    int       `json:"node_count"`
-	LastError    string    `json:"last_error"`
-	RefreshCount int       `json:"refresh_count"`
-	IsRefreshing bool      `json:"is_refreshing"`
-	NodesHash    string    `json:"nodes_hash"`
-	UpdatedAt    time.Time `json:"updated_at"`
 }
 
 // UnlockResult is the latest unlock detection result stored for a node: the

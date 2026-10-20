@@ -365,10 +365,6 @@ func loadNodesFromStore(ctx context.Context, cfg *config.Config, s store.Store) 
 		}
 		if adopted > 0 {
 			log.Printf("[app] recovered %d orphan subscription nodes as manual nodes", adopted)
-			nodes, err = s.ListNodes(ctx, store.NodeFilter{})
-			if err != nil {
-				return fmt.Errorf("reload recovered nodes: %w", err)
-			}
 			effectiveSubscriptionNodes, err = s.ListEffectiveSubscriptionNodes(ctx)
 			if err != nil {
 				return fmt.Errorf("reload effective subscription nodes: %w", err)

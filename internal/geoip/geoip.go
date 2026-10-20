@@ -339,37 +339,6 @@ func validateMMDB(path string) error {
 	return nil
 }
 
-// downloadFile downloads a file from URL to the specified path
-func downloadFile(filepath string, url string) error {
-	// Create the file
-	out, err := os.Create(filepath)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	// Get the data
-	resp, err := http.Get(url)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	// Check server response
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("bad status: %s", resp.Status)
-	}
-
-	// Writer the body to file
-	size, err := io.Copy(out, resp.Body)
-	if err != nil {
-		return err
-	}
-
-	log.Printf("   Downloaded %d bytes", size)
-	return nil
-}
-
 // New creates a new GeoIP lookup instance
 func New(dbPath string) (*Lookup, error) {
 	return NewWithAutoUpdate(dbPath, 0)
