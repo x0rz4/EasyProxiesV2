@@ -16,7 +16,9 @@ nodes.txt
 # Data directory (SQLite database, etc.)
 data/
 plans/
-docs/
+# docs/ 不是忽略项：docs/architecture.md、docs/code-standards.md、docs/subsystems/ 等
+# 是工程文档体系（路由表 → 规则/形态/子系统地契），必须入库（见 LESSONS L-017、
+# code-standards §K）。历史上这里是 v1.0.0 时代的本地草稿目录守卫，已废止。
 .kilocode/
 
 # GeoIP database (auto-downloaded)

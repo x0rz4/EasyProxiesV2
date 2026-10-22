@@ -285,7 +285,7 @@ flowchart TB
 - **进 pool**：成员集合只能由 `runtimenodes.Load` 决定（启动、订阅 reconcile、`TriggerReload` 共用）。`boxmgr` 以两阶段提交 `PrepareUpdate` → `Commit` 发布快照；`ReconcileSilent` 的状态迁移要等新快照可见后才 `NotifyEvents`。健康结果与流量失败只影响候选 / current，不增删成员。
 - **读路径**：数据面每次连接只做一次 `atomic.Pointer.Load()` 取不可变快照，不持锁选路；控制面读运行态走 `monitor` 注册表，持久化列表直接读 `store`。
 
-更多模块职责与依赖方向见 [AGENTS.md](AGENTS.md)（§3 Module Map），运行时契约与写路径审计见 [plane/README.md](plane/README.md)。
+工程约定入口见 [AGENTS.md](AGENTS.md)（路由表）→ [docs/architecture.md](docs/architecture.md)（模块与依赖方向）、[docs/code-standards.md](docs/code-standards.md)（硬规则）、[LESSONS.md](LESSONS.md)（复盘错题本）；运行时契约与写路径审计见 [plane/README.md](plane/README.md)。
 
 ## 📁 目录结构简述
 

@@ -2,6 +2,8 @@
 
 本目录服务于 EasyProxiesV2 的单机大型代理池建设：汇聚多来源节点，以统一身份、健康事实、成员规则和有界自愈提供稳定出口。产品层次为 L0 节点事实、L1 健康平面、L2 分组策略、L3 数据面、L4 运营控制面、L5 平台化。
 
+> **与 `docs/` 的分工**：仓库根部的 [docs/architecture.md](../docs/architecture.md) 写"当前代码真实形态"，[docs/code-standards.md](../docs/code-standards.md) 是硬规则唯一体，[LESSONS.md](../LESSONS.md) 是复盘错题本。本目录（`plane/`）承载**运行时契约（specs/）、变更提案（changes/）与专题/历史记录**。同一约束只在一处定义：本目录引用 Requirement ID，不复述规则；历史文档的旧限制不覆盖当前规范。路由入口见 [AGENTS.md](../AGENTS.md)。
+
 ## 阅读入口
 
 | 文档 | 用途与状态 |

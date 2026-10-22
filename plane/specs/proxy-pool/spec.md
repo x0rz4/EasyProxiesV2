@@ -53,7 +53,7 @@
 - WHEN 手动测速、解锁或质量检测成功。
 - THEN 诊断可展示成功，节点仍保持原剔除状态与恢复计数；只有合法健康复检能推进恢复。
 
-代码：`internal/probe/applier.go`、`internal/monitor/probe_applier.go`、`internal/monitor/nodecheck.go`。已有测试：`TestManualResultCannotPublishHealth`、`TestNodeCheckLatencyDoesNotMutateHealth`；完整剔除×各诊断类型矩阵待补。
+代码：`internal/probe/applier.go`、`internal/httpapi/probe_applier.go`、`internal/httpapi/nodecheck.go`。已有测试：`TestManualResultCannotPublishHealth`、`TestNodeCheckLatencyDoesNotMutateHealth`；完整剔除×各诊断类型矩阵待补。
 
 ## Requirement MEMBERSHIP-001：候选资格先于运行态容量选择
 
@@ -127,7 +127,7 @@
 - WHEN 已经过了 30 天。
 - THEN 不得承诺后台已清理旧记录；独立清理属于阶段 4 计划。
 
-代码：`internal/store/sqlite_healer.go`、`internal/monitor/healer_handlers.go`、`frontend/src/components/GroupHealLog.tsx`。
+代码：`internal/store/sqlite_healer.go`、`internal/httpapi/healer_handlers.go`、`frontend/src/components/GroupHealLog.tsx`。
 
 ## 现状未满足的规模能力
 

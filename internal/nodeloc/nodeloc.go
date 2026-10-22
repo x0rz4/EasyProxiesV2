@@ -8,7 +8,8 @@
 // "other") until some later probe succeeded. Only a successful observation that
 // names a country may change the location.
 //
-// The package has no dependencies so every write path can share the one rule.
+// The package depends only on noderegion (no persistence, no runtime), so every
+// write path can share the one rule without an import cycle.
 package nodeloc
 
 import (

@@ -1,0 +1,43 @@
+# 子系统：控制面（HTTP + 领域服务）
+
+改动 `internal/httpapi`、`internal/controlplane` 之前先读这份。
+
+## 边界
+
+```
+httpapi → monitor（读运行时状态） / controlplane（消费接口） / store（直连持久化） / config
+controlplane → config / store（不 import monitor / httpapi）
+boxmgr / subscription → controlplane（实现其接口）
+monitor 从不反向 import httpapi；httpapi 不 import boxmgr
+```
+
+跨层消费方接口（`NodeManager` / `GroupRuntimeManager` / `GroupMembershipManager` / `SubscriptionRefresher` 等）定义在 **`internal/controlplane/ports.go`**，由 `boxmgr` / `subscription` 实现、`httpapi` 消费。**不在 `monitor`**（`monitor/ports.go` 已于 `1e05e17` 迁至 controlplane；AGENTS 旧版曾记错，本文件为准）。
+
+## httpapi 文件分布
+
+| 文件 | 承载 |
+| --- | --- |
+| `server.go` | `Server` 生命周期、`//go:embed assets/*`、节点管理器注入 |
+| `routes.go` | 全部路由表 |
+| `response.go` | 响应管线：`pathID` / `pathIDOrNotFound` / `requireStore` / 三个域状态函数 / `decodeJSON` |
+| `server_auth.go` | 会话认证、`withAPIKey`、API Key 中间件 |
+| `server_groups.go` / `server_nodes.go` / `server_subscriptions.go` / `server_settings.go` / `server_geoip.go` / `server_import.go` / `server_static.go` | 各领域 handler |
+| `nodecheck*.go` / `nodeview_handlers.go` / `tag_handlers.go` / `tag_schema.go` / `group_preview.go` / `group_subscription.go` / `node_maintenance.go` / `healer_handlers.go` / `probe_applier.go` | 检测 / 视图 / 标签 / 分组 / 自愈 / 探测应用 handler |
+
+## 认证
+
+- `/api/*` 需认证（`management.password` 为空则免密；Cookie `session_token` 或 `Authorization: Bearer`，会话 24h 存 SQLite）。
+- `/sub/{groupID}` 公开，但用分组 `SubscriptionToken` 做常量时间比较。
+- 免登录公共 API（`POST /api/public/subscriptions`、`/api/public/import`）由 `withAPIKey` 保护，接受 `X-API-Key`/`Bearer`/`?api_key=`，**故意不接受会话 Cookie**（面向脚本）。新公共接口一律复用现有 handler，不另写实现。
+
+## 错误→状态码是三个策略（护栏 12）
+
+`response.go`：`nodeErrorStatus`（类型驱动，`respondNodeError` 额外带 `existing_node_id`）、`subscriptionErrorStatus`（消息驱动，未识别→500）、`tagErrorStatus`（消息驱动，未识别→400）。**故意不一致**：同是"节点不存在"，tag 域 400、订阅域 404，`tag_handlers_test.go` 钉住了这个 400。调用方必须显式点名用哪个策略，不存在统一分发器。`pathID`（400）与 `pathIDOrNotFound`（公开 `/sub/*` 用 404，避免探测 ID 形态）不可互换。
+
+## controlplane 领域服务
+
+- `Auth`：会话、登录限流、API Key 凭据。
+- `Settings`：配置读写、校验、持久化、`ApplyPlan` —— **所有配置写入者的唯一序列化点**。
+- `ports.go`：跨层接口与领域错误（`ErrNodeNotFound`、`NodeDuplicateError`、`ErrRefreshInProgress` 等）。
+
+**不要**为"减少 handler 样板"引入泛型 `handle[Req,Resp]`（护栏 13）：14 个解码请求体的 handler 各带 3–19 个错误分支，包装只省最外层 decode/serialize，分支一个不少，且会丢掉 `respondNodeError` 的 `existing_node_id` 造成行为变化。
