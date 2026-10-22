@@ -82,3 +82,20 @@ func TestHealthResultCannotCrossIdentityReplacement(t *testing.T) {
 		t.Fatalf("stale result affected runtime: %+v", snapshot)
 	}
 }
+
+func TestRetiredRuntimeHealthResultCannotAdvanceNewGeneration(t *testing.T) {
+	mgr, _, node := NewPersistentHealthFixture(t)
+	entry := mgr.registry.byTagEntry("health@v1")
+	ticket, err := mgr.beginHealthResult(t.Context(), entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.MigrateRuntimeTag(node.ID, NodeInfo{NodeID: node.ID, URI: node.URI, Name: node.Name, Tag: "health@v2"})
+	if err := mgr.commitHealthResult(entry, ticket, time.Millisecond, nil, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	after := mgr.SnapshotForNodeID(node.ID)
+	if after.Tag != "health@v2" || after.SuccessCount != 0 || after.InitialCheckDone {
+		t.Fatalf("retired result advanced replacement: %+v", after)
+	}
+}

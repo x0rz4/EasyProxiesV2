@@ -73,6 +73,10 @@ type Manager struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 	refreshMu  sync.Mutex
+	// resultMu serializes source edits/deletes with result validation and writes.
+	// Never hold it across fetching, runtime reconciliation or observer callbacks.
+	resultMu       sync.Mutex
+	sourceVersions map[int64]uint64
 	// refreshing tracks in-flight downloads by subscription ID. It is the only
 	// source of IsRefreshing, so a single refresh reports itself the same way a
 	// full pass does. Guarded by mu.
@@ -92,7 +96,7 @@ func New(cfg *config.Config, boxMgr runtimeManager, opts ...Option) *Manager {
 	// No client-wide timeout: each request carries the subscription's own
 	// deadline. A 60s client cap silently overrode any larger per-sub timeout.
 	m := &Manager{baseCfg: cfg, boxMgr: boxMgr, ctx: ctx, cancel: cancel,
-		refreshing: make(map[int64]struct{}),
+		refreshing: make(map[int64]struct{}), sourceVersions: make(map[int64]uint64),
 		httpClient: &http.Client{Transport: transport}}
 	for _, opt := range opts {
 		opt(m)
@@ -238,9 +242,24 @@ func (m *Manager) Create(ctx context.Context, sub store.Subscription) (*store.Su
 }
 
 func (m *Manager) Update(ctx context.Context, id int64, input store.Subscription) (*store.Subscription, error) {
+	if err := m.updateSettings(ctx, id, input); err != nil {
+		return nil, err
+	}
+	if err := m.reconcileRuntime(ctx); err != nil {
+		return nil, err
+	}
+	if input.Enabled {
+		m.refreshInBackground(id)
+	}
+	return m.Get(ctx, id)
+}
+
+func (m *Manager) updateSettings(ctx context.Context, id int64, input store.Subscription) error {
+	m.resultMu.Lock()
+	defer m.resultMu.Unlock()
 	current, err := m.Get(ctx, id)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	settings := store.SubscriptionSettings{
 		Name:                   input.Name,
@@ -253,30 +272,28 @@ func (m *Manager) Update(ctx context.Context, id int64, input store.Subscription
 		SortOrder:              input.SortOrder,
 	}
 	if err := applySettingsDefaults(&settings, m.defaults); err != nil {
-		return nil, err
+		return err
 	}
 	if err := validateSettings(&settings); err != nil {
-		return nil, err
+		return err
 	}
 	urlChanged := strings.TrimSpace(current.URL) != settings.URL
 	if err := m.store.UpdateSubscriptionSettings(ctx, id, settings); err != nil {
-		return nil, err
+		return err
+	}
+	if urlChanged || current.Format != settings.Format || current.UserAgent != settings.UserAgent {
+		// A -> B -> A must also invalidate the original in-flight request.
+		m.sourceVersions[id]++
 	}
 	if urlChanged {
 		// Pointing the subscription at another provider makes every existing
 		// member an artifact of the old upstream. Clear them instead of merging
 		// two unrelated node sets together.
 		if err := m.store.ResetSubscriptionNodes(ctx, id); err != nil {
-			return nil, err
+			return err
 		}
 	}
-	if err := m.reconcileRuntime(ctx); err != nil {
-		return nil, err
-	}
-	if settings.Enabled {
-		m.refreshInBackground(id)
-	}
-	return m.Get(ctx, id)
+	return nil
 }
 
 // refreshInBackground queues one subscription behind any in-flight refresh. The
@@ -296,7 +313,13 @@ func (m *Manager) Delete(ctx context.Context, id int64) error {
 	if _, err := m.Get(ctx, id); err != nil {
 		return err
 	}
-	if err := m.store.DeleteSubscription(ctx, id); err != nil {
+	m.resultMu.Lock()
+	err := m.store.DeleteSubscription(ctx, id)
+	if err == nil {
+		delete(m.sourceVersions, id)
+	}
+	m.resultMu.Unlock()
+	if err != nil {
 		return err
 	}
 	return m.reconcileRuntime(ctx)
@@ -452,11 +475,11 @@ func (m *Manager) refreshOneLocked(ctx context.Context, id int64, healing bool) 
 	m.beginRefreshing(id)
 	defer m.endRefreshing(id)
 	err = m.refreshSubscription(ctx, sub)
-	m.recordRunResult(err)
-	if err != nil {
-		return err
+	if err == nil {
+		err = m.reconcileRuntime(ctx)
 	}
-	return m.reconcileRuntime(ctx)
+	m.recordRunResult(err)
+	return err
 }
 
 func (m *Manager) RefreshNow() error {
@@ -567,28 +590,60 @@ func (m *Manager) endRefreshing(id int64) {
 // Splitting fetch from commit lets a refresh pass overlap the network work while
 // keeping every database mutation serial.
 type fetchedSubscription struct {
-	nodes        []config.NodeConfig
-	parseIssues  []string
-	etag         string
-	lastModified string
-	notModified  bool
-	err          error
+	sourceVersion uint64
+	nodes         []config.NodeConfig
+	parseIssues   []string
+	etag          string
+	lastModified  string
+	notModified   bool
+	err           error
 }
 
 func (m *Manager) fetchFor(ctx context.Context, sub *store.Subscription) fetchedSubscription {
+	// RefreshDue may have listed this row before an edit. Read the request
+	// settings and its version together immediately before starting the fetch.
+	m.resultMu.Lock()
+	current, err := m.Get(ctx, sub.ID)
+	version := m.sourceVersions[sub.ID]
+	if err == nil {
+		*sub = *current
+	}
+	m.resultMu.Unlock()
+	if err != nil {
+		return fetchedSubscription{sourceVersion: version, err: err}
+	}
 	timeout := time.Duration(sub.RefreshTimeoutSeconds) * time.Second
 	if timeout <= 0 {
 		_, seconds := m.defaults()
 		timeout = time.Duration(seconds) * time.Second
 	}
 	nodes, parseIssues, etag, lastModified, notModified, err := m.fetchSubscription(ctx, sub, timeout)
-	return fetchedSubscription{nodes: nodes, parseIssues: parseIssues, etag: etag,
+	return fetchedSubscription{sourceVersion: version, nodes: nodes, parseIssues: parseIssues, etag: etag,
 		lastModified: lastModified, notModified: notModified, err: err}
 }
 
 // commitFetched persists one fetch result. It returns whether a successful
 // snapshot changed the node set (which requires a runtime reconcile).
 func (m *Manager) commitFetched(ctx context.Context, sub *store.Subscription, fetched fetchedSubscription) (bool, error) {
+	m.resultMu.Lock()
+	changed, err := m.commitFetchedLocked(ctx, sub, fetched)
+	m.resultMu.Unlock()
+	if err == nil && !fetched.notModified && m.refreshObserver != nil {
+		m.refreshObserver()
+	}
+	return changed, err
+}
+
+func (m *Manager) commitFetchedLocked(ctx context.Context, sub *store.Subscription, fetched fetchedSubscription) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if _, err := m.Get(ctx, sub.ID); err != nil {
+		return false, err
+	}
+	if fetched.sourceVersion != m.sourceVersions[sub.ID] {
+		return false, errors.New("subscription source changed during refresh; result discarded")
+	}
 	attempt := time.Now().UTC()
 	// Rows the parser dropped are not fatal, but they silently shrink the node
 	// list; log them so the operator can see the gap.
@@ -612,7 +667,7 @@ func (m *Manager) commitFetched(ctx context.Context, sub *store.Subscription, fe
 	if fetched.notModified {
 		// Keep the stored validators and snapshot; only the attempt moves.
 		if err := m.store.RecordSubscriptionNotModified(ctx, sub.ID, attempt); err != nil {
-			m.logger.Warnf("record 304 for subscription %d: %v", sub.ID, err)
+			return false, fmt.Errorf("record 304 for subscription %d: %w", sub.ID, err)
 		}
 		return false, nil
 	}
@@ -649,9 +704,6 @@ func (m *Manager) commitFetched(ctx context.Context, sub *store.Subscription, fe
 	m.status.Created += commit.Created
 	m.status.Updated += commit.Updated
 	m.mu.Unlock()
-	if m.refreshObserver != nil {
-		m.refreshObserver()
-	}
 	return commit.Created > 0 || commit.Updated > 0 || commit.Removed > 0, nil
 }
 

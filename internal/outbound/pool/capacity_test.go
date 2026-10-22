@@ -81,3 +81,37 @@ func TestCapacityCommitMissingMemberLeavesPolicyAndStateUnchanged(t *testing.T) 
 		t.Fatal("failed commit partially changed capacity or group state")
 	}
 }
+
+func TestCommitPublishesSnapshotBeforeGroupNotification(t *testing.T) {
+	group.Reset()
+	defer group.Reset()
+	ResetSharedStateStore()
+	defer ResetSharedStateStore()
+	states := map[string]group.GroupInitialState{"a": {NodeID: 1}, "b": {NodeID: 2, Standby: true}}
+	group.Register(993, time.Minute, 3, "a", states)
+	manager := &capacityManager{members: map[string]adapter.Outbound{"a": &fakeOutbound{}, "b": &fakeOutbound{}}}
+	p := &poolOutbound{manager: manager, options: Options{GroupID: 993}, runtimeByTag: make(map[string]*memberRuntime)}
+	notifications := 0
+	unsubscribe := group.SubscribeStateChanges(func(event group.GroupStateEvent) {
+		if event.GroupID != 993 {
+			return
+		}
+		notifications++
+		snapshot := p.current.Load()
+		if snapshot == nil || len(snapshot.Members) != 1 || snapshot.Members[0].tag != "b" {
+			t.Error("group notification preceded matching pool snapshot")
+		}
+	})
+	defer unsubscribe()
+	prepared, err := p.PrepareUpdate(RuntimeUpdate{CapacityTarget: 1, ActiveNodeIDs: []int64{2}, Mode: modeFixed,
+		Members: []RuntimeMemberSpec{{Tag: "a", Meta: MemberMeta{NodeID: 1}}, {Tag: "b", Meta: MemberMeta{NodeID: 2}}}, InitialGroupState: states})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := prepared.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if notifications == 0 {
+		t.Fatal("test did not exercise group notification")
+	}
+}

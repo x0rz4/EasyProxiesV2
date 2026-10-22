@@ -14,6 +14,7 @@
 | [实施任务](changes/scale-proxy-pool/tasks.md) | 阶段 0–5、依赖、责任领域、验收产物 |
 | [验证与规模门槛](changes/scale-proxy-pool/validation.md) | 回归矩阵、压测口径、指标和证据模板 |
 | [写路径审计清单](write-path-audit.md) | 允许的写入者、旁路检索、待确认风险、评审检查 |
+| [2026-10-23 稳定性审计](stability-audit-2026-10-23.md) | 订阅与重载局部修复、健康事件溢出复现、验证结果及独立改造建议 |
 | [容量自愈运营手册](group-healing.md) | 从 dry-run 到执行、缺口排查、关闭和回滚 |
 
 ## 文档层次与变更工作流

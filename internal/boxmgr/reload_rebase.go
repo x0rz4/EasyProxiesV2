@@ -28,18 +28,21 @@ func rebaseReloadedNodes(snapshotCfg, runtimeCfg, newCfg *config.Config) int {
 	for _, node := range snapshotCfg.Nodes {
 		oldByKey[node.NodeKey()] = node
 	}
-	newByKey := make(map[string]*config.NodeConfig, len(newCfg.Nodes))
+	// Keep indices, not element pointers: appending window-created nodes can
+	// reallocate Nodes before later entries receive their updated facts.
+	newByKey := make(map[string]int, len(newCfg.Nodes))
 	for index := range newCfg.Nodes {
-		newByKey[newCfg.Nodes[index].NodeKey()] = &newCfg.Nodes[index]
+		newByKey[newCfg.Nodes[index].NodeKey()] = index
 	}
 	mutated := 0
 	for _, runtime := range runtimeCfg.Nodes {
 		key := runtime.NodeKey()
 		old, hadOld := oldByKey[key]
-		target, inNew := newByKey[key]
+		index, inNew := newByKey[key]
 		if !hadOld {
 			// Created during the window: keep it in the committed topology.
 			if !inNew {
+				newByKey[key] = len(newCfg.Nodes)
 				newCfg.Nodes = append(newCfg.Nodes, runtime)
 				mutated++
 			}
@@ -50,6 +53,7 @@ func rebaseReloadedNodes(snapshotCfg, runtimeCfg, newCfg *config.Config) int {
 			continue
 		}
 		if nodeFactsDiffer(old, runtime) {
+			target := &newCfg.Nodes[index]
 			target.Tags = append([]string(nil), runtime.Tags...)
 			target.Region = runtime.Region
 			target.Country = runtime.Country

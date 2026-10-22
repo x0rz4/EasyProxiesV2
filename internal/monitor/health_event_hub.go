@@ -9,9 +9,10 @@ import (
 // appends to the queue, so slow control-plane callbacks cannot block probe
 // workers — but without a bound a wedged consumer would grow its queue
 // without limit, because probe results keep arriving for as long as the
-// process runs. Once the limit is hit further events are dropped: every
-// consumer of this hub (pool candidate rebuilds, UI streams) reconciles from
-// current snapshots, so a dropped event costs at most one extra refresh.
+// process runs. Once the limit is hit further events are dropped. This can
+// lose group failure/recovery transitions; reading the latest snapshot does
+// not reconstruct those transitions. See plane/stability-audit-2026-10-23.md
+// for the reproduced limitation and the separate delivery redesign.
 const healthEventQueueLimit = 4096
 
 // Each subscription owns a bounded FIFO.

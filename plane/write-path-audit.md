@@ -26,7 +26,7 @@ P1 首批新增调用者分类及代码收敛见 [健康边界报告](changes/sc
 | A1 | `EntryHandle.MarkAvailable`、`MarkInitialCheckDone`、`RecordSuccessWithLatency`、`Blacklist/ClearBlacklist` 仍公开 | P1.1 必须查全部调用者、对生产/测试/生命周期分类；不能仅凭定义就断言已旁路或没有旁路 |
 | A2 | `SetProbeStore(nil)` 保留无 Store 内存路径 | P1.1 验证生产 app 装配总是注入 Store；内存兼容测试不作为持久化路径验收 |
 | A3 | `HealthResultEvent`、`GroupStateEvent` 已有，`TopologyChanged` 没有统一类型 | P1.2 先明确现有方法调用顺序；如新增事件则另写 schema/幂等/重放规格 |
-| A4 | `healthEventSubscription.queue` 为无界 FIFO | P2.3 慢消费者压测并设计有界投递；保留每次合法失败/成功顺序和恢复计数 |
+| A4 | 原始盘点为无界 FIFO；2026-10-23 核对代码已为容量 4096、溢出丢弃的 FIFO | 已复现失败/恢复事件与快照标记丢失；仍需 P2.3 无损有界投递改造，证据及方案见 [稳定性审计](stability-audit-2026-10-23.md) |
 | A5 | Healer.current 与执行端反复调用全量 `HealingInputs` | P2.4 profile 后决定按组读取/缓存；每次执行不得省略新政策验证 |
 | A6 | 审计按状态/动作详情去重，且只在追加时清理 | P3/P4 分开动作计数与审计；补独立清理，未来追踪字段需要 migration |
 | A7 | 关闭执行时已在途动作没有统一取消保证 | P1.4/P3.5 明确线性化点与 UI 语义，区分未来动作、在途请求和正常周期 |

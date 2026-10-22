@@ -209,8 +209,8 @@ type DebugLogEvent struct {
 }
 
 // HealthResultEvent is emitted for every completed automatic, startup, or
-// manual probe. Subscribers are invoked synchronously after node state is
-// committed so health transitions cannot be dropped.
+// manual probe. Subscribers run asynchronously after node state is committed.
+// The bounded delivery queue currently drops events on overflow.
 type HealthResultEvent struct {
 	Tag       string
 	NodeID    int64
@@ -1400,7 +1400,8 @@ func (m *Manager) publishDebugLog(event DebugLogEvent) {
 	}
 }
 
-// SubscribeHealthResults installs a lossless in-process health observer.
+// SubscribeHealthResults installs an asynchronous in-process health observer.
+// Delivery is FIFO for accepted events, but the bounded queue can overflow.
 // Callbacks run outside manager and entry locks and must remain lightweight.
 func (m *Manager) SubscribeHealthResults(callback func(HealthResultEvent)) func() {
 	return m.healthEvents.subscribe(nil, nil, true, callback)
@@ -1415,8 +1416,9 @@ func (m *Manager) SubscribeHealthResultsFor(tags []string, nodeIDs []int64, call
 // PublishHealthResult delivers event to every health-result subscriber through
 // the same FIFO the probe path uses. Exported because out-of-package consumers
 // (the HTTP layer) need to act as a barrier over that FIFO: a SnapshotOnly
-// marker published here is only observed after the callbacks for everything
-// published before it have already run. Use it for ordering, not to inject
+// marker, if accepted, is observed after earlier accepted events. Overflow
+// can drop the marker or preceding events, so this is not a reliable barrier.
+// Use it for ordering under that limitation, not to inject
 // health facts — a success event delivered here drives group recovery exactly
 // like a probe result.
 func (m *Manager) PublishHealthResult(event HealthResultEvent) {

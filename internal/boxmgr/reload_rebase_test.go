@@ -57,3 +57,22 @@ func TestRebaseReloadedNodesIsNoopWithoutMutations(t *testing.T) {
 		t.Fatalf("nil runtime: mutated = %d, want 0", mutated)
 	}
 }
+
+func TestRebaseKeepsFactsAfterAppendingWindowCreatedNode(t *testing.T) {
+	old := config.NodeConfig{ID: 1, URI: "http://a:1", Tags: []string{"old"}, Region: "us"}
+	updated := old
+	updated.Tags = []string{"new"}
+	updated.Region = "hk"
+	snapshot := &config.Config{Nodes: []config.NodeConfig{old}}
+	// The new node sorts before an existing node. Appending it reallocates the
+	// destination slice; subsequent fact writes must target the new backing array.
+	runtime := &config.Config{Nodes: []config.NodeConfig{{ID: 2, URI: "http://b:1"}, updated}}
+	result := &config.Config{Nodes: make([]config.NodeConfig, 1, 1)}
+	result.Nodes[0] = old
+	if n := rebaseReloadedNodes(snapshot, runtime, result); n != 2 {
+		t.Fatalf("rebased %d nodes", n)
+	}
+	if result.Nodes[0].Region != "hk" || result.Nodes[0].Tags[0] != "new" {
+		t.Fatalf("append lost rebased facts: %+v", result.Nodes[0])
+	}
+}

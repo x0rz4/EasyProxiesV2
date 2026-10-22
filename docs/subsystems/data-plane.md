@@ -34,3 +34,5 @@
 ## 探测链（L1）
 
 `monitor.beginHealthResult` → `probe.Applier`（收据/幂等/身份） → `ProjectHealthOutcome` → `health_applier` → 运行态 entry → `HealthResultEvent`。诊断 origin（`nodedetect`、`unlock`）**绝不发布健康事件**；`SnapshotOnly` 事件只要求重读快照，MUST NOT 推进恢复/失败窗口（spec HEALTH-001 / DIAGNOSTIC-001）。
+
+当前投递限制：每个健康订阅使用容量 4096 的异步 FIFO，溢出直接丢弃，不能保证无损。pool 消费者会推进分组失败/恢复状态，丢失不能仅靠最新快照补偿；`SnapshotOnly` 标记也会被丢弃。关闭会清空待处理事件，但不会等待正在执行的回调结束。复现和独立改造方案见 [稳定性审计](../../plane/stability-audit-2026-10-23.md)。
