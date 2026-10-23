@@ -256,6 +256,11 @@ type groupStatePersister struct {
 	// merged counts events superseded by a newer one for the same member. This
 	// is normal operation, not loss.
 	merged atomic.Int64
+	// drainMu serialises drains. Close flushes synchronously while the worker
+	// may still be inside its own drain; two drains racing on the same member
+	// let the older snapshot win, resurrecting an eviction that was just
+	// cleared. Holding this across a drain keeps writes in queue order.
+	drainMu sync.Mutex
 }
 
 type groupStateKey struct {
@@ -348,6 +353,8 @@ func (p *groupStatePersister) run() {
 // drainStates writes every pending member state. A failed write stays pending so
 // the next tick retries it instead of losing the transition.
 func (p *groupStatePersister) drainStates() {
+	p.drainMu.Lock()
+	defer p.drainMu.Unlock()
 	p.mu.Lock()
 	batch := p.pending
 	p.pending = make(map[groupStateKey]group.GroupStateEvent, len(batch))

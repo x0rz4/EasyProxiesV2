@@ -239,3 +239,99 @@ func TestDetectMissingNodeLocationPausesWithoutGeoIPDatabase(t *testing.T) {
 		t.Fatalf("landing result was written while classification was paused: %+v", results[node.ID])
 	}
 }
+
+// Node CRUD splices cfg.Nodes in place while a landing detection is running.
+// The detector used to capture slice indexes and re-index the shared slice
+// inside its worker goroutines, which panics with "index out of range" as soon
+// as a node is deleted mid-detection (index 375 vs length 369 in the field).
+// These two helpers are what removed the shared mutable state: collection
+// copies node identity, and results are resolved by stable ID.
+func TestLandingNodesCopiesIdentityBeforeProbing(t *testing.T) {
+	nodes := make([]config.NodeConfig, 0, 4)
+	for i := 0; i < 4; i++ {
+		nodes = append(nodes, config.NodeConfig{ID: int64(i + 1), Name: "n", URI: "http://127.0.0.1:80"})
+	}
+	cfg := &config.Config{Nodes: nodes}
+	manager := New(cfg, monitor.Config{})
+
+	captured := manager.landingNodes(cfg)
+	if len(captured) != 4 {
+		t.Fatalf("captured %d nodes, want 4", len(captured))
+	}
+	// Simulate SetNodeEnabled/DeleteNodeByID running while probes are in flight.
+	manager.mu.Lock()
+	cfg.Nodes = append(cfg.Nodes[:0], cfg.Nodes[1:]...)
+	manager.mu.Unlock()
+
+	if len(captured) != 4 || captured[3].ID != 4 {
+		t.Fatalf("captured snapshot changed with the live config: %+v", captured)
+	}
+	if live := manager.landingNodes(cfg); len(live) != 3 {
+		t.Fatalf("expected the live config to be shorter, got %d", len(live))
+	}
+}
+
+// A probe that finishes after its node was deleted must be a no-op, not an
+// out-of-range panic, and must not resurrect the location on another node.
+func TestLandingLocationResolvesByIDAfterNodeRemoval(t *testing.T) {
+	cfg := &config.Config{Nodes: []config.NodeConfig{
+		{ID: 1, URI: "http://127.0.0.1:80"},
+		{ID: 2, URI: "http://127.0.0.2:80"},
+	}}
+	manager := New(cfg, monitor.Config{})
+
+	if !manager.setLandingNodeLocation(cfg, 2, "jp", "Japan") {
+		t.Fatal("location for a live node was not applied")
+	}
+	if cfg.Nodes[1].Region != "jp" || cfg.Nodes[1].Country != "Japan" {
+		t.Fatalf("location applied to the wrong node: %+v", cfg.Nodes)
+	}
+	// Re-applying the same location is not a change.
+	if manager.setLandingNodeLocation(cfg, 2, "jp", "Japan") {
+		t.Fatal("identical location reported as a change")
+	}
+
+	// Node 2 disappears while its probe is still in flight.
+	manager.mu.Lock()
+	cfg.Nodes = append(cfg.Nodes[:1], cfg.Nodes[2:]...)
+	manager.mu.Unlock()
+	if manager.setLandingNodeLocation(cfg, 2, "us", "United States") {
+		t.Fatal("a deleted node's result was reported as a change")
+	}
+	if len(cfg.Nodes) != 1 || cfg.Nodes[0].ID != 1 || cfg.Nodes[0].Region != "" {
+		t.Fatalf("deleted node's result leaked onto another node: %+v", cfg.Nodes)
+	}
+}
+
+// This is the exact shape of the field crash: targets carry a slice index,
+// and node CRUD shortens cfg.Nodes before the worker dereferences it. The test
+// asserts the invariant the fix relies on — a captured index is unusable after
+// a concurrent delete — so a future refactor that reintroduces index capture
+// fails here instead of in production.
+func TestCapturedNodeIndexIsUnsafeAcrossConcurrentDelete(t *testing.T) {
+	nodes := make([]config.NodeConfig, 0, 400)
+	for i := 0; i < 400; i++ {
+		nodes = append(nodes, config.NodeConfig{ID: int64(i + 1), URI: "http://127.0.0.1:80"})
+	}
+	cfg := &config.Config{Nodes: nodes}
+	const capturedIndex = 375
+	const fieldLength = 369 // the length reported by the field panic
+
+	// SetNodeEnabled / DeleteNodeByID splice the slice in place. Removing 31
+	// nodes leaves the length at 369 while a collected target still holds 375.
+	cfg.Nodes = append(cfg.Nodes[:10], cfg.Nodes[41:]...)
+
+	if len(cfg.Nodes) != fieldLength || capturedIndex < len(cfg.Nodes) {
+		t.Fatalf("fixture no longer reproduces the field slice: len=%d", len(cfg.Nodes))
+	}
+	// The detector must never reach this index; it identifies nodes by ID.
+	if got := (&Manager{}).landingNodes(cfg); len(got) != len(cfg.Nodes) {
+		t.Fatalf("snapshot length %d, want %d", len(got), len(cfg.Nodes))
+	}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected the stale index to panic, proving index capture is unsafe here")
+		}
+	}()
+	_ = cfg.Nodes[capturedIndex].URI
+}

@@ -47,11 +47,12 @@ func (m *Manager) applyCachedLocations(ctx context.Context, cfg *config.Config, 
 		m.logger.Warnf("load cached landing IP results: %v", err)
 		return
 	}
-	for index := range cfg.Nodes {
-		node := &cfg.Nodes[index]
+	for _, node := range m.landingNodes(cfg) {
 		if node.ID == 0 {
 			continue
 		}
+		// node is a copy: the DB round-trips below give node CRUD time to
+		// shorten cfg.Nodes, so a pointer into the live slice would dangle.
 		state, err := m.store.GetNodeLocation(ctx, node.ID)
 		if err != nil || state.Identity != node.NodeKey() {
 			continue
@@ -88,7 +89,7 @@ func (m *Manager) applyCachedLocations(ctx context.Context, cfg *config.Config, 
 			}
 			location = change.Location
 		}
-		node.Region, node.Country = location.ISO, location.Country
+		m.setLandingNodeLocation(cfg, node.ID, location.ISO, location.Country)
 	}
 }
 
@@ -113,18 +114,21 @@ func (m *Manager) detectMissingNodeLocations(ctx context.Context, cfg *config.Co
 		}
 	}
 	type target struct {
-		index int
-		id    int64
-		tag   string
+		id  int64
+		tag string
+		// uri is copied here rather than re-read from cfg.Nodes in the worker:
+		// on the Start path cfg is the manager's published config, and node
+		// CRUD shortens that Nodes slice in place, so a captured index can
+		// point past the end by the time a worker uses it.
+		uri string
 	}
 	var targets []target
-	for index := range cfg.Nodes {
-		node := &cfg.Nodes[index]
+	for _, node := range m.landingNodes(cfg) {
 		if node.ID == 0 || hasSuccessfulLandingIP(results[node.ID]) {
 			continue
 		}
 		if tag := tags[node.ID]; tag != "" {
-			targets = append(targets, target{index: index, id: node.ID, tag: tag})
+			targets = append(targets, target{id: node.ID, tag: tag, uri: node.URI})
 		}
 	}
 	if len(targets) == 0 {
@@ -169,7 +173,7 @@ func (m *Manager) detectMissingNodeLocations(ctx context.Context, cfg *config.Co
 		go func() {
 			defer wg.Done()
 			for item := range jobs {
-				observation, err := store.BeginLandingProbe(ctx, m.store, item.id, cfg.Nodes[item.index].URI, "")
+				observation, err := store.BeginLandingProbe(ctx, m.store, item.id, item.uri, "")
 				if err != nil {
 					m.logger.Warnf("begin landing probe for node %d: %v", item.id, err)
 					continue
@@ -226,19 +230,65 @@ func (m *Manager) detectMissingNodeLocations(ctx context.Context, cfg *config.Co
 	wg.Wait()
 	close(done)
 
+	// Resolve by stable NodeID, not by a captured slice index: concurrent node
+	// CRUD can remove an entry (or reorder the slice) while the probes run, and
+	// a deleted node simply has nothing left to update.
 	changed := false
 	for item := range done {
-		node := &cfg.Nodes[item.index]
-		if item.region != "" && (node.Region != item.region || node.Country != item.country) {
-			node.Region, node.Country = item.region, item.country
+		if item.region == "" {
+			continue
+		}
+		if m.setLandingNodeLocation(cfg, item.id, item.region, item.country) {
 			changed = true
 		}
-		if item.region != "" {
-			m.monitorMgr.UpdateNodeLocation(item.id, item.region, item.country)
-		}
+		m.monitorMgr.UpdateNodeLocation(item.id, item.region, item.country)
 	}
 	m.logger.Infof("landing IP initialization checked %d uncached nodes", len(targets))
 	return changed
+}
+
+// landingNodes returns a detached copy of cfg.Nodes.
+//
+// The detector keeps probing for seconds after collecting its targets, and node
+// CRUD splices the same slice in place (`m.cfg.Nodes = append(...[:idx], ...)`)
+// while holding the manager lock. Capturing an index into that slice and
+// dereferencing it later therefore panics with "index out of range" as soon as a
+// node is deleted or disabled mid-detection; copying the identity up front
+// removes the shared mutable state from the probe window.
+func (m *Manager) landingNodes(cfg *config.Config) []config.NodeConfig {
+	if cfg == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	nodes := make([]config.NodeConfig, len(cfg.Nodes))
+	copy(nodes, cfg.Nodes)
+	return nodes
+}
+
+// setLandingNodeLocation writes the discovered location and reports whether it
+// changed. It resolves the node by stable ID rather than by a captured index —
+// the slice may have been shortened while the probes ran — and holds the
+// manager lock because cfg may be the published config other goroutines read.
+func (m *Manager) setLandingNodeLocation(cfg *config.Config, nodeID int64, region, country string) bool {
+	if cfg == nil || nodeID == 0 {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for idx := range cfg.Nodes {
+		if cfg.Nodes[idx].ID != nodeID {
+			continue
+		}
+		if cfg.Nodes[idx].Region == region && cfg.Nodes[idx].Country == country {
+			return false
+		}
+		cfg.Nodes[idx].Region, cfg.Nodes[idx].Country = region, country
+		return true
+	}
+	// The node was removed while its probe was in flight; there is nothing left
+	// to update.
+	return false
 }
 
 func (m *Manager) openLandingGeoIP(cfg *config.Config) *geoip.Lookup {
