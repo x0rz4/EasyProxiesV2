@@ -18,6 +18,7 @@ import (
 
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/monitor"
+	"easy_proxies/internal/store"
 )
 
 func newOperationsTestServer(t *testing.T) (*Server, *monitor.Manager, string) {
@@ -245,5 +246,31 @@ func TestUnlockAllKeepsSSEEventShapeWhenNodesFail(t *testing.T) {
 	}
 	if !strings.Contains(body, `"total":3,"success":0,"failed":3`) {
 		t.Fatalf("unexpected unlock completion summary: %s", body)
+	}
+}
+
+// TestHealthEventStatsReportsJournalBacklog pins the observability contract: an
+// operator must be able to see that a consumer is behind, because that replaced
+// the old silent event drop.
+func TestHealthEventStatsReportsJournalBacklog(t *testing.T) {
+	server, mgr, _ := newOperationsTestServer(t)
+	db, err := store.Open(filepath.Join(t.TempDir(), "health-events.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	mgr.SetProbeStore(db)
+
+	response := httptest.NewRecorder()
+	server.handleHealthEventStats(response, httptest.NewRequest(http.MethodGet, "/api/operations/health-events", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var stats monitor.HealthEventStats
+	if err := json.Unmarshal(response.Body.Bytes(), &stats); err != nil {
+		t.Fatal(err)
+	}
+	if stats.Capacity != store.HealthEventJournalLimit || stats.Count != 0 || stats.Backlog != 0 {
+		t.Fatalf("unexpected empty-journal stats: %+v", stats)
 	}
 }

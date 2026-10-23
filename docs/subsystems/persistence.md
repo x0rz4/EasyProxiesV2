@@ -8,7 +8,7 @@
 
 ## migration 只追加（AGENTS §8）
 
-`internal/store/migrations.go` 的列表按 `Version` 递增、**只允许在末尾新增**。每个 migration 独立事务，`schema_migrations` 记录已应用版本。当前最新 **v23**（v23 仅为 `nodes.name` 建普通索引；名称**故意不唯一**）。**新列必须带 `NOT NULL DEFAULT`**，保证升级行为不变。
+`internal/store/migrations.go` 的列表按 `Version` 递增、**只允许在末尾新增**。每个 migration 独立事务，`schema_migrations` 记录已应用版本。当前最新 **v24**（v23 仅为 `nodes.name` 建普通索引，名称**故意不唯一**；v24 新建 `health_events` 与 `health_event_cursors`，见下）。**新列必须带 `NOT NULL DEFAULT`**，保证升级行为不变。
 
 表结构变更后同步 `sqlite.go` 的列常量 / `scan*` / `INSERT` / `UPDATE`；改 `store.GroupPool` 还要同步 `config.GroupPoolConfig` + `boxmgr` 的双向转换与相等性判断（否则热重载判定不到变化）。
 
@@ -19,6 +19,14 @@
 - `probe_id.go`：`NewProbeID(prefix)` = `wall_unixNano + 进程内单调序号`。墙钟 `UnixNano` 在某些平台粒度粗（Windows ≈1ms、legacy 中断 ≈15.6ms），同 tick 紧邻的两次同节点探测会拿到相同 ProbeID 被下游判为 duplicate 丢弃。单调序号消除进程内碰撞；**重试路径必须显式复用同一原 ID**（幂等契约靠这个，绝不能二次调 `NewProbeID`）。
 - `sqlite_location.go`：落地地区证据的应用（配合 `nodeloc`）。
 - `sqlite_tags.go`：标签 API；`nodes.tags` 只是 `node_tags` 的只读投影。
+
+## 健康事件日志（v24）
+
+- `health_events`：被接受的健康测量按 `seq`（`AUTOINCREMENT`，清理后**不复用**编号，否则游标会指到另一条事件）追加，字段含 NodeID、身份 token/revision、tag、ProbeID、成功/延迟/错误、`checked_at`、`recorded_at`。写入只发生在 `probe.Applier.Apply` 健康分支的**同一事务**内。
+- `health_event_cursors`：持久消费者的投递进度（`consumer` 为主键）；`PutHealthEventCursor` 只前进不后退，重试旧批次不会回退游标。
+- 容量 `HealthEventJournalLimit`=8192；满时 `AppendHealthEvent` 返回 `ErrHealthEventJournalFull`，测量整体回滚（显式背压，不静默丢旧事实）。
+- `PruneHealthEvents(olderThan, activeConsumers)` 只删"超过保留窗口**且** `seq <= MIN(活跃游标)`"的行。`activeConsumers` 是**当前注册**的消费者键，不是整张 `health_event_cursors` 表：已删除/禁用分组留下的游标行必须被忽略，否则会永久钉住清理（详见 spec HEALTH-005）。没有注册消费者时按年龄清理。
+- 时间列用固定宽度布局 `2006-01-02T15:04:05.000000000Z07:00`：`RFC3339Nano` 会去掉末尾零，使 `…:00Z` 在 SQL 字符串比较里排到 `…:00.1Z` 之后，按年龄清理就会删错行。
 
 ## 窄写规则（呼应订阅子系统）
 

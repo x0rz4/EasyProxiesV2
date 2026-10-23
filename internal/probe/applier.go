@@ -57,6 +57,10 @@ type Outcome struct {
 	Applied   bool           `json:"applied"`
 	Reason    string         `json:"reason"`
 	Location  nodeloc.Change `json:"location"`
+	// Seq is the health event journal row created in the same transaction as
+	// the health fact. Consumers replay the journal by cursor, so delivery no
+	// longer depends on an in-memory queue that could drop the transition.
+	Seq int64 `json:"seq,omitempty"`
 }
 type Applier struct{ db store.Store }
 
@@ -220,6 +224,15 @@ func (a *Applier) Apply(ctx context.Context, event Result) (Outcome, error) {
 		case Unlock:
 			err = tx.UpsertUnlockResult(ctx, event.Unlock)
 		case Health: // Health runtime effects are executed only by the health consumer.
+			// The journal row commits with the fact: a consumer that is slow,
+			// wedged or restarting still sees the transition, and a rejected
+			// event (journal at capacity) must not leave a fact behind.
+			out.Seq, err = tx.AppendHealthEvent(ctx, store.HealthEvent{
+				NodeID: event.NodeID, IdentityToken: current.Identity, IdentityRevision: current.Revision,
+				Tag: event.Health.Tag, ProbeID: event.Observation.ProbeID, Success: event.Health.Success,
+				LatencyMs: event.Health.Latency.Milliseconds(), Error: event.Health.Error,
+				CheckedAt: event.Observation.CheckedAt,
+			})
 		}
 		if err != nil {
 			return err

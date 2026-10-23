@@ -115,11 +115,11 @@ func TestStandbyRecoveryPreservesStreakAcrossCapacityChange(t *testing.T) {
 	states := map[string]GroupInitialState{"a": {NodeID: 1}, "b": {NodeID: 2, Standby: true}}
 	Register(993, time.Minute, 1, "a", states, policy)
 	RecordFailure(993, "a", nil, time.Now())
-	RecordHealthSuccess(993, "a")
+	RecordHealthSuccess(993, "a", "")
 	states["a"] = GroupInitialState{NodeID: 1, Standby: true}
 	states["b"] = GroupInitialState{NodeID: 2}
 	NotifyEvents(ReconcileSilent(993, RuntimeUpdate{FailureWindow: time.Minute, FailureThreshold: 1, Members: states, Recovery: policy}))
-	if !RecordHealthSuccess(993, "a") {
+	if !RecordHealthSuccess(993, "a", "") {
 		t.Fatal("capacity update reset recovery progress")
 	}
 	if MemberAvailable(993, "a") {

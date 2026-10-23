@@ -11,8 +11,13 @@ import (
 )
 
 // SetProbeStore is called before registering runtime nodes. A nil store keeps
-// the standalone in-memory manager useful to embedders and isolated tests.
+// the standalone in-memory manager useful to embedders and isolated tests: the
+// probe path then has no receipts and health delivery falls back to the bounded
+// in-memory compatibility queue.
 func (m *Manager) SetProbeStore(db store.Store) {
+	m.journalMu.Lock()
+	m.journalDB = db
+	m.journalMu.Unlock()
 	if db == nil {
 		m.resultApplier.Store(nil)
 		return
@@ -46,7 +51,7 @@ func (m *Manager) beginHealthResult(ctx context.Context, e *entry) (*healthTicke
 
 func (m *Manager) commitHealthResult(e *entry, ticket *healthTicket, latency time.Duration, probeErr error, checkedAt time.Time) error {
 	if ticket == nil {
-		m.projectHealthResult(e, latency, probeErr, checkedAt)
+		m.projectHealthResult(e, latency, probeErr, checkedAt, 0, "")
 		return nil
 	}
 	event := ticket.event
@@ -59,6 +64,11 @@ func (m *Manager) commitHealthResult(e *entry, ticket *healthTicket, latency tim
 	defer cancel()
 	out, err := ticket.applier.Apply(ctx, event)
 	if err != nil {
+		if errors.Is(err, store.ErrHealthEventJournalFull) {
+			// Explicit backpressure: the measurement is rejected instead of
+			// silently dropping a transition a wedged consumer still owes.
+			m.healthEvents.rejected.Add(1)
+		}
 		return err
 	}
 	if !out.Applied {
@@ -96,7 +106,7 @@ func (m *Manager) ProjectHealthOutcome(out probe.Outcome) error {
 	if !event.Health.Success {
 		err = errors.New(event.Health.Error)
 	}
-	m.projectHealthResult(e, event.Health.Latency, err, event.Observation.CheckedAt)
+	m.projectHealthResult(e, event.Health.Latency, err, event.Observation.CheckedAt, out.Seq, event.Observation.ProbeID)
 	e.healthReceiptID, e.healthReceiptAt = out.ReceiptID, event.Observation.CheckedAt
 	return nil
 }

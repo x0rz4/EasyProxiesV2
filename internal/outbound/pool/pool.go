@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1058,12 +1059,23 @@ func (p *poolOutbound) refreshHealthSubscriptionLocked() {
 			nodeIDs = append(nodeIDs, nodeID)
 		}
 	}
-	next := p.monitor.SubscribeHealthResultsFor(tags, nodeIDs, p.handleHealthResult)
+	next := p.monitor.SubscribeDurableHealthResults(p.healthConsumerKey(), tags, nodeIDs, p.handleHealthResult)
 	previous := p.unsubscribeHealth
 	p.unsubscribeHealth = next
 	if previous != nil {
 		previous()
 	}
+}
+
+// healthConsumerKey is the stable cursor identity of this pool. It survives a
+// topology refresh (which re-subscribes) and a process restart, so a health
+// event committed before the restart is still applied to the group state
+// instead of being lost with the in-memory subscription.
+func (p *poolOutbound) healthConsumerKey() string {
+	if p.options.GroupID == 0 {
+		return "pool:base"
+	}
+	return "pool:" + strconv.FormatInt(p.options.GroupID, 10)
 }
 
 func (p *poolOutbound) memberName(member *memberState) string {
@@ -1426,9 +1438,9 @@ func (p *poolOutbound) handleHealthResult(event monitor.HealthResultEvent) {
 	}
 	if p.options.GroupID != 0 {
 		if event.Success {
-			group.RecordHealthSuccess(p.options.GroupID, tag)
+			group.RecordHealthSuccess(p.options.GroupID, tag, event.ProbeID)
 		} else {
-			group.RecordGroupHealthFailure(p.options.GroupID, tag, errors.New(event.Error), event.CheckedAt)
+			group.RecordGroupHealthFailure(p.options.GroupID, tag, event.ProbeID, errors.New(event.Error), event.CheckedAt)
 			p.scheduleExpiryRebuild(p.currentFailureWindow())
 		}
 	}

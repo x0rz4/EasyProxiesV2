@@ -538,6 +538,34 @@ CREATE INDEX idx_subscription_nodes_missed ON subscription_nodes(subscription_id
 			// GetNodeByName a lookup instead of a table scan.
 			Up: `CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);`,
 		},
+		{
+			Version:     24,
+			Description: "add durable ordered health event journal and consumer cursors",
+			// The journal keeps accepted health measurements in commit order so
+			// group failure/recovery transitions survive a slow consumer and a
+			// restart. AUTOINCREMENT matters: a reused rowid would let a cursor
+			// point at a different event after pruning.
+			Up: `
+CREATE TABLE health_events (
+    seq               INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id           INTEGER NOT NULL,
+    identity_token    TEXT    NOT NULL DEFAULT '',
+    identity_revision INTEGER NOT NULL DEFAULT 0,
+    tag               TEXT    NOT NULL DEFAULT '',
+    probe_id          TEXT    NOT NULL DEFAULT '',
+    success           INTEGER NOT NULL DEFAULT 0,
+    latency_ms        INTEGER NOT NULL DEFAULT 0,
+    error             TEXT    NOT NULL DEFAULT '',
+    checked_at        TEXT    NOT NULL DEFAULT '',
+    recorded_at       TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX idx_health_events_recorded ON health_events(recorded_at);
+CREATE TABLE health_event_cursors (
+    consumer   TEXT    PRIMARY KEY,
+    seq        INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT    NOT NULL DEFAULT ''
+);`,
+		},
 	}
 }
 

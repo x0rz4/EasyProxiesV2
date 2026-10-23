@@ -95,9 +95,30 @@ func TestProbeBatchRetriesOnceAndCommitsOneHealthResult(t *testing.T) {
 	if attempts.Load() != 2 || result.Attempts != 2 || summary.Success != 1 {
 		t.Fatalf("attempts=%d result=%+v summary=%+v", attempts.Load(), result, summary)
 	}
-	if events.Load() != 1 {
+	// Health delivery is asynchronous by contract (no-store compatibility path
+	// here), so the callback may still be pending when RunProbeBatch returns.
+	// Polling keeps the assertion about the count without asserting a timing the
+	// implementation never promised. 1/200 failures were observed on the base
+	// commit before this change, hence the fix rather than a retry.
+	if !waitForCount(&events, 1, time.Second) {
 		t.Fatalf("health results = %d, want exactly one final result", events.Load())
 	}
+	time.Sleep(20 * time.Millisecond)
+	if events.Load() != 1 {
+		t.Fatalf("health results = %d after settling, want exactly one final result", events.Load())
+	}
+}
+
+// waitForCount polls until counter reaches want or the deadline expires.
+func waitForCount(counter *atomic.Int32, want int32, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if counter.Load() >= want {
+			return true
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return counter.Load() >= want
 }
 
 func TestProbeBatchKeepsPhaseTimeoutSnapshot(t *testing.T) {

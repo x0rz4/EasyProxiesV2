@@ -27,13 +27,15 @@ func TestSuccessfulDiagnosticsDoNotRecoverEvictedMember(t *testing.T) {
 			group.Register(1, time.Minute, 1, "health@v1", members, policy)
 			group.Register(2, time.Minute, 1, "health@v1", members, policy)
 			group.RecordFailure(1, "health@v1", errors.New("down"), time.Now())
-			group.RecordHealthSuccess(1, "health@v1")
+			group.RecordHealthSuccess(1, "health@v1", "")
 			before := group.GroupRuntimeSnapshotsReadonly()
 			if member := before[1].Members[0]; member.Status != "EVICTED" || member.RecoverySuccesses != 1 {
 				t.Fatalf("invalid recovery fixture: %+v", member)
 			}
-			// A FIFO barrier ensures any accidentally published health event has
-			// reached recovery before comparing state, without polling or sleeps.
+			// The SnapshotOnly marker is a mergeable barrier: it is delivered
+			// after the journal catch-up that precedes it, so any accidentally
+			// published health event has reached recovery before we compare
+			// state — without polling or sleeps.
 			barrier := make(chan struct{})
 			unsubscribe := mgr.SubscribeHealthResultsFor([]string{"health@v1"}, []int64{node.ID}, func(event monitor.HealthResultEvent) {
 				if event.SnapshotOnly {
@@ -41,9 +43,9 @@ func TestSuccessfulDiagnosticsDoNotRecoverEvictedMember(t *testing.T) {
 					return
 				}
 				if event.Success {
-					group.RecordHealthSuccess(1, event.Tag)
+					group.RecordHealthSuccess(1, event.Tag, "")
 				} else {
-					group.RecordGroupHealthFailure(1, event.Tag, errors.New(event.Error), event.CheckedAt)
+					group.RecordGroupHealthFailure(1, event.Tag, event.ProbeID, errors.New(event.Error), event.CheckedAt)
 				}
 			})
 			defer unsubscribe()

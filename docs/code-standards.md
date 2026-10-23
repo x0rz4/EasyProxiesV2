@@ -43,7 +43,7 @@
 
 ## E. 数据库与配置
 
-- **migration 只追加**：`internal/store/migrations.go` 按 `Version` 递增、只在末尾新增；每个 migration 独立事务；新列必须带 `NOT NULL DEFAULT`。当前最新 v23。
+- **migration 只追加**：`internal/store/migrations.go` 按 `Version` 递增、只在末尾新增；每个 migration 独立事务；新列必须带 `NOT NULL DEFAULT`。当前最新 v24。
 - 表结构变更同步 `sqlite.go` 列常量 / `scan*` / `INSERT` / `UPDATE`；改 `store.GroupPool` 同步 `config.GroupPoolConfig` + `boxmgr` 双向转换与相等性判断。
 - `nodes.tags` 只是 `node_tags` 的只读投影；改标签必须走 store 的 tag API，旁路写入会被下次重算覆盖。
 - 配置优先级：**store 优先于 `config.yaml`**；只来自 store 的字段标 `yaml:"-"`。

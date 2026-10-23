@@ -4,6 +4,8 @@
 
 增量：`2.1.1` 的首批健康入口硬化与实际测试证据见 [P1 健康边界](../../changes/scale-proxy-pool/p1-health-boundaries.md)，不等同于 M1 或规模认证。
 
+增量：`2.2.6` 的健康事件投递改造（HEALTH-002..005）见 [健康事件日志](../../changes/health-event-log/proposal.md)；它替换了"每订阅 4096 条 FIFO、溢出丢弃"的旧形态。
+
 ## 能力与事实源
 
 | 层 | 权威能力及代码入口 | 当前边界 |
@@ -42,6 +44,66 @@
 - THEN 挂起收据保留；重复投影不重复计数；确认只能确认相应收据。
 
 代码：`internal/probe/applier.go`、`internal/monitor/health_applier.go`、`internal/boxmgr/probe_projection.go`。已有测试：`TestProjectionRetryAndConditionalAcknowledgment`、`TestPersistentHealthProjectionIsIdempotent`。
+
+## Requirement HEALTH-002：健康测量与有序事件日志同事务
+
+每条**被接受**的健康测量 MUST 在与事实、收据同一事务内追加一条不可变日志行（`health_events`，单调 `seq`，携带 NodeID、身份 token/revision、tag、ProbeID、成功/延迟/错误、CheckedAt）。被判为 `obsolete_identity` / `duplicate` / `older_probe` 的结果 MUST NOT 追加；诊断 origin MUST NOT 追加（DIAGNOSTIC-001）。
+
+日志容量有硬上限；达到上限时 MUST 拒绝新的测量提交并显式报错，MUST NOT 静默丢弃旧事实或改由队列丢弃。
+
+### Scenario: 消费者滞后导致日志满
+
+- GIVEN 消费者长期不推进，日志已达容量上限。
+- WHEN 新的健康测量提交。
+- THEN 提交整体失败（`health event journal full`），事实、收据与日志都不变化；`GET /api/operations/health-events` 的 `rejected_measurements` 递增。
+
+代码：`internal/probe/applier.go`、`internal/store/health_events.go`、`internal/store/migrations.go`（v24）。已有测试：`TestHealthMeasurementAppendsJournalRowInSameTransaction`、`TestHealthMeasurementRejectedWhenJournalFull`、`TestHealthEventJournalRejectsWhenFull`。
+
+## Requirement HEALTH-003：投递按游标有序消费，通知只唤醒
+
+订阅 MUST 从日志按 `seq` 升序读取，并只有在该批回调返回后才推进游标；内存通知只表示"可能有新行"，其合并、丢失或重复 MUST NOT 改变已提交事实的最终投递。被订阅过滤掉的事件 MUST 也推进游标（否则会永久卡住）。`SnapshotOnly` MUST 是可合并的刷新标志，MUST NOT 推进恢复/失败窗口，并在该订阅的日志补读之后投递。
+
+### Scenario: 消费者阻塞期间积压超过旧队列上限
+
+- GIVEN 回调被阻塞。
+- WHEN 期间提交 5000 条健康测量（超过旧 FIFO 的 4096）。
+- THEN 解除阻塞后 MUST 全部按序投递，`dropped=0`、`backlog=0`；分组恢复进度与逐条投递一致。
+
+代码：`internal/monitor/health_event_hub.go`。已有测试：`TestHealthJournalDeliversBeyondLegacyQueueLimit`、`TestHealthEventSnapshotOnlyIsMergeable`。
+
+## Requirement HEALTH-004：持久消费者从游标续读，重放幂等
+
+需要跨重启生效的消费者 MUST 以稳定 key 注册（pool 为 `pool:<groupID>`/`pool:base`）；首次注册从日志尾部开始，已有游标则从游标续读。游标 MUST 在回调返回后持久化，持久化失败 MUST 阻止该消费者继续前进——不只是记录失败，而是停止读取新行，直到写入成功。原因是进程内 ProbeID 去重环只覆盖一个投递批次：带着未落盘的进度继续前进，崩溃重启后会重放已被挤出环的事件并二次推进恢复计数。同一测量被重复投递或重放时 MUST NOT 二次推进恢复计数或二次计入失败窗口。
+
+### Scenario: 崩溃后重启
+
+- GIVEN 事件已应用但游标未落盘，进程崩溃。
+- WHEN 重启后从旧游标重放该批事件。
+- THEN 已应用的 ProbeID 被去重，恢复计数不变；新事件照常推进。
+
+代码：`internal/monitor/health_event_hub.go`、`internal/monitor/manager.go`（`SubscribeDurableHealthResults`）、`internal/group/runtime.go`、`internal/outbound/pool/pool.go`。已有测试：`TestHealthEventCursorResumesAfterRestart`、`TestHealthEventFirstRegistrationStartsAtTail`、`TestHealthEventCloseKeepsJournalForNextStart`、`TestHealthEventCursorFailureStopsDelivery`、`TestHealthReplayDoesNotAdvanceRecoveryTwice`、`TestHealthFailureReplayIsIgnored`。
+
+## Requirement HEALTH-005：投递状态必须可观测
+
+控制面 MUST 暴露日志容量、当前行数、`seq` 上界、积压、最老事件年龄、被拒测量次数，以及每个消费者的游标、已投递、空洞、读失败与游标失败次数。
+
+清理 MUST 只删除"超过保留窗口**且**所有**当前注册**的持久消费者都已越过"的行；已不再注册的消费者（分组被删除、被禁用、实例停止）留下的游标行 MUST NOT 约束清理，它恢复注册时从自己的游标续读，中间被清理的行计为空洞。否则一个不活跃消费者会永久钉住最慢位置，日志被填满后**所有**分组的测量都被拒绝。
+
+保留窗口 MUST 让正常探测速率下的稳态日志大小（`速率 × 窗口`）显著低于容量，否则即使消费者完全跟上也会持续触顶。当前：已消费行保留 5 分钟（`healthEventConsumedRetention`，容量 8192 对应约 27 行/秒），没有注册消费者时按 30 分钟年龄清理。
+
+### Scenario: 消费者卡死
+
+- GIVEN 某持久消费者回调永久阻塞。
+- WHEN 该消费者游标不再前进。
+- THEN 积压持续上升并可在统计接口看到；最老事件的保留条数不被清理掉，直到达到容量上限转为显式背压。
+
+### Scenario: 分组被删除后重新创建
+
+- GIVEN 分组 9 的 pool 曾消费到 seq 3 后被删除，日志继续增长到 seq 200。
+- WHEN 该分组的游标行仍在，消费者已不再注册。
+- THEN 清理不受该行约束，活跃消费者的进度正常释放空间；分组重建后从 seq 3 续读并记一次空洞，不重放已清理的转移。
+
+代码：`internal/monitor/health_event_hub.go`（`stats`、`durableConsumers`）、`internal/monitor/manager.go`（`pruneHealthJournal`）、`internal/httpapi/server_health_events.go`、`internal/store/health_events.go`（`PruneHealthEvents`）。已有测试：`TestPruneHealthEventsKeepsSlowestConsumerBacklog`、`TestPruneHealthEventsIgnoresInactiveConsumerCursor`、`TestHealthEventJournalSustainsConfiguredProbeRate`、`TestHealthEventStatsReportsJournalBacklog`。
 
 ## Requirement DIAGNOSTIC-001：诊断不产生路由健康成功
 
@@ -131,4 +193,4 @@
 
 ## 现状未满足的规模能力
 
-健康 EventHub 每订阅为容量 4096 的 FIFO，溢出直接丢弃，仍不满足关键健康转移无损投递；复现及独立方案见 [2026-10-23 稳定性审计](../../stability-audit-2026-10-23.md)。`HealingInputs` 多次全量读取；预算和熔断未完整配置化；缺少统一指标及确定的规模报告。WAL、单写连接和四读连接已经存在。统一拓扑事件、多实例权威状态、完整操作审计、备份恢复演练均不能声明已交付。
+健康事件投递已改为"持久日志 + 游标"（HEALTH-002..005），不再因订阅队列溢出丢弃转移；剩余缺口是崩溃窗口内一批（≤64）事件可能重复应用（消除它需要把游标与分组状态写入同一事务），以及多进程共用同一数据库不受保证。`HealingInputs` 多次全量读取；预算和熔断未完整配置化；除健康投递外仍缺统一指标及确定的规模报告。WAL、单写连接和四读连接已经存在。统一拓扑事件、多实例权威状态、完整操作审计、备份恢复演练均不能声明已交付。

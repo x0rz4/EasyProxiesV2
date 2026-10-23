@@ -143,3 +143,85 @@ func TestManualResultCannotPublishHealth(t *testing.T) {
 		t.Fatal("manual event accepted health payload")
 	}
 }
+
+// healthEvent builds a valid health-origin measurement for the journal tests.
+func healthEvent(t *testing.T, db store.Store, node store.Node, tag string) Result {
+	t.Helper()
+	event, err := New(db).Begin(context.Background(), node.ID, node.URI, HealthProbe, Health)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event.Observation.StartedAt = time.Date(2026, 2, 2, 0, 0, 0, 0, time.UTC)
+	event.Observation.CheckedAt = event.Observation.StartedAt.Add(time.Second)
+	event.Observation.ProbeID = store.NewProbeID("health")
+	event.Health = &HealthResult{Tag: tag, Success: true, Latency: 12 * time.Millisecond}
+	return event
+}
+
+func TestHealthMeasurementAppendsJournalRowInSameTransaction(t *testing.T) {
+	db, node, latencyEvent := fixture(t)
+	ctx := context.Background()
+	// A manual latency diagnostic is a fact, not a health transition: it must
+	// stay out of the journal the group state machine consumes.
+	if out, err := New(db).Apply(ctx, latencyEvent); err != nil || !out.Applied {
+		t.Fatalf("latency apply: %+v %v", out, err)
+	}
+	if events, err := db.ListHealthEventsAfter(ctx, 0, 10); err != nil || len(events) != 0 {
+		t.Fatalf("diagnostic entered health journal: %+v %v", events, err)
+	}
+
+	event := healthEvent(t, db, node, "node")
+	out, err := New(db).Apply(ctx, event)
+	if err != nil || !out.Applied || out.Seq == 0 {
+		t.Fatalf("health apply: %+v %v", out, err)
+	}
+	events, err := db.ListHealthEventsAfter(ctx, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("journal rows = %d, want 1", len(events))
+	}
+	row := events[0]
+	if row.Seq != out.Seq || row.ProbeID != event.Observation.ProbeID || row.Tag != "node" || !row.Success {
+		t.Fatalf("journal row lost evidence: %+v", row)
+	}
+	if row.IdentityToken == "" || row.IdentityRevision == 0 {
+		t.Fatalf("journal row lost identity token: %+v", row)
+	}
+}
+
+func TestHealthMeasurementRejectedWhenJournalFull(t *testing.T) {
+	db, node, _ := fixture(t)
+	ctx := context.Background()
+	err := db.WithTx(ctx, func(tx store.Store) error {
+		for i := 0; i < store.HealthEventJournalLimit; i++ {
+			if _, err := tx.AppendHealthEvent(ctx, store.HealthEvent{NodeID: node.ID, ProbeID: "seed", Tag: "node"}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := healthEvent(t, db, node, "node")
+	out, err := New(db).Apply(ctx, event)
+	if !errors.Is(err, store.ErrHealthEventJournalFull) {
+		t.Fatalf("expected journal full, got %+v %v", out, err)
+	}
+	if out.Applied || out.Seq != 0 {
+		t.Fatalf("rejected measurement left a result: %+v", out)
+	}
+	// Backpressure must not leave the fact behind without its journal row.
+	if receipt, err := db.GetProbeReceipt(ctx, node.ID, "health"); err != nil || receipt != nil {
+		t.Fatalf("receipt written under backpressure: %+v %v", receipt, err)
+	}
+	stats, err := db.GetNodeStats(ctx, node.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats != nil && stats.InitialCheckDone {
+		t.Fatalf("node health advanced under backpressure: %+v", stats)
+	}
+}

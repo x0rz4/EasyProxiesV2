@@ -46,6 +46,7 @@ func (s *Server) routes() http.Handler {
 	authenticated("GET /api/operations/probe-settings", s.handleProbeSettingsGet)
 	authenticated("PUT /api/operations/probe-settings", s.handleProbeSettingsUpdate)
 	authenticated("GET /api/operations/probe-status", s.handleProbeStatus)
+	authenticated("GET /api/operations/health-events", s.handleHealthEventStats)
 	authenticated("GET /api/operations/node-check-settings", s.handleNodeCheckSettingsGet)
 	authenticated("PUT /api/operations/node-check-settings", s.handleNodeCheckSettingsUpdate)
 

@@ -49,6 +49,7 @@ var routeContracts = []routeContract{
 	{classSession, "GET", "/api/operations/probe-settings", "/api/operations/probe-settings"},
 	{classSession, "PUT", "/api/operations/probe-settings", "/api/operations/probe-settings"},
 	{classSession, "GET", "/api/operations/probe-status", "/api/operations/probe-status"},
+	{classSession, "GET", "/api/operations/health-events", "/api/operations/health-events"},
 	{classSession, "GET", "/api/operations/node-check-settings", "/api/operations/node-check-settings"},
 	{classSession, "PUT", "/api/operations/node-check-settings", "/api/operations/node-check-settings"},
 	{classSession, "GET", "/api/node-check/results", "/api/node-check/results"},

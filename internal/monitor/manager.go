@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/url"
 	"sort"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"easy_proxies/internal/probe"
+	"easy_proxies/internal/store"
 	M "github.com/sagernet/sing/common/metadata"
 )
 
@@ -210,16 +212,27 @@ type DebugLogEvent struct {
 
 // HealthResultEvent is emitted for every completed automatic, startup, or
 // manual probe. Subscribers run asynchronously after node state is committed.
-// The bounded delivery queue currently drops events on overflow.
+//
+// Delivery is journal-backed whenever a store is configured: Seq identifies the
+// committed journal row and the subscriber reads the ordered rows from its own
+// cursor, so a lost or coalesced wakeup costs latency instead of a group
+// failure/recovery transition. Only events that never entered a journal (manual
+// injection, no-store embedders) still use the bounded in-memory path.
 type HealthResultEvent struct {
-	Tag       string
-	NodeID    int64
-	Success   bool
-	Latency   time.Duration
-	Error     string
+	Tag     string
+	NodeID  int64
+	Success bool
+	Latency time.Duration
+	Error   string
+	// ProbeID identifies the measurement for replay idempotency: the same
+	// probe must never advance a recovery streak twice.
+	ProbeID   string
+	Seq       int64
 	CheckedAt time.Time
 	// SnapshotOnly asks routing observers to rebuild from the current monitor
-	// snapshot without treating the notification as a new health result.
+	// snapshot without treating the notification as a new health result. It is
+	// a mergeable flag, delivered after the journal catch-up, and never counted
+	// as a success or failure.
 	SnapshotOnly bool
 }
 
@@ -339,6 +352,8 @@ type entry struct {
 // Manager aggregates all node states for the UI/API.
 type Manager struct {
 	resultApplier atomic.Pointer[probe.Applier]
+	journalMu     sync.RWMutex
+	journalDB     store.Store
 	probeEpoch    time.Time
 	cfg           Config
 	probeTarget   ProbeTarget
@@ -413,11 +428,54 @@ func NewManager(cfg Config) (*Manager, error) {
 		m.probeReady = true
 	}
 	m.registry = newNodeRegistry(m)
-	m.healthEvents = newHealthEventHub()
+	m.healthEvents = newHealthEventHub(m.healthJournal)
 	m.probeScheduler = newProbeScheduler(m)
 	go m.startTrafficSpeedSampler()
 	go m.probeScheduler.run()
+	go m.pruneHealthJournal()
 	return m, nil
+}
+
+// healthJournal resolves the store backing the health event journal. Consumers
+// read ordered rows from it; a nil store keeps the compatibility path working
+// for embedders and tests that run without persistence.
+func (m *Manager) healthJournal() store.Store {
+	m.journalMu.RLock()
+	defer m.journalMu.RUnlock()
+	return m.journalDB
+}
+
+// pruneHealthJournal reclaims journal rows once every durable consumer has
+// passed them. Rows still owed by a slow consumer are never deleted, so a
+// wedged consumer shows up as backlog instead of a silent gap.
+func (m *Manager) pruneHealthJournal() {
+	ticker := time.NewTicker(healthEventPruneInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-ticker.C:
+			db := m.healthJournal()
+			if db == nil {
+				continue
+			}
+			consumers := m.healthEvents.durableConsumers()
+			window := healthEventConsumedRetention
+			if len(consumers) == 0 {
+				// Nothing owes the journal: reclaim by age alone.
+				window = healthEventRetention
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			removed, err := db.PruneHealthEvents(ctx, time.Now().UTC().Add(-window), consumers)
+			cancel()
+			if err != nil {
+				log.Printf("[monitor] prune health event journal: %v", err)
+			} else if removed > 0 {
+				log.Printf("[monitor] pruned %d consumed health event(s)", removed)
+			}
+		}
+	}
 }
 
 func NormalizeStartupAvailabilityPolicy(policy string) string {
@@ -1174,7 +1232,7 @@ func (m *Manager) EndProbeLease(tag string) {
 	m.probeScheduler.endTagProbe(tag)
 }
 
-func (m *Manager) projectHealthResult(e *entry, latency time.Duration, probeErr error, checkedAt time.Time) {
+func (m *Manager) projectHealthResult(e *entry, latency time.Duration, probeErr error, checkedAt time.Time, seq int64, probeID string) {
 	if checkedAt.IsZero() {
 		checkedAt = time.Now()
 	}
@@ -1203,7 +1261,7 @@ func (m *Manager) projectHealthResult(e *entry, latency time.Duration, probeErr 
 	e.mu.RLock()
 	tag, nodeID := e.info.Tag, e.info.NodeID
 	e.mu.RUnlock()
-	event := HealthResultEvent{Tag: tag, NodeID: nodeID, Success: probeErr == nil, Latency: latency, CheckedAt: checkedAt}
+	event := HealthResultEvent{Tag: tag, NodeID: nodeID, Success: probeErr == nil, Latency: latency, CheckedAt: checkedAt, Seq: seq, ProbeID: probeID}
 	if probeErr != nil {
 		event.Error = probeErr.Error()
 	}
@@ -1401,8 +1459,10 @@ func (m *Manager) publishDebugLog(event DebugLogEvent) {
 }
 
 // SubscribeHealthResults installs an asynchronous in-process health observer.
-// Delivery is FIFO for accepted events, but the bounded queue can overflow.
-// Callbacks run outside manager and entry locks and must remain lightweight.
+// When a store is configured the callback receives every accepted measurement
+// in journal order; the wakeup itself is coalescible. Consumers that must
+// survive a restart use SubscribeDurableHealthResults instead. Callbacks run
+// outside manager and entry locks and must remain lightweight.
 func (m *Manager) SubscribeHealthResults(callback func(HealthResultEvent)) func() {
 	return m.healthEvents.subscribe(nil, nil, true, callback)
 }
@@ -1413,14 +1473,29 @@ func (m *Manager) SubscribeHealthResultsFor(tags []string, nodeIDs []int64, call
 	return m.healthEvents.subscribe(tags, nodeIDs, false, callback)
 }
 
+// SubscribeDurableHealthResults registers a consumer whose progress must
+// survive a restart. key is the cursor identity (for example "pool:3"); the
+// first registration starts at the journal tail and later ones resume from the
+// persisted cursor. The pool consumer is the production user: it advances group
+// failure windows and recovery streaks, so losing an event would change the
+// state machine rather than just refresh a view.
+func (m *Manager) SubscribeDurableHealthResults(key string, tags []string, nodeIDs []int64, callback func(HealthResultEvent)) func() {
+	return m.healthEvents.subscribeAs(key, tags, nodeIDs, false, callback)
+}
+
+// HealthEventStats reports journal capacity, backlog and per-consumer progress.
+// A growing backlog or a stalled cursor is the honest signal that a consumer is
+// wedged; it replaces the previous silent overflow.
+func (m *Manager) HealthEventStats(ctx context.Context) (HealthEventStats, error) {
+	return m.healthEvents.stats(ctx)
+}
+
 // PublishHealthResult delivers event to every health-result subscriber through
-// the same FIFO the probe path uses. Exported because out-of-package consumers
-// (the HTTP layer) need to act as a barrier over that FIFO: a SnapshotOnly
-// marker, if accepted, is observed after earlier accepted events. Overflow
-// can drop the marker or preceding events, so this is not a reliable barrier.
-// Use it for ordering under that limitation, not to inject
-// health facts — a success event delivered here drives group recovery exactly
-// like a probe result.
+// the same path the probe path uses. A SnapshotOnly marker is a mergeable
+// barrier: it is observed after the journal catch-up that precedes it, so a
+// control-plane caller can wait for "all accepted measurements so far" without
+// sleeping. Events carrying a journal Seq (the normal case) are not double
+// delivered — each consumer reads from its own cursor.
 func (m *Manager) PublishHealthResult(event HealthResultEvent) {
 	m.healthEvents.publish(event)
 }

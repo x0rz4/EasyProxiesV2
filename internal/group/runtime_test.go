@@ -59,7 +59,7 @@ func TestSuccessfulHealthCheckClearsConsecutiveFailures(t *testing.T) {
 	if MemberAvailable(10, "node-a") {
 		t.Fatal("suspect member remained available")
 	}
-	if !RecordHealthSuccess(10, "node-a") {
+	if !RecordHealthSuccess(10, "node-a", "") {
 		t.Fatal("successful probe did not restore suspect member")
 	}
 	if !MemberAvailable(10, "node-a") {
@@ -168,7 +168,7 @@ func TestEvictedMemberRecoversAfterConsecutiveSuccesses(t *testing.T) {
 		t.Fatal("eviction did not propagate")
 	}
 
-	if RecordHealthSuccess(301, "node-a") {
+	if RecordHealthSuccess(301, "node-a", "") {
 		t.Fatal("member recovered before the success threshold was reached")
 	}
 	progress := GroupRuntimeSnapshots()[301].Members[0]
@@ -176,7 +176,7 @@ func TestEvictedMemberRecoversAfterConsecutiveSuccesses(t *testing.T) {
 		t.Fatalf("recovery progress was not exposed: %+v", progress)
 	}
 
-	if !RecordHealthSuccess(301, "node-a") {
+	if !RecordHealthSuccess(301, "node-a", "") {
 		t.Fatal("member did not recover after the success threshold was reached")
 	}
 	if !MemberAvailable(301, "node-a") || !MemberAvailable(302, "node-a") {
@@ -196,7 +196,7 @@ func TestRecoveryCooldownIgnoresEarlySuccesses(t *testing.T) {
 
 	RecordFailure(303, "node-a", errors.New("down"), time.Now())
 	for i := 0; i < 3; i++ {
-		if RecordHealthSuccess(303, "node-a") {
+		if RecordHealthSuccess(303, "node-a", "") {
 			t.Fatal("member recovered during the cooldown")
 		}
 	}
@@ -216,7 +216,7 @@ func TestRecoveryDisabledStillRequiresManualRestore(t *testing.T) {
 
 	RecordFailure(304, "node-a", errors.New("down"), time.Now())
 	for i := 0; i < 3; i++ {
-		if RecordHealthSuccess(304, "node-a") {
+		if RecordHealthSuccess(304, "node-a", "") {
 			t.Fatal("disabled recovery re-admitted the member")
 		}
 	}
@@ -237,17 +237,17 @@ func TestObservedFailureResetsRecoveryStreak(t *testing.T) {
 	Register(305, time.Minute, 1, "node-a", map[string]GroupInitialState{"node-a": {NodeID: 45}}, recoverablePolicy(2))
 
 	RecordFailure(305, "node-a", errors.New("down"), time.Now())
-	RecordHealthSuccess(305, "node-a")
+	RecordHealthSuccess(305, "node-a", "")
 	// A failure observed while evicted invalidates the streak, so the member
 	// must earn a full new run of successes.
 	RecordFailure(305, "node-a", errors.New("still down"), time.Now())
 	if progress := GroupRuntimeSnapshots()[305].Members[0]; progress.RecoverySuccesses != 0 {
 		t.Fatalf("failure did not reset the streak: %+v", progress)
 	}
-	if RecordHealthSuccess(305, "node-a") {
+	if RecordHealthSuccess(305, "node-a", "") {
 		t.Fatal("member recovered from a single success after the streak was reset")
 	}
-	if !RecordHealthSuccess(305, "node-a") {
+	if !RecordHealthSuccess(305, "node-a", "") {
 		t.Fatal("member did not recover after a fresh run of successes")
 	}
 }
@@ -285,5 +285,53 @@ func TestReconcileSilentPrunesGlobalEvictionForFullyRemovedNode(t *testing.T) {
 	Register(403, 5*time.Minute, 1, "node-a", map[string]GroupInitialState{"node-a": {NodeID: 42}})
 	if !MemberAvailable(403, "node-a") {
 		t.Fatal("re-added node inherited a stale global eviction mark")
+	}
+}
+
+// TestHealthReplayDoesNotAdvanceRecoveryTwice pins the at-least-once delivery
+// contract of the health journal: the same ProbeID delivered twice (crash
+// between callback and cursor commit) must count once.
+func TestHealthReplayDoesNotAdvanceRecoveryTwice(t *testing.T) {
+	Reset()
+	defer Reset()
+	Register(401, time.Minute, 3, "node-a", map[string]GroupInitialState{
+		"node-a": {NodeID: 44, Evicted: true, EvictedAt: time.Now().Add(-time.Hour)},
+	}, RecoveryPolicy{Enabled: true, SuccessThreshold: 3})
+
+	RecordHealthSuccess(401, "node-a", "probe-1")
+	RecordHealthSuccess(401, "node-a", "probe-1")
+	RecordHealthSuccess(401, "node-a", "probe-1")
+	if progress := GroupRuntimeSnapshots()[401].Members[0].RecoverySuccesses; progress != 1 {
+		t.Fatalf("replay advanced recovery to %d, want 1", progress)
+	}
+
+	RecordHealthSuccess(401, "node-a", "probe-2")
+	if progress := GroupRuntimeSnapshots()[401].Members[0].RecoverySuccesses; progress != 2 {
+		t.Fatalf("distinct probe not counted: %d", progress)
+	}
+	RecordHealthSuccess(401, "node-a", "probe-3")
+	if !MemberAvailable(401, "node-a") {
+		t.Fatal("recovery threshold not reached by distinct probes")
+	}
+}
+
+// TestHealthFailureReplayIsIgnored covers the failure side: a replayed failure
+// must not add a second entry to the window nor reset a streak a third time.
+func TestHealthFailureReplayIsIgnored(t *testing.T) {
+	Reset()
+	defer Reset()
+	Register(402, time.Minute, 3, "node-a", map[string]GroupInitialState{"node-a": {NodeID: 45}})
+	at := time.Now()
+
+	RecordGroupHealthFailure(402, "node-a", "probe-1", errors.New("down"), at)
+	RecordGroupHealthFailure(402, "node-a", "probe-1", errors.New("down"), at)
+	member := GroupRuntimeSnapshots()[402].Members[0]
+	if member.FailureCount != 1 {
+		t.Fatalf("replay added a failure: %+v", member)
+	}
+	// A manual call without event identity keeps the previous behaviour.
+	RecordGroupHealthFailure(402, "node-a", "", errors.New("down"), at.Add(time.Minute))
+	if member := GroupRuntimeSnapshots()[402].Members[0]; member.FailureCount != 2 {
+		t.Fatalf("manual failure not counted: %+v", member)
 	}
 }

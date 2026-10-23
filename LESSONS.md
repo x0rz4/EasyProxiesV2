@@ -136,7 +136,8 @@
 
 ### L-015 Windows 应用控制策略拦测试二进制：换执行方式，不改代码
 - 原因：`go test` 偶发 `fork/exec ... blocked by Application Control policy`（与代码无关）。绕行：`go test -c -o ./pkg.test.exe ./pkg/ && ./pkg.test.exe`，验完删二进制；并把"哪些包因此重跑过"如实写进验证报告。
-- 证据：2026-10-21 清理批实录（httpapi/app/boxmgr/monitor/groupmember 全部 `-c` 重跑 PASS）、2026-10-23 本批复现。
+- 补充（2026-10-23）：`-c` 产物放在 `%TEMP%` 或项目内都可能继续被拦，**最稳的绕行是把 Go 的临时目录搬出用户 Temp**：`GOTMPDIR=$(pwd)/.gotmp go test -p 1 ./internal/<pkg>`（逐包串行，`-p 1` 减少并发启动被拦概率），验完 `rm -rf .gotmp`。同一轮里被拦的包名每次不同（连 `runtimetag`/`netx` 这种与改动无关的包也会中招），所以"某包没跑过"必须按包记录，不能用一次全量 `./...` 的失败当回归证据。
+- 证据：2026-10-21 清理批实录（httpapi/app/boxmgr/monitor/groupmember 全部 `-c` 重跑 PASS）、2026-10-23 本批复现（`./...` 一轮拦 12 个包，`GOTMPDIR` + `-p 1` 后 9 个受改动影响的包全部通过）。
 - Seen：2×（2026-10-21、2026-10-23）
 - 状态：观察期。
 

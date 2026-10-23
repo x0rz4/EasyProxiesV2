@@ -15,6 +15,7 @@
 | [验证与规模门槛](changes/scale-proxy-pool/validation.md) | 回归矩阵、压测口径、指标和证据模板 |
 | [写路径审计清单](write-path-audit.md) | 允许的写入者、旁路检索、待确认风险、评审检查 |
 | [2026-10-23 稳定性审计](stability-audit-2026-10-23.md) | 订阅与重载局部修复、健康事件溢出复现、验证结果及独立改造建议 |
+| [健康事件日志提案](changes/health-event-log/proposal.md) | 2.2.6 落地审计的独立改造建议：持久有序事件日志 + 游标投递 + 显式背压（已实现，契约见 design） |
 | [容量自愈运营手册](group-healing.md) | 从 dry-run 到执行、缺口排查、关闭和回滚 |
 
 ## 文档层次与变更工作流
@@ -29,6 +30,10 @@ plane/
     design.md                         如何分层及设计取舍
     tasks.md                          待办、依赖和里程碑
     validation.md                     验收方法及尚缺的证据
+  changes/health-event-log/
+    proposal.md                       健康事件无损投递：为什么、范围、回滚
+    design.md                         HEALTH-002..007 契约、日志/游标/背压设计
+    tasks.md                          进度与遗留
   write-path-audit.md                  维护中的审计清单
   group-healing.md                     运维手册
   *.md                                专题设计或历史记录
@@ -41,6 +46,8 @@ plane/
 5. 同一约束只在 specs 中定义；设计、任务和手册引用 ID，不各自发明一份语义。历史文档的旧限制不能覆盖当前用户指令。
 
 当前变更状态：**In progress，已开始 P1 首批健康入口硬化，M1–M4 尚未完成验收**。首批变更与验证记录见 [P1 健康边界](changes/scale-proxy-pool/p1-health-boundaries.md)；规模假设仍需实测冻结。
+
+2.2.6 的健康事件日志变更（[proposal](changes/health-event-log/proposal.md) / [design](changes/health-event-log/design.md) / [tasks](changes/health-event-log/tasks.md)）：**已实现并合入 specs HEALTH-002..005**，遗留项（崩溃窗口内一批事件可能重复应用）记在 tasks.md。
 
 ## 专题文档索引
 

@@ -20,6 +20,20 @@ type Store interface {
 	PutProbeReceipt(ctx context.Context, receipt ProbeReceipt) error
 	ListPendingProbeReceipts(ctx context.Context, limit int) ([]ProbeReceipt, error)
 	AcknowledgeProbeReceipt(ctx context.Context, nodeID int64, stream, eventID string) error
+	// --- Health event journal ---
+	// Accepted health measurements are appended in commit order in the same
+	// transaction as the fact. Consumers replay them by cursor, so a slow or
+	// restarted consumer never loses a group failure/recovery transition.
+	AppendHealthEvent(ctx context.Context, event HealthEvent) (int64, error)
+	ListHealthEventsAfter(ctx context.Context, after int64, limit int) ([]HealthEvent, error)
+	MaxHealthEventSeq(ctx context.Context) (int64, error)
+	HealthEventJournalStats(ctx context.Context) (HealthEventJournalStats, error)
+	GetHealthEventCursor(ctx context.Context, consumer string) (int64, bool, error)
+	PutHealthEventCursor(ctx context.Context, consumer string, seq int64) error
+	// PruneHealthEvents drops consumed journal rows older than olderThan. Only
+	// activeConsumers constrain the cutoff; cursor rows of consumers that are
+	// not currently registered must not pin the journal (see the method doc).
+	PruneHealthEvents(ctx context.Context, olderThan time.Time, activeConsumers []string) (int64, error)
 	ListSavedFilters(ctx context.Context) ([]SavedFilter, error)
 	GetSavedFilter(ctx context.Context, id int64) (*SavedFilter, error)
 	SaveFilter(ctx context.Context, filter *SavedFilter) error

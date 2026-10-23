@@ -9,8 +9,8 @@
 | `outbound/pool` | `pool.go`、`shared_state.go` | 不可变快照上的选路、黑名单、失败记账、两阶段提交、共享状态 |
 | `group` | `runtime.go`、`healer.go`、`healer_coordinator.go` | 成员状态机（ALIVE/SUSPECT/EVICTED）、滑动失败窗、踢出/恢复、自愈规划与容量选择 |
 | `boxmgr` | `manager.go`、`healer.go`、`landing_location.go`、`probe_projection.go`、`reload_rebase.go` | sing-box 实例生命周期与"代"、三条重载路径、自愈执行端 |
-| `monitor` | `node_registry.go`、`probe_scheduler.go`、`health_event_hub.go`、`health_applier.go`、`speedtest.go`、`tag_providers.go` | 运行态注册表、探测调度、健康事件 hub、健康投影 |
-| `probe` | `applier.go` | 测量事件唯一应用链（收据/幂等/身份门禁） |
+| `monitor` | `node_registry.go`、`probe_scheduler.go`、`health_event_hub.go`、`health_applier.go`、`speedtest.go`、`tag_providers.go` | 运行态注册表、探测调度、健康事件游标投递、健康投影 |
+| `probe` | `applier.go` | 测量事件唯一应用链（收据/幂等/身份门禁/健康日志行） |
 | `builder` | `builder.go` | config+store → sing-box `option.Options` |
 
 ## 关键不变量
@@ -33,6 +33,13 @@
 
 ## 探测链（L1）
 
-`monitor.beginHealthResult` → `probe.Applier`（收据/幂等/身份） → `ProjectHealthOutcome` → `health_applier` → 运行态 entry → `HealthResultEvent`。诊断 origin（`nodedetect`、`unlock`）**绝不发布健康事件**；`SnapshotOnly` 事件只要求重读快照，MUST NOT 推进恢复/失败窗口（spec HEALTH-001 / DIAGNOSTIC-001）。
+`monitor.beginHealthResult` → `probe.Applier`（收据/幂等/身份/**日志行**） → `ProjectHealthOutcome` → `health_applier` → 运行态 entry → `HealthResultEvent`（**只作唤醒**） → 消费者按游标读 `health_events`。诊断 origin（`nodedetect`、`unlock`）**绝不发布健康事件**；`SnapshotOnly` 是可合并的刷新标志，只要求重读快照，MUST NOT 推进恢复/失败窗口（spec HEALTH-001/002/003、DIAGNOSTIC-001）。
 
-当前投递限制：每个健康订阅使用容量 4096 的异步 FIFO，溢出直接丢弃，不能保证无损。pool 消费者会推进分组失败/恢复状态，丢失不能仅靠最新快照补偿；`SnapshotOnly` 标记也会被丢弃。关闭会清空待处理事件，但不会等待正在执行的回调结束。复现和独立改造方案见 [稳定性审计](../../plane/stability-audit-2026-10-23.md)。
+当前投递形态（2.2.6 起）：被接受的健康测量在**测量事务内**追加一条 `health_events` 行（`seq` 单调），订阅从日志按游标有序消费。pool 是持久消费者（key `pool:<groupID>`/`pool:base`），重启后从游标续读，重复投递按 ProbeID 幂等（`groupMemberRuntime.appliedProbes`，环深 64 = 一个投递批次）。日志容量 8192，满时**拒绝新测量并报错**（显式背压）。
+
+清理边界有两处容易搞反，改之前先读 spec HEALTH-005：
+
+- 只有**当前注册**的持久消费者约束清理。分组被删除/禁用/实例停止后留下的游标行不参与计算——否则它会把最慢位置永久钉住，日志填满后所有分组的测量都被拒绝。
+- 已消费的行按 5 分钟窗口释放（无注册消费者时 30 分钟）。稳态大小 = `速率 × 窗口`；沿用 30 分钟时长，约 137 个节点按 60s 探测就会在消费者完全跟上的情况下触顶。
+
+游标持久化失败会**停止**该消费者继续读取（不是只记一次失败），因为去重环只覆盖一批，带着未落盘进度前进会在重启后二次推进恢复计数。积压/最老年龄/游标见 `GET /api/operations/health-events`。关闭只取消等待，未投递的行保留给下次启动；已开始的回调可在 close 返回后完成。无 store 的内存模式仍走有界直投（1024），是兼容/测试路径，不是生产契约。契约与边界见 spec HEALTH-002..005 与 [健康事件日志设计](../../plane/changes/health-event-log/design.md)。

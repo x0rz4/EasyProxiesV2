@@ -117,6 +117,36 @@ type groupMemberRuntime struct {
 	// recoverySuccesses counts consecutive successful health probes since the
 	// eviction cooldown elapsed. Any observed failure resets it to zero.
 	recoverySuccesses int
+	// appliedProbes is a ring of the health ProbeIDs already applied to this
+	// member. The health journal is delivered at least once (a crash between
+	// callback return and cursor commit replays one batch), so applying the
+	// same measurement twice must not advance a recovery streak twice.
+	appliedProbes []string
+}
+
+// groupProbeRing bounds the per-member replay window. Delivery is in journal
+// order and a resumed consumer restarts at its persisted cursor, so a replay is
+// never deeper than one delivery batch (monitor.healthEventReadBatch).
+const groupProbeRing = 64
+
+// alreadyAppliedProbe reports whether probeID was already applied to this
+// member, recording it when it is new. Must be called with the runtime lock
+// held. An empty probeID means the caller has no event identity (manual or
+// legacy path) and is never de-duplicated.
+func (m *groupMemberRuntime) alreadyAppliedProbe(probeID string) bool {
+	if probeID == "" {
+		return false
+	}
+	for _, applied := range m.appliedProbes {
+		if applied == probeID {
+			return true
+		}
+	}
+	if len(m.appliedProbes) >= groupProbeRing {
+		m.appliedProbes = append(m.appliedProbes[:0], m.appliedProbes[1:]...)
+	}
+	m.appliedProbes = append(m.appliedProbes, probeID)
+	return false
 }
 
 type groupRuntime struct {
@@ -621,7 +651,11 @@ func RecordFailure(groupID int64, tag string, cause error, at time.Time) bool {
 // without operator intervention. Recovery progress is deliberately not
 // announced: the candidate topology has not changed yet, and the management API
 // reads the progress from the runtime snapshot.
-func RecordHealthSuccess(groupID int64, tag string) bool {
+//
+// probeID is the measurement identity carried by the health journal. A replay
+// of an already-applied probe is a no-op, so a resumed consumer cannot count
+// the same success twice.
+func RecordHealthSuccess(groupID int64, tag, probeID string) bool {
 	value, ok := groupRuntimeStore.Load(groupID)
 	if !ok {
 		return false
@@ -632,6 +666,11 @@ func RecordHealthSuccess(groupID int64, tag string) bool {
 	if member == nil {
 		runtime.mu.Unlock()
 		return false
+	}
+	if member.alreadyAppliedProbe(probeID) {
+		evicted := member.evicted
+		runtime.mu.Unlock()
+		return !evicted
 	}
 	if member.evicted {
 		if !runtime.recovery.Enabled {
@@ -714,13 +753,19 @@ func recoverEvictedNodeEverywhere(nodeID, originGroupID int64) {
 }
 
 // RecordGroupHealthFailure feeds a failed background probe into every group
-// containing the member. Repeated reports with the same second are de-duplicated.
-func RecordGroupHealthFailure(groupID int64, tag string, cause error, at time.Time) bool {
+// containing the member. Repeated reports with the same second are de-duplicated,
+// and a replayed probe (same probeID) is ignored entirely.
+func RecordGroupHealthFailure(groupID int64, tag, probeID string, cause error, at time.Time) bool {
 	value, ok := groupRuntimeStore.Load(groupID)
 	if ok {
 		runtime := value.(*groupRuntime)
 		runtime.mu.Lock()
 		member := runtime.members[tag]
+		if member != nil && member.alreadyAppliedProbe(probeID) {
+			evicted := member.evicted
+			runtime.mu.Unlock()
+			return evicted
+		}
 		if member != nil && len(member.failureHistory) > 0 && member.failureHistory[len(member.failureHistory)-1] == at.Unix() {
 			evicted := member.evicted
 			runtime.mu.Unlock()
