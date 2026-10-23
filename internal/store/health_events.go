@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
+	"strings"
 	"time"
 )
 
@@ -184,6 +186,46 @@ func (s *sqliteStore) PutHealthEventCursor(ctx context.Context, consumer string,
  ON CONFLICT(consumer) DO UPDATE SET seq=CASE WHEN excluded.seq>seq THEN excluded.seq ELSE seq END, updated_at=excluded.updated_at`,
 		consumer, seq, formatHealthEventTime(time.Now()))
 	return err
+}
+
+// AdvanceHealthCursorWithState persists delivery progress and the member states
+// that progress produced in one transaction.
+//
+// The health consumer applies a transition in memory, then records "I applied up
+// to seq N". Those are two facts about the same event. Splitting them is the
+// bug this method exists to close: if the cursor lands and the state does not, a
+// crash leaves the eviction missing from group_node_states and the node returns
+// as healthy; if the state lands and the cursor does not, the event is replayed
+// (harmless, deduplicated by ProbeID) but wasted.
+func (s *sqliteStore) AdvanceHealthCursorWithState(ctx context.Context, consumer string, seq int64, states []GroupNodeState) error {
+	return s.WithTx(ctx, func(tx Store) error {
+		for _, state := range states {
+			if err := tx.UpsertGroupNodeState(ctx, &state); err != nil {
+				if !isMissingSubjectErr(err) {
+					return fmt.Errorf("persist group node state %d/%d: %w", state.GroupID, state.NodeID, err)
+				}
+				// The group or node this row describes was deleted between the
+				// transition and this commit. That is not a retryable failure:
+				// the row has nowhere to go and retrying would park the
+				// consumer forever, blocking every other group's delivery
+				// behind one deleted target. Dropping it is correct — there is
+				// no state left to protect.
+				log.Printf("[store] dropping health state for deleted group %d node %d: %v",
+					state.GroupID, state.NodeID, err)
+				continue
+			}
+		}
+		if consumer == "" || seq <= 0 {
+			return nil
+		}
+		return tx.PutHealthEventCursor(ctx, consumer, seq)
+	})
+}
+
+// isMissingSubjectErr reports whether err is a foreign-key rejection, which in
+// this schema means the referenced group or node no longer exists.
+func isMissingSubjectErr(err error) bool {
+	return strings.Contains(err.Error(), "FOREIGN KEY constraint failed")
 }
 
 // PruneHealthEvents deletes events older than olderThan that every *currently

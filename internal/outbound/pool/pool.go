@@ -20,6 +20,7 @@ import (
 
 	"easy_proxies/internal/group"
 	"easy_proxies/internal/monitor"
+	"easy_proxies/internal/store"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
@@ -1413,14 +1414,19 @@ func (p *poolOutbound) handleGroupState(event group.GroupStateEvent) {
 	}
 }
 
-func (p *poolOutbound) handleHealthResult(event monitor.HealthResultEvent) {
+// handleHealthResult applies one journal event and returns the durable member
+// states it produced. The monitor commits them in the same transaction as the
+// delivery cursor, so a restart cannot see progress without the state that
+// progress created — losing an eviction that way would bring a bad node back as
+// healthy.
+func (p *poolOutbound) handleHealthResult(event monitor.HealthResultEvent) []store.GroupNodeState {
 	if event.SnapshotOnly {
 		if p.closed.Load() {
-			return
+			return nil
 		}
 		p.rebuildCandidatesNow()
 		p.reconcileCurrent()
-		return
+		return nil
 	}
 	tag := event.Tag
 	if p.options.GroupID != 0 && event.NodeID != 0 {
@@ -1434,8 +1440,9 @@ func (p *poolOutbound) handleHealthResult(event monitor.HealthResultEvent) {
 		p.mu.Unlock()
 	}
 	if !p.hasMember(tag) {
-		return
+		return nil
 	}
+	var states []store.GroupNodeState
 	if p.options.GroupID != 0 {
 		if event.Success {
 			group.RecordHealthSuccess(p.options.GroupID, tag, event.ProbeID)
@@ -1443,6 +1450,7 @@ func (p *poolOutbound) handleHealthResult(event monitor.HealthResultEvent) {
 			group.RecordGroupHealthFailure(p.options.GroupID, tag, event.ProbeID, errors.New(event.Error), event.CheckedAt)
 			p.scheduleExpiryRebuild(p.currentFailureWindow())
 		}
+		states = p.durableStates(event.NodeID)
 	}
 	p.mu.Lock()
 	if member := p.topologyByTag[tag]; member != nil {
@@ -1461,6 +1469,35 @@ func (p *poolOutbound) handleHealthResult(event monitor.HealthResultEvent) {
 		p.rebuildCandidatesNow()
 		p.reconcileCurrent()
 	}
+	return states
+}
+
+// durableStates snapshots the members whose durable state the transition just
+// changed. The health consumer commits the snapshot with its cursor, so the
+// state and the "I applied this event" claim can never disagree after a crash.
+func (p *poolOutbound) durableStates(nodeID int64) []store.GroupNodeState {
+	if p.options.GroupID == 0 {
+		return nil
+	}
+	snapshots := group.SnapshotStates([]int64{nodeID})
+	if len(snapshots) == 0 {
+		return nil
+	}
+	now := time.Now().UTC()
+	states := make([]store.GroupNodeState, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		states = append(states, store.GroupNodeState{
+			GroupID:        snapshot.GroupID,
+			NodeID:         snapshot.NodeID,
+			FailureHistory: snapshot.FailureHistory,
+			Evicted:        snapshot.Evicted,
+			LastError:      snapshot.LastError,
+			EvictedAt:      snapshot.EvictedAt,
+			UpdatedAt:      now,
+			Revision:       snapshot.Revision,
+		})
+	}
+	return states
 }
 
 func (p *poolOutbound) hasMember(tag string) bool {

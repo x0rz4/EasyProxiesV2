@@ -36,11 +36,20 @@ const (
 	healthEventInlineLimit = 1024
 )
 
+// HealthEventCallback consumes one delivered event and returns the durable member
+// states the event produced. The hub commits those states in the same
+// transaction as the delivery cursor, so "this transition was applied" and "the
+// state it produced is on disk" cannot diverge.
+//
+// Returning nil is correct for observers that only read: HTTP views and tests do
+// not own group state.
+type HealthEventCallback func(HealthResultEvent) []store.GroupNodeState
+
 // healthEventSubscription is one consumer of the health journal. The journal is
 // the authoritative ordered stream; wakeups here only say "there may be new
 // rows", so coalesced or lost wakeups cost latency, never a transition.
 type healthEventSubscription struct {
-	callback func(HealthResultEvent)
+	callback HealthEventCallback
 	tags     map[string]struct{}
 	nodeIDs  map[int64]struct{}
 	global   bool
@@ -59,6 +68,10 @@ type healthEventSubscription struct {
 	// past unpersisted progress would let a restart replay events whose
 	// ProbeIDs have already been evicted from that ring and count them twice.
 	cursorBlocked bool
+	// pendingStates holds the member states produced by the callbacks whose seq
+	// has not been committed yet. They are written in the same transaction as
+	// the cursor, so progress and the state it produced cannot diverge.
+	pendingStates []store.GroupNodeState
 
 	inline         []HealthResultEvent
 	closed         bool
@@ -74,7 +87,7 @@ type healthEventSubscription struct {
 	done chan struct{}
 }
 
-func newHealthEventSubscription(callback func(HealthResultEvent), tags []string, nodeIDs []int64, global bool, consumer string, journal func() store.Store) *healthEventSubscription {
+func newHealthEventSubscription(callback HealthEventCallback, tags []string, nodeIDs []int64, global bool, consumer string, journal func() store.Store) *healthEventSubscription {
 	s := &healthEventSubscription{
 		callback: callback, global: global, consumer: consumer, journal: journal,
 		tags: make(map[string]struct{}, len(tags)), nodeIDs: make(map[int64]struct{}, len(nodeIDs)),
@@ -192,10 +205,18 @@ func (s *healthEventSubscription) step() bool {
 		s.deliver(event)
 		return true
 	}
-	if s.flushCursor() {
+	// Commit after every batch, not only when the journal runs dry: a consumer
+	// catching up on a large backlog would otherwise accumulate one state per
+	// event in memory before anything is written.
+	if more := s.readJournal(); more {
+		s.flushCursor()
 		return true
 	}
-	if more := s.readJournal(); more {
+	// The journal is drained: commit progress together with the member states
+	// it produced. Deferring this to a later wakeup would leave an applied
+	// transition addressing a cursor that a crash rewinds, so the event is
+	// replayed against a state that already contains it.
+	if s.flushCursor() {
 		return true
 	}
 	if s.takeRefresh() {
@@ -233,18 +254,27 @@ func (s *healthEventSubscription) takeRefresh() bool {
 func (s *healthEventSubscription) flushCursor() bool {
 	s.mu.Lock()
 	pending, consumer := s.pendingCursor, s.consumer
-	if s.closed || pending == 0 || consumer == "" {
+	states := s.pendingStates
+	if s.closed || consumer == "" || (pending == 0 && len(states) == 0) {
 		s.mu.Unlock()
 		return false
 	}
+	// Detach the states: on failure they go back, on success they are committed.
+	s.pendingStates = nil
 	s.mu.Unlock()
 	db := s.journal()
 	if db == nil {
+		// No store configured (embedders, unit tests): there is nowhere to commit
+		// to, so holding the states would grow this slice forever without ever
+		// being able to write them.
 		return false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := db.PutHealthEventCursor(ctx, consumer, pending); err != nil {
+	// Progress and the state it produced commit together; see
+	// store.AdvanceHealthCursorWithState.
+	if err := db.AdvanceHealthCursorWithState(ctx, consumer, pending, states); err != nil {
+		s.restoreStates(states)
 		s.mu.Lock()
 		s.cursorFailures++
 		s.cursorBlocked = true
@@ -260,6 +290,57 @@ func (s *healthEventSubscription) flushCursor() bool {
 	s.cursorBlocked = false
 	s.mu.Unlock()
 	return true
+}
+
+// restoreStates returns uncommitted states to the pending set. A state already
+// queued by a later callback wins: it is the newer reading of the same member.
+func (s *healthEventSubscription) restoreStates(states []store.GroupNodeState) {
+	if len(states) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	queued := make(map[[2]int64]struct{}, len(s.pendingStates))
+	for _, state := range s.pendingStates {
+		queued[[2]int64{state.GroupID, state.NodeID}] = struct{}{}
+	}
+	for _, state := range states {
+		key := [2]int64{state.GroupID, state.NodeID}
+		if _, newer := queued[key]; newer {
+			continue
+		}
+		queued[key] = struct{}{}
+		s.pendingStates = append(s.pendingStates, state)
+	}
+}
+
+// recordStates merges the durable state produced by one delivered event. The
+// callback may return states for other groups too (a recovery is global), so the
+// list comes from the callback rather than from the event's own identity.
+//
+// Newest wins per group+node: a node that failed three times in one batch only
+// needs its final row, and keeping the intermediate readings would make the
+// pending set grow with the batch size instead of with the member count.
+func (s *healthEventSubscription) recordStates(states []store.GroupNodeState) {
+	if len(states) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, state := range states {
+		key := [2]int64{state.GroupID, state.NodeID}
+		replaced := false
+		for i := range s.pendingStates {
+			if [2]int64{s.pendingStates[i].GroupID, s.pendingStates[i].NodeID} == key {
+				s.pendingStates[i] = state
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			s.pendingStates = append(s.pendingStates, state)
+		}
+	}
 }
 
 // cursorIsBlocked reports whether delivery must stay parked on an unpersisted
@@ -370,8 +451,11 @@ func (s *healthEventSubscription) matches(event store.HealthEvent) bool {
 	return false
 }
 
+// deliver runs one callback and records the durable state it produced. The state
+// is committed with the cursor by the next flushCursor, so an applied transition
+// is never lost while its progress is recorded.
 func (s *healthEventSubscription) deliver(event HealthResultEvent) {
-	s.callback(event)
+	s.recordStates(s.callback(event))
 	s.mu.Lock()
 	s.delivered++
 	s.mu.Unlock()
@@ -476,18 +560,18 @@ func (h *healthEventHub) durableConsumers() []string {
 
 // subscribe installs an observer. An empty consumer key keeps the process-local
 // cursor that the compatibility and UI paths have always used.
-func (h *healthEventHub) subscribe(tags []string, nodeIDs []int64, global bool, callback func(HealthResultEvent)) func() {
+func (h *healthEventHub) subscribe(tags []string, nodeIDs []int64, global bool, callback HealthEventCallback) func() {
 	return h.subscribeAs("", tags, nodeIDs, global, callback)
 }
 
-func (h *healthEventHub) subscribeAs(consumer string, tags []string, nodeIDs []int64, global bool, callback func(HealthResultEvent)) func() {
+func (h *healthEventHub) subscribeAs(consumer string, tags []string, nodeIDs []int64, global bool, callback HealthEventCallback) func() {
 	if callback == nil {
 		return func() {}
 	}
 	return h.register(consumer, tags, nodeIDs, global, callback)
 }
 
-func (h *healthEventHub) register(consumer string, tags []string, nodeIDs []int64, global bool, callback func(HealthResultEvent)) func() {
+func (h *healthEventHub) register(consumer string, tags []string, nodeIDs []int64, global bool, callback HealthEventCallback) func() {
 	subscription := newHealthEventSubscription(callback, tags, nodeIDs, global, consumer, h.journal)
 	id := h.nextID.Add(1)
 	h.mu.Lock()

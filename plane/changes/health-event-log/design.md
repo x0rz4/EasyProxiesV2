@@ -55,15 +55,27 @@
 - 持久消费者以**稳定 key** 注册（pool：`pool:<groupID>`，非分组池为 `pool:base`）。
 - 首次注册（无游标行）MUST 从当前日志尾部开始，避免把历史事件整体重放成“启动即批量踢出/恢复”。
 - 游标 MUST 在回调成功返回后持久化；持久化失败 MUST 记 `cursor_failures` 并**停止该消费者继续投递**（重试同一 cursor），不得带着未落盘的进度继续前进。
+- 游标 MUST 与该批事件产出的 `group_node_states` **在同一事务内**提交（`Store.AdvanceHealthCursorWithState`）。回调签名因此是 `func(HealthResultEvent) []store.GroupNodeState`：消费者把状态变更带回来，由 hub 连同游标一起落库。只读观察者（HTTP、测试）返回 `nil`。
 - 临时消费者（HTTP 观察、测试）不持久游标，进程内游标从尾部开始；滞后到日志已被清理时计一次 `gaps` 并跳到最老可用 `seq`，即“已消费 + 空洞”可加总为投递总量。
 
 ### Scenario: 崩溃窗口内的重复
 
-- GIVEN 回调已把事件应用到分组状态，游标写入前进程崩溃。
+- GIVEN 回调已把事件应用到分组状态，游标与状态提交前进程崩溃。
 - WHEN 重启后从旧游标重放。
 - THEN 同一 `probe_id` 的重复成功/失败 MUST NOT 二次推进恢复计数（见 §5）；重复只可能发生在崩溃所在的那一批（≤64），不会无限放大。
 
-反向边界（本批不修，如实记录）：分组状态经 `group.SetGroupStateObserver` 接到的 `internal/app` 持久化器**异步**落库（`groupStatePersister`，队列 256，满时丢事件）。游标在回调返回后立即持久化，因此崩溃时游标可能**领先于**已落库的分组状态——那种情况下丢的是"一次踢出/恢复记录"，不是重复应用。要彻底消除，需要游标与 `group_node_states` 写入同一事务。
+### Scenario: 状态与游标不可分裂
+
+- GIVEN 回调判定节点踢出。
+- WHEN 提交时 `group_node_states` 写入失败。
+- THEN 游标 MUST NOT 前进，该消费者停止投递并退避重试；重启后同一事件重放，踢出最终仍会落库。
+- 状态行指向的**分组或节点已被删除**（外键拒绝）不是可重试失败：该行已无处可去，MUST 丢弃并继续推进游标，否则一个已删除目标会永久卡住该消费者，拖住其它所有分组。
+
+### 双写者与 revision
+
+`group_node_states` 有两个写者：健康投递的同步事务，以及 `internal/app` 的**异步**合并持久化器（`groupStatePersister`，负责当前节点与非健康转换，按 group+node 合并、失败重试、`Close` 同步 flush，无固定队列上限）。异步写者持有的是转换发生时的快照，可能晚于同步写者落库。
+
+因此每行带 `revision`（`group_node_states.revision`，全局单调，由 group runtime 在持有运行时锁时分配）：`UpsertGroupNodeState` 只在 `revision = 0 OR revision >= 已存值` 时应用。`revision = 0` 表示无版本（兼容既有调用方）。revision 随 `store→config→runtime` 往返，启动时用磁盘上的最大值抬升全局时钟，否则重启后时钟归零会让所有新写入被当成过期写入丢弃。
 
 ## 5. Requirement HEALTH-005：按 ProbeID 幂等
 
@@ -148,6 +160,10 @@ CREATE TABLE health_event_cursors (
 | 清理边界 | `TestPruneHealthEventsKeepsSlowestConsumerBacklog`、`TestPruneHealthEventsWithoutConsumersUsesAgeOnly`、`TestPruneHealthEventsIgnoresInactiveConsumerCursor` |
 | 容量可持续 | `TestHealthEventJournalSustainsConfiguredProbeRate`（已消费行按 5 分钟窗口释放；复用旧 30 分钟窗口会被该断言挡住） |
 | 游标失败停投 | `TestHealthEventCursorFailureStopsDelivery`（注入游标写失败后只停在 1 批，恢复后继续） |
+| 游标+状态同事务 | `TestHealthEventCursorAndStateCommitTogether`（hub 端到端：提交失败时游标不动、状态不落，恢复后两者一起落）、`TestAdvanceHealthCursorWithStateIsAtomic`（触发器注入写失败 → 事务回滚）、`TestAdvanceHealthCursorSkipsStateForDeletedGroup`（已删除目标丢弃该行但游标前进） |
+| 双写者定序 | `TestUpsertGroupNodeStateRejectsStaleRevision`（旧 revision 不覆盖新状态；`revision=0` 仍生效） |
+| 异步持久化不丢事件 | `TestGroupStatePersisterKeepsEveryMemberUnderBurst`（500 成员一次风暴全部落库；旧 256 队列丢 234 条） |
+| 消费者交出状态 | `TestHandleHealthResultReturnsDurableState`（pool 回调返回踢出快照与 revision；SnapshotOnly/未知节点返回 nil） |
 | 关闭 | `TestHealthEventCloseKeepsJournalForNextStart` |
 | 可观测 | `TestHealthEventStatsReportsJournalBacklog`（`GET /api/operations/health-events`） |
 | 兼容 | 无 store 的 in-memory 路径：`TestHealthEventInlineFallbackIsExplicitlyBounded` 与既有 monitor/probe/pool 测试通过 |

@@ -34,6 +34,12 @@ type Store interface {
 	// activeConsumers constrain the cutoff; cursor rows of consumers that are
 	// not currently registered must not pin the journal (see the method doc).
 	PruneHealthEvents(ctx context.Context, olderThan time.Time, activeConsumers []string) (int64, error)
+	// AdvanceHealthCursorWithState commits a consumer's progress together with
+	// the group member states that progress produced. The two must not be split:
+	// a cursor that advances without its state loses the transition on a crash,
+	// and state written without the cursor replays an applied transition
+	// (deduplicated by ProbeID, but still wasted work).
+	AdvanceHealthCursorWithState(ctx context.Context, consumer string, seq int64, states []GroupNodeState) error
 	ListSavedFilters(ctx context.Context) ([]SavedFilter, error)
 	GetSavedFilter(ctx context.Context, id int64) (*SavedFilter, error)
 	SaveFilter(ctx context.Context, filter *SavedFilter) error
@@ -315,11 +321,11 @@ type Node struct {
 // A duplicate row is not an error: the batch keeps going and the caller turns
 // the outcome into a per-row message.
 type NodeCreateOutcome struct {
-	Index        int   `json:"index"`
-	Created      bool  `json:"created"`
-	Duplicate    bool  `json:"duplicate"`
-	ID           int64 `json:"id,omitempty"`
-	ExistingID   int64 `json:"existing_id,omitempty"`
+	Index        int    `json:"index"`
+	Created      bool   `json:"created"`
+	Duplicate    bool   `json:"duplicate"`
+	ID           int64  `json:"id,omitempty"`
+	ExistingID   int64  `json:"existing_id,omitempty"`
 	ExistingName string `json:"existing_name,omitempty"`
 }
 
@@ -469,6 +475,13 @@ type GroupNodeState struct {
 	LastError      string    `json:"last_error,omitempty"`
 	EvictedAt      time.Time `json:"evicted_at,omitempty"`
 	UpdatedAt      time.Time `json:"updated_at"`
+	// Revision orders concurrent writers of the same row. The group runtime
+	// stamps every transition it emits, so a slow writer holding an older
+	// snapshot cannot overwrite a newer one: the write is dropped instead.
+	// Zero means "unversioned" and always applies, which keeps existing
+	// callers working. Restored state re-seeds the clock from the highest
+	// revision on disk so a post-restart write still outranks its predecessor.
+	Revision int64 `json:"-"`
 }
 
 // Subscription is a remotely refreshed collection of nodes.

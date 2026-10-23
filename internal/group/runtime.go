@@ -4,6 +4,7 @@ import (
 	"errors"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -15,6 +16,9 @@ type GroupInitialState struct {
 	Evicted        bool
 	LastError      string
 	EvictedAt      time.Time
+	// Revision is the ordering token this state was last written with, restored
+	// from disk so a post-restart change still outranks what it replaces.
+	Revision int64
 }
 
 // GroupStateEvent is emitted after a state change so the application can
@@ -30,6 +34,10 @@ type GroupStateEvent struct {
 	CurrentChanged bool
 	StateChanged   bool
 	Recovered      bool
+	// Revision is the order this change was made in. Persisters must write it
+	// through so a slow writer holding an older snapshot cannot overwrite a
+	// newer transition.
+	Revision int64
 }
 
 // GroupMemberSnapshot is the runtime view consumed by the management API.
@@ -122,6 +130,36 @@ type groupMemberRuntime struct {
 	// callback return and cursor commit replays one batch), so applying the
 	// same measurement twice must not advance a recovery streak twice.
 	appliedProbes []string
+	// revision stamps the durable fields above with the order in which this
+	// runtime changed them. Two writers persist member state (the synchronous
+	// health-delivery transaction and the asynchronous coalescing persister),
+	// so without an ordering token a stalled writer could overwrite a recovery
+	// with the eviction that preceded it.
+	revision int64
+}
+
+// stateRevision assigns the next global state revision. It is global rather
+// than per-member so revisions stay comparable across groups: an eviction
+// propagates to every group holding the node.
+var stateRevision atomic.Int64
+
+// touch bumps the member revision. Callers must hold the owning runtime lock, so
+// the assigned order matches the order the mutations actually happened in.
+func (m *groupMemberRuntime) touch() int64 {
+	m.revision = stateRevision.Add(1)
+	return m.revision
+}
+
+// advanceStateRevision raises the global clock to at least revision. Restored
+// state carries the value it was written with; without this the clock would
+// restart at zero and every new write would be rejected as stale.
+func advanceStateRevision(revision int64) {
+	for {
+		current := stateRevision.Load()
+		if current >= revision || stateRevision.CompareAndSwap(current, revision) {
+			return
+		}
+	}
 }
 
 // groupProbeRing bounds the per-member replay window. Delivery is in journal
@@ -308,9 +346,18 @@ func ReconcileSilent(groupID int64, update RuntimeUpdate) []GroupStateEvent {
 			member.failureHistory = append([]int64(nil), old.failureHistory...)
 			member.evicted, member.lastError, member.evictedAt = old.evicted, old.lastError, old.evictedAt
 			member.recoverySuccesses = old.recoverySuccesses
+			// Carry the ordering token: this member's durable state did not
+			// change, so it must not look newer (or older) than it is.
+			member.revision = old.revision
 		} else {
 			member.failureHistory = append([]int64(nil), initial.FailureHistory...)
 			member.evicted, member.lastError, member.evictedAt = initial.Evicted, initial.LastError, initial.EvictedAt
+			if initial.Revision > 0 {
+				// State restored from disk: resume its ordering token so the next
+				// change outranks it and a stale writer cannot overwrite it.
+				member.revision = initial.Revision
+				advanceStateRevision(initial.Revision)
+			}
 		}
 		if _, globallyEvicted := globalEvictedNodes.Load(member.nodeID); globallyEvicted {
 			member.evicted = true
@@ -337,7 +384,8 @@ func ReconcileSilent(groupID int64, update RuntimeUpdate) []GroupStateEvent {
 		if pruned || newlyEvicted {
 			events = append(events, GroupStateEvent{GroupID: groupID, NodeID: member.nodeID,
 				FailureHistory: append([]int64(nil), member.failureHistory...), Evicted: member.evicted,
-				LastError: member.lastError, EvictedAt: member.evictedAt, StateChanged: true})
+				LastError: member.lastError, EvictedAt: member.evictedAt, StateChanged: true,
+				Revision: member.touch()})
 		}
 		next[tag] = member
 	}
@@ -450,11 +498,19 @@ func Register(groupID int64, failureWindow time.Duration, failureThreshold int, 
 			// it keeps the recovery cooldown measurable across restarts.
 			evictedAt = now
 		}
-		runtime.members[tag] = &groupMemberRuntime{
+		member := &groupMemberRuntime{
 			standby: initial.Standby,
 			nodeID:  initial.NodeID, tag: tag, failureHistory: append([]int64(nil), initial.FailureHistory...),
 			evicted: evicted, lastError: initial.LastError, evictedAt: evictedAt,
 		}
+		if initial.Revision > 0 {
+			// Restored state already on disk: resume from its revision so a
+			// later change still outranks it, and the global clock never
+			// rewinds below a value that is already stored.
+			member.revision = initial.Revision
+			advanceStateRevision(initial.Revision)
+		}
+		runtime.members[tag] = member
 	}
 	if current := runtime.members[runtime.currentTag]; current == nil || current.standby || current.evicted || len(current.failureHistory) > 0 {
 		runtime.currentTag = ""
@@ -633,7 +689,8 @@ func RecordFailure(groupID int64, tag string, cause error, at time.Time) bool {
 	}
 	event := GroupStateEvent{GroupID: groupID, NodeID: member.nodeID,
 		FailureHistory: append([]int64(nil), member.failureHistory...), Evicted: member.evicted,
-		LastError: member.lastError, EvictedAt: member.evictedAt, CurrentChanged: currentChanged, StateChanged: true}
+		LastError: member.lastError, EvictedAt: member.evictedAt, CurrentChanged: currentChanged, StateChanged: true,
+		Revision: member.touch()}
 	runtime.mu.Unlock()
 	notifyGroupState(event)
 	if newlyEvicted {
@@ -691,9 +748,10 @@ func RecordHealthSuccess(groupID int64, tag, probeID string) bool {
 		}
 		nodeID := member.nodeID
 		clearMemberEviction(member)
+		revision := member.touch()
 		runtime.mu.Unlock()
 		globalEvictedNodes.Delete(nodeID)
-		notifyGroupState(GroupStateEvent{GroupID: groupID, NodeID: nodeID, StateChanged: true, Recovered: true})
+		notifyGroupState(GroupStateEvent{GroupID: groupID, NodeID: nodeID, StateChanged: true, Recovered: true, Revision: revision})
 		recoverEvictedNodeEverywhere(nodeID, groupID)
 		return true
 	}
@@ -705,10 +763,78 @@ func RecordHealthSuccess(groupID int64, tag, probeID string) bool {
 	member.failureHistory = nil
 	member.lastError = ""
 	member.recoverySuccesses = 0
-	event := GroupStateEvent{GroupID: groupID, NodeID: member.nodeID, StateChanged: true, Recovered: true}
+	event := GroupStateEvent{GroupID: groupID, NodeID: member.nodeID, StateChanged: true, Recovered: true,
+		Revision: member.touch()}
 	runtime.mu.Unlock()
 	notifyGroupState(event)
 	return true
+}
+
+// StateSnapshot is the durable part of one member's state, captured right after
+// a health transition. The health consumer writes it in the same transaction as
+// its delivery cursor: the cursor records that the transition was applied, so
+// the state it produced must land with it. Commit one without the other and a
+// crash either replays an applied eviction (deduplicated by ProbeID) or, worse,
+// loses an eviction entirely so a bad node returns healthy after a restart.
+type StateSnapshot struct {
+	GroupID        int64
+	NodeID         int64
+	FailureHistory []int64
+	Evicted        bool
+	LastError      string
+	EvictedAt      time.Time
+	// Revision orders this snapshot against other writers of the same row.
+	Revision int64
+}
+
+// SnapshotStates returns the durable state of every member the transition just
+// touched, for the caller to persist atomically with its cursor. It reads the
+// live runtimes after the transition, so the snapshot is always the state the
+// transition produced.
+//
+// It scans every group, not just the one that observed the event: eviction and
+// recovery are facts about a NodeID and propagate to every group holding it, so
+// those rows are part of the same transition. Persisting them through the
+// asynchronous path would let a crash keep the origin group's eviction and lose
+// every other group's, which reintroduces the bad node in exactly the groups the
+// operator is not looking at.
+func SnapshotStates(nodeIDs []int64) []StateSnapshot {
+	wanted := make(map[int64]struct{}, len(nodeIDs))
+	for _, nodeID := range nodeIDs {
+		if nodeID != 0 {
+			wanted[nodeID] = struct{}{}
+		}
+	}
+	if len(wanted) == 0 {
+		return nil
+	}
+	var states []StateSnapshot
+	groupRuntimeStore.Range(func(_, value any) bool {
+		runtime := value.(*groupRuntime)
+		runtime.mu.Lock()
+		seen := make(map[int64]struct{}, len(wanted))
+		for _, member := range runtime.members {
+			if _, ok := wanted[member.nodeID]; !ok {
+				continue
+			}
+			// One node can appear under several runtime tags during a reload
+			// window; collapse to the first so the caller writes one row per
+			// group+node.
+			if _, duplicate := seen[member.nodeID]; duplicate {
+				continue
+			}
+			seen[member.nodeID] = struct{}{}
+			states = append(states, StateSnapshot{
+				GroupID: runtime.id, NodeID: member.nodeID,
+				FailureHistory: append([]int64(nil), member.failureHistory...),
+				Evicted:        member.evicted, LastError: member.lastError, EvictedAt: member.evictedAt,
+				Revision: member.revision,
+			})
+		}
+		runtime.mu.Unlock()
+		return true
+	})
+	return states
 }
 
 // clearMemberEviction returns a member to a clean, never-failed state. It must
@@ -737,16 +863,18 @@ func recoverEvictedNodeEverywhere(nodeID, originGroupID int64) {
 		}
 		runtime.mu.Lock()
 		recovered := false
+		var revision int64
 		for _, member := range runtime.members {
 			if member.nodeID != nodeID || !member.evicted {
 				continue
 			}
 			clearMemberEviction(member)
+			revision = member.touch()
 			recovered = true
 		}
 		runtime.mu.Unlock()
 		if recovered {
-			notifyGroupState(GroupStateEvent{GroupID: runtime.id, NodeID: nodeID, StateChanged: true, Recovered: true})
+			notifyGroupState(GroupStateEvent{GroupID: runtime.id, NodeID: nodeID, StateChanged: true, Recovered: true, Revision: revision})
 		}
 		return true
 	})
@@ -790,17 +918,19 @@ func RestoreGroupMember(groupID, nodeID int64) error {
 		runtime := value.(*groupRuntime)
 		runtime.mu.Lock()
 		restored := false
+		var revision int64
 		for _, member := range runtime.members {
 			if member.nodeID != nodeID {
 				continue
 			}
 			found = true
 			clearMemberEviction(member)
+			revision = member.touch()
 			restored = true
 		}
 		runtime.mu.Unlock()
 		if restored {
-			notifyGroupState(GroupStateEvent{GroupID: runtime.id, NodeID: nodeID, StateChanged: true, Recovered: true})
+			notifyGroupState(GroupStateEvent{GroupID: runtime.id, NodeID: nodeID, StateChanged: true, Recovered: true, Revision: revision})
 		}
 		return true
 	})
@@ -834,7 +964,8 @@ func groupRuntimeSnapshots(prune bool) map[int64]GroupRuntimeSnapshot {
 		for _, member := range runtime.members {
 			if prune && !member.evicted && pruneFailures(member, runtime.window, time.Now()) {
 				expiredEvents = append(expiredEvents, GroupStateEvent{GroupID: runtime.id, NodeID: member.nodeID,
-					FailureHistory: append([]int64(nil), member.failureHistory...), LastError: member.lastError, StateChanged: true})
+					FailureHistory: append([]int64(nil), member.failureHistory...), LastError: member.lastError, StateChanged: true,
+					Revision: member.touch()})
 			}
 			status := "ALIVE"
 			if member.evicted {
@@ -921,7 +1052,8 @@ func propagateEviction(nodeID int64, lastError string, evictedAt time.Time) {
 				currentChanged = true
 			}
 			event := GroupStateEvent{GroupID: runtime.id, NodeID: nodeID, FailureHistory: append([]int64(nil), member.failureHistory...),
-				Evicted: true, LastError: lastError, EvictedAt: evictedAt, CurrentChanged: currentChanged, StateChanged: true}
+				Evicted: true, LastError: lastError, EvictedAt: evictedAt, CurrentChanged: currentChanged, StateChanged: true,
+				Revision: member.touch()}
 			runtime.mu.Unlock()
 			notifyGroupState(event)
 			return true

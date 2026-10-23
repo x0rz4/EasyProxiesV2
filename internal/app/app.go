@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -230,45 +231,100 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	return nil
 }
 
+// groupStatePersister writes member state changes to group_node_states.
+//
+// It coalesces by member instead of queueing one event per change. State events
+// carry the complete member state (failure history, Evicted, EvictedAt), so the
+// newest event for a group+node fully supersedes older ones — and a failure
+// storm produces many changes for the same handful of members. Holding the
+// pending set under a mutex means a burst can never overflow a fixed buffer and
+// shed an eviction, which is the failure this type used to have: a dropped
+// eviction leaves no row, so after a restart the bad node comes back healthy.
 type groupStatePersister struct {
 	store  store.Store
-	events chan group.GroupStateEvent
+	wake   chan struct{}
+	stop   chan struct{}
 	mu     sync.RWMutex
 	closed bool
 	wg     sync.WaitGroup
+	// pending is keyed by group+node and always holds the newest state. Guarded
+	// by mu.
+	pending map[groupStateKey]group.GroupStateEvent
+	// current holds the newest current-tag per group, flushed on a ticker so a
+	// per-connection dial does not become a database write.
+	current map[int64]int64
+	// merged counts events superseded by a newer one for the same member. This
+	// is normal operation, not loss.
+	merged atomic.Int64
+}
+
+type groupStateKey struct {
+	groupID int64
+	nodeID  int64
 }
 
 func newGroupStatePersister(dataStore store.Store) *groupStatePersister {
-	p := &groupStatePersister{store: dataStore, events: make(chan group.GroupStateEvent, 256)}
+	p := &groupStatePersister{
+		store:   dataStore,
+		wake:    make(chan struct{}, 1),
+		stop:    make(chan struct{}),
+		pending: make(map[groupStateKey]group.GroupStateEvent),
+		current: make(map[int64]int64),
+	}
 	p.wg.Add(1)
 	go p.run()
 	return p
 }
 
+// Observe records a state change. The observer runs on the group failure/dial
+// paths, so it must never block or fail: every accepted event is kept, newest
+// wins for a given member.
 func (p *groupStatePersister) Observe(event group.GroupStateEvent) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
 	if p.closed {
+		p.mu.Unlock()
 		return
 	}
-	// Non-blocking: the observer runs on the group failure/dial paths, so a
-	// full buffer must drop events rather than backpressure the data plane or
-	// stall Close. The next successful event for the same group overwrites the
-	// persisted state anyway, and the periodic stat flush re-syncs currents.
+	if event.StateChanged && event.NodeID != 0 {
+		key := groupStateKey{groupID: event.GroupID, nodeID: event.NodeID}
+		if _, replaced := p.pending[key]; replaced {
+			p.merged.Add(1)
+		}
+		p.pending[key] = event
+	}
+	if event.CurrentChanged {
+		p.current[event.GroupID] = event.CurrentNodeID
+	}
+	p.mu.Unlock()
+	// Wake only after releasing mu: the worker takes mu to drain, and nothing
+	// here should hold it while signalling.
 	select {
-	case p.events <- event:
+	case p.wake <- struct{}{}:
 	default:
-		log.Printf("[app] group state persist queue full, dropping event group=%d node=%d", event.GroupID, event.NodeID)
 	}
 }
 
+// Merged reports state changes superseded by a newer change for the same
+// member before they were written. This is expected coalescing, not loss.
+func (p *groupStatePersister) Merged() int64 { return p.merged.Load() }
+
+// Close flushes what is already pending and stops the worker. Once it returns no
+// Observe call is accepted, so a late state change is not silently dropped
+// behind a stopped writer.
 func (p *groupStatePersister) Close() {
 	p.mu.Lock()
-	if !p.closed {
-		p.closed = true
-		close(p.events)
-	}
+	closed := p.closed
+	p.closed = true
 	p.mu.Unlock()
+	if closed {
+		p.wg.Wait()
+		return
+	}
+	// Final synchronous drain: the worker may already be exiting on stop, so
+	// flush here rather than racing it for the queue.
+	p.drainStates()
+	p.flushCurrent()
+	close(p.stop)
 	p.wg.Wait()
 }
 
@@ -276,40 +332,87 @@ func (p *groupStatePersister) run() {
 	defer p.wg.Done()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	pendingCurrent := make(map[int64]int64)
-	flushCurrent := func() {
-		for groupID, nodeID := range pendingCurrent {
-			if err := p.store.UpdateGroupCurrentActiveNode(context.Background(), groupID, nodeID); err != nil {
-				log.Printf("[app] persist group current %d: %v", groupID, err)
-				if strings.Contains(err.Error(), "not found") {
-					delete(pendingCurrent, groupID)
-				}
-				continue
-			}
-			delete(pendingCurrent, groupID)
-		}
-	}
 	for {
 		select {
-		case event, ok := <-p.events:
-			if !ok {
-				flushCurrent()
-				return
-			}
-			if event.StateChanged && event.NodeID != 0 {
-				if err := p.store.UpsertGroupNodeState(context.Background(), &store.GroupNodeState{
-					GroupID: event.GroupID, NodeID: event.NodeID, FailureHistory: event.FailureHistory,
-					Evicted: event.Evicted, LastError: event.LastError, EvictedAt: event.EvictedAt,
-				}); err != nil {
-					log.Printf("[app] persist group node state %d/%d: %v", event.GroupID, event.NodeID, err)
-				}
-			}
-			if event.CurrentChanged {
-				pendingCurrent[event.GroupID] = event.CurrentNodeID
-			}
+		case <-p.stop:
+			return
+		case <-p.wake:
+			p.drainStates()
 		case <-ticker.C:
-			flushCurrent()
+			p.drainStates()
+			p.flushCurrent()
 		}
+	}
+}
+
+// drainStates writes every pending member state. A failed write stays pending so
+// the next tick retries it instead of losing the transition.
+func (p *groupStatePersister) drainStates() {
+	p.mu.Lock()
+	batch := p.pending
+	p.pending = make(map[groupStateKey]group.GroupStateEvent, len(batch))
+	closed := p.closed
+	p.mu.Unlock()
+	if len(batch) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var failed map[groupStateKey]group.GroupStateEvent
+	for key, event := range batch {
+		if err := p.store.UpsertGroupNodeState(ctx, &store.GroupNodeState{
+			GroupID: event.GroupID, NodeID: event.NodeID, FailureHistory: event.FailureHistory,
+			Evicted: event.Evicted, LastError: event.LastError, EvictedAt: event.EvictedAt,
+			Revision: event.Revision,
+		}); err != nil {
+			log.Printf("[app] persist group node state %d/%d: %v", event.GroupID, event.NodeID, err)
+			if failed == nil {
+				failed = make(map[groupStateKey]group.GroupStateEvent, len(batch))
+			}
+			failed[key] = event
+		}
+	}
+	if len(failed) == 0 {
+		return
+	}
+	p.mu.Lock()
+	for key, event := range failed {
+		// A newer event already queued for this member supersedes the retry.
+		if _, newer := p.pending[key]; !newer {
+			p.pending[key] = event
+		}
+	}
+	p.mu.Unlock()
+	if !closed {
+		select {
+		case p.wake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (p *groupStatePersister) flushCurrent() {
+	p.mu.Lock()
+	batch := p.current
+	p.current = make(map[int64]int64, len(batch))
+	p.mu.Unlock()
+	for groupID, nodeID := range batch {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err := p.store.UpdateGroupCurrentActiveNode(ctx, groupID, nodeID)
+		cancel()
+		if err == nil {
+			continue
+		}
+		log.Printf("[app] persist group current %d: %v", groupID, err)
+		if strings.Contains(err.Error(), "not found") {
+			continue
+		}
+		// Transient failure: retry next tick unless a newer value superseded it.
+		p.mu.Lock()
+		if _, newer := p.current[groupID]; !newer {
+			p.current[groupID] = nodeID
+		}
+		p.mu.Unlock()
 	}
 }
 

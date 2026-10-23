@@ -44,7 +44,16 @@
 - [ ] 未受影响的其余包（builder/nodefacts/nodetag/controlplane/netx/nodecodec/ipquality/nodedetect/nodeview/runtimetag 等）本轮被 Windows 应用控制策略拦截，未取得本轮证据；其中 builder/nodetag 曾单次通过，其余未验证
 - [ ] 生产规模压测、跨进程崩溃注入：不在本批
 
+## 后续修复（fix/health-state-atomicity）
+
+- [x] 游标推进与 `group_node_states` 同一事务：回调改为返回状态（`HealthEventCallback`），hub 用 `Store.AdvanceHealthCursorWithState` 一次提交；`SnapshotStates` 覆盖跨分组传播的行 → `TestHealthEventCursorAndStateCommitTogether`、`TestAdvanceHealthCursorWithStateIsAtomic`
+- [x] 已删除分组/节点的状态行丢弃而非重试（否则一个死引用永久卡住消费者）→ `TestAdvanceHealthCursorSkipsStateForDeletedGroup`
+- [x] 双写者（同步事务 + 异步合并持久化器）按 `revision` 定序，旧快照不覆盖新状态；revision 随 store→config→runtime 往返、启动时抬升全局时钟 → `TestUpsertGroupNodeStateRejectsStaleRevision`
+- [x] 异步持久化器去掉固定 256 队列：按 group+node 合并的 map、失败重试、`Close` 同步 flush → `TestGroupStatePersisterKeepsEveryMemberUnderBurst`（旧实现实测 500 成员丢 234 条）
+- [x] pool 消费者返回踢出/恢复快照与 revision → `TestHandleHealthResultReturnsDurableState`
+- [x] migration v25（只追加）：`group_node_states.revision`
+
 ## 遗留（转后续）
 
-- 崩溃窗口内一批（≤64）事件可能重复应用；反向也可能因分组状态异步落库而丢一条状态记录 → 需把游标推进与 `group_node_states` 写入同一事务
+- 崩溃窗口内一批（≤64）事件仍可能**重复应用**；ProbeID 环覆盖整整一批，所以重复被去重，但跨重启的批次边界没有额外的幂等证据（§5 已说明这是设计边界）
 - 审计“仍需后续核查的静态风险”三条未动

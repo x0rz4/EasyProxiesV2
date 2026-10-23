@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -61,6 +62,65 @@ func TestGroupStatePersisterFlushesClearedCurrent(t *testing.T) {
 	}
 	if updated.CurrentActiveNodeID != 0 {
 		t.Fatalf("current node ID = %d, want 0", updated.CurrentActiveNodeID)
+	}
+}
+
+// A failure storm fans one event per group out of a single probe, and the
+// observer runs on the data path. The persister therefore must not have a fixed
+// buffer that can overflow: an eviction shed on the floor leaves no row, so after
+// a restart the bad node comes back healthy.
+func TestGroupStatePersisterKeepsEveryMemberUnderBurst(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "group-state-burst.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	groupPool := &store.GroupPool{Name: "burst", BindAddress: "127.0.0.1", BindPort: 12096,
+		Protocol: "mixed", DispatchMode: "fixed", FailureWindowSeconds: 300, FailureThreshold: 3,
+		HealthCheckSeconds: 60, Enabled: true}
+	if err := db.CreateGroupPool(ctx, groupPool); err != nil {
+		t.Fatal(err)
+	}
+	const members = 500 // well past any fixed queue the observer might have had
+	nodeIDs := make([]int64, 0, members)
+	for i := 0; i < members; i++ {
+		node := &store.Node{URI: "http://burst-" + strconv.Itoa(i) + ".example:80",
+			Name: "burst-" + strconv.Itoa(i), Source: store.NodeSourceManual, Enabled: true}
+		if err := db.CreateNode(ctx, node); err != nil {
+			t.Fatal(err)
+		}
+		nodeIDs = append(nodeIDs, node.ID)
+	}
+
+	persister := newGroupStatePersister(db)
+	for _, nodeID := range nodeIDs {
+		persister.Observe(group.GroupStateEvent{GroupID: groupPool.ID, NodeID: nodeID,
+			FailureHistory: []int64{1, 2, 3}, Evicted: true, LastError: "down", StateChanged: true})
+	}
+	// A later change for the same member must win over the earlier one whether
+	// it replaced it in the queue or was written after it.
+	persister.Observe(group.GroupStateEvent{GroupID: groupPool.ID, NodeID: nodeIDs[0],
+		Evicted: false, StateChanged: true})
+	persister.Close()
+
+	updated, err := db.GetGroupPool(ctx, groupPool.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.NodeStates) != members {
+		t.Fatalf("persisted %d of %d member states; a burst shed events", len(updated.NodeStates), members)
+	}
+	for _, state := range updated.NodeStates {
+		if state.NodeID == nodeIDs[0] {
+			if state.Evicted {
+				t.Fatalf("the superseding recovery was not applied: %+v", state)
+			}
+			continue
+		}
+		if !state.Evicted {
+			t.Fatalf("eviction lost for node %d: %+v", state.NodeID, state)
+		}
 	}
 }
 

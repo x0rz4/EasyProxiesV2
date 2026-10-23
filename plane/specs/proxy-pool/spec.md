@@ -75,13 +75,25 @@
 
 需要跨重启生效的消费者 MUST 以稳定 key 注册（pool 为 `pool:<groupID>`/`pool:base`）；首次注册从日志尾部开始，已有游标则从游标续读。游标 MUST 在回调返回后持久化，持久化失败 MUST 阻止该消费者继续前进——不只是记录失败，而是停止读取新行，直到写入成功。原因是进程内 ProbeID 去重环只覆盖一个投递批次：带着未落盘的进度继续前进，崩溃重启后会重放已被挤出环的事件并二次推进恢复计数。同一测量被重复投递或重放时 MUST NOT 二次推进恢复计数或二次计入失败窗口。
 
+游标 MUST 与该批事件产出的 `group_node_states` 在同一事务内提交。消费者回调因此 MUST 返回它造成的状态变更（`func(HealthResultEvent) []store.GroupNodeState`），只读观察者返回 `nil`。分成两次写入会让"已应用"与"应用结果"可能不一致：崩溃时游标领先，踢出记录丢失，重启后坏节点以健康身份复活。因此 consumer 的返回值里 MUST 包含跨分组传播的那些行（踢出/恢复是节点级事实）。
+
+状态行指向的分组或节点已被删除（外键拒绝）MUST 视为该行无处可去：丢弃该行并继续推进游标，MUST NOT 当成可重试失败，否则一个已删除目标会永久卡住该消费者并拖住其它分组。
+
+`group_node_states` 存在第二个异步写者（应用层合并持久化器）。每行 MUST 带单调 `revision`，写入 MUST 只在 `revision = 0` 或不小于已存值时生效，否则晚到的旧快照会覆盖新状态（例如把刚解除的踢出写回去）。`revision` MUST 随存储→配置→运行时往返并在启动时抬升全局时钟，否则重启后时钟归零会让所有新写入被当成过期。
+
 ### Scenario: 崩溃后重启
 
 - GIVEN 事件已应用但游标未落盘，进程崩溃。
 - WHEN 重启后从旧游标重放该批事件。
 - THEN 已应用的 ProbeID 被去重，恢复计数不变；新事件照常推进。
 
-代码：`internal/monitor/health_event_hub.go`、`internal/monitor/manager.go`（`SubscribeDurableHealthResults`）、`internal/group/runtime.go`、`internal/outbound/pool/pool.go`。已有测试：`TestHealthEventCursorResumesAfterRestart`、`TestHealthEventFirstRegistrationStartsAtTail`、`TestHealthEventCloseKeepsJournalForNextStart`、`TestHealthEventCursorFailureStopsDelivery`、`TestHealthReplayDoesNotAdvanceRecoveryTwice`、`TestHealthFailureReplayIsIgnored`。
+### Scenario: 状态写入失败
+
+- GIVEN 回调判定踢出。
+- WHEN 提交时状态写入失败。
+- THEN 游标 MUST NOT 前进，消费者停止投递并退避重试；恢复后两者一起落库。
+
+代码：`internal/monitor/health_event_hub.go`、`internal/monitor/manager.go`（`SubscribeDurableHealthResults`）、`internal/group/runtime.go`（`SnapshotStates`）、`internal/store/health_events.go`（`AdvanceHealthCursorWithState`）、`internal/outbound/pool/pool.go`、`internal/app/app.go`（异步持久化器）。已有测试：`TestHealthEventCursorResumesAfterRestart`、`TestHealthEventFirstRegistrationStartsAtTail`、`TestHealthEventCloseKeepsJournalForNextStart`、`TestHealthEventCursorFailureStopsDelivery`、`TestHealthEventCursorAndStateCommitTogether`、`TestAdvanceHealthCursorWithStateIsAtomic`、`TestAdvanceHealthCursorSkipsStateForDeletedGroup`、`TestUpsertGroupNodeStateRejectsStaleRevision`、`TestGroupStatePersisterKeepsEveryMemberUnderBurst`、`TestHandleHealthResultReturnsDurableState`、`TestHealthReplayDoesNotAdvanceRecoveryTwice`、`TestHealthFailureReplayIsIgnored`。
 
 ## Requirement HEALTH-005：投递状态必须可观测
 

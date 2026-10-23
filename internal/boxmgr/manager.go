@@ -716,7 +716,7 @@ func storeGroupFromConfig(groupCfg config.GroupPoolConfig) *store.GroupPool {
 	for _, state := range groupCfg.NodeStates {
 		groupPool.NodeStates = append(groupPool.NodeStates, store.GroupNodeState{GroupID: groupCfg.ID, NodeID: state.NodeID,
 			FailureHistory: append([]int64(nil), state.FailureHistory...), Evicted: state.Evicted,
-			LastError: state.LastError, EvictedAt: state.EvictedAt})
+			LastError: state.LastError, EvictedAt: state.EvictedAt, Revision: state.Revision})
 	}
 	return groupPool
 }
@@ -1433,7 +1433,7 @@ func (m *Manager) applyGroupRuntimeIncremental(cfg *config.Config, groupCfg conf
 		state := stateByNodeID[spec.Meta.NodeID]
 		initial[spec.Tag] = group.GroupInitialState{NodeID: spec.Meta.NodeID,
 			FailureHistory: append([]int64(nil), state.FailureHistory...), Evicted: state.Evicted,
-			LastError: state.LastError, EvictedAt: state.EvictedAt}
+			LastError: state.LastError, EvictedAt: state.EvictedAt, Revision: state.Revision}
 	}
 	capacityTarget := 0
 	if groupCfg.Execute {
@@ -2682,7 +2682,7 @@ func GroupConfigsFromStore(groups []store.GroupPool) []config.GroupPoolConfig {
 		for _, state := range group.NodeStates {
 			converted.NodeStates = append(converted.NodeStates, config.GroupNodeStateConfig{NodeID: state.NodeID,
 				FailureHistory: append([]int64(nil), state.FailureHistory...), Evicted: state.Evicted,
-				LastError: state.LastError, EvictedAt: state.EvictedAt})
+				LastError: state.LastError, EvictedAt: state.EvictedAt, Revision: state.Revision})
 		}
 		result = append(result, converted)
 	}

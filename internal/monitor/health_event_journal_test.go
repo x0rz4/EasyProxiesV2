@@ -27,6 +27,15 @@ func healthJournalFixture(t *testing.T) (*healthEventHub, store.Store) {
 	return hub, db
 }
 
+// subscribeReadOnly registers a test observer. Observers do not own group state,
+// so they contribute no rows to the cursor transaction.
+func (h *healthEventHub) subscribeReadOnly(consumer string, tags []string, nodeIDs []int64, global bool, callback func(HealthResultEvent)) func() {
+	return h.subscribeAs(consumer, tags, nodeIDs, global, func(event HealthResultEvent) []store.GroupNodeState {
+		callback(event)
+		return nil
+	})
+}
+
 // appendJournal writes rows the way probe.Applier does: the fact and its
 // journal row commit together, then the probe path publishes the wakeup.
 func appendJournal(t *testing.T, db store.Store, count int) []int64 {
@@ -60,7 +69,7 @@ func TestHealthJournalDeliversBeyondLegacyQueueLimit(t *testing.T) {
 	entered, release := make(chan struct{}), make(chan struct{})
 	delivered := make(chan HealthResultEvent, total)
 	var once sync.Once
-	unsubscribe := hub.subscribeAs("pool:1", []string{"node-a"}, nil, false, func(event HealthResultEvent) {
+	unsubscribe := hub.subscribeReadOnly("pool:1", []string{"node-a"}, nil, false, func(event HealthResultEvent) {
 		once.Do(func() { close(entered); <-release })
 		delivered <- event
 	})
@@ -125,7 +134,7 @@ func TestHealthEventCursorResumesAfterRestart(t *testing.T) {
 
 	first := make(chan HealthResultEvent, 8)
 	hubOne := newHealthEventHub(journal)
-	unsubscribe := hubOne.subscribeAs("pool:7", []string{"node-a"}, nil, false, func(event HealthResultEvent) { first <- event })
+	unsubscribe := hubOne.subscribeReadOnly("pool:7", []string{"node-a"}, nil, false, func(event HealthResultEvent) { first <- event })
 	seqs := appendJournal(t, db, 3)
 	for _, seq := range seqs {
 		hubOne.publish(HealthResultEvent{Tag: "node-a", NodeID: 1, Seq: seq})
@@ -160,7 +169,7 @@ func TestHealthEventCursorResumesAfterRestart(t *testing.T) {
 	second := make(chan HealthResultEvent, 8)
 	hubTwo := newHealthEventHub(journal)
 	defer hubTwo.close()
-	hubTwo.subscribeAs("pool:7", []string{"node-a"}, nil, false, func(event HealthResultEvent) { second <- event })
+	hubTwo.subscribeReadOnly("pool:7", []string{"node-a"}, nil, false, func(event HealthResultEvent) { second <- event })
 	more := appendJournal(t, db, 2)
 	for _, seq := range more {
 		hubTwo.publish(HealthResultEvent{Tag: "node-a", NodeID: 1, Seq: seq})
@@ -197,6 +206,16 @@ func (s *cursorRefusingStore) PutHealthEventCursor(ctx context.Context, consumer
 	return s.Store.PutHealthEventCursor(ctx, consumer, seq)
 }
 
+// AdvanceHealthCursorWithState is the commit path the hub actually uses, so the
+// injection has to sit here too; overriding only PutHealthEventCursor would let
+// the test pass while production writes kept succeeding.
+func (s *cursorRefusingStore) AdvanceHealthCursorWithState(ctx context.Context, consumer string, seq int64, states []store.GroupNodeState) error {
+	if s.refuse.Load() {
+		return errors.New("injected cursor write failure")
+	}
+	return s.Store.AdvanceHealthCursorWithState(ctx, consumer, seq, states)
+}
+
 func TestHealthEventCursorFailureStopsDelivery(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "cursor-blocked.db"))
 	if err != nil {
@@ -212,7 +231,7 @@ func TestHealthEventCursorFailureStopsDelivery(t *testing.T) {
 	guarded.refuse.Store(true)
 	var mu sync.Mutex
 	delivered := 0
-	hub.subscribeAs("pool:13", []string{"node-a"}, nil, false, func(HealthResultEvent) {
+	hub.subscribeReadOnly("pool:13", []string{"node-a"}, nil, false, func(HealthResultEvent) {
 		mu.Lock()
 		delivered++
 		mu.Unlock()
@@ -273,7 +292,7 @@ func TestHealthEventJournalSustainsConfiguredProbeRate(t *testing.T) {
 
 	hub, db := healthJournalFixture(t)
 	ctx := context.Background()
-	hub.subscribeAs("pool:15", []string{"node-a"}, nil, false, func(HealthResultEvent) {})
+	hub.subscribeReadOnly("pool:15", []string{"node-a"}, nil, false, func(HealthResultEvent) {})
 	// 2000 rows already older than the consumed window, with the sole consumer
 	// caught up: a healthy deployment reclaiming space, not a wedged one.
 	old := time.Now().UTC().Add(-healthEventConsumedRetention - time.Minute)
@@ -315,7 +334,7 @@ func TestHealthEventFirstRegistrationStartsAtTail(t *testing.T) {
 	appendJournal(t, db, 4)
 
 	delivered := make(chan HealthResultEvent, 8)
-	hub.subscribeAs("pool:9", []string{"node-a"}, nil, false, func(event HealthResultEvent) { delivered <- event })
+	hub.subscribeReadOnly("pool:9", []string{"node-a"}, nil, false, func(event HealthResultEvent) { delivered <- event })
 	seqs := appendJournal(t, db, 1)
 	hub.publish(HealthResultEvent{Tag: "node-a", NodeID: 1, Seq: seqs[0]})
 	select {
@@ -344,7 +363,7 @@ func TestHealthEventCloseKeepsJournalForNextStart(t *testing.T) {
 	entered, release := make(chan struct{}), make(chan struct{})
 	hubOne := newHealthEventHub(journal)
 	var once sync.Once
-	hubOne.subscribeAs("pool:5", []string{"node-a"}, nil, false, func(HealthResultEvent) {
+	hubOne.subscribeReadOnly("pool:5", []string{"node-a"}, nil, false, func(HealthResultEvent) {
 		once.Do(func() { close(entered); <-release })
 	})
 	seqs := appendJournal(t, db, 2)
@@ -364,7 +383,7 @@ func TestHealthEventCloseKeepsJournalForNextStart(t *testing.T) {
 	second := make(chan HealthResultEvent, 8)
 	hubTwo := newHealthEventHub(journal)
 	defer hubTwo.close()
-	hubTwo.subscribeAs("pool:5", []string{"node-a"}, nil, false, func(event HealthResultEvent) { second <- event })
+	hubTwo.subscribeReadOnly("pool:5", []string{"node-a"}, nil, false, func(event HealthResultEvent) { second <- event })
 	next := appendJournal(t, db, 1)
 	hubTwo.publish(HealthResultEvent{Tag: "node-a", NodeID: 1, Seq: next[0]})
 	for i := 0; i < len(seqs)+1; i++ {
@@ -385,7 +404,7 @@ func TestHealthEventInlineFallbackIsExplicitlyBounded(t *testing.T) {
 	entered, release := make(chan struct{}), make(chan struct{})
 	var received atomic.Int64
 	var once sync.Once
-	unsubscribe := hub.subscribeAs("", nil, nil, true, func(HealthResultEvent) {
+	unsubscribe := hub.subscribeReadOnly("", nil, nil, true, func(HealthResultEvent) {
 		once.Do(func() { close(entered); <-release })
 		received.Add(1)
 	})
@@ -431,7 +450,7 @@ func (h *healthEventHub) onlySubscription(t *testing.T) *healthEventSubscription
 func TestHealthEventSnapshotOnlyIsMergeable(t *testing.T) {
 	hub, _ := healthJournalFixture(t)
 	delivered := make(chan HealthResultEvent, 8)
-	hub.subscribeAs("pool:3", []string{"node-a"}, nil, false, func(event HealthResultEvent) { delivered <- event })
+	hub.subscribeReadOnly("pool:3", []string{"node-a"}, nil, false, func(event HealthResultEvent) { delivered <- event })
 	// Repeated refresh requests collapse into one notification. Refresh
 	// markers are broadcast (they are not addressed to one tag or node).
 	for i := 0; i < 5; i++ {
@@ -452,4 +471,88 @@ func TestHealthEventSnapshotOnlyIsMergeable(t *testing.T) {
 			return
 		}
 	}
+}
+
+// The cursor and the member state it produced must be one commit. This drives
+// the hub end to end: when the combined write fails, delivery must park and
+// neither half may land; when it recovers, both appear together.
+type failingCommitStore struct {
+	store.Store
+	fail atomic.Bool
+}
+
+func (s *failingCommitStore) AdvanceHealthCursorWithState(ctx context.Context, consumer string, seq int64, states []store.GroupNodeState) error {
+	if s.fail.Load() {
+		return errors.New("injected commit failure")
+	}
+	return s.Store.AdvanceHealthCursorWithState(ctx, consumer, seq, states)
+}
+
+func TestHealthEventCursorAndStateCommitTogether(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "atomic.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	node := &store.Node{URI: "http://atomic.example:80", Name: "atomic", Source: store.NodeSourceManual, Enabled: true}
+	if err := db.CreateNode(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+	groupPool := &store.GroupPool{Name: "atomic", BindAddress: "127.0.0.1", BindPort: 12099, Protocol: "mixed",
+		DispatchMode: "fixed", FailureWindowSeconds: 300, FailureThreshold: 3, HealthCheckSeconds: 60, Enabled: true}
+	if err := db.CreateGroupPool(ctx, groupPool); err != nil {
+		t.Fatal(err)
+	}
+	guarded := &failingCommitStore{Store: db}
+	hub := newHealthEventHub(func() store.Store { return guarded })
+	defer hub.close()
+
+	var delivered atomic.Int64
+	hub.subscribeAs("pool:21", []string{"node-a"}, nil, false, func(HealthResultEvent) []store.GroupNodeState {
+		delivered.Add(1)
+		return []store.GroupNodeState{{GroupID: groupPool.ID, NodeID: node.ID,
+			FailureHistory: []int64{1, 2, 3}, Evicted: true, LastError: "down"}}
+	})
+
+	guarded.fail.Store(true)
+	seqs := appendJournal(t, db, 3)
+	for _, seq := range seqs {
+		hub.publish(HealthResultEvent{Tag: "node-a", NodeID: node.ID, Seq: seq})
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && delivered.Load() == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if delivered.Load() == 0 {
+		t.Fatal("callback never ran")
+	}
+	// Delivery must park: running ahead of an uncommitted transition is what
+	// makes a restart replay it against a state that already contains it.
+	time.Sleep(250 * time.Millisecond)
+	if seq, _, err := db.GetHealthEventCursor(ctx, "pool:21"); err != nil || seq != 0 {
+		t.Fatalf("cursor advanced to %d while the commit was failing: %v", seq, err)
+	}
+	loaded, err := db.GetGroupPool(ctx, groupPool.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.NodeStates) != 0 {
+		t.Fatalf("state written without its cursor: %+v", loaded.NodeStates)
+	}
+
+	// Once the commit succeeds, cursor and state land together.
+	guarded.fail.Store(false)
+	hub.onlySubscription(t).wakeup()
+	deadline = time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		loaded, err = db.GetGroupPool(ctx, groupPool.ID)
+		if err == nil && len(loaded.NodeStates) == 1 && loaded.NodeStates[0].Evicted {
+			if seq, _, err := db.GetHealthEventCursor(ctx, "pool:21"); err == nil && seq == seqs[len(seqs)-1] {
+				return
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("state and cursor did not converge: states=%+v", loaded.NodeStates)
 }

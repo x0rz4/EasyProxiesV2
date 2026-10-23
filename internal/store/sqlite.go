@@ -2496,13 +2496,19 @@ func (s *sqliteStore) DeleteGroupPool(ctx context.Context, id int64) error {
 
 func (s *sqliteStore) UpsertGroupNodeState(ctx context.Context, state *GroupNodeState) error {
 	history, _ := json.Marshal(state.FailureHistory)
+	// A revisioned write only applies if it is at least as new as what is
+	// stored. Two writers race here (see GroupNodeState.Revision); without this
+	// guard a stalled one could overwrite a recovery with the eviction that
+	// preceded it. An unversioned write (revision 0) always applies.
 	_, err := s.writeConn().ExecContext(ctx, `INSERT INTO group_node_states
-(group_id, node_id, failure_history_json, evicted, last_error, evicted_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?)
+(group_id, node_id, failure_history_json, evicted, last_error, evicted_at, updated_at, revision)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(group_id, node_id) DO UPDATE SET failure_history_json=excluded.failure_history_json,
 evicted=excluded.evicted, last_error=excluded.last_error, evicted_at=excluded.evicted_at,
-updated_at=excluded.updated_at`, state.GroupID, state.NodeID, string(history), boolToInt(state.Evicted),
-		state.LastError, formatTime(state.EvictedAt), formatTime(time.Now()))
+updated_at=excluded.updated_at, revision=excluded.revision
+WHERE excluded.revision = 0 OR excluded.revision >= group_node_states.revision`,
+		state.GroupID, state.NodeID, string(history), boolToInt(state.Evicted),
+		state.LastError, formatTime(state.EvictedAt), formatTime(time.Now()), state.Revision)
 	if err != nil {
 		return fmt.Errorf("upsert group node state: %w", err)
 	}
@@ -2516,7 +2522,7 @@ func (s *sqliteStore) ClearGroupNodeState(ctx context.Context, groupID, nodeID i
 
 func (s *sqliteStore) listGroupNodeStates(ctx context.Context, groupID int64) ([]GroupNodeState, error) {
 	rows, err := s.readConn().QueryContext(ctx, `SELECT group_id, node_id, failure_history_json, evicted,
-last_error, evicted_at, updated_at FROM group_node_states WHERE group_id = ?`, groupID)
+last_error, evicted_at, updated_at, revision FROM group_node_states WHERE group_id = ?`, groupID)
 	if err != nil {
 		return nil, fmt.Errorf("list group node states: %w", err)
 	}
@@ -2526,7 +2532,8 @@ last_error, evicted_at, updated_at FROM group_node_states WHERE group_id = ?`, g
 		var state GroupNodeState
 		var history, evictedAt, updatedAt string
 		var evicted int
-		if err := rows.Scan(&state.GroupID, &state.NodeID, &history, &evicted, &state.LastError, &evictedAt, &updatedAt); err != nil {
+		if err := rows.Scan(&state.GroupID, &state.NodeID, &history, &evicted, &state.LastError, &evictedAt, &updatedAt,
+			&state.Revision); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(history), &state.FailureHistory)

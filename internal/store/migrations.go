@@ -566,6 +566,19 @@ CREATE TABLE health_event_cursors (
     updated_at TEXT    NOT NULL DEFAULT ''
 );`,
 		},
+		{
+			Version:     25,
+			Description: "order group node state writes by a monotonic revision",
+			// group_node_states has two writers: the synchronous health-delivery
+			// transaction (cursor + state, for crash atomicity) and the
+			// asynchronous coalescing persister (current-tag and non-health
+			// transitions). Each writes a snapshot taken when the transition
+			// happened, so without an ordering token whichever commits last wins
+			// even if it observed the older state — which can resurrect an
+			// eviction that was just cleared. Revisions come from the group
+			// runtime, the only place that sees every transition in order.
+			Up: `ALTER TABLE group_node_states ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;`,
+		},
 	}
 }
 

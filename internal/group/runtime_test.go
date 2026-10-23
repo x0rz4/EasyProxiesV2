@@ -2,6 +2,7 @@ package group
 
 import (
 	"errors"
+	"sync"
 	"testing"
 	"time"
 )
@@ -333,5 +334,41 @@ func TestHealthFailureReplayIsIgnored(t *testing.T) {
 	RecordGroupHealthFailure(402, "node-a", "", errors.New("down"), at.Add(time.Minute))
 	if member := GroupRuntimeSnapshots()[402].Members[0]; member.FailureCount != 2 {
 		t.Fatalf("manual failure not counted: %+v", member)
+	}
+}
+
+// Restored state carries the revision it was written with. The runtime must
+// resume that clock rather than restart at zero: otherwise every write after
+// startup looks stale to the store and evictions stop persisting silently.
+func TestRegisterResumesRevisionFromRestoredState(t *testing.T) {
+	Reset()
+	defer Reset()
+	var mu sync.Mutex
+	var revision int64
+	unsubscribe := SubscribeStateChanges(func(event GroupStateEvent) {
+		if event.StateChanged && event.Revision > 0 {
+			mu.Lock()
+			revision = event.Revision
+			mu.Unlock()
+		}
+	})
+	defer unsubscribe()
+
+	// Far above anything other tests can produce: the clock is process-global,
+	// so a small seed would already be beaten by leftovers from earlier tests.
+	const restored = int64(1) << 40
+	Register(1, 5*time.Minute, 3, "", map[string]GroupInitialState{"node-a": {NodeID: 42, Revision: restored}})
+	if got := stateRevision.Load(); got < restored {
+		t.Fatalf("global revision clock = %d, want at least %d", got, restored)
+	}
+	now := time.Now()
+	for i := 0; i < 3; i++ {
+		RecordFailure(1, "node-a", errors.New("down"), now.Add(time.Duration(i)*time.Minute))
+	}
+	mu.Lock()
+	got := revision
+	mu.Unlock()
+	if got <= restored {
+		t.Fatalf("emitted revision = %d; the restored clock was not resumed (stored state would reject it as stale)", got)
 	}
 }

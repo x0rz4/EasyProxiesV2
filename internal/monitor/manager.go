@@ -1464,13 +1464,23 @@ func (m *Manager) publishDebugLog(event DebugLogEvent) {
 // survive a restart use SubscribeDurableHealthResults instead. Callbacks run
 // outside manager and entry locks and must remain lightweight.
 func (m *Manager) SubscribeHealthResults(callback func(HealthResultEvent)) func() {
-	return m.healthEvents.subscribe(nil, nil, true, callback)
+	return m.healthEvents.subscribe(nil, nil, true, observerCallback(callback))
+}
+
+// observerCallback adapts a read-only observer to the state-returning contract.
+// Observers never own group state, so they contribute no rows to the cursor
+// transaction.
+func observerCallback(callback func(HealthResultEvent)) HealthEventCallback {
+	return func(event HealthResultEvent) []store.GroupNodeState {
+		callback(event)
+		return nil
+	}
 }
 
 // SubscribeHealthResultsFor installs a targeted observer. A subscription
 // indexed by both tag and Node ID is invoked at most once for each event.
 func (m *Manager) SubscribeHealthResultsFor(tags []string, nodeIDs []int64, callback func(HealthResultEvent)) func() {
-	return m.healthEvents.subscribe(tags, nodeIDs, false, callback)
+	return m.healthEvents.subscribe(tags, nodeIDs, false, observerCallback(callback))
 }
 
 // SubscribeDurableHealthResults registers a consumer whose progress must
@@ -1479,7 +1489,7 @@ func (m *Manager) SubscribeHealthResultsFor(tags []string, nodeIDs []int64, call
 // persisted cursor. The pool consumer is the production user: it advances group
 // failure windows and recovery streaks, so losing an event would change the
 // state machine rather than just refresh a view.
-func (m *Manager) SubscribeDurableHealthResults(key string, tags []string, nodeIDs []int64, callback func(HealthResultEvent)) func() {
+func (m *Manager) SubscribeDurableHealthResults(key string, tags []string, nodeIDs []int64, callback HealthEventCallback) func() {
 	return m.healthEvents.subscribeAs(key, tags, nodeIDs, false, callback)
 }
 

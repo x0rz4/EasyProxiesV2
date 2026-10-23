@@ -127,6 +127,10 @@ type GroupNodeStateConfig struct {
 	Evicted        bool      `json:"evicted"`
 	LastError      string    `json:"last_error,omitempty"`
 	EvictedAt      time.Time `json:"evicted_at,omitempty"`
+	// Revision is the ordering token the state was written with. It must
+	// survive the store→config→runtime round trip, otherwise a reload would
+	// re-seed the clock at zero and the next write would be rejected as stale.
+	Revision int64 `json:"revision,omitempty"`
 }
 
 // MultiPortConfig defines address/credential defaults for multi-port mode.

@@ -273,7 +273,7 @@ func BuildVersion(cfg *config.Config, runtimeTagVersion uint64) (option.Options,
 			if state, ok := stateByNodeID[nodeID]; ok {
 				stateByTag[tag] = groupruntime.GroupInitialState{NodeID: nodeID,
 					FailureHistory: append([]int64(nil), state.FailureHistory...), Evicted: state.Evicted,
-					LastError: state.LastError, EvictedAt: state.EvictedAt}
+					LastError: state.LastError, EvictedAt: state.EvictedAt, Revision: state.Revision}
 			} else {
 				stateByTag[tag] = groupruntime.GroupInitialState{NodeID: nodeID}
 			}
