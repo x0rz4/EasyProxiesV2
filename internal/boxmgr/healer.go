@@ -6,6 +6,7 @@ import (
 	"slices"
 	"time"
 
+	"easy_proxies/internal/config"
 	"easy_proxies/internal/group"
 	"easy_proxies/internal/monitor"
 )
@@ -36,12 +37,13 @@ func (m *Manager) healingInputs(ctx context.Context, now time.Time, groupID int6
 	m.mu.RLock()
 	source := m.cfg
 	if source != nil && groupID != 0 {
-		copy := *source
-		copy.Groups = nil
+		// Only these fields feed candidate selection. Construct a fresh config
+		// before cloning its slices; Config also owns a mutex that must not copy.
+		scoped := &config.Config{Nodes: source.Nodes, TagNames: source.TagNames}
 		if g, ok := groupConfigByID(source, groupID); ok {
-			copy.Groups = append(copy.Groups, g)
+			scoped.Groups = []config.GroupPoolConfig{g}
 		}
-		source = &copy
+		source = scoped
 	}
 	cfg, mon, db := source.Clone(), m.monitorMgr, m.store
 	m.mu.RUnlock()
