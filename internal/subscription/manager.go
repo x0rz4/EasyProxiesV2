@@ -19,8 +19,6 @@ import (
 	"easy_proxies/internal/group"
 	"easy_proxies/internal/runtimenodes"
 	"easy_proxies/internal/store"
-
-	"golang.org/x/sync/errgroup"
 )
 
 var ErrNotFound = errors.New("订阅不存在")
@@ -531,28 +529,60 @@ func (m *Manager) refreshDue(ctx context.Context, dueOnly bool) error {
 		pending = append(pending, sub)
 	}
 
-	// Fetch in parallel — one slow provider should not hold up the rest — but
-	// commit strictly in order afterwards. Commits share the single SQLite
-	// writer and the run counters, and reconcile must see the final state.
-	fetched := make([]fetchedSubscription, len(pending))
-	groupFetch := new(errgroup.Group)
-	groupFetch.SetLimit(fetchConcurrency)
-	for i := range pending {
-		i := i
-		groupFetch.Go(func() error {
-			sub := pending[i]
-			m.beginRefreshing(sub.ID)
-			fetched[i] = m.fetchFor(ctx, sub)
-			m.endRefreshing(sub.ID)
-			return nil
+	// Each lane holds at most one uncommitted response. It cannot fetch its
+	// next subscription until the current result commits, so a slow first
+	// provider cannot accumulate the entire provider set in memory.
+	fetchCtx, cancelFetch := context.WithCancel(ctx)
+	var workers sync.WaitGroup
+	defer func() { cancelFetch(); workers.Wait() }()
+	type lane struct {
+		result    chan fetchedSubscription
+		committed chan struct{}
+	}
+	lanes := make([]lane, min(fetchConcurrency, len(pending)))
+	for index := range lanes {
+		lanes[index] = lane{make(chan fetchedSubscription), make(chan struct{})}
+		worker := lanes[index]
+		workers.Go(func() {
+			for i := index; i < len(pending) && fetchCtx.Err() == nil; i += len(lanes) {
+				sub := pending[i]
+				m.beginRefreshing(sub.ID)
+				result := m.fetchFor(fetchCtx, sub)
+				m.endRefreshing(sub.ID)
+				select {
+				case worker.result <- result:
+				case <-fetchCtx.Done():
+					return
+				}
+				result = fetchedSubscription{}
+				select {
+				case <-worker.committed:
+				case <-fetchCtx.Done():
+					return
+				}
+			}
 		})
 	}
-	_ = groupFetch.Wait()
 
 	var errs []error
 	changed := false
 	for i, sub := range pending {
-		removed, commitErr := m.commitFetched(ctx, sub, fetched[i])
+		worker := lanes[i%len(lanes)]
+		var fetched fetchedSubscription
+		select {
+		case fetched = <-worker.result:
+		case <-ctx.Done():
+			errs = append(errs, ctx.Err())
+			m.recordRunResult(errors.Join(errs...))
+			return errors.Join(errs...)
+		}
+		removed, commitErr := m.commitFetched(ctx, sub, fetched)
+		// Drop the parsed payload before admitting the next download.
+		fetched = fetchedSubscription{}
+		select {
+		case worker.committed <- struct{}{}:
+		case <-ctx.Done():
+		}
 		if commitErr != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", sub.Name, commitErr))
 			m.logger.Warnf("refresh subscription %d failed: %v", sub.ID, commitErr)
