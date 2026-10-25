@@ -4,8 +4,8 @@
 > 权威行为契约见 [plane/specs/proxy-pool/spec.md](../plane/specs/proxy-pool/spec.md)（MUST/场景）；
 > 变更提案与历史见 [plane/](../plane/)。本文件只讲"现在是怎么搭的"，不写"应该怎么改"。
 >
-> 基线核对：v2.2.6，migration 至 v24，`internal/` + `cmd/` 约 **39.3k** 行非测试代码、约 **21.3k** 行测试，
-> 前端 `frontend/src` 约 **10.1k** 行 TS/TSX。核对日期 2026-10-23。
+> 基线核对：v2.2.9，migration 至 v25，`internal/` + `cmd/` 约 **40.1k** 行非测试代码、约 **22.5k** 行测试，
+> 前端 `frontend/src` 约 **10.1k** 行 TS/TSX。核对日期 2026-10-26。
 
 ## 1. 一句话说清这个系统
 
@@ -131,7 +131,7 @@ GeoIP 预热 → 开 SQLite → 从 store 载入 nodes/groups/tags（store 覆�
 
 | 包 | 职责 | 关键入口 |
 | --- | --- | --- |
-| `store` | **唯一持久化层**：`Store` 接口（当前 **108** 个方法）+ 手写 migration（append-only，当前最新 **v24**）+ 单写连接 / WAL / 四读连接 | `Open` / `Migrate`、`sqlite.go`、`sqlite_tags.go`、`sqlite_location.go`、`health_events.go`、`node_identity.go`、`probe_id.go` |
+| `store` | **唯一持久化层**：`Store` 接口（当前 **109** 个方法）+ 手写 migration（append-only，当前最新 **v25**）+ 单写连接 / WAL / 四读连接 | `Open` / `Migrate`、`sqlite.go`、`sqlite_tags.go`、`sqlite_location.go`、`health_events.go`、`node_identity.go`、`probe_id.go` |
 
 ## 5. 依赖方向（2026-10-23 由 AST 级 import 扫描实测，修正了旧文档多处失实）
 

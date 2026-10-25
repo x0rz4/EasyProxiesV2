@@ -1,6 +1,6 @@
 # 资源占用与稳定性修复计划
 
-日期：2026-10-26。基线：2.2.8。状态：实施中。
+日期：2026-10-26。基线：2.2.8。状态：已完成（2.2.9）。
 
 本批处理源码审查发现的七项资源与生命周期问题。现有 OOM 日志只能证明系统内存分配失败，不能证明下列任一项是生产事故的唯一根因。每项修复独立提交，并在此记录验证结果；本批最后统一递增一次 patch 版本。
 
@@ -24,7 +24,7 @@
 
 ## 验证记录
 
-R1：新增两项回归用例，保留晚到结果不改健康状态的已有用例。`go test ./internal/monitor -run 'TestDetachedProbeRetainsSlotUntilActualReturn|TestOutstandingProbeCallsBoundRuntimeGenerations|TestInitialProbeHardTimeoutCannotWedgeRoundOrCommitLateSuccess' -count=1` 编译成功，测试启动被 Windows 应用控制阻止，运行未验证。`git diff --check` 通过。此前审查的临时测试已复现半关闭行为差异。
+R1：新增占位保留、总上限、容量背压不改节点健康三项回归；保留晚到结果不改健康状态用例。首次运行被 Windows 应用控制拦截；后续定向测试及完整 monitor 包测试均已成功运行并通过，未调整系统策略。
 
 R2：默认每连接 4096 KiB，可用启动环境变量显式覆盖；连接 PRAGMA、非法配置及事务隔离四项定向测试通过。
 
@@ -37,3 +37,25 @@ R5：所有综合/单节点/批量诊断按类型共享进程级预算（延迟1
 R6：两种订阅入口共用 10 MiB 响应体上限，最多读取上限加一个字节；边界、正常旧订阅、chunked 超限、托管订阅失败保留旧成员与原有抓取测试通过。
 
 R7：连接包装按底层能力暴露读/写半关闭，不支持时保留 sing-box 完整关闭路径；四种能力组合、半关闭转发、一次性释放及已建立连接错误归因定向测试通过。
+
+## 独立提交
+
+| 项目 | 提交 |
+| --- | --- |
+| 计划 | 8a2ad1f |
+| R1 探测调用有界 | 09ae1a7 |
+| R2 SQLite 缓存预算 | 5bf177a |
+| R3 成员更新队列 | b5a9495 |
+| R4 任务状态持久化 | 08f2737 |
+| R5 全局检测预算 | e6dce15 |
+| R6 订阅响应上限 | 1b5b495 |
+| R7 半关闭能力 | 0cbde58 |
+
+## 最终验收
+
+- `go test -p 1 ./...`：全部通过（包括完整 monitor、app、httpapi、boxmgr、store、subscription、pool 包）。
+- `npm run lint`、`npm run build`：通过；前端构建完成后才启动 Go 生产构建。Vite 有既有的大 chunk 提示，构建成功。
+- Linux amd64、CGO_ENABLED=0、with_utls/with_quic/with_grpc/with_wireguard/with_gvisor 全部生产 tags 构建链接：通过。首次官方 Go 代理下载超时，使用仅对重试命令生效的 GOPROXY=https://goproxy.cn,direct 后成功；未改全局 Go 配置。
+- `-race` 未执行：本机 CGO_ENABLED=0 且无 gcc；本批不安装编译器或调整系统策略。
+- 本批版本统一递增为 2.2.9，三处版本字段同步；更新当前形态文档及代码/测试行数基线。
+- 未进行线上 RSS/堆采样或持续负载测试，不把功能回归通过等同于生产 OOM 已消失。
