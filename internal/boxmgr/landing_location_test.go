@@ -167,6 +167,14 @@ func TestListConfigNodesReturnsPersistedLocationForDisabledNodes(t *testing.T) {
 	}
 
 	manager := New(&config.Config{Nodes: []config.NodeConfig{{ID: enabled.ID, URI: enabled.URI}}}, monitor.Config{}, WithStore(db))
+	page, pageErr := manager.ListConfigNodesByIDs(ctx, nil, []int64{disabled.ID})
+	if pageErr != nil || len(page) != 1 || page[0].ID != disabled.ID || !page[0].Disabled {
+		t.Fatalf("disabled page: %+v %v", page, pageErr)
+	}
+	empty, emptyErr := manager.ListConfigNodesByIDs(ctx, nil, nil)
+	if emptyErr != nil || len(empty) != 0 {
+		t.Fatalf("empty page: %+v %v", empty, emptyErr)
+	}
 	nodes, err := manager.ListConfigNodes(ctx, nil)
 	if err != nil {
 		t.Fatal(err)

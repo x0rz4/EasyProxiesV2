@@ -11,7 +11,7 @@ import type {
   Subscription,
 } from '../types'
 import { queryNodeIDs, cancelNodeCheckTask, createNodeCheckTask, fetchConfigNodes, fetchNodeCheckResults, fetchNodeCheckSettings, fetchNodeCheckTasks, fetchNodes, fetchUnlockResults, listSubscriptions, streamNodeCheckTask, unlockNode, updateNodeCheckSettings } from '../api/client'
-import { useQueryClient } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useNodeFilter } from '../hooks/useNodeFilter'
 import NodeFilterBar from './NodeFilterBar'
 import { regionFlag } from '../utils/region'
@@ -76,20 +76,36 @@ export default function UnlockPanel() {
   const queryClient = useQueryClient()
   const nodeFilter = useNodeFilter({ version: 2 }, true, true)
   const [preparingTask, setPreparingTask] = useState(false)
-  const [nodes, setNodes] = useState<NodeSnapshot[]>([])
-  const [configNodes, setConfigNodes] = useState<ConfigNodeConfig[]>([])
   const [subscriptions, setSubscriptions] = useState<Subscription[]>([])
-  const [loading, setLoading] = useState(true)
+  const [metadataLoading, setMetadataLoading] = useState(true)
+  const pageIDs = useMemo(() => (nodeFilter.query.data?.items || []).map(node => node.id), [nodeFilter.query.data?.items])
+  const pageDetails = useQuery({
+    queryKey: ['nodeDiagnosticPage', pageIDs],
+    enabled: nodeFilter.query.isSuccess,
+    queryFn: async ({ signal }) => {
+      const [runtime, config, unlock, checks] = await Promise.all([
+        fetchNodes(pageIDs, signal), fetchConfigNodes(undefined, pageIDs, signal),
+        fetchUnlockResults(pageIDs, signal), fetchNodeCheckResults(pageIDs, signal),
+      ])
+      return { nodes: runtime.nodes, configNodes: config.nodes, unlock: normalizeUnlockResults(unlock.results),
+        diagnostics: Object.fromEntries(checks.results.map(item => [item.node_id, item])) }
+    },
+    refetchInterval: 10_000,
+  })
+  const nodes = useMemo(() => pageDetails.data?.nodes || [], [pageDetails.data?.nodes])
+  const configNodes = useMemo(() => pageDetails.data?.configNodes || [], [pageDetails.data?.configNodes])
+  const loading = metadataLoading || nodeFilter.query.isLoading || pageDetails.isLoading
 
   // node_id -> result. Results are kept across batch runs and single runs alike.
   // Keyed by the stable node ID, never by the runtime tag: tags carry a
   // generation suffix and are regenerated on every reload, which used to strand
   // persisted results and render the node as 未检测.
-  const [results, setResults] = useState<Record<number, UnlockResult>>({})
+  const [singleResults, setResults] = useState<Record<number, UnlockResult>>({})
+  const results = { ...pageDetails.data?.unlock, ...singleResults }
   const [errors, setErrors] = useState<Record<number, string>>({})
   // Per-node in-flight state, keyed by node ID for the same reason.
   const [checking, setChecking] = useState<Record<number, boolean>>({})
-  const [diagnostics, setDiagnostics] = useState<Record<number, NodeCheckResultItem>>({})
+  const diagnostics: Record<number, NodeCheckResultItem> = pageDetails.data?.diagnostics || {}
   const [checkSettings, setCheckSettings] = useState<NodeCheckSettings | null>(null)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [checkDialogOpen, setCheckDialogOpen] = useState(false)
@@ -121,37 +137,19 @@ export default function UnlockPanel() {
   // nodes that only finished their initial health check after this panel mounted
   // stop being permanently invisible here.
   const loadNodeList = useCallback(async () => {
-    const [res, configRes, subscriptionRes] = await Promise.all([
-      fetchNodes(),
-      fetchConfigNodes().catch(() => null),
-      listSubscriptions().catch(() => null),
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ['nodeDiagnosticPage'] }),
+      queryClient.invalidateQueries({ queryKey: ['nodeQuery'] }),
+      queryClient.invalidateQueries({ queryKey: ['nodeFacets'] }),
     ])
-    // unlock-checked; the dialer is registered per member tag.
-    const usable = (res.nodes || []).filter((n) => n.tag)
-    setNodes([...new Map(usable.map(node => [node.node_id, node])).values()])
-    void queryClient.invalidateQueries({ queryKey: ['nodeQuery'] })
-    void queryClient.invalidateQueries({ queryKey: ['nodeFacets'] })
-    setConfigNodes(configRes?.nodes || [])
-    setSubscriptions(subscriptionRes?.subscriptions || [])
   }, [queryClient])
 
   const loadNodes = useCallback(async () => {
     try {
       await loadNodeList()
-      // Load any previously persisted detection results so the user sees
-      // last-saved state without re-running checks.
       try {
-        const saved = await fetchUnlockResults()
-        if (saved?.results) {
-          const normalized = normalizeUnlockResults(saved.results)
-          setResults((prev) => ({ ...normalized, ...prev }))
-        }
-      } catch {
-        /* persisted results are optional */
-      }
-      try {
-        const [savedDiagnostics, settings, tasks] = await Promise.all([fetchNodeCheckResults(), fetchNodeCheckSettings(), fetchNodeCheckTasks()])
-        setDiagnostics(Object.fromEntries(savedDiagnostics.results.map((item) => [item.node_id, item])))
+        const [subscriptionRes, settings, tasks] = await Promise.all([listSubscriptions(), fetchNodeCheckSettings(), fetchNodeCheckTasks()])
+        setSubscriptions(subscriptionRes.subscriptions || [])
         setCheckSettings(settings)
         setCheckStages((current) => ({ ...current, quality: settings.ippure_enabled || settings.ip_api_enabled }))
         const running = tasks.tasks.find((task) => task.status === 'pending' || task.status === 'running')
@@ -163,7 +161,7 @@ export default function UnlockPanel() {
     } catch (err) {
       toast.error(err instanceof Error ? err.message : '加载节点失败')
     } finally {
-      setLoading(false)
+      setMetadataLoading(false)
     }
   }, [loadNodeList])
 
@@ -209,9 +207,8 @@ export default function UnlockPanel() {
     // task may have rebuilt nodes under new runtime tags, and newly available
     // nodes should appear without a manual refresh.
     await loadNodeList().catch(() => undefined)
-    const [savedDiagnostics, savedUnlock, tasks] = await Promise.all([fetchNodeCheckResults(), fetchUnlockResults(), fetchNodeCheckTasks()])
-    setDiagnostics(Object.fromEntries(savedDiagnostics.results.map((item) => [item.node_id, item])))
-    setResults(normalizeUnlockResults(savedUnlock.results || {}))
+    const tasks = await fetchNodeCheckTasks()
+    setResults({})
     setTaskHistory(tasks.tasks)
   }, [loadNodeList])
 
@@ -354,7 +351,7 @@ export default function UnlockPanel() {
     else sortedNodes.forEach((node) => next.add(node.node_id))
     return next
   })
-  const selectedTargets = nodes.filter(node => selectedIds.has(node.node_id))
+  const selectedTargets = [...selectedIds]
 
   return (
     <PageLayout className="lg:h-[calc(100vh-4rem)] lg:min-h-0 lg:overflow-hidden">
@@ -371,10 +368,10 @@ export default function UnlockPanel() {
               </button>
             ) : (
               <>
-                <button className="btn btn-primary btn-sm gap-2 shadow-sm lg:btn-md" onClick={() => setCheckDialogOpen(true)} disabled={loading || nodes.length === 0}>
+                <button className="btn btn-primary btn-sm gap-2 shadow-sm lg:btn-md" onClick={() => setCheckDialogOpen(true)} disabled={loading || summary.total === 0}>
                   <Gauge className="h-4 w-4" />综合检测
                 </button>
-                <button className="btn btn-ghost btn-sm gap-2 border border-base-300 lg:btn-md" onClick={runBatch} disabled={preparingTask || loading || nodes.length === 0}>
+                <button className="btn btn-ghost btn-sm gap-2 border border-base-300 lg:btn-md" onClick={runBatch} disabled={preparingTask || loading || summary.total === 0}>
                   <Play className="h-4 w-4" />快速解锁
                 </button>
               </>
@@ -393,6 +390,7 @@ export default function UnlockPanel() {
       />
 
       <PageContent fill className="lg:overflow-hidden">
+        {(pageDetails.error || nodeFilter.query.error) && <div role="alert" className="alert alert-error mb-4 text-sm">{(pageDetails.error || nodeFilter.query.error)?.message}</div>}
         <p className="mb-4 shrink-0 text-sm leading-6 text-base-content/55">
           原生 IP / 解锁标签现由“节点标签”页面中的规则产生；本页只负责检测并保存事实。
         </p>
@@ -447,9 +445,9 @@ export default function UnlockPanel() {
         <section className="mb-5 grid shrink-0 grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
           <SummaryCard
             label="解锁已检测 / 节点"
-            value={nodes.length > 0 ? `${summary.tested} / ${summary.total}` : '0'}
+            value={summary.total > 0 ? `${summary.tested} / ${summary.total}` : '0'}
             hint={
-              nodes.length === 0
+              summary.total === 0
                 ? '暂无运行节点'
                 : summary.untested === 0
                   ? '覆盖率 100% · 全部已完成'
@@ -524,7 +522,7 @@ export default function UnlockPanel() {
                   active={statusFilter === ''}
                   onClick={() => setStatusFilter('')}
                   label="全部"
-                  count={nodes.length}
+                  count={nodeFilter.query.data?.total || 0}
                 />
                 <FilterChip
                   active={statusFilter === 'residential'}
@@ -685,9 +683,9 @@ export default function UnlockPanel() {
                       <div className="flex flex-col items-center justify-center gap-2">
                         <Globe2 className="h-8 w-8 text-base-content/30" />
                         <p className="font-medium text-base-content/70">
-                          {nodes.length === 0 ? '暂无运行节点' : '没有找到匹配的节点'}
+                          {summary.total === 0 ? '暂无运行节点' : '没有找到匹配的节点'}
                         </p>
-                        {nodes.length > 0 && nodeFilter.spec.text?.trim() && (
+                        {summary.total > 0 && nodeFilter.spec.text?.trim() && (
                           <p className="text-xs text-base-content/45">请尝试缩短关键词或检查拼写</p>
                         )}
                         {isFilterActive && (
@@ -755,7 +753,7 @@ export default function UnlockPanel() {
             catch (error) { toast.error(error instanceof Error ? error.message : '保存设置失败') }
           }}
           onClose={() => setCheckDialogOpen(false)}
-          onStart={() => { if (!preparingTask) void (checkScope === 'selected' ? launchTask(selectedTargets.map(node => node.node_id), checkStages, checkSettings) : runFilteredTask(checkStages, checkSettings)) }}
+          onStart={() => { if (!preparingTask) void (checkScope === 'selected' ? launchTask(selectedTargets, checkStages, checkSettings) : runFilteredTask(checkStages, checkSettings)) }}
         />
       )}
     </PageLayout>

@@ -20,6 +20,20 @@ import (
 )
 
 func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
+	ids, ok := requestedNodeIDs(w, r)
+	if !ok {
+		return
+	}
+	if ids != nil {
+		nodes := []monitor.Snapshot{}
+		for _, id := range ids {
+			if node := s.mgr.SnapshotForNodeID(id); node != nil {
+				nodes = append(nodes, *node)
+			}
+		}
+		writeJSON(w, map[string]any{"nodes": nodes, "total_nodes": len(nodes)})
+		return
+	}
 	// 返回所有注册节点，让前端根据状态过滤展示
 	allNodes := s.mgr.Snapshot()
 	totalNodes := len(allNodes)
@@ -524,13 +538,23 @@ func (s *Server) handleUnlockAll(w http.ResponseWriter, r *http.Request) {
 // detections without re-running the checks. It is read-only and never touches
 // the live probes.
 func (s *Server) handleUnlockResults(w http.ResponseWriter, r *http.Request) {
+	ids, ok := requestedNodeIDs(w, r)
+	if !ok {
+		return
+	}
 	if s.store == nil {
 		writeJSON(w, map[string]any{"results": map[string]any{}})
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	stored, err := s.store.ListUnlockResults(ctx)
+	var stored map[int64]*store.UnlockResult
+	var err error
+	if ids == nil {
+		stored, err = s.store.ListUnlockResults(ctx)
+	} else {
+		stored, err = s.store.ListUnlockResultsByIDs(ctx, ids)
+	}
 	if err != nil {
 		writeJSON(w, map[string]any{"error": err.Error()})
 		return

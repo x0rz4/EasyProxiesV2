@@ -51,6 +51,7 @@ type Store interface {
 	// ListManagedNodes returns nodes visible to node management. Subscription
 	// nodes are included only through enabled subscription memberships.
 	ListManagedNodes(ctx context.Context, subscriptionID *int64) ([]ManagedNode, error)
+	ListManagedNodesByIDs(ctx context.Context, subscriptionID *int64, ids []int64) ([]ManagedNode, error)
 
 	// GetNode returns a node by its ID.
 	GetNode(ctx context.Context, id int64) (*Node, error)

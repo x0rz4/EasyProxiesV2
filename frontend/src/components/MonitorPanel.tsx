@@ -29,7 +29,7 @@ export default function MonitorPanel() {
   
   const { data, refetch: refetchNodes, error: monitorError, isLoading: loadingNodes, isRefetching } = useQuery({
     queryKey: ['nodes'],
-    queryFn: fetchNodes,
+    queryFn: ({ signal }) => fetchNodes(undefined, signal),
     refetchInterval: autoRefresh > 0 ? autoRefresh * 1000 : false
   })
   

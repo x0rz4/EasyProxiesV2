@@ -296,12 +296,27 @@ func (s *Server) handleNodeCheckResults(w http.ResponseWriter, r *http.Request) 
 	if !s.requireStore(w, storeUnavailableNotInitialized) {
 		return
 	}
-	detections, err := s.store.ListNodeDetectionResults(r.Context())
+	requested, ok := requestedNodeIDs(w, r)
+	if !ok {
+		return
+	}
+	var detections map[int64]*store.NodeDetectionResult
+	var quality map[int64][]store.NodeIPQualityResult
+	var err error
+	if requested == nil {
+		detections, err = s.store.ListNodeDetectionResults(r.Context())
+	} else {
+		detections, err = s.store.ListNodeDetectionResultsByIDs(r.Context(), requested)
+	}
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	quality, err := s.store.ListNodeIPQualityResults(r.Context())
+	if requested == nil {
+		quality, err = s.store.ListNodeIPQualityResults(r.Context())
+	} else {
+		quality, err = s.store.ListNodeIPQualityResultsByIDs(r.Context(), requested)
+	}
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -313,9 +328,15 @@ func (s *Server) handleNodeCheckResults(w http.ResponseWriter, r *http.Request) 
 		ExitIPDrift bool                        `json:"exit_ip_drift"`
 	}
 	ids := make(map[int64]struct{})
-	for _, snapshot := range s.mgr.Snapshot() {
-		if snapshot.NodeID > 0 {
-			ids[snapshot.NodeID] = struct{}{}
+	if requested != nil {
+		for _, id := range requested {
+			ids[id] = struct{}{}
+		}
+	} else {
+		for _, snapshot := range s.mgr.Snapshot() {
+			if snapshot.NodeID > 0 {
+				ids[snapshot.NodeID] = struct{}{}
+			}
 		}
 	}
 	for id := range detections {

@@ -52,3 +52,5 @@ frontend/src/
 ```
 
 配 vite dev server + 临时入口 html（如 `frontend/panel-check.html` + `src/panel-check.tsx`，**验完必须删除**）。用 `?open=N` 之类 query 参数 + `setTimeout` 里 `document.querySelectorAll('[aria-haspopup="listbox"]')[N].click()` 可截到浮层展开态。
+
+节点管理与解锁检测页先查询当前页 ID，再按 ID 获取配置、运行态及诊断结果；详情请求随页面切换取消。全局数量来自 facets，跨页选择只保存 ID，检测筛选全体走 query-ids。批量探测在点击后分批解析所选运行态，每次最多 200 个；不会为显示一页后台抓取所有节点。

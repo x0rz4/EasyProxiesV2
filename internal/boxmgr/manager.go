@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -1973,17 +1974,40 @@ var errConfigUnavailable = errors.New("config is not initialized")
 // Port numbers are taken from the active config (m.cfg.Nodes) since they
 // are dynamically assigned by NormalizeWithPortMap and may not be in the Store.
 func (m *Manager) ListConfigNodes(ctx context.Context, subscriptionID *int64) ([]controlplane.ManagedNodeConfig, error) {
+	return m.listConfigNodes(ctx, subscriptionID, nil)
+}
+
+func (m *Manager) ListConfigNodesByIDs(ctx context.Context, subscriptionID *int64, ids []int64) ([]controlplane.ManagedNodeConfig, error) {
+	if len(ids) == 0 {
+		return []controlplane.ManagedNodeConfig{}, nil
+	}
+	return m.listConfigNodes(ctx, subscriptionID, ids)
+}
+
+func (m *Manager) listConfigNodes(ctx context.Context, subscriptionID *int64, ids []int64) ([]controlplane.ManagedNodeConfig, error) {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
 
 	if m.cfg == nil {
+		m.mu.RUnlock()
 		return nil, errConfigUnavailable
 	}
 
+	activeNodes := make([]config.NodeConfig, 0)
+	for _, node := range m.cfg.Nodes {
+		if ids == nil || slices.Contains(ids, node.ID) {
+			activeNodes = append(activeNodes, node)
+		}
+	}
+	dataStore := m.store
+	m.mu.RUnlock()
+
 	// If no store, just return active nodes
-	if m.store == nil {
-		result := make([]controlplane.ManagedNodeConfig, 0, len(m.cfg.Nodes))
-		for _, node := range m.cfg.Nodes {
+	if dataStore == nil {
+		result := make([]controlplane.ManagedNodeConfig, 0, len(activeNodes))
+		for _, node := range activeNodes {
+			if ids != nil && !slices.Contains(ids, node.ID) {
+				continue
+			}
 			result = append(result, managedNodeConfig(node, nil))
 		}
 		return result, nil
@@ -1992,20 +2016,29 @@ func (m *Manager) ListConfigNodes(ctx context.Context, subscriptionID *int64) ([
 	// Build a lookup from URI → runtime port from the active config.
 	// These ports are dynamically assigned by NormalizeWithPortMap and
 	// reflect the actual listening ports in the current sing-box instance.
-	runtimePorts := make(map[string]uint16, len(m.cfg.Nodes))
-	for _, n := range m.cfg.Nodes {
+	runtimePorts := make(map[string]uint16, len(activeNodes))
+	for _, n := range activeNodes {
 		if n.Port > 0 {
 			runtimePorts[n.NodeKey()] = n.Port
 		}
 	}
 
 	// Fetch all nodes from store (including disabled ones)
-	storeNodes, err := m.store.ListManagedNodes(ctx, subscriptionID)
+	var storeNodes []store.ManagedNode
+	var err error
+	if ids == nil {
+		storeNodes, err = dataStore.ListManagedNodes(ctx, subscriptionID)
+	} else {
+		storeNodes, err = dataStore.ListManagedNodesByIDs(ctx, subscriptionID, ids)
+	}
 	if err != nil {
+		if ids != nil {
+			return nil, err
+		}
 		// Fallback to config nodes if store fails
 		m.logger.Warnf("failed to list nodes from store: %v, falling back to config", err)
-		result := make([]controlplane.ManagedNodeConfig, 0, len(m.cfg.Nodes))
-		for _, node := range m.cfg.Nodes {
+		result := make([]controlplane.ManagedNodeConfig, 0, len(activeNodes))
+		for _, node := range activeNodes {
 			result = append(result, managedNodeConfig(node, nil))
 		}
 		return result, nil

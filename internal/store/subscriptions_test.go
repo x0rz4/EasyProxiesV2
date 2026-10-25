@@ -722,6 +722,18 @@ func TestListManagedNodes(t *testing.T) {
 	}
 
 	filtered, err := db.ListManagedNodes(ctx, &enabled.ID)
+	page, pageErr := db.ListManagedNodesByIDs(ctx, nil, []int64{byName[shared.Name].ID, orphan.ID})
+	if pageErr != nil || len(page) != 1 || page[0].Name != shared.Name {
+		t.Fatalf("ID page widened visibility: %+v %v", page, pageErr)
+	}
+	empty, emptyErr := db.ListManagedNodesByIDs(ctx, nil, []int64{})
+	if emptyErr != nil || len(empty) != 0 {
+		t.Fatalf("empty IDs widened: %+v %v", empty, emptyErr)
+	}
+	wrongSource, sourceErr := db.ListManagedNodesByIDs(ctx, &enabled.ID, []int64{manual.ID})
+	if sourceErr != nil || len(wrongSource) != 0 {
+		t.Fatalf("ID filter escaped subscription: %+v %v", wrongSource, sourceErr)
+	}
 	if err != nil || len(filtered) != 2 {
 		t.Fatalf("enabled subscription filter: nodes=%+v err=%v", filtered, err)
 	}

@@ -162,8 +162,21 @@ export function logout() {
 
 // ---- Nodes API ----
 
-export async function fetchNodes(): Promise<NodesResponse> {
-  return request<NodesResponse>('/api/nodes')
+function nodeIDsQuery(ids?: number[]): string {
+  return ids === undefined ? '' : `?node_ids=${encodeURIComponent(ids.join(','))}`
+}
+
+export async function fetchNodes(ids?: number[], signal?: AbortSignal): Promise<NodesResponse> {
+  return request<NodesResponse>(`/api/nodes${nodeIDsQuery(ids)}`, { signal })
+}
+
+/** Explicit bulk actions resolve stable IDs in bounded detail requests. */
+export async function fetchNodesByIDs(ids: number[]) {
+  const nodes: NodesResponse['nodes'] = []
+  for (let offset = 0; offset < ids.length; offset += 200) {
+    nodes.push(...(await fetchNodes(ids.slice(offset, offset + 200))).nodes)
+  }
+  return nodes
 }
 
 export async function fetchProbeSettings(): Promise<ProbeOperationsSettings> {
@@ -178,8 +191,8 @@ export async function updateNodeCheckSettings(settings: NodeCheckSettings): Prom
   return request<NodeCheckSettings>('/api/operations/node-check-settings', { method: 'PUT', body: JSON.stringify(settings) })
 }
 
-export async function fetchNodeCheckResults(): Promise<{ results: NodeCheckResultItem[] }> {
-  return request('/api/node-check/results')
+export async function fetchNodeCheckResults(ids?: number[], signal?: AbortSignal): Promise<{ results: NodeCheckResultItem[] }> {
+  return request(`/api/node-check/results${nodeIDsQuery(ids)}`, { signal })
 }
 
 export async function fetchNodeCheckTasks(): Promise<{ tasks: NodeCheckTask[] }> {
@@ -389,8 +402,8 @@ export async function unlockNode(tag: string): Promise<UnlockResult> {
 }
 
 /** Fetch the last persisted unlock detection result for every node. */
-export async function fetchUnlockResults(): Promise<UnlockResultsResponse> {
-  return request<UnlockResultsResponse>('/api/nodes/unlock-results')
+export async function fetchUnlockResults(ids?: number[], signal?: AbortSignal): Promise<UnlockResultsResponse> {
+  return request<UnlockResultsResponse>(`/api/nodes/unlock-results${nodeIDsQuery(ids)}`, { signal })
 }
 
 /** Probe all nodes with SSE progress updates */
@@ -584,9 +597,11 @@ export async function updateSettings(settings: SettingsData): Promise<SettingsUp
 
 // ---- Config Nodes CRUD API ----
 
-export async function fetchConfigNodes(subscriptionId?: number): Promise<ConfigNodesResponse> {
-  const query = subscriptionId === undefined ? '' : `?subscription_id=${encodeURIComponent(subscriptionId)}`
-  return request<ConfigNodesResponse>(`/api/nodes/config${query}`)
+export async function fetchConfigNodes(subscriptionId?: number, ids?: number[], signal?: AbortSignal): Promise<ConfigNodesResponse> {
+  const query = new URLSearchParams()
+  if (subscriptionId !== undefined) query.set('subscription_id', String(subscriptionId))
+  if (ids !== undefined) query.set('node_ids', ids.join(','))
+  return request<ConfigNodesResponse>(`/api/nodes/config?${query}`, { signal })
 }
 
 export async function createConfigNode(payload: ConfigNodePayload): Promise<ConfigNodeMutationResponse> {

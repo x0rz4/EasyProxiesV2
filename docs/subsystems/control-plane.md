@@ -47,3 +47,5 @@ monitor 从不反向 import httpapi；httpapi 不 import boxmgr
 综合检测 SSE 在同一任务锁内订阅并复制初始状态；已结束任务直接发送 done。终态事件在满队列时替换一条进度，保证可达。连接每 15 秒心跳，每次写入/flush 设置 10 秒期限，写失败、请求取消或 Server 关闭后解除订阅。
 
 Server 关闭幂等发送停止信号，HTTP 优雅关闭超时则关闭连接；等待综合检测任务完成终态写入后返回。自动随运行上下文关闭时使用十秒预算。
+
+GET /api/nodes、/api/nodes/config、/api/nodes/unlock-results、/api/node-check/results 支持 node_ids 正整数逗号列表（最多 200 个）。参数缺席保持全量兼容；显式空列表返回空，非法值返回 400。配置详情复用 controlplane.NodeDetailReader 与 store.ListManagedNodesByIDs，保持启用订阅可见性；认证权限与原接口一致。

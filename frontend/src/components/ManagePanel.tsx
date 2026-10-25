@@ -4,7 +4,7 @@ import {
   fetchConfigNodes, createConfigNode, updateConfigNode, deleteConfigNode,
   toggleConfigNode, batchToggleConfigNodes, batchDeleteConfigNodes, triggerReload,
   importNodes, exportProxies,
-  fetchNodes, fetchProbeStatus, probeNode, releaseNode, listSubscriptions,
+  fetchNodes, fetchNodesByIDs, fetchProbeStatus, probeNode, releaseNode, listSubscriptions,
 } from '../api/client'
 import type { ImportIssue, ImportNodesResult } from '../api/client'
 import { regionFlag } from '../utils/region'
@@ -162,6 +162,8 @@ const emptyPayload: ConfigNodePayload = {
 
 export default function ManagePanel() {
   const queryClient = useQueryClient()
+  const nodeFilter = useNodeFilter()
+  const pageIDs = useMemo(() => (nodeFilter.query.data?.items || []).map(node => node.id), [nodeFilter.query.data?.items])
 
   const { data: probeStatus } = useQuery({
     queryKey: ['probeStatus'],
@@ -171,10 +173,11 @@ export default function ManagePanel() {
       : pendingProbeRefreshInterval,
   })
   const probeInFlight = Boolean(probeStatus?.round.in_flight)
-  const { data: configRes, isLoading: configLoading } = useQuery({ queryKey: ['configNodes'], queryFn: () => fetchConfigNodes() })
+  const { data: configRes, isLoading: configLoading } = useQuery({ queryKey: ['configNodes', pageIDs], queryFn: ({ signal }) => fetchConfigNodes(undefined, pageIDs, signal), enabled: nodeFilter.query.isSuccess })
   const { data: monitorRes, isLoading: monitorLoading } = useQuery({
-    queryKey: ['nodes'],
-    queryFn: () => fetchNodes().catch(() => null),
+    queryKey: ['nodes', pageIDs],
+    queryFn: ({ signal }) => fetchNodes(pageIDs, signal),
+    enabled: nodeFilter.query.isSuccess,
     refetchInterval: (query) => {
       if (probeInFlight) return activeProbeRefreshInterval
       const hasPendingNodes = hasPendingRuntimeNodes(configRes?.nodes || [], query.state.data?.nodes || [])
@@ -194,7 +197,7 @@ export default function ManagePanel() {
   const configNodes = useMemo(() => configRes?.nodes || [], [configRes?.nodes])
   const monitorData = monitorRes
   const subscriptions = subRes?.subscriptions || []
-  const loading = configLoading || monitorLoading || subLoading
+  const loading = nodeFilter.query.isLoading || configLoading || monitorLoading || subLoading
 
   const [needReload, setNeedReload] = useState(false)
 
@@ -221,7 +224,6 @@ export default function ManagePanel() {
   const [batchDeleteConfirm, setBatchDeleteConfirm] = useState(false)
   const [batchProbeProgress, setBatchProbeProgress] = useState<{ current: number; total: number } | null>(null)
 
-  const nodeFilter = useNodeFilter()
   const sortKey: ManageSortKey = nodeFilter.page.sort === 'latency_ms' ? 'latency' : (['name', 'status', 'region', 'port', 'source'] as string[]).includes(nodeFilter.page.sort) ? nodeFilter.page.sort as ManageSortKey : 'name'
   const sortDir: SortDir = nodeFilter.page.descending ? 'desc' : 'asc'
   const hasFilters = Object.keys(nodeFilter.spec).some(key => key !== 'version')
@@ -317,10 +319,10 @@ export default function ManagePanel() {
       return node ? [node] : []
     })
   }, [mergedNodes, nodeFilter.query.data])
-  // Selection survives pagination. Batch actions use every selected existing node.
+  // Selection is independent of the currently loaded page.
   const visibleSelectedIDs = useMemo(
-    () => mergedNodes.filter(node => node.id !== undefined && selectedNodes.has(node.id)).map(node => node.id as number),
-    [mergedNodes, selectedNodes],
+    () => [...selectedNodes],
+    [selectedNodes],
   )
   const pageSelectedCount = sortedNodes.filter(node => node.id !== undefined && selectedNodes.has(node.id)).length
 
@@ -491,9 +493,13 @@ export default function ManagePanel() {
   }
 
   const handleBatchProbe = async () => {
-    const nodesToProbe = mergedNodes.filter(n => n.id !== undefined && selectedNodes.has(n.id) && !n.disabled && n.tag)
+    setBatchProcessing(true)
+    let nodesToProbe: NodeSnapshot[]
+    try { nodesToProbe = (await fetchNodesByIDs([...selectedNodes])).filter(node => node.tag) }
+    catch (error) { toast.error(error instanceof Error ? error.message : '加载所选节点失败'); setBatchProcessing(false); return }
     if (nodesToProbe.length === 0) {
       toast.error('所选节点中没有可探测的节点（已禁用或无运行时标识的节点将被跳过）')
+      setBatchProcessing(false)
       return
     }
 
@@ -655,10 +661,12 @@ export default function ManagePanel() {
   }
 
   // ---- Stats ----
-  const disabledCount = mergedNodes.filter(n => n.runtimeStatus === 'disabled').length
-  const blacklistedCount = mergedNodes.filter(n => n.runtimeStatus === 'blacklisted').length
-  const normalCount = mergedNodes.filter(n => n.runtimeStatus === 'normal').length
-  const unloadedCount = mergedNodes.filter(n => n.runtimeStatus === 'unloaded').length
+  const statusCount = (status: string) => nodeFilter.facets.data?.statuses.find(item => item.value === status)?.count || 0
+  const disabledCount = statusCount('disabled')
+  const blacklistedCount = statusCount('blacklisted')
+  const normalCount = statusCount('normal')
+  const unloadedCount = statusCount('unloaded')
+  const totalNodes = nodeFilter.facets.data?.total || 0
 
   // ---- Render ----
 
@@ -680,7 +688,7 @@ export default function ManagePanel() {
       <PageHeader
         title="节点管理"
         description={<div className="flex flex-wrap items-center gap-2 font-medium">
-              <span>共 <strong className="text-base-content/80">{mergedNodes.length}</strong> 个节点</span>
+              <span>共 <strong className="text-base-content/80">{totalNodes}</strong> 个节点</span>
               {normalCount > 0 && <span className="badge badge-success badge-xs border-none bg-success/15 text-success">正常 {normalCount}</span>}
               {blacklistedCount > 0 && <span className="badge badge-error badge-xs border-none bg-error/15 text-error">黑名单 {blacklistedCount}</span>}
               {unloadedCount > 0 && (
@@ -720,6 +728,9 @@ export default function ManagePanel() {
       />
 
       <PageContent>
+      {(nodeFilter.query.error || configRes === undefined && !configLoading || monitorRes === undefined && !monitorLoading) && (
+        <div role="alert" className="alert alert-error text-sm">节点详情加载失败，请刷新重试。</div>
+      )}
         {/* Alerts */}
       {needReload && (
         <div role="alert" className="alert alert-warning alert-soft text-sm">
@@ -965,9 +976,9 @@ export default function ManagePanel() {
       </div>
 
       {/* Summary */}
-      {(nodeFilter.query.data?.total || 0) !== mergedNodes.length && (
+      {(nodeFilter.query.data?.total || 0) !== totalNodes && (
         <div className="text-center text-xs text-base-content/30">
-          筛选显示 {(nodeFilter.query.data?.total || 0)} / {mergedNodes.length} 个节点
+          筛选显示 {(nodeFilter.query.data?.total || 0)} / {totalNodes} 个节点
         </div>
       )}
 

@@ -48,6 +48,10 @@ func (s *Server) handleConfigNodesList(w http.ResponseWriter, r *http.Request) {
 	if !s.ensureNodeManager(w) {
 		return
 	}
+	ids, ok := requestedNodeIDs(w, r)
+	if !ok {
+		return
+	}
 	var subscriptionID *int64
 	if raw := r.URL.Query().Get("subscription_id"); raw != "" {
 		id, err := strconv.ParseInt(raw, 10, 64)
@@ -58,7 +62,16 @@ func (s *Server) handleConfigNodesList(w http.ResponseWriter, r *http.Request) {
 		}
 		subscriptionID = &id
 	}
-	nodes, err := s.nodeMgr.ListConfigNodes(r.Context(), subscriptionID)
+	var nodes []controlplane.ManagedNodeConfig
+	var err error
+	if ids == nil {
+		nodes, err = s.nodeMgr.ListConfigNodes(r.Context(), subscriptionID)
+	} else if reader, ok := s.nodeMgr.(controlplane.NodeDetailReader); ok {
+		nodes, err = reader.ListConfigNodesByIDs(r.Context(), subscriptionID, ids)
+	} else {
+		writeAPIError(w, 503, "节点详情读取不可用")
+		return
+	}
 	if err != nil {
 		s.respondNodeError(w, err)
 		return

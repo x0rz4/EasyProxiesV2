@@ -28,6 +28,11 @@ type BatchNodeCreator interface {
 	CreateNodes(ctx context.Context, nodes []config.NodeConfig, dryRun bool) (NodeBatchResult, error)
 }
 
+// NodeDetailReader serves bounded management pages through the normal node view.
+type NodeDetailReader interface {
+	ListConfigNodesByIDs(context.Context, *int64, []int64) ([]ManagedNodeConfig, error)
+}
+
 // NodeBatchResult is the per-row outcome of a batch creation.
 //
 // Planned holds the normalized rows that were (or, for a dry run, would be)

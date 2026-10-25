@@ -217,6 +217,17 @@ func nodeFilterConditions(filter NodeFilter) ([]string, []any) {
 }
 
 func (s *sqliteStore) ListManagedNodes(ctx context.Context, subscriptionID *int64) ([]ManagedNode, error) {
+	return s.listManagedNodes(ctx, subscriptionID, nil)
+}
+
+func (s *sqliteStore) ListManagedNodesByIDs(ctx context.Context, subscriptionID *int64, ids []int64) ([]ManagedNode, error) {
+	if len(ids) == 0 {
+		return []ManagedNode{}, nil
+	}
+	return s.listManagedNodes(ctx, subscriptionID, ids)
+}
+
+func (s *sqliteStore) listManagedNodes(ctx context.Context, subscriptionID *int64, ids []int64) ([]ManagedNode, error) {
 	query := `SELECT n.id, n.uri, n.name, n.source, n.port, n.username, n.password,
 		n.region, n.country, n.enabled, n.tags, n.identity_hash, n.canonical_json, n.created_at, n.updated_at,
 		COALESCE(GROUP_CONCAT(DISTINCT CASE WHEN subscriptions.enabled=1 THEN subscriptions.id END), '')
@@ -230,10 +241,14 @@ func (s *sqliteStore) ListManagedNodes(ctx context.Context, subscriptionID *int6
 			WHERE filter_membership.node_id=n.id AND filter_membership.subscription_id=? AND filter_subscription.enabled=1)`
 		args = append(args, *subscriptionID)
 	} else {
-		query += ` WHERE n.source<>? OR EXISTS (SELECT 1 FROM subscription_nodes visible_membership
+		query += ` WHERE (n.source<>? OR EXISTS (SELECT 1 FROM subscription_nodes visible_membership
 			JOIN subscriptions visible_subscription ON visible_subscription.id=visible_membership.subscription_id
-			WHERE visible_membership.node_id=n.id AND visible_subscription.enabled=1)`
+			WHERE visible_membership.node_id=n.id AND visible_subscription.enabled=1))`
 		args = append(args, NodeSourceSubscription)
+	}
+	if len(ids) > 0 {
+		query += ` AND n.id IN ` + inClause(len(ids))
+		args = append(args, idArgs(ids)...)
 	}
 	query += ` GROUP BY n.id ORDER BY n.id`
 
