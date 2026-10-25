@@ -35,13 +35,13 @@ EasyProxiesV2 是一个轻量级、高性能的代理池与订阅管理工具，
 
 ## 一键安装（Linux amd64 / arm64）
 
-下载脚本后选择 Docker 或二进制部署。Docker 模式需要事先安装 Docker；二进制自动启动需要 root 和 systemd。
+下载脚本后选择 Docker 或二进制部署。二进制模式自动注册 Linux 系统服务、启用开机自启并立即启动，需要 root 和正在运行的 systemd 或 OpenRC；Docker 模式需要事先安装 Docker。
 
 ```bash
 curl -fL https://raw.githubusercontent.com/x0rz4/EasyProxiesV2/main/install.sh -o install.sh
 # Docker 部署（当前用户需有 Docker 权限，默认使用 host 网络）
 sudo bash install.sh --method docker
-# 或：Release 二进制 + systemd 服务
+# 或：Release 二进制 + 系统服务（自动识别 systemd / OpenRC）
 sudo bash install.sh --method binary
 ```
 
@@ -56,11 +56,33 @@ bash install.sh --method binary --version 2.1.0 --dir "$HOME/easy-proxies" --no-
 
 二进制安装会验证 Release 提供的 SHA256。`--no-start` 在二进制模式只安装文件，在 Docker 模式只拉取镜像和准备配置。Docker 容器名为 `easy-proxies`，脚本只替换自身创建的容器。切换部署方式前，请先停止旧服务以免端口冲突；降级前备份数据。
 
+已安装的二进制可以单独注册服务，无需重新下载。下面的服务管理命令均适用于 systemd / OpenRC：
+
+```bash
+# 用现有 easy-proxies 和 config.yaml 注册服务、开启自启并启动
+sudo bash install.sh --action register --dir /opt/easy-proxies
+# 查询运行状态和开机自启状态
+bash install.sh --action status
+# 启动 / 停止 / 重启
+sudo bash install.sh --action start
+sudo bash install.sh --action stop
+sudo bash install.sh --action restart
+# 关闭 / 开启开机自启（不改变当前运行状态）
+sudo bash install.sh --action disable
+sudo bash install.sh --action enable
+# 注销系统服务，保留二进制、配置和数据库
+sudo bash install.sh --action unregister --dir /opt/easy-proxies
+```
+
+`--action register --no-start` 只注册并启用自启，不立即启动；安装/注册时添加 `--no-autostart` 则关闭开机自启。详细参数、OpenRC 依赖和失败排查见 [Linux 服务部署说明](docs/deployment.md)。
+
 ```bash
 # 二进制服务日志 / Docker 日志
 journalctl -u easy-proxies -f
 docker logs -f easy-proxies
 ```
+
+OpenRC 将进程输出写入系统日志，标签为 `easy-proxies`，可用系统的日志工具查询（例如 Alpine 的 `logread -e easy-proxies`）。
 
 ## 🚀 Release 二进制（Linux amd64 / arm64）
 

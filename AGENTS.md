@@ -24,6 +24,7 @@ EasyProxiesV2：基于 [sing-box](https://github.com/SagerNet/sing-box)（**以�
 | **写代码 / 自审** | [docs/code-standards.md](docs/code-standards.md)（§A–§K 硬规则） | 收工前扫 [LESSONS.md](LESSONS.md) 相关条目；PR 自检用 [code-standards §L 审查清单](docs/code-standards.md) |
 | **提 PR / 审社区 PR** | [docs/contributors.md](docs/contributors.md)（PR 必含内容、验证矩阵、直接打回清单、特别项） | [code-standards §L](docs/code-standards.md) 逐条过 |
 | 构建 / 测试 / 发布 / 版本递增 | [docs/code-standards.md](docs/code-standards.md) §I + §H（命令与陷阱） | 发布纪律另见 [LESSONS L-012 / L-013](LESSONS.md) |
+| 改 install.sh / Linux 服务注册 / 开机自启 | [docs/deployment.md](docs/deployment.md) | [code-standards](docs/code-standards.md) §I；tests/test_install.py |
 | 查"运行时契约/Requirement/规模提案/历史设计" | [plane/README.md](plane/README.md)（specs/ 当前契约、changes/ 提案、专题与历史记录入口） | 历史文档的旧限制不覆盖当前规范（[LESSONS L-018](LESSONS.md)） |
 | **每晚复盘**（合并当天 commit 后） | [LESSONS.md](LESSONS.md) §机制（三类问题、Seen 3× 升级、Done right） | 执行 code-standards §K 的文档同步清单 |
 | 碰到怪现象，怀疑以前踩过 | [LESSONS.md](LESSONS.md) 全文检索关键词 | — |

@@ -266,3 +266,15 @@ API Key 使用记录 MUST 合并同一 Key 的最新观测，使用单一消费�
 - THEN 最新时间保留待重试，写入受节流约束，退出尝试最终写入。
 
 代码：`internal/controlplane/auth_usage.go`、`internal/store/sqlite.go`。测试：`TestAPIKeyUseCoalescesAndFlushesLatest`、`TestAPIKeyUseRetriesWithoutDroppingNewObservation`、`TestAPIKeyUseShutdownBudgetAndRebinding`、`TestAPIKeyUsageQueueIsBounded`。
+
+## Requirement DEPLOY-001：Linux 服务注册和自启可独立管理
+
+二进制默认安装 MUST 注册当前 Linux 服务管理器的服务、启用开机自启并启动；已有本地程序的 register 和各服务管理动作 MUST 不依赖 Release 下载。默认 install 的 no-start MUST 保持仅文件安装语义。禁用自启不停止当前进程；注销服务 MUST 保留程序、配置和数据库。非法环境或服务归属冲突 MUST 拒绝操作，启动/自启验证失败不得记录安装成功。
+
+### Scenario: 已有程序补注册、关闭自启和注销
+
+- GIVEN 目录里有可执行程序、配置与数据库，Linux 使用 systemd 或 OpenRC。
+- WHEN 离线注册，随后禁用自启或注销服务。
+- THEN 注册可重复执行；禁用只改开机行为，注销停止服务但保留已有文件；下载和无关服务不受影响。
+
+代码：`install.sh`。测试：`tests/test_install.py`（离线注册、systemd/OpenRC 生命周期、归属保护、失败与数据保留）。部署说明：`docs/deployment.md`。测试中的服务管理器是模拟，不代替真实服务器重启验收。

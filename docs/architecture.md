@@ -4,7 +4,7 @@
 > 权威行为契约见 [plane/specs/proxy-pool/spec.md](../plane/specs/proxy-pool/spec.md)（MUST/场景）；
 > 变更提案与历史见 [plane/](../plane/)。本文件只讲"现在是怎么搭的"，不写"应该怎么改"。
 >
-> 基线核对：v2.2.10，migration 至 v25，`internal/` + `cmd/` 约 **40.7k** 行非测试代码、约 **23.1k** 行测试，
+> 基线核对：v2.2.11，migration 至 v25，`internal/` + `cmd/` 约 **40.7k** 行非测试代码、约 **23.1k** 行测试，
 > 前端 `frontend/src` 约 **10.1k** 行 TS/TSX。核对日期 2026-10-26。
 
 ## 1. 一句话说清这个系统
@@ -37,7 +37,7 @@ plane/README.md               规格入口：当前契约 specs/、变更计划 
 config.example.yaml           配置模板（复制为 config.yaml 使用；config.yaml 不入库）
 Dockerfile / Dockerfile.ci    本地全量构建 / CI 只带产物的运行时镜像
 docker-compose.yml            GHCR 镜像 + 数据卷（EASY_PROXIES_VERSION 可指定版本）
-install.sh                    Linux Docker / 二进制安装及更新入口
+install.sh                    Linux Docker / 二进制安装、systemd/OpenRC 注册及服务管理入口
 tests/test_install.py         安装脚本单测
 .github/workflows/            打 tag 触发：多架构二进制 + Docker 镜像发布
 ```
@@ -231,5 +231,6 @@ docker compose up -d --build
 | subscription/config/nodecodec/subrender 订阅与解析 | [subsystems/subscription.md](subsystems/subscription.md) |
 | store/migrations/jsonx 持久化 | [subsystems/persistence.md](subsystems/persistence.md) |
 | frontend 前端 | [subsystems/frontend.md](subsystems/frontend.md) |
+| Linux 安装与服务生命周期 | [deployment.md](deployment.md) |
 
 退出由 internal/app/shutdown.go 的单一清理链负责：先取消运行上下文，再按逆装配顺序关闭组件，数据库最后关闭。整个退出（含启动失败清理）共享 30 秒预算；超时 Run 返回错误，由进程入口结束进程。不可取消的第三方 Close 只占用一个清理 goroutine，清理链仍按顺序等待，不会在后台组件未退出时提前关闭数据库。
