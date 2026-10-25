@@ -123,6 +123,21 @@ func TestApplyGroupMembershipChangesRebuildsOnlyAffectedGroups(t *testing.T) {
 	if len(members) != 2 {
 		t.Fatalf("cached config still resolves %d VIP members, want 2: %+v", len(members), members)
 	}
+	// A failed prior application may leave current cached facts with an older
+	// published runtime. A retry must compare against that runtime as well.
+	slot := manager.groupSlot(21)
+	slot.mu.Lock()
+	slot.appliedFingerprint = "previous runtime"
+	slot.mu.Unlock()
+	if err := manager.ApplyGroupMembershipChanges(ctx, []int64{untagged.ID}); err != nil {
+		t.Fatal(err)
+	}
+	slot.mu.RLock()
+	applied := slot.appliedFingerprint
+	slot.mu.RUnlock()
+	if applied != groupAppliedFingerprint(cached, vipGroup) {
+		t.Fatal("unchanged cached facts prevented runtime retry")
+	}
 }
 
 // TestApplyGroupMembershipChangesFollowsLandingRegion covers the other fact that

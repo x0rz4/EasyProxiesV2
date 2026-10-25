@@ -70,7 +70,8 @@ func WithUnlockProviders(providers []nodefacts.ProviderInfo) Option {
 
 // WithMembershipNotifier registers a callback receiving the nodes whose visible
 // tag set changed. It is how a recompute reaches group membership without this
-// package importing the runtime.
+// package importing the runtime. The callback must enqueue without blocking;
+// its consumer owns retries and shutdown.
 func WithMembershipNotifier(notify func([]int64)) Option {
 	return func(s *Service) { s.notify = notify }
 }
@@ -199,14 +200,10 @@ func (s *Service) Recompute(ctx context.Context, nodeIDs []int64) ([]int64, erro
 		}
 	}
 	if len(changed) > 0 && s.notify != nil {
-		// The notifier reaches the runtime through per-group rebuilds that take
-		// the boxmgr write lock and clone the whole config twice. Running it
-		// inline would stall this queue — and therefore every future recompute —
-		// for the length of those rebuilds, so it runs detached. The changed set
-		// is copied: the caller may reuse the slice, and the queue may be
-		// racing ahead with the next batch.
+		// The app's notifier coalesces these IDs in a fixed worker. Starting a
+		// goroutine here would bypass that worker's resource and shutdown bounds.
 		changedCopy := append([]int64(nil), changed...)
-		go s.notify(changedCopy)
+		s.notify(changedCopy)
 	}
 	return changed, nil
 }

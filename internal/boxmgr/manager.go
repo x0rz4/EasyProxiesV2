@@ -1722,7 +1722,15 @@ func (m *Manager) ApplyGroupMembershipChanges(ctx context.Context, changedNodeID
 		}
 		previous, found := groupConfigByID(before, groupCfg.ID)
 		if found && reflect.DeepEqual(groupMemberRuntimeShape(before, previous), groupMemberRuntimeShape(after, groupCfg)) {
-			continue
+			// The cached facts can already be current after a failed application.
+			// Only the fingerprint of the published runtime proves it caught up.
+			slot := m.groupSlot(groupCfg.ID)
+			slot.mu.RLock()
+			applied := slot.appliedFingerprint
+			slot.mu.RUnlock()
+			if applied == groupAppliedFingerprint(after, groupCfg) {
+				continue
+			}
 		}
 		groupPool := storeGroupFromConfig(groupCfg)
 		// The group definition itself did not change, so the running listener is

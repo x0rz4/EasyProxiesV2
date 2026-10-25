@@ -232,8 +232,8 @@ func TestRecomputeNotifiesOnlyVisibleChanges(t *testing.T) {
 	dataStore := openTagStore(t)
 	node := newNode(t, dataStore, "fast", 50)
 
-	// The notifier runs detached from the recompute, so the test waits for it
-	// on a channel instead of reading a slice after RecomputeAll returns.
+	// The notifier only enqueues membership work; keep a channel to observe
+	// exactly which visible changes are queued.
 	notified := make(chan []int64, 4)
 	service := NewService(dataStore, WithMembershipNotifier(func(nodeIDs []int64) {
 		notified <- append([]int64(nil), nodeIDs...)

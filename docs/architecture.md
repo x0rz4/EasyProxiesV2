@@ -62,7 +62,7 @@ GeoIP 预热 → 开 SQLite → 从 store 载入 nodes/groups/tags（store 覆�
 
 | 包 | 职责 | 关键入口 |
 | --- | --- | --- |
-| `app` | 唯一装配点、优雅退出、`groupStatePersister`（把 `GroupStateEvent` 落库）、Healer 后端 | `Run()`、`load*FromStore` |
+| `app` | 唯一装配点、优雅退出、`groupStatePersister`（把 `GroupStateEvent` 落库）、成员对账合并队列、Healer 后端 | `Run()`、`load*FromStore`、`membership_queue.go` |
 | `config` | YAML 加载/校验、节点 URI 与订阅内容解析、`NodeConfig.NodeKey()`、重载路径 `LoadForReload` | `Load` / `LoadForReload` / `ParseSubscriptionContent` / `ParseImportContent` |
 | `jsonx` | JSON 编解码唯一出口（Sonic + `MarshalCanonical`） | `Marshal` / `Unmarshal` / `MarshalCanonical` |
 | `netx` | 经节点 outbound 拨号的 HTTP client/transport 唯一构造点；**叶子包，不 import 本项目任何包** | `NewClient(dial, Options)` / `NewTransport` / `CloseIdleConnections` |

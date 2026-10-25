@@ -39,9 +39,11 @@
 ```
 检测落库 → enqueueRetag(nodeID) → nodetag.Queue（2s 防抖，10min sweep）
   → Service.Recompute（CompileRules → nodefacts.Loader.Load → Resolve → ReplaceAutoNodeTags）
-  → notify（仅"可见 tag 名集合变化"的节点）
+  → notify（仅"可见 tag 名集合变化"的节点，投递 app.membershipQueue）
   → boxmgr.ApplyGroupMembershipChanges → 只重建成员集合真正变化的组（base box 从不 reload）
 ```
+
+`internal/app/membership_queue.go` 用一个消费者合并节点 ID、对账最新事实，每批最多 15 秒；失败保留待办并重试，关闭取消运行中的对账。运行时应用指纹也参与判等，避免缓存事实已更新而上次应用失败时跳过重试。
 
 ## 标签语义区分
 

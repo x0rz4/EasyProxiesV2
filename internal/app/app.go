@@ -142,11 +142,9 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	// A tag change reaches the runtime as a per-group rebuild, never as a full
 	// reload: only the groups whose member set actually moved are touched, so the
 	// other listeners keep their live connections.
-	tagService := newTagService(dataStore, func(nodeIDs []int64) {
-		if err := boxMgr.ApplyGroupMembershipChanges(ctx, nodeIDs); err != nil {
-			log.Printf("⚠️ Failed to apply group membership changes after retag: %v", err)
-		}
-	})
+	membershipUpdates := newMembershipQueue(ctx, boxMgr.ApplyGroupMembershipChanges, time.Second)
+	defer membershipUpdates.Close()
+	tagService := newTagService(dataStore, membershipUpdates.Enqueue)
 	retagQueue := nodetag.NewQueue(tagService)
 	defer retagQueue.Close()
 	if server := boxMgr.MonitorServer(); server != nil {
@@ -206,6 +204,8 @@ func Run(ctx context.Context, cfg *config.Config) error {
 
 	stopGroupHealer()
 	stopProbeProjections()
+	retagQueue.Close()
+	membershipUpdates.Close()
 
 	// Flush stats one final time before shutdown
 	flushStatsToStore(context.Background(), boxMgr, dataStore)
