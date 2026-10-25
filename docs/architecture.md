@@ -4,7 +4,7 @@
 > 权威行为契约见 [plane/specs/proxy-pool/spec.md](../plane/specs/proxy-pool/spec.md)（MUST/场景）；
 > 变更提案与历史见 [plane/](../plane/)。本文件只讲"现在是怎么搭的"，不写"应该怎么改"。
 >
-> 基线核对：v2.2.13，migration 至 v25，`internal/` + `cmd/` 约 **40.7k** 行非测试代码、约 **23.3k** 行测试，
+> 基线核对：v2.2.14，migration 至 v25，`internal/` + `cmd/` 约 **40.7k** 行非测试代码、约 **23.3k** 行测试，
 > 前端 `frontend/src` 约 **10.0k** 行 TS/TSX。核对日期 2026-10-26。
 
 ## 1. 一句话说清这个系统
@@ -37,7 +37,7 @@ plane/README.md               规格入口：当前契约 specs/、变更计划 
 config.example.yaml           配置模板（复制为 config.yaml 使用；config.yaml 不入库）
 Dockerfile / Dockerfile.ci    本地全量构建 / CI 只带产物的运行时镜像
 docker-compose.yml            GHCR 镜像 + 数据卷（EASY_PROXIES_VERSION 可指定版本）
-install.sh                    Linux Docker / 二进制安装、systemd/OpenRC 注册及服务管理入口
+install.sh                    Linux 中文安装/更新、systemd/OpenRC 注册及服务管理入口
 tests/test_install.py         安装脚本单测
 .github/workflows/            打 tag 触发：多架构二进制 + Docker 镜像发布
 ```

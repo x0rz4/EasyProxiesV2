@@ -290,3 +290,15 @@ API Key 使用记录 MUST 合并同一 Key 的最新观测，使用单一消费�
 - THEN 注册可重复执行；禁用只改开机行为，注销停止服务但保留已有文件；下载和无关服务不受影响。
 
 代码：`install.sh`。测试：`tests/test_install.py`（离线注册、systemd/OpenRC 生命周期、归属保护、失败与数据保留）。部署说明：`docs/deployment.md`。测试中的服务管理器是模拟，不代替真实服务器重启验收。
+
+## ADDED Requirement DEPLOY-002：中文安装与保留状态的更新
+
+安装器默认帮助与提示 MUST 使用中文，默认安装目录 MUST 为 `/opt/easy-proxies`，并允许 `--dir` 覆盖。`--action update` 和 `--update` MUST 等效且要求已有安装；更新 MUST 保留配置、节点文件和数据库。默认二进制更新 MUST 保留服务文件、自启状态及运行/停止状态，原先运行时才重启；Docker 更新 MUST 校验容器归属及三个标准挂载源，保留重启策略和运行/停止状态。下载、校验或拉取失败 MUST 不替换旧程序/容器，更新失败 MUST 不写入新的成功版本记录。
+
+### Scenario: 已停止且禁用了自启的服务更新
+
+- GIVEN 已有本地程序和配置，服务已停止且禁用了开机自启。
+- WHEN 使用 update 更新版本。
+- THEN 程序替换后服务仍停止且自启仍关闭；配置和数据保留。使用 no-start 时仅准备文件/镜像，现有进程/容器不被重启或替换。
+
+代码及测试：`install.sh`、`tests/test_install.py`。操作语义、版本记录与失败边界见 `docs/deployment.md`。

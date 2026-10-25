@@ -8,6 +8,7 @@
 
 | 文档 | 用途与状态 |
 | --- | --- |
+| [安装器中文与更新](changes/installer-chinese-update/plan.md) | 默认 /opt 子目录、中文帮助、显式更新及服务/容器状态保留 |
 | [解锁页布局与计数修复](changes/unlock-page-cleanup/plan.md) | 整页滚动、移除重复统计、运行态节点计数及分页详情一致性 |
 | [SS obfs 兼容修复](changes/ss-obfs-compatibility/plan.md) | Clash 混淆插件运行时适配、身份兼容与重载回归 |
 | [Linux 服务安装优化](changes/linux-service-installation/plan.md) | systemd/OpenRC 注册、自启、离线管理及验收记录 |

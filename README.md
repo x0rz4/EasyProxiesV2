@@ -45,16 +45,24 @@ sudo bash install.sh --method docker
 sudo bash install.sh --method binary
 ```
 
-默认解析最新 Release，并将下载文件、配置模板和镜像固定到同一个版本。数据和配置默认保存在 `/opt/easy-proxies`，新配置会生成随机管理密码，保存在 `config.yaml`。已有配置及数据在更新时保留。
+脚本默认显示中文，直接执行 `sudo bash install.sh` 即可安装到 `/opt/easy-proxies`。默认解析最新 Release，并将下载文件、配置模板和镜像固定到同一个版本。新配置会生成随机管理密码，保存在 `config.yaml`。已有配置及数据在更新时保留。
 
 ```bash
-# 指定版本与目录；重复执行可更新同一种部署方式
+# 更新默认目录中的二进制，保留运行状态和自启设置
+sudo bash install.sh --update
+# 更新到指定版本；--action update 与 --update 等效
+sudo bash install.sh --action update --version 2.2.14
+# 更新现有 Docker 容器，保留运行状态与重启策略
+sudo bash install.sh --method docker --update
+# 首次使用 Docker，可指定版本与目录
 sudo bash install.sh --method docker --version 2.1.0 --dir /opt/easy-proxies
 # 不安装系统服务，适合普通用户或没有 systemd 的环境
 bash install.sh --method binary --version 2.1.0 --dir "$HOME/easy-proxies" --no-start
 ```
 
 二进制安装会验证 Release 提供的 SHA256。`--no-start` 在二进制模式只安装文件，在 Docker 模式只拉取镜像和准备配置。Docker 容器名为 `easy-proxies`，脚本只替换自身创建的容器。切换部署方式前，请先停止旧服务以免端口冲突；降级前备份数据。
+
+更新使用 `--update`，要求已有对应安装；配置、节点文件和数据库保留。默认只重启原本运行的服务/容器，已停止的仍保持停止，自启设置不变。`--update --no-start` 仅准备新文件/镜像，需手动重启二进制或再次更新 Docker 才会加载新版本。
 
 已安装的二进制可以单独注册服务，无需重新下载。下面的服务管理命令均适用于 systemd / OpenRC：
 

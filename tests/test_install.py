@@ -46,6 +46,7 @@ exec /usr/bin/mv "$@"
         self.mock('uname', '[[ "$1" == -s ]] && echo Linux || echo "${TEST_ARCH:-x86_64}"')
         self.mock('curl', '''
 printf '%s\n' "$*" >> "$FIXTURES/calls"
+[[ "${FAIL_DOWNLOAD:-0}" != 1 ]] || exit 9
 output=
 url=
 while (($#)); do
@@ -107,7 +108,22 @@ printf 'docker %s\n' "$*" >> "$FIXTURES/calls"
 case "$1" in
   pull) [[ "${FAIL_PULL:-0}" != 1 ]] ;;
   container) [[ "${EXISTING_CONTAINER:-0}" == 1 ]] ;;
-  inspect) echo unrelated-owner ;;
+  inspect)
+    case "$3" in
+      *Config.Labels*) echo "${DOCKER_OWNER:-unrelated-owner}" ;;
+      *Mounts*)
+        if [[ "${DOCKER_WRONG_MOUNT:-0}" == 1 ]]; then echo /another/install; exit 0; fi
+        case "$3" in
+          */config.yaml*) echo "$FIXTURES/deployment/config.yaml" ;;
+          */nodes.txt*) echo "$FIXTURES/deployment/nodes.txt" ;;
+          */data*) echo "$FIXTURES/deployment/data" ;;
+        esac ;;
+      *MaximumRetryCount*) echo "${DOCKER_RETRIES:-3}" ;;
+      *RestartPolicy.Name*) echo "${DOCKER_POLICY:-unless-stopped}" ;;
+      *State.Running*) echo "${DOCKER_RUNNING:-true}" ;;
+    esac ;;
+  create) [[ "${FAIL_CREATE:-0}" != 1 ]] ;;
+  start) [[ "${FAIL_CONTAINER_START:-0}" != 1 ]] ;;
   *) exit 0 ;;
 esac
 ''')
@@ -128,7 +144,7 @@ OPENRC_STATE_FILE="$FIXTURES/softlevel"
 main "$@"
 '''
         result = subprocess.run([BASH or 'bash', '-c', command, '--', '--dir', bash_path(self.target), *args],
-                                env=self.env, text=True, capture_output=True)
+                                env=self.env, text=True, encoding='utf-8', capture_output=True)
         self.assertEqual(result.returncode == 0, ok, result.stdout + result.stderr)
         return result
 
@@ -189,7 +205,7 @@ main "$@"
     def test_unmanaged_container_is_not_removed(self):
         self.env['EXISTING_CONTAINER'] = '1'
         result = self.run_install('--method', 'docker', '--version', '2.1.0', ok=False)
-        self.assertIn('not managed by this installer', result.stderr)
+        self.assertIn('不属于本安装器', result.stderr)
         self.assertNotIn('docker rm', self.calls.read_text())
 
     def test_invalid_version_and_architecture(self):
@@ -216,7 +232,7 @@ main "$@"
         self.assertLess(calls.index('systemctl daemon-reload'), calls.index('systemctl enable'))
         self.assertLess(calls.index('systemctl enable'), calls.index('systemctl restart'))
         self.assertIn('systemctl is-active --quiet easy-proxies', calls)
-        self.assertIn('Boot autostart: enabled', result.stdout)
+        self.assertIn('开机自启：已启用', result.stdout)
 
     def test_openrc_registration_and_service_lifecycle(self):
         self.env['TEST_INIT'] = 'openrc'
@@ -341,7 +357,7 @@ main "$@"
         result = self.run_install('--version', '2.1.0', ok=False)
         self.assertIn('systemctl --no-pager --full status easy-proxies', self.calls.read_text())
         self.assertIn('journalctl', result.stderr)
-        self.assertNotIn('Installed v', result.stdout)
+        self.assertNotIn('安装完成', result.stdout)
         self.assertFalse((self.target / 'installed-version').exists())
 
     def test_enable_is_verified_and_failure_does_not_start(self):
@@ -366,8 +382,181 @@ main "$@"
 
     def test_public_help_and_syntax(self):
         for args in (['-n', bash_path(ROOT / 'install.sh')], [bash_path(ROOT / 'install.sh'), '--help']):
-            result = subprocess.run([BASH or 'bash', *args], capture_output=True, text=True)
+            result = subprocess.run([BASH or 'bash', *args], capture_output=True, text=True, encoding='utf-8')
             self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_chinese_help_errors_and_default_opt_directory(self):
+        result = self.run_install('--help')
+        self.assertIn('用法：', result.stdout)
+        self.assertIn('--update', result.stdout)
+        self.assertIn('/opt/easy-proxies', result.stdout)
+        self.assertIn('未知参数', self.run_install('--bad-option', ok=False).stderr)
+        self.assertIn('错误：', self.run_install('--version', ok=False).stderr)
+        command = '''source "$PROJECT/install.sh"
+parse_args
+printf '%s|%s|%s' "$INSTALL_DIR" "$METHOD" "$ACTION"
+'''
+        result = subprocess.run([BASH or 'bash', '-c', command], env=self.env,
+                                text=True, encoding='utf-8', capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '/opt/easy-proxies|binary|install')
+        self.assertFalse(self.target.exists())
+
+    def prepare_old_installation(self):
+        self.prepare_local_binary()
+        (self.target / 'easy-proxies').write_bytes(b'#!/bin/sh\necho old-version\n')
+        (self.target / 'easy-proxies').chmod(0o755)
+        (self.target / 'nodes.txt').write_text('existing nodes\n')
+        (self.target / 'installed-version').write_text('v2.0.0\n')
+
+    def assert_preserved_data(self):
+        self.assertEqual((self.target / 'config.yaml').read_text(), 'custom config\n')
+        self.assertEqual((self.target / 'nodes.txt').read_text(), 'existing nodes\n')
+        self.assertEqual((self.target / 'data' / 'data.db').read_text(), 'existing database')
+
+    def test_update_preserves_service_running_and_boot_states(self):
+        self.prepare_old_installation()
+        for init in ('systemd', 'openrc'):
+            for running in (False, True):
+                for enabled in (False, True):
+                    with self.subTest(init=init, running=running, enabled=enabled):
+                        self.env['TEST_INIT'] = init
+                        self.run_install('--action', 'register', '--no-start',
+                                         *([] if enabled else ['--no-autostart']))
+                        marker = self.base / 'running'
+                        if running:
+                            marker.touch()
+                        else:
+                            marker.unlink(missing_ok=True)
+                        unit_file = self.systemd_file if init == 'systemd' else self.openrc_file
+                        unit_before = unit_file.read_bytes()
+                        self.calls.write_text('')
+                        result = self.run_install('--action', 'update', '--version', 'v2.1.0')
+                        self.assertIn('更新完成', result.stdout)
+                        self.assertEqual(marker.exists(), running)
+                        self.assertEqual((self.base / 'enabled').exists(), enabled)
+                        self.assertEqual(unit_file.read_bytes(), unit_before)
+                        calls = self.calls.read_text()
+                        self.assertEqual(('restart easy-proxies' in calls or 'easy-proxies restart' in calls), running)
+                        self.assertNotIn('systemctl enable', calls)
+                        self.assertNotIn('systemctl disable', calls)
+                        self.assertNotIn('daemon-reload', calls)
+                        self.assertNotIn('rc-update add', calls)
+                        self.assertNotIn('rc-update del', calls)
+                        self.assertEqual((self.target / 'easy-proxies').read_bytes(), self.asset.read_bytes())
+                        self.assertEqual((self.target / 'installed-version').read_text(), 'v2.1.0\n')
+                        self.assert_preserved_data()
+
+    def test_update_files_only_works_without_root_or_service_manager(self):
+        self.prepare_old_installation()
+        self.env.update(TEST_INIT='none', TEST_UID='1000')
+        result = self.run_install('--update', '--no-start')
+        self.assertIn('未操作现有服务', result.stdout)
+        calls = self.calls.read_text()
+        self.assertNotIn('systemctl', calls)
+        self.assertNotIn('rc-service', calls)
+        self.assertEqual((self.target / 'easy-proxies').read_bytes(), self.asset.read_bytes())
+        self.assert_preserved_data()
+
+    def test_update_requires_existing_installation_and_registration(self):
+        self.run_install('--update', '--no-start', ok=False)
+        self.assertFalse(self.target.exists())
+        self.prepare_old_installation()
+        result = self.run_install('--update', ok=False)
+        self.assertIn('未找到已注册服务', result.stderr)
+        self.assertNotIn('https://', self.calls.read_text())
+        self.run_install('--update', '--no-autostart', ok=False)
+        (self.target / 'config.yaml').write_text('')
+        self.run_install('--update', '--no-start', ok=False)
+        self.assertEqual((self.target / 'installed-version').read_text(), 'v2.0.0\n')
+
+    def test_update_failed_download_or_checksum_keeps_old_files(self):
+        self.prepare_old_installation()
+        self.run_install('--action', 'register')
+        old_binary = (self.target / 'easy-proxies').read_bytes()
+        for failure in ('download', 'checksum'):
+            with self.subTest(failure=failure):
+                self.calls.write_text('')
+                if failure == 'download':
+                    self.env['FAIL_DOWNLOAD'] = '1'
+                else:
+                    self.env.pop('FAIL_DOWNLOAD')
+                    self.checksum.write_text('0' * 64 + '  binary\n')
+                self.run_install('--update', '--version', '2.1.0', ok=False)
+                self.assertEqual((self.target / 'easy-proxies').read_bytes(), old_binary)
+                self.assertEqual((self.target / 'installed-version').read_text(), 'v2.0.0\n')
+                self.assertNotIn('systemctl restart', self.calls.read_text())
+                self.assertTrue((self.base / 'running').exists())
+                self.assert_preserved_data()
+
+    def test_update_restart_failure_does_not_record_success(self):
+        self.prepare_old_installation()
+        self.run_install('--action', 'register')
+        self.env['FAIL_START'] = '1'
+        result = self.run_install('--update', '--version', '2.1.0', ok=False)
+        self.assertNotIn('更新完成', result.stdout)
+        self.assertIn('journalctl', result.stderr)
+        self.assertEqual((self.target / 'installed-version').read_text(), 'v2.0.0\n')
+        self.assert_preserved_data()
+
+    def prepare_docker_update(self):
+        self.prepare_old_installation()
+        self.env.update(EXISTING_CONTAINER='1', DOCKER_OWNER='x0rz4/EasyProxiesV2')
+
+    def test_docker_update_preserves_policy_running_state_and_mounts(self):
+        self.prepare_docker_update()
+        for running in ('true', 'false'):
+            for policy in ('no', 'unless-stopped', 'always', 'on-failure'):
+                with self.subTest(running=running, policy=policy):
+                    self.env.update(DOCKER_RUNNING=running, DOCKER_POLICY=policy)
+                    self.calls.write_text('')
+                    self.run_install('--method', 'docker', '--update', '--version', '2.1.0')
+                    calls = self.calls.read_text()
+                    expected = 'on-failure:3' if policy == 'on-failure' else policy
+                    self.assertIn(f'docker create --name easy-proxies --restart {expected}', calls)
+                    self.assertEqual('docker start easy-proxies' in calls, running == 'true')
+                    self.assertNotIn('docker run', calls)
+                    for name in ('config.yaml', 'nodes.txt', 'data'):
+                        self.assertIn(f'src={bash_path(self.target)}/{name},dst=/etc/easy-proxies/{name}', calls)
+                    self.assertLess(calls.index('docker pull'), calls.index('docker rm'))
+                    self.assert_preserved_data()
+
+    def test_docker_update_rejects_missing_container_or_wrong_mount(self):
+        self.prepare_docker_update()
+        for variable, value in (('EXISTING_CONTAINER', '0'), ('DOCKER_WRONG_MOUNT', '1'), ('DOCKER_OWNER', 'other-owner')):
+            with self.subTest(variable=variable):
+                original = dict(self.env)
+                self.env[variable] = value
+                self.calls.write_text('')
+                self.run_install('--method', 'docker', '--update', ok=False)
+                self.assertNotIn('docker pull', self.calls.read_text())
+                self.assertNotIn('docker rm', self.calls.read_text())
+                self.env = original
+
+    def test_docker_update_no_start_only_pulls_image(self):
+        self.prepare_docker_update()
+        result = self.run_install('--method', 'docker', '--update', '--no-start')
+        calls = self.calls.read_text()
+        self.assertIn('docker pull', calls)
+        self.assertNotIn('docker rm', calls)
+        self.assertNotIn('docker create', calls)
+        self.assertNotIn('docker start', calls)
+        self.assertIn('未替换现有容器', result.stdout)
+        self.assert_preserved_data()
+
+    def test_docker_update_failures_do_not_record_success(self):
+        self.prepare_docker_update()
+        for failure in ('FAIL_PULL', 'FAIL_CREATE', 'FAIL_CONTAINER_START'):
+            with self.subTest(failure=failure):
+                self.env[failure] = '1'
+                self.calls.write_text('')
+                result = self.run_install('--method', 'docker', '--update', '--version', '2.1.0', ok=False)
+                self.assertNotIn('更新完成', result.stdout)
+                self.assertEqual((self.target / 'installed-version').read_text(), 'v2.0.0\n')
+                if failure == 'FAIL_PULL':
+                    self.assertNotIn('docker rm', self.calls.read_text())
+                self.assert_preserved_data()
+                self.env.pop(failure)
 
     def test_openrc_package_without_boot_state_is_rejected(self):
         self.env['TEST_INIT'] = 'openrc'
