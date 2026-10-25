@@ -160,6 +160,10 @@ func (s *Server) handleNodeFacets(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, 500, err.Error())
 		return
 	}
+	if r.URL.Query().Get("healthy_only") == "true" {
+		writeJSON(w, view.HealthyFacets())
+		return
+	}
 	if r.URL.Query().Get("runtime_only") == "true" {
 		writeJSON(w, view.RuntimeFacets())
 		return

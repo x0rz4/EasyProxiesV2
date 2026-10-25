@@ -37,9 +37,9 @@ frontend/src/
 - 解锁检测页与节点管理页使用默认 `PageLayout` / `PageContent`，由 App 的 `<main class="overflow-y-auto">` 整页滚动。
 - 两页表格使用 `max-h-[calc(100vh-280px)] min-h-[400px]` 独立纵横滚动，表头固定；筛选栏不锁在固定高度视口内。解锁页手机端标题操作仅显示图标，保留可访问名称与提示。
 
-解锁页仅显示运行态节点（含待检查、不可用及黑名单），不以在线/健康状态限制范围。已移除统计卡片及标签归属提示，诊断筛选保留。
+解锁页基础范围仅在线可用节点：复用 nodeview.Healthy，排除未加载、待检查、不可用、黑名单、停用及临时放行节点。`useNodeFilter` 的 scope 在用户筛选之后施加，清除/加载保存筛选不能放宽这个范围。已移除统计卡片及标签归属提示，诊断筛选保留。
 
-`NodeFilterBar` 的可选 `countDisplay="runtime"` 仅用于解锁页：本页数量来自查询 items，匹配总数来自查询 total，运行节点总数来自 runtime facets；加载与失败分别显示查询中、数量暂不可用，后台刷新显示更新中。默认模式沿用原文案，节点管理页不受影响。“全部”诊断按钮显示运行节点总数。
+`NodeFilterBar` 的可选 `countDisplay="healthy"` 仅用于解锁页：本页数量来自查询 items，匹配总数来自查询 total，在线可用总数来自 healthy facets；加载与失败分别显示查询中、数量暂不可用，后台刷新显示更新中。默认模式沿用原文案，节点管理页不受影响。“全部”诊断按钮显示在线可用总数。
 
 解锁表格按查询页的稳定节点 ID 渲染、选择和排序，不因详情暂缺而过滤掉行；缺失运行态时显示“运行态更新中”并禁用单节点操作，抽屉也只使用当前运行态。页码超出最新总数时回到最后有效页。
 
@@ -58,3 +58,5 @@ frontend/src/
 配 vite dev server + 临时入口 html（如 `frontend/panel-check.html` + `src/panel-check.tsx`，**验完必须删除**）。用 `?open=N` 之类 query 参数 + `setTimeout` 里 `document.querySelectorAll('[aria-haspopup="listbox"]')[N].click()` 可截到浮层展开态。
 
 节点管理与解锁检测页先查询当前页 ID，再按 ID 获取配置、运行态及诊断结果；详情请求随页面切换取消。全局数量来自 facets，跨页选择只保存 ID，检测筛选全体走 query-ids。批量探测在点击后分批解析所选运行态，每次最多 200 个；不会为显示一页后台抓取所有节点。
+
+解锁页已选批量检测在提交前通过 healthy_only 的 query-ids 与跨页选择取交集，提示并移除不再在线可用的目标。检测筛选全体也携带同一健康范围；状态变更按当前查询快照判断，后续检测错误仍按原任务流程保存，不额外发布健康事实。

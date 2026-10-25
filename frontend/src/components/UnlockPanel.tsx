@@ -75,7 +75,7 @@ function normalizeUnlockResults(raw: Record<string, UnlockResult>): Record<numbe
 
 export default function UnlockPanel() {
   const queryClient = useQueryClient()
-  const nodeFilter = useNodeFilter({ version: 2 }, true, true)
+  const nodeFilter = useNodeFilter({ version: 2 }, true, { runtimeOnly: true, healthyOnly: true })
   const [preparingTask, setPreparingTask] = useState(false)
   const [subscriptions, setSubscriptions] = useState<Subscription[]>([])
   const [metadataLoading, setMetadataLoading] = useState(true)
@@ -290,6 +290,23 @@ export default function UnlockPanel() {
   }
   const runBatch = () => void runFilteredTask({ latency: false, speed: false, quality: false, unlock: true })
 
+  const runSelectedTask = async () => {
+    if (preparingTask) return
+    setPreparingTask(true)
+    try {
+      const { ids } = await queryNodeIDs({ version: 2, runtime_only: true, healthy_only: true })
+      const available = new Set(ids)
+      const targets = [...selectedIds].filter(id => available.has(id))
+      if (targets.length !== selectedIds.size) {
+        setSelectedIds(new Set(targets))
+        toast.info(`已跳过 ${selectedIds.size - targets.length} 个不再在线可用的节点`)
+      }
+      if (!targets.length) { toast.error('已选节点中没有在线可用节点'); return }
+      await launchTask(targets, checkStages, checkSettings || undefined)
+    } catch (error) { toast.error(error instanceof Error ? error.message : '获取在线可用节点失败') }
+    finally { setPreparingTask(false) }
+  }
+
   const stopBatch = useCallback(() => {
     if (activeTask) void cancelNodeCheckTask(activeTask.id)
     taskAbortRef.current?.abort()
@@ -304,7 +321,7 @@ export default function UnlockPanel() {
   // Diagnostic counts come from the same fact predicates as the query.
   const diagnosticCount = (name: string) => nodeFilter.facets.isError || !nodeFilter.facets.data
     ? undefined : nodeFilter.facets.data.diagnostics.find(item => item.value === name)?.count || 0
-  const runtimeTotal = nodeFilter.facets.data?.total
+  const availableTotal = nodeFilter.facets.data?.total
   const matchedTotal = nodeFilter.query.data?.total
 
   const nodeConfigByID = useMemo(() => new Map(
@@ -377,7 +394,7 @@ export default function UnlockPanel() {
               className="btn btn-ghost btn-sm gap-2 border border-base-300 shadow-sm lg:btn-md"
               onClick={() => void loadNodes()}
               disabled={loading}
-              title="重新加载运行节点列表"
+              title="重新加载在线可用节点列表"
               aria-label="刷新节点"
             >
               <RefreshCw className={cn('h-4 w-4', loading && 'animate-spin')} />
@@ -439,7 +456,7 @@ export default function UnlockPanel() {
         {/* ---- Redesigned Search & Filter Toolbar ---- */}
         <section className={cn(surfaceClass, 'mb-5 shrink-0 p-4 sm:p-5')}>
           <div className="flex flex-col gap-4">
-            <NodeFilterBar filter={nodeFilter} countDisplay="runtime" />
+            <NodeFilterBar filter={nodeFilter} countDisplay="healthy" />
 
             {/* Row 2: Status Filter Chips & Result Counter */}
             <div className="flex flex-wrap items-center justify-between gap-3 border-t border-base-200 pt-3.5">
@@ -449,7 +466,7 @@ export default function UnlockPanel() {
                   active={statusFilter === ''}
                   onClick={() => setStatusFilter('')}
                   label="全部"
-                  count={nodeFilter.facets.isError ? undefined : runtimeTotal}
+                  count={nodeFilter.facets.isError ? undefined : availableTotal}
                 />
                 <FilterChip
                   active={statusFilter === 'residential'}
@@ -607,9 +624,9 @@ export default function UnlockPanel() {
                       <div className="flex flex-col items-center justify-center gap-2">
                         <Globe2 className="h-8 w-8 text-base-content/30" />
                         <p className="font-medium text-base-content/70">
-                          {runtimeTotal === 0 ? '暂无运行节点' : '没有找到匹配的节点'}
+                          {availableTotal === 0 ? '暂无在线可用节点' : '没有找到匹配的节点'}
                         </p>
-                        {(runtimeTotal ?? 0) > 0 && nodeFilter.spec.text?.trim() && (
+                        {(availableTotal ?? 0) > 0 && nodeFilter.spec.text?.trim() && (
                           <p className="text-xs text-base-content/45">请尝试缩短关键词或检查拼写</p>
                         )}
                         {isFilterActive && (
@@ -678,7 +695,7 @@ export default function UnlockPanel() {
             catch (error) { toast.error(error instanceof Error ? error.message : '保存设置失败') }
           }}
           onClose={() => setCheckDialogOpen(false)}
-          onStart={() => { if (!preparingTask) void (checkScope === 'selected' ? launchTask(selectedTargets, checkStages, checkSettings) : runFilteredTask(checkStages, checkSettings)) }}
+          onStart={() => { if (!preparingTask) void (checkScope === 'selected' ? runSelectedTask() : runFilteredTask(checkStages, checkSettings)) }}
         />
       )}
     </PageLayout>

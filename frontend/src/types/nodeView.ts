@@ -19,6 +19,7 @@ export interface NodeFilterSpec {
   subscription_ids?: number[]
   unsubscribed?: boolean
   runtime_only?: boolean
+  healthy_only?: boolean
   condition?: TagCondition
 }
 export interface NodeViewItem {

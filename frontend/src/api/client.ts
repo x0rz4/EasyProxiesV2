@@ -819,8 +819,11 @@ import type { GroupPreview, NodeFacets, NodeFilterSpec, NodeViewPage, NodeViewRe
 export function queryNodeView(spec: NodeFilterSpec, page: NodeViewPage, signal?: AbortSignal) {
   return request<NodeViewResult>('/api/nodes/query', { method: 'POST', body: JSON.stringify({ spec, page }), signal })
 }
-export function fetchNodeFacets(signal?: AbortSignal, runtimeOnly = false) {
-  return request<NodeFacets>(`/api/nodes/facets${runtimeOnly ? '?runtime_only=true' : ''}`, { signal })
+export function fetchNodeFacets(signal?: AbortSignal, runtimeOnly = false, healthyOnly = false) {
+  const params = new URLSearchParams()
+  if (runtimeOnly) params.set('runtime_only', 'true')
+  if (healthyOnly) params.set('healthy_only', 'true')
+  return request<NodeFacets>(`/api/nodes/facets${params.size ? `?${params}` : ''}`, { signal })
 }
 export function listSavedNodeFilters() {
   return request<{ filters: SavedNodeFilter[] }>('/api/node-filters')

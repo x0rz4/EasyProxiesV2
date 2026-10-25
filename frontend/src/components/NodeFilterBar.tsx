@@ -222,7 +222,7 @@ export function RegionSelect({ value, onChange, facets = [], label = '地区' }:
 
 export default function NodeFilterBar({ filter, countDisplay = 'default' }: {
   filter: ReturnType<typeof useNodeFilter>
-  countDisplay?: 'default' | 'runtime'
+  countDisplay?: 'default' | 'healthy'
 }) {
   const { spec, setSpec, page, setPage, facets, query, saved } = filter
   const [name, setName] = useState('')
@@ -244,10 +244,10 @@ export default function NodeFilterBar({ filter, countDisplay = 'default' }: {
     finally { setBusy(false) }
   }
   const facetOptions = (key: 'statuses' | 'sources' | 'protocols' | 'tags') => (facets.data?.[key] || []).map(item => ({ value: item.value, label: item.label, count: item.count }))
-  const countText = countDisplay === 'runtime'
+  const countText = countDisplay === 'healthy'
     ? query.isError || facets.isError ? '节点数量暂不可用'
       : !query.data || !facets.data ? '查询中…'
-        : `本页 ${query.data.items.length} 个 · 匹配 ${query.data.total} 个 · 运行节点共 ${facets.data.total} 个${query.isFetching || facets.isFetching ? ' · 更新中…' : ''}`
+        : `本页 ${query.data.items.length} 个 · 匹配 ${query.data.total} 个 · 在线可用节点共 ${facets.data.total} 个${query.isFetching || facets.isFetching ? ' · 更新中…' : ''}`
     : query.isFetching ? '查询中…' : `共 ${query.data?.total || 0} 个节点`
   return <section className="panel-card space-y-3 p-4" aria-label="节点筛选">
     <div className="flex flex-wrap items-start gap-3">
@@ -290,8 +290,8 @@ export default function NodeFilterBar({ filter, countDisplay = 'default' }: {
       {previous && <button className="btn btn-sm btn-ghost" disabled={busy} onClick={() => void persist(true)}>删除筛选</button>}
     </div>
     {(query.error || facets.error) && <p role="alert" className="text-sm text-error">{(query.error || facets.error)?.message}</p>}
-    <div className={cn('flex items-center gap-3 text-xs', countDisplay === 'runtime' && 'flex-wrap')}>
-      <span aria-live={countDisplay === 'runtime' ? 'polite' : undefined}>{countText} · 全选作用于当前页；已选节点跨页保留</span>
+    <div className={cn('flex items-center gap-3 text-xs', countDisplay === 'healthy' && 'flex-wrap')}>
+      <span aria-live={countDisplay === 'healthy' ? 'polite' : undefined}>{countText} · 全选作用于当前页；已选节点跨页保留</span>
       <button className="btn btn-xs" disabled={!page.offset || query.isFetching} onClick={() => setPage({ ...page, offset: Math.max(0, page.offset - page.limit) })}>上一页</button>
       <span>第 {Math.floor(page.offset / page.limit) + 1} 页</span>
       <button className="btn btn-xs" disabled={query.isFetching || !query.data || page.offset + page.limit >= query.data.total} onClick={() => setPage({ ...page, offset: page.offset + page.limit })}>下一页</button>

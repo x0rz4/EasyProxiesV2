@@ -50,4 +50,6 @@ Server 关闭幂等发送停止信号，HTTP 优雅关闭超时则关闭连接�
 
 GET /api/nodes、/api/nodes/config、/api/nodes/unlock-results、/api/node-check/results 支持 node_ids 正整数逗号列表（最多 200 个）。参数缺席保持全量兼容；显式空列表返回空，非法值返回 400。配置详情复用 controlplane.NodeDetailReader 与 store.ListManagedNodesByIDs，保持启用订阅可见性；认证权限与原接口一致。
 
+节点查询 Spec 和 GET /api/nodes/facets 支持可选 `healthy_only`；只返回有 runtime tag 且 Healthy 为真的节点，查询、query-ids 和含诊断数量的 facets 共用 nodeview 的范围谓词。Healthy 由现有运行时投影计算（启用、完成首次检查、可用、非黑名单、非 provisional）。未传参数时保留原全量或 runtime_only 语义，不影响节点管理页。
+
 Auth 按 API Key ID 合并使用时间，仅在首次使用及之后每分钟写入；失败五秒后重试并保留最新观测。惰性启动一个消费者，单次数据库调用三秒上限，Server 关闭时用剩余预算写完待办。最多保留 1024 个 Key 的元数据状态，溢出只跳过新 Key 的使用元数据并限频记录累计丢弃数，认证不受影响；闲置/删除 Key 会回收。重复绑定同一 store 保留待办，换库清空旧 ID 状态，SQLite 也拒绝旧时间覆盖新时间。

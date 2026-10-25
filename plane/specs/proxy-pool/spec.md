@@ -29,6 +29,18 @@ SS 出站构建 MUST 将插件名 `obfs` 适配为 sing-box 内嵌的 `obfs-loca
 
 代码：`internal/builder/shadowsocks_plugin.go`。测试：`TestClashObfsBuildsSupportedPlugin`、`TestShadowsocksPluginCompatibility`、`TestObfsPluginStartsAndReloads`。
 
+## ADDED Requirement DIAGNOSTIC-002：解锁页仅匹配在线可用节点
+
+解锁页分页、筛选统计、诊断分类和批量目标 MUST 使用同一在线可用基础范围：有 runtime tag 且 nodeview.Healthy 为真；清除筛选、保存筛选或显式选中 ID MUST NOT 绕过该范围。Healthy 沿用现有投影（已启用、完成首次检查、可用、非黑名单、非 provisional）。已选批量检测 MUST 在提交前与当前在线可用 ID 取交集；统计和任务匹配均基于各自读取的当前快照，不保证提交后健康状态不再变化。其它管理页面及未指定 healthy_only 的接口 MUST 保持原范围。
+
+### Scenario: 混合健康节点与检测前状态变化
+
+- GIVEN 已加载节点包含在线可用、待检查、不可用、黑名单及临时放行状态。
+- WHEN 打开解锁页、清除/加载筛选或发起批量检测。
+- THEN 列表、计数及目标仅包含在线可用节点；已选节点变为不可用时在提交前跳过，节点管理页仍能查看全部节点。
+
+代码：`internal/nodeview/view.go`、`internal/httpapi/nodeview_handlers.go`、`frontend/src/components/UnlockPanel.tsx`。测试：`TestHealthyScopeAgreesAcrossQueryFacetsAndTargets`、`TestNodeViewHealthyScopeUsesCurrentRuntimeHealth`。
+
 ## Requirement IDENTITY-001：结果必须绑定身份与运行时代际
 
 持久化测量 MUST 在联网前记录身份 token/revision、ProbeID 和 StartedAt；结果应用 MUST 拒绝旧身份、重复或乱序结果。NodeID、身份 revision 与 runtime tag generation 不是同一概念，不能互相替代。显示名不作为身份。

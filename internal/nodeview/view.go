@@ -36,6 +36,7 @@ type Spec struct {
 	SubscriptionIDs      []int64              `json:"subscription_ids,omitempty"`
 	Unsubscribed         bool                 `json:"unsubscribed,omitempty"`
 	RuntimeOnly          bool                 `json:"runtime_only,omitempty"`
+	HealthyOnly          bool                 `json:"healthy_only,omitempty"`
 	Condition            *nodefacts.Condition `json:"condition,omitempty"`
 }
 
@@ -292,9 +293,10 @@ func (v *View) Query(spec Spec, page Page) (Result, error) {
 }
 
 // Facets counts the entire visible snapshot, not just the current page.
-func (v *View) Facets() Facets        { return v.facets(false) }
-func (v *View) RuntimeFacets() Facets { return v.facets(true) }
-func (v *View) facets(runtimeOnly bool) Facets {
+func (v *View) Facets() Facets        { return v.facets(Spec{}) }
+func (v *View) RuntimeFacets() Facets { return v.facets(Spec{RuntimeOnly: true}) }
+func (v *View) HealthyFacets() Facets { return v.facets(Spec{HealthyOnly: true}) }
+func (v *View) facets(scope Spec) Facets {
 	total := 0
 	regions, tags, statuses, sources, protocols := map[string]*Facet{}, map[string]*Facet{}, map[string]*Facet{}, map[string]*Facet{}, map[string]*Facet{}
 	add := func(target map[string]*Facet, value, label string, healthy bool) {
@@ -313,7 +315,7 @@ func (v *View) facets(runtimeOnly bool) Facets {
 		tagIDs[name] = id
 	}
 	for _, node := range v.nodes {
-		if runtimeOnly && node.RuntimeTag == "" {
+		if !scope.inScope(node) {
 			continue
 		}
 		total++
@@ -353,7 +355,7 @@ func (v *View) facets(runtimeOnly bool) Facets {
 		labels := map[string]string{"untested": "未检测", "failed": "解锁失败", "unlocked": "完整解锁", "mixed": "混合解锁", "locked": "受限 / 部分", "residential": "住宅 IP", "broadcast": "广播 IP", "proxy": "代理 / 托管", "quality_success": "质量已测", "quality_failed": "质量失败", "speed_fast": "速度 ≥5 MB/s", "speed_failed": "测速失败", "fraud_high": "风险分 ≥71"}
 		item := Facet{Value: name, Label: labels[name]}
 		for _, node := range v.nodes {
-			if runtimeOnly && node.RuntimeTag == "" {
+			if !scope.inScope(node) {
 				continue
 			}
 			if allowed, _ := nodefacts.Evaluate(*condition, v.facts[node.ID], v.now); allowed {
@@ -363,6 +365,14 @@ func (v *View) facets(runtimeOnly bool) Facets {
 		diagnostics = append(diagnostics, item)
 	}
 	return Facets{Diagnostics: diagnostics, Regions: list(regions), Tags: list(tags), Statuses: list(statuses), Sources: list(sources), Protocols: list(protocols), Total: total, SnapshotRevision: v.revision}
+}
+
+// inScope is shared by queries and all facet counters, including diagnostics.
+func (s Spec) inScope(node Node) bool {
+	if (s.RuntimeOnly || s.HealthyOnly) && node.RuntimeTag == "" {
+		return false
+	}
+	return !s.HealthyOnly || node.Healthy
 }
 
 // Allow applies the same constraints as Query to one node from this snapshot.
@@ -376,7 +386,7 @@ func (v *View) allow(spec Spec, filter nodeselect.Filter, node Node) (bool, erro
 	if spec.Text != "" && !strings.Contains(strings.ToLower(node.Name), strings.ToLower(strings.TrimSpace(spec.Text))) {
 		return false, nil
 	}
-	if spec.RuntimeOnly && node.RuntimeTag == "" {
+	if !spec.inScope(node) {
 		return false, nil
 	}
 	if len(spec.Status) > 0 && !slices.Contains(spec.Status, node.Status) {
