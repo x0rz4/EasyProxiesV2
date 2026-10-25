@@ -358,6 +358,14 @@ func (s *Server) Shutdown(ctx context.Context) {
 	if s.nodeChecks != nil {
 		s.nodeChecks.workers.Wait()
 	}
+	s.authMu.Lock()
+	auth := s.auth
+	s.authMu.Unlock()
+	if auth != nil {
+		if err := auth.Close(ctx); err != nil && s.logger != nil {
+			s.logger.Printf("[auth] shutdown usage writer: %v", err)
+		}
+	}
 }
 
 // authService returns the authentication domain, building it on first use.

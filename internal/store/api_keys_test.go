@@ -75,6 +75,12 @@ func TestAPIKeyLifecycle(t *testing.T) {
 	if !touched.LastUsedAt.Equal(usedAt) {
 		t.Fatalf("last used at=%v, want %v", touched.LastUsedAt, usedAt)
 	}
+	if err := db.TouchAPIKey(ctx, key.ID, usedAt.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if latest, err := db.GetAPIKeyByToken(ctx, key.Token); err != nil || !latest.LastUsedAt.Equal(usedAt) {
+		t.Fatalf("late old observation overwrote last use: %+v %v", latest, err)
+	}
 
 	if err := db.DeleteAPIKey(ctx, key.ID); err != nil {
 		t.Fatal(err)

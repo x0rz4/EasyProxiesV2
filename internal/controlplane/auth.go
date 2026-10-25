@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"reflect"
 	"sync"
 	"time"
 
@@ -92,6 +93,7 @@ type Auth struct {
 	loginMu           sync.Mutex
 	loginFailures     map[string]*loginFailureState
 	loginFailuresLast time.Time
+	usage             apiKeyUsage
 }
 
 // NewAuth builds the service. A nil Now or SessionTTL falls back to the
@@ -128,8 +130,17 @@ func NewAuth(opts AuthOptions) *Auth {
 // stay valid; a nil store means sessions are process-local only.
 func (a *Auth) SetStore(st store.Store) {
 	a.mu.Lock()
+	defer a.mu.Unlock()
+	previous := reflect.ValueOf(a.store)
+	if previous.Comparable() && previous.Equal(reflect.ValueOf(st)) {
+		return
+	}
+	if a.store == nil && st == nil {
+		return
+	}
 	a.store = st
-	a.mu.Unlock()
+	a.usage.generation++
+	a.usage.entries = nil // IDs from the previous database must not cross bindings.
 }
 
 func (a *Auth) currentStore() store.Store {
@@ -384,18 +395,7 @@ func (a *Auth) APIKeyByToken(ctx context.Context, token string) (*store.APIKey, 
 // RecordAPIKeyUse refreshes last_used_at without blocking the request. Failures
 // are logged only: the credential already authenticated the call.
 func (a *Auth) RecordAPIKeyUse(id int64) {
-	st := a.currentStore()
-	if st == nil {
-		return
-	}
-	logger := a.logger
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := st.TouchAPIKey(ctx, id, time.Now()); err != nil {
-			logger.Printf("Failed to record API key usage: %v", err)
-		}
-	}()
+	a.recordAPIKeyUse(id)
 }
 
 // ListAPIKeys returns every session-free credential.
@@ -430,7 +430,13 @@ func (a *Auth) DeleteAPIKey(ctx context.Context, id int64) error {
 	if st == nil {
 		return ErrStoreUnavailable
 	}
-	return st.DeleteAPIKey(ctx, id)
+	if err := st.DeleteAPIKey(ctx, id); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	delete(a.usage.entries, id)
+	a.mu.Unlock()
+	return nil
 }
 
 // GenerateToken creates a cryptographically secure random token (256 bits).

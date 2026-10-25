@@ -1962,7 +1962,7 @@ func (s *sqliteStore) TouchAPIKey(ctx context.Context, id int64, usedAt time.Tim
 		usedAt = time.Now()
 	}
 	_, err := s.writeConn().ExecContext(ctx,
-		"UPDATE api_keys SET last_used_at = ? WHERE id = ?",
+		"UPDATE api_keys SET last_used_at = MAX(last_used_at, ?) WHERE id = ?",
 		usedAt.UTC().Format(time.RFC3339), id,
 	)
 	return err

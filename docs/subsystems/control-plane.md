@@ -49,3 +49,5 @@ monitor 从不反向 import httpapi；httpapi 不 import boxmgr
 Server 关闭幂等发送停止信号，HTTP 优雅关闭超时则关闭连接；等待综合检测任务完成终态写入后返回。自动随运行上下文关闭时使用十秒预算。
 
 GET /api/nodes、/api/nodes/config、/api/nodes/unlock-results、/api/node-check/results 支持 node_ids 正整数逗号列表（最多 200 个）。参数缺席保持全量兼容；显式空列表返回空，非法值返回 400。配置详情复用 controlplane.NodeDetailReader 与 store.ListManagedNodesByIDs，保持启用订阅可见性；认证权限与原接口一致。
+
+Auth 按 API Key ID 合并使用时间，仅在首次使用及之后每分钟写入；失败五秒后重试并保留最新观测。惰性启动一个消费者，单次数据库调用三秒上限，Server 关闭时用剩余预算写完待办。最多保留 1024 个 Key 的元数据状态，溢出只跳过新 Key 的使用元数据并限频记录累计丢弃数，认证不受影响；闲置/删除 Key 会回收。重复绑定同一 store 保留待办，换库清空旧 ID 状态，SQLite 也拒绝旧时间覆盖新时间。
