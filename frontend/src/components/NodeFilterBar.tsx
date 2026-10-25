@@ -36,7 +36,7 @@ interface MultiSelectProps {
 /**
  * 下拉式多选。
  * 原生 `<select multiple>` 在 DaisyUI 下会被 `.select{display:inline-flex}` 影响，
- * 选项被当作 flex 项逐字竖排；而常驻展开的列表又会把固定高度的页面（如解锁检测）撑爆。
+ * 选项被当作 flex 项逐字竖排；而常驻展开的列表又会挤占页面空间。
  * 因此收起时只占一个控件高度，展开时浮层承载搜索与复选列表。
  */
 export function MultiSelect({
@@ -220,7 +220,10 @@ export function RegionSelect({ value, onChange, facets = [], label = '地区' }:
     allowCustom searchHint="搜索，回车添加地区码" />
 }
 
-export default function NodeFilterBar({ filter }: { filter: ReturnType<typeof useNodeFilter> }) {
+export default function NodeFilterBar({ filter, countDisplay = 'default' }: {
+  filter: ReturnType<typeof useNodeFilter>
+  countDisplay?: 'default' | 'runtime'
+}) {
   const { spec, setSpec, page, setPage, facets, query, saved } = filter
   const [name, setName] = useState('')
   const [selected, setSelected] = useState<number>(0)
@@ -241,6 +244,11 @@ export default function NodeFilterBar({ filter }: { filter: ReturnType<typeof us
     finally { setBusy(false) }
   }
   const facetOptions = (key: 'statuses' | 'sources' | 'protocols' | 'tags') => (facets.data?.[key] || []).map(item => ({ value: item.value, label: item.label, count: item.count }))
+  const countText = countDisplay === 'runtime'
+    ? query.isError || facets.isError ? '节点数量暂不可用'
+      : !query.data || !facets.data ? '查询中…'
+        : `本页 ${query.data.items.length} 个 · 匹配 ${query.data.total} 个 · 运行节点共 ${facets.data.total} 个${query.isFetching || facets.isFetching ? ' · 更新中…' : ''}`
+    : query.isFetching ? '查询中…' : `共 ${query.data?.total || 0} 个节点`
   return <section className="panel-card space-y-3 p-4" aria-label="节点筛选">
     <div className="flex flex-wrap items-start gap-3">
       <label className="flex w-40 flex-col gap-1 text-xs">
@@ -282,8 +290,8 @@ export default function NodeFilterBar({ filter }: { filter: ReturnType<typeof us
       {previous && <button className="btn btn-sm btn-ghost" disabled={busy} onClick={() => void persist(true)}>删除筛选</button>}
     </div>
     {(query.error || facets.error) && <p role="alert" className="text-sm text-error">{(query.error || facets.error)?.message}</p>}
-    <div className="flex items-center gap-3 text-xs">
-      <span>{query.isFetching ? '查询中…' : `共 ${query.data?.total || 0} 个节点`} · 全选作用于当前页；已选节点跨页保留</span>
+    <div className={cn('flex items-center gap-3 text-xs', countDisplay === 'runtime' && 'flex-wrap')}>
+      <span aria-live={countDisplay === 'runtime' ? 'polite' : undefined}>{countText} · 全选作用于当前页；已选节点跨页保留</span>
       <button className="btn btn-xs" disabled={!page.offset || query.isFetching} onClick={() => setPage({ ...page, offset: Math.max(0, page.offset - page.limit) })}>上一页</button>
       <span>第 {Math.floor(page.offset / page.limit) + 1} 页</span>
       <button className="btn btn-xs" disabled={query.isFetching || !query.data || page.offset + page.limit >= query.data.total} onClick={() => setPage({ ...page, offset: page.offset + page.limit })}>下一页</button>

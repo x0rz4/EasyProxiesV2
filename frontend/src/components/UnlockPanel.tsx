@@ -13,6 +13,7 @@ import type {
 import { queryNodeIDs, cancelNodeCheckTask, createNodeCheckTask, fetchConfigNodes, fetchNodeCheckResults, fetchNodeCheckSettings, fetchNodeCheckTasks, fetchNodes, fetchUnlockResults, listSubscriptions, streamNodeCheckTask, unlockNode, updateNodeCheckSettings } from '../api/client'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useNodeFilter } from '../hooks/useNodeFilter'
+import type { NodeViewItem } from '../types/nodeView'
 import NodeFilterBar from './NodeFilterBar'
 import { regionFlag } from '../utils/region'
 import { displayLatency, unlockNetworkInfo } from '../utils/unlockDisplay'
@@ -20,7 +21,7 @@ import { PageContent, PageHeader, PageLayout, surfaceClass } from './ui/PageLayo
 import UnlockDrawer from './UnlockDrawer'
 import {
   ShieldCheck, X, Play, RefreshCw, ArrowUpDown, ArrowUp, ArrowDown,
-  Sparkles, AlertTriangle, CheckCircle2, XCircle, RotateCcw,
+  XCircle, RotateCcw,
   Globe2,
   Gauge, Settings2, Wifi, Database, Save,
 } from 'lucide-react'
@@ -117,7 +118,8 @@ export default function UnlockPanel() {
 
   // Drawer state
   const [drawerOpen, setDrawerOpen] = useState(false)
-  const [selectedNode, setSelectedNode] = useState<NodeSnapshot | null>(null)
+  const [selectedNodeID, setSelectedNodeID] = useState<number | null>(null)
+  const selectedNode = nodes.find(node => node.node_id === selectedNodeID) || null
 
   // Batch progress
   const [batchRunning, setBatchRunning] = useState(false)
@@ -300,24 +302,14 @@ export default function UnlockPanel() {
   }, [activeTask])
 
   // Diagnostic counts come from the same fact predicates as the query.
-  const diagnosticCount = (name: string) => nodeFilter.facets.data?.diagnostics.find(item => item.value === name)?.count || 0
-  const summary = {
-    total: nodeFilter.facets.data?.total || 0, tested: Math.max(0, (nodeFilter.facets.data?.total || 0) - diagnosticCount('untested')),
-    untested: diagnosticCount('untested'), unlocked: diagnosticCount('unlocked'),
-    pureIp: diagnosticCount('residential'), qualityTested: diagnosticCount('quality_success'),
-    locked: diagnosticCount('locked'), mixed: diagnosticCount('mixed'), failed: diagnosticCount('failed'),
-  }
+  const diagnosticCount = (name: string) => nodeFilter.facets.isError || !nodeFilter.facets.data
+    ? undefined : nodeFilter.facets.data.diagnostics.find(item => item.value === name)?.count || 0
+  const runtimeTotal = nodeFilter.facets.data?.total
+  const matchedTotal = nodeFilter.query.data?.total
 
-  // ---- Filtered and sorted data ----
-  const nodeConfigByID = useMemo(() => {
-    const byID = new Map(configNodes.filter((node) => node.id).map((node) => [node.id!, node]))
-    const byURI = new Map(configNodes.filter((node) => node.uri).map((node) => [node.uri, node]))
-    const byName = new Map(configNodes.map((node) => [node.name, node]))
-    return new Map(nodes.flatMap((node) => {
-      const config = byID.get(node.node_id) || byURI.get(node.uri) || byName.get(node.name)
-      return config ? [[node.node_id, config] as const] : []
-    }))
-  }, [configNodes, nodes])
+  const nodeConfigByID = useMemo(() => new Map(
+    configNodes.flatMap(node => node.id ? [[node.id, node] as const] : []),
+  ), [configNodes])
 
   const subscriptionNamesByID = useMemo(
     () => new Map(subscriptions.map((subscription) => [subscription.id, subscription.name])),
@@ -326,11 +318,16 @@ export default function UnlockPanel() {
 
   const sortedNodes = useMemo(() => {
     const byID = new Map(nodes.map(node => [node.node_id, node]))
-    return (nodeFilter.query.data?.items || []).flatMap(item => {
-      const node = byID.get(item.id)
-      return node ? [node] : []
-    })
+    return (nodeFilter.query.data?.items || []).map(item => ({ ...item, runtime: byID.get(item.id) }))
   }, [nodes, nodeFilter.query.data])
+
+  // A periodic refresh can remove the last page while its details are in flight.
+  const { page, setPage, query } = nodeFilter
+  useEffect(() => {
+    if (!query.isSuccess || query.isFetching) return
+    const lastOffset = Math.max(0, Math.ceil(query.data.total / page.limit) - 1) * page.limit
+    if (page.offset > lastOffset) setPage(current => ({ ...current, offset: lastOffset }))
+  }, [page.limit, page.offset, query.data, query.isFetching, query.isSuccess, setPage])
 
   const progressPct =
     batchProgress.total > 0
@@ -338,23 +335,23 @@ export default function UnlockPanel() {
       : 0
 
   const openDrawer = (node: NodeSnapshot) => {
-    setSelectedNode(node)
+    setSelectedNodeID(node.node_id)
     setDrawerOpen(true)
   }
 
   const isFilterActive = Object.keys(nodeFilter.spec).some(key => key !== 'version')
   const resetFilters = () => nodeFilter.setSpec({ version: 2 })
-  const allFilteredSelected = sortedNodes.length > 0 && sortedNodes.every((node) => selectedIds.has(node.node_id))
+  const allFilteredSelected = sortedNodes.length > 0 && sortedNodes.every((node) => selectedIds.has(node.id))
   const toggleAllFiltered = () => setSelectedIds((current) => {
     const next = new Set(current)
-    if (allFilteredSelected) sortedNodes.forEach((node) => next.delete(node.node_id))
-    else sortedNodes.forEach((node) => next.add(node.node_id))
+    if (allFilteredSelected) sortedNodes.forEach((node) => next.delete(node.id))
+    else sortedNodes.forEach((node) => next.add(node.id))
     return next
   })
   const selectedTargets = [...selectedIds]
 
   return (
-    <PageLayout className="lg:h-[calc(100vh-4rem)] lg:min-h-0 lg:overflow-hidden">
+    <PageLayout>
       <PageHeader
         title="解锁检测"
         description="手动检测节点延迟、下载速度、独立 IP 质量来源与流媒体解锁；结果不影响路由健康"
@@ -362,17 +359,17 @@ export default function UnlockPanel() {
         actions={
           <div className="flex items-center gap-2">
             {batchRunning ? (
-              <button className="btn btn-error btn-sm gap-2 lg:btn-md" onClick={stopBatch}>
+              <button className="btn btn-error btn-sm gap-2 lg:btn-md" onClick={stopBatch} aria-label="停止检测" title="停止检测">
                 <X className="h-4 w-4" />
-                停止检测
+                <span className="hidden sm:inline">停止检测</span>
               </button>
             ) : (
               <>
-                <button className="btn btn-primary btn-sm gap-2 shadow-sm lg:btn-md" onClick={() => setCheckDialogOpen(true)} disabled={loading || summary.total === 0}>
-                  <Gauge className="h-4 w-4" />综合检测
+                <button className="btn btn-primary btn-sm gap-2 shadow-sm lg:btn-md" onClick={() => setCheckDialogOpen(true)} disabled={loading || nodeFilter.query.isError || !matchedTotal} aria-label="综合检测" title="综合检测">
+                  <Gauge className="h-4 w-4" /><span className="hidden sm:inline">综合检测</span>
                 </button>
-                <button className="btn btn-ghost btn-sm gap-2 border border-base-300 lg:btn-md" onClick={runBatch} disabled={preparingTask || loading || summary.total === 0}>
-                  <Play className="h-4 w-4" />快速解锁
+                <button className="btn btn-ghost btn-sm gap-2 border border-base-300 lg:btn-md" onClick={runBatch} disabled={preparingTask || loading || nodeFilter.query.isError || !matchedTotal} aria-label="快速解锁" title="快速解锁">
+                  <Play className="h-4 w-4" /><span className="hidden sm:inline">快速解锁</span>
                 </button>
               </>
             )}
@@ -381,6 +378,7 @@ export default function UnlockPanel() {
               onClick={() => void loadNodes()}
               disabled={loading}
               title="重新加载运行节点列表"
+              aria-label="刷新节点"
             >
               <RefreshCw className={cn('h-4 w-4', loading && 'animate-spin')} />
               <span className="hidden sm:inline">刷新节点</span>
@@ -389,11 +387,8 @@ export default function UnlockPanel() {
         }
       />
 
-      <PageContent fill className="lg:overflow-hidden">
+      <PageContent>
         {(pageDetails.error || nodeFilter.query.error) && <div role="alert" className="alert alert-error mb-4 text-sm">{(pageDetails.error || nodeFilter.query.error)?.message}</div>}
-        <p className="mb-4 shrink-0 text-sm leading-6 text-base-content/55">
-          原生 IP / 解锁标签现由“节点标签”页面中的规则产生；本页只负责检测并保存事实。
-        </p>
         {/* ---- Batch progress banner ---- */}
         {batchRunning && (
           <div className={cn(surfaceClass, 'mb-5 shrink-0 border-primary/30 bg-primary/5 p-4 sm:p-5')}>
@@ -441,78 +436,10 @@ export default function UnlockPanel() {
           </details>
         )}
 
-        {/* ---- Redesigned Status Summary Cards ---- */}
-        <section className="mb-5 grid shrink-0 grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
-          <SummaryCard
-            label="解锁已检测 / 节点"
-            value={summary.total > 0 ? `${summary.tested} / ${summary.total}` : '0'}
-            hint={
-              summary.total === 0
-                ? '暂无运行节点'
-                : summary.untested === 0
-                  ? '覆盖率 100% · 全部已完成'
-                  : `覆盖率 ${Math.round((summary.tested / summary.total) * 100)}% · 待检测 ${summary.untested}`
-            }
-            icon={<ShieldCheck className="h-5 w-5" />}
-            toneBg="bg-primary/10"
-            toneText="text-primary"
-            active={statusFilter === ''}
-            onClick={() => setStatusFilter('')}
-          />
-          <SummaryCard
-            label="住宅 IP"
-            value={summary.pureIp}
-            hint={
-              summary.qualityTested > 0
-                ? `住宅率 ${Math.round((summary.pureIp / summary.qualityTested) * 100)}% · 来自质量源`
-                : '需启用 IP 质量提供商'
-            }
-            icon={<Sparkles className="h-5 w-5" />}
-            toneBg="bg-cyan-500/10"
-            toneText="text-cyan-600 dark:text-cyan-400"
-            active={statusFilter === 'residential'}
-            onClick={() => setStatusFilter(statusFilter === 'residential' ? '' : 'residential')}
-          />
-          <SummaryCard
-            label="完整解锁"
-            value={summary.unlocked}
-            hint={
-              summary.tested > 0
-                ? `占比 ${Math.round((summary.unlocked / summary.tested) * 100)}% · 全平台畅通`
-                : '全部平台完全解锁'
-            }
-            icon={<CheckCircle2 className="h-5 w-5" />}
-            toneBg="bg-success/10"
-            toneText="text-success"
-            active={statusFilter === 'unlocked'}
-            onClick={() => setStatusFilter(statusFilter === 'unlocked' ? '' : 'unlocked')}
-          />
-          <SummaryCard
-            label="受限 / 部分"
-            value={summary.locked}
-            hint="仅自制剧或部分流媒体"
-            icon={<AlertTriangle className="h-5 w-5" />}
-            toneBg="bg-warning/10"
-            toneText="text-warning"
-            active={statusFilter === 'locked'}
-            onClick={() => setStatusFilter(statusFilter === 'locked' ? '' : 'locked')}
-          />
-          <SummaryCard
-            label="检测失败"
-            value={summary.failed}
-            hint="超时或节点不可达"
-            icon={<XCircle className="h-5 w-5" />}
-            toneBg={summary.failed > 0 ? 'bg-error/10' : 'bg-base-200'}
-            toneText={summary.failed > 0 ? 'text-error' : 'text-base-content/40'}
-            active={statusFilter === 'failed'}
-            onClick={() => setStatusFilter(statusFilter === 'failed' ? '' : 'failed')}
-          />
-        </section>
-
         {/* ---- Redesigned Search & Filter Toolbar ---- */}
         <section className={cn(surfaceClass, 'mb-5 shrink-0 p-4 sm:p-5')}>
           <div className="flex flex-col gap-4">
-            <NodeFilterBar filter={nodeFilter} />
+            <NodeFilterBar filter={nodeFilter} countDisplay="runtime" />
 
             {/* Row 2: Status Filter Chips & Result Counter */}
             <div className="flex flex-wrap items-center justify-between gap-3 border-t border-base-200 pt-3.5">
@@ -522,13 +449,13 @@ export default function UnlockPanel() {
                   active={statusFilter === ''}
                   onClick={() => setStatusFilter('')}
                   label="全部"
-                  count={nodeFilter.query.data?.total || 0}
+                  count={nodeFilter.facets.isError ? undefined : runtimeTotal}
                 />
                 <FilterChip
                   active={statusFilter === 'residential'}
                   onClick={() => setStatusFilter(statusFilter === 'residential' ? '' : 'residential')}
                   label="住宅 IP"
-                  count={summary.pureIp}
+                  count={diagnosticCount('residential')}
                   tone="cyan"
                 />
                 <FilterChip
@@ -584,29 +511,29 @@ export default function UnlockPanel() {
                   active={statusFilter === 'unlocked'}
                   onClick={() => setStatusFilter(statusFilter === 'unlocked' ? '' : 'unlocked')}
                   label="全解锁"
-                  count={summary.unlocked}
+                  count={diagnosticCount('unlocked')}
                   tone="success"
                 />
                 <FilterChip
                   active={statusFilter === 'locked'}
                   onClick={() => setStatusFilter(statusFilter === 'locked' ? '' : 'locked')}
                   label="受限 / 部分"
-                  count={summary.locked}
+                  count={diagnosticCount('locked')}
                   tone="warning"
                 />
                 <FilterChip
                   active={statusFilter === 'failed'}
                   onClick={() => setStatusFilter(statusFilter === 'failed' ? '' : 'failed')}
                   label="解锁失败"
-                  count={summary.failed}
+                  count={diagnosticCount('failed')}
                   tone="error"
                 />
-                {summary.untested > 0 && (
+                {(diagnosticCount('untested') ?? 0) > 0 && (
                   <FilterChip
                     active={statusFilter === 'untested'}
                     onClick={() => setStatusFilter(statusFilter === 'untested' ? '' : 'untested')}
                     label="未检测"
-                    count={summary.untested}
+                    count={diagnosticCount('untested')}
                     tone="ghost"
                   />
                 )}
@@ -614,9 +541,6 @@ export default function UnlockPanel() {
 
               {/* Status information & Reset */}
               <div className="flex items-center gap-3 text-xs text-base-content/55">
-                <span>
-                  当前页 <strong className="font-bold text-base-content">{sortedNodes.length}</strong> / {nodeFilter.query.data?.total || 0} 个匹配节点
-                </span>
                 {isFilterActive && (
                   <button
                     type="button"
@@ -633,12 +557,12 @@ export default function UnlockPanel() {
         </section>
 
         {/* ---- Results Table ---- */}
-        <section className={cn(surfaceClass, 'flex flex-1 min-h-0 flex-col overflow-hidden')}>
-          <div className="flex-1 overflow-auto">
+        <section className={cn(surfaceClass, 'overflow-hidden')}>
+          <div className="max-h-[calc(100vh-280px)] min-h-[400px] overflow-auto">
             <table className="table table-sm w-full relative">
               <thead className="sticky top-0 z-10 border-b border-base-200 bg-base-100 text-xs font-semibold uppercase tracking-wider text-base-content/60 backdrop-blur-md">
                 <tr>
-                  <th className="w-12 text-center"><input type="checkbox" className="checkbox checkbox-sm" checked={allFilteredSelected} onChange={toggleAllFiltered} aria-label="选择当前筛选节点" /></th>
+                  <th className="w-12 text-center"><input type="checkbox" className="checkbox checkbox-sm" checked={allFilteredSelected} onChange={toggleAllFiltered} aria-label="选择当前页节点" /></th>
                   <th
                     className="w-72 cursor-pointer select-none transition-colors hover:bg-base-200/60"
                     onClick={() => handleSort('name')}
@@ -677,15 +601,15 @@ export default function UnlockPanel() {
                     </td>
                   </tr>
                 )}
-                {!loading && sortedNodes.length === 0 && (
+                {!loading && !nodeFilter.query.isError && sortedNodes.length === 0 && (
                   <tr>
                     <td colSpan={8} className="py-16 text-center text-base-content/50">
                       <div className="flex flex-col items-center justify-center gap-2">
                         <Globe2 className="h-8 w-8 text-base-content/30" />
                         <p className="font-medium text-base-content/70">
-                          {summary.total === 0 ? '暂无运行节点' : '没有找到匹配的节点'}
+                          {runtimeTotal === 0 ? '暂无运行节点' : '没有找到匹配的节点'}
                         </p>
-                        {summary.total > 0 && nodeFilter.spec.text?.trim() && (
+                        {(runtimeTotal ?? 0) > 0 && nodeFilter.spec.text?.trim() && (
                           <p className="text-xs text-base-content/45">请尝试缩短关键词或检查拼写</p>
                         )}
                         {isFilterActive && (
@@ -704,22 +628,23 @@ export default function UnlockPanel() {
                 )}
                 {sortedNodes.map((n, i) => (
                   <UnlockRow
-                    key={n.tag}
-                    index={i}
+                    key={n.id}
+                    index={nodeFilter.page.offset + i}
                     node={n}
-                    config={nodeConfigByID.get(n.node_id)}
-                    source={nodeSourceLabel(nodeConfigByID.get(n.node_id), subscriptionNamesByID)}
-                    result={results[n.node_id]}
-                    diagnostic={diagnostics[n.node_id]}
-                    nodeError={errors[n.node_id]}
-                    checking={Boolean(checking[n.node_id])}
-                    isSelected={selectedNode?.tag === n.tag}
-                    checked={selectedIds.has(n.node_id)}
-                    onToggle={() => setSelectedIds((current) => { const next = new Set(current); if (next.has(n.node_id)) next.delete(n.node_id); else next.add(n.node_id); return next })}
-                    onClick={() => openDrawer(n)}
+                    runtime={n.runtime}
+                    config={nodeConfigByID.get(n.id)}
+                    source={nodeSourceLabel(nodeConfigByID.get(n.id), subscriptionNamesByID)}
+                    result={results[n.id]}
+                    diagnostic={diagnostics[n.id]}
+                    nodeError={errors[n.id]}
+                    checking={Boolean(checking[n.id])}
+                    isSelected={selectedNodeID === n.id}
+                    checked={selectedIds.has(n.id)}
+                    onToggle={() => setSelectedIds((current) => { const next = new Set(current); if (next.has(n.id)) next.delete(n.id); else next.add(n.id); return next })}
+                    onClick={() => { if (n.runtime) openDrawer(n.runtime) }}
                     onCheck={(e) => {
                       e.stopPropagation()
-                      void runSingle(n)
+                      if (n.runtime) void runSingle(n.runtime)
                     }}
                   />
                 ))}
@@ -771,48 +696,6 @@ function SortIcon({ active, dir }: { active: boolean; dir: 'asc' | 'desc' }) {
   )
 }
 
-function SummaryCard({
-  label,
-  value,
-  hint,
-  icon,
-  toneBg,
-  toneText,
-  active = false,
-  onClick,
-}: {
-  label: string
-  value: number | string
-  hint: string
-  icon: React.ReactNode
-  toneBg: string
-  toneText: string
-  active?: boolean
-  onClick?: () => void
-}) {
-  return (
-    <article
-      onClick={onClick}
-      className={cn(
-        surfaceClass,
-        'cursor-pointer p-4 transition-all duration-200 hover:-translate-y-0.5 hover:shadow-md sm:p-5',
-        active && 'ring-2 ring-primary/60 border-primary/40',
-      )}
-    >
-      <div className="flex items-center justify-between">
-        <span className="text-xs font-semibold uppercase tracking-wider text-base-content/55">{label}</span>
-        <span className={cn('rounded-xl p-2 transition-colors', toneBg, toneText)}>{icon}</span>
-      </div>
-      <div className={cn('mt-2.5 text-2xl font-black tabular-nums sm:text-3xl', toneText)}>
-        {value}
-      </div>
-      <p className="mt-1.5 truncate text-[11px] font-medium text-base-content/50" title={hint}>
-        {hint}
-      </p>
-    </article>
-  )
-}
-
 function FilterChip({
   active,
   onClick,
@@ -823,7 +706,7 @@ function FilterChip({
   active: boolean
   onClick: () => void
   label: string
-  count: number
+  count?: number
   tone?: 'default' | 'cyan' | 'success' | 'warning' | 'error' | 'ghost'
 }) {
   const toneClasses = {
@@ -851,7 +734,7 @@ function FilterChip({
           active ? 'bg-black/20 text-current' : 'bg-base-300/60 text-current opacity-80',
         )}
       >
-        {count}
+        {count ?? '—'}
       </span>
     </button>
   )
@@ -947,6 +830,7 @@ function taskStatusLabel(status: NodeCheckTask['status']) { return ({ pending: '
 function UnlockRow({
   index,
   node,
+  runtime,
   config,
   source,
   result,
@@ -960,7 +844,8 @@ function UnlockRow({
   onCheck,
 }: {
   index: number
-  node: NodeSnapshot
+  node: NodeViewItem
+  runtime?: NodeSnapshot
   config?: ConfigNodeConfig
   source: string
   result?: UnlockResult
@@ -976,7 +861,7 @@ function UnlockRow({
   const err = nodeError || result?.error
   const network = unlockNetworkInfo(diagnostic, result)
   const exitCountryCode = network.countryCode
-  const latency = displayLatency(node, diagnostic)
+  const latency = displayLatency(runtime, diagnostic)
   const configuredRegion = config?.region || node.region || config?.country || node.country || ''
   const configuredTags = config?.tags || []
 
@@ -1056,7 +941,7 @@ function UnlockRow({
 
   return (
     <tr
-      className={cn('cursor-pointer transition-colors hover:bg-base-200/50', rowTint)}
+      className={cn('transition-colors hover:bg-base-200/50', runtime && 'cursor-pointer', rowTint)}
       onClick={onClick}
     >
       <td className="text-center font-mono text-xs text-base-content/40">
@@ -1071,6 +956,7 @@ function UnlockRow({
             <div className="truncate font-semibold text-base-content" title={node.name}>
               <span className="mr-1.5 font-mono text-[10px] text-base-content/35">{index + 1}</span>{node.name}
             </div>
+            {!runtime && <span className="badge badge-ghost badge-xs mt-1">运行态更新中</span>}
             {(configuredTags.length > 0 || source) && (
               <div className="mt-1 flex min-w-0 flex-wrap items-center gap-1 text-[10px] text-base-content/50">
                 {configuredTags.slice(0, 2).map((tag) => (
@@ -1148,8 +1034,8 @@ function UnlockRow({
             result ? 'btn-ghost text-primary hover:bg-primary/15' : 'btn-primary btn-outline',
           )}
           onClick={onCheck}
-          disabled={checking}
-          title={result ? '重新测试该节点解锁与 IP 属性' : '立即测试该节点'}
+          disabled={checking || !runtime}
+          title={!runtime ? '运行态更新中，暂不可检测' : result ? '重新测试该节点解锁与 IP 属性' : '立即测试该节点'}
         >
           {checking ? <span className="loading loading-spinner loading-xs" /> : result ? '重测' : '检测'}
         </button>

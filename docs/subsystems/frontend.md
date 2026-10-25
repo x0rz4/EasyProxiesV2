@@ -32,12 +32,16 @@ frontend/src/
 
 **表单字段 `Field` 目前不是共享组件**：`GroupPoolsPanel.tsx`、`OperationsPanel.tsx`、`tags/TagEditorDrawer.tsx` 各自定义了本地 `Field`，三者签名不同（`{label,hint,children}` vs `{id,label,hint,className,children}`）。写新表单时**不要**假设它来自 `PageLayout.tsx`。若要统一，先对齐这三份签名再上提。
 
-## 固定视口 vs 整页滚动
+## 页面与表格滚动
 
-- 解锁检测页：`PageLayout lg:h-[calc(100vh-4rem)] lg:overflow-hidden` + `PageContent fill lg:overflow-hidden`，**只有表格区内部滚动**。
-- 节点管理页：`PageLayout` 默认 `min-h-full`，由 App 的 `<main class="overflow-y-auto">` 整页滚动。
+- 解锁检测页与节点管理页使用默认 `PageLayout` / `PageContent`，由 App 的 `<main class="overflow-y-auto">` 整页滚动。
+- 两页表格使用 `max-h-[calc(100vh-280px)] min-h-[400px]` 独立纵横滚动，表头固定；筛选栏不锁在固定高度视口内。解锁页手机端标题操作仅显示图标，保留可访问名称与提示。
 
-改这两个页面高度时要留意差异——往固定视口页里放常驻展开的高控件会把内容撑爆裁掉。
+解锁页仅显示运行态节点（含待检查、不可用及黑名单），不以在线/健康状态限制范围。已移除统计卡片及标签归属提示，诊断筛选保留。
+
+`NodeFilterBar` 的可选 `countDisplay="runtime"` 仅用于解锁页：本页数量来自查询 items，匹配总数来自查询 total，运行节点总数来自 runtime facets；加载与失败分别显示查询中、数量暂不可用，后台刷新显示更新中。默认模式沿用原文案，节点管理页不受影响。“全部”诊断按钮显示运行节点总数。
+
+解锁表格按查询页的稳定节点 ID 渲染、选择和排序，不因详情暂缺而过滤掉行；缺失运行态时显示“运行态更新中”并禁用单节点操作，抽屉也只使用当前运行态。页码超出最新总数时回到最后有效页。
 
 ## 多选控件
 

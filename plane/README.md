@@ -8,6 +8,7 @@
 
 | 文档 | 用途与状态 |
 | --- | --- |
+| [解锁页布局与计数修复](changes/unlock-page-cleanup/plan.md) | 整页滚动、移除重复统计、运行态节点计数及分页详情一致性 |
 | [SS obfs 兼容修复](changes/ss-obfs-compatibility/plan.md) | Clash 混淆插件运行时适配、身份兼容与重载回归 |
 | [Linux 服务安装优化](changes/linux-service-installation/plan.md) | systemd/OpenRC 注册、自启、离线管理及验收记录 |
 | [控制面、刷新与退出链修复计划](changes/control-plane-scaling/plan.md) | 2026-10-26 后续七项修复、独立提交与验证记录 |

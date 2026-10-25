@@ -12,10 +12,10 @@ export interface UnlockNetworkInfo {
   organization: string
 }
 
-export function displayLatency(node: NodeSnapshot, diagnostic?: NodeCheckResultItem | null): DisplayLatency {
+export function displayLatency(node: NodeSnapshot | undefined, diagnostic?: NodeCheckResultItem | null): DisplayLatency {
   const diagnosticLatency = diagnostic?.detection?.latency_ms
   if (diagnosticLatency != null) return { value: diagnosticLatency, source: '综合检测' }
-  if (node.last_latency_ms >= 0) return { value: node.last_latency_ms, source: '健康探测' }
+  if (node && node.last_latency_ms >= 0) return { value: node.last_latency_ms, source: '健康探测' }
   return { value: null, source: null }
 }
 

@@ -4,8 +4,8 @@
 > 权威行为契约见 [plane/specs/proxy-pool/spec.md](../plane/specs/proxy-pool/spec.md)（MUST/场景）；
 > 变更提案与历史见 [plane/](../plane/)。本文件只讲"现在是怎么搭的"，不写"应该怎么改"。
 >
-> 基线核对：v2.2.12，migration 至 v25，`internal/` + `cmd/` 约 **40.7k** 行非测试代码、约 **23.3k** 行测试，
-> 前端 `frontend/src` 约 **10.1k** 行 TS/TSX。核对日期 2026-10-26。
+> 基线核对：v2.2.13，migration 至 v25，`internal/` + `cmd/` 约 **40.7k** 行非测试代码、约 **23.3k** 行测试，
+> 前端 `frontend/src` 约 **10.0k** 行 TS/TSX。核对日期 2026-10-26。
 
 ## 1. 一句话说清这个系统
 
