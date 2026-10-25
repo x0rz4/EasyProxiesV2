@@ -32,6 +32,8 @@
 - `NodeKey()` 用于内联节点与库内节点的匹配回填。
 - **协议白名单唯一真源是 `nodecodec.ParseURI`**，`supportedProxyURISchemes` 必须与它一致。
 
+Clash SS 的 `obfs` 插件及 `mode/host` 参数保留在节点 URI 中；到 builder 构建出站时再适配 sing-box 格式（OUTBOUND-001），避免升级改写已存节点身份。
+
 ## 订阅渲染（subrender）
 
 把节点 URI 渲染成 Clash/Mihomo 订阅文档与入口代理（`RenderClash`）。无运行时依赖，供 `/sub/*` 复用。

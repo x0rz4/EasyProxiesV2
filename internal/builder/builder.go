@@ -649,8 +649,12 @@ func buildSpecOutbound(tag string, spec nodecodec.Spec, skipCertVerify bool) (op
 			Password:      spec.Auth.Password,
 		}
 		if spec.Plugin.Name != "" {
-			opts.Plugin = spec.Plugin.Name
-			opts.PluginOptions = spec.Plugin.Options
+			plugin, err := shadowsocksRuntimePlugin(spec.Plugin)
+			if err != nil {
+				return option.Outbound{}, err
+			}
+			opts.Plugin = plugin.Name
+			opts.PluginOptions = plugin.Options
 		}
 		return option.Outbound{Type: C.TypeShadowsocks, Tag: tag, Options: &opts}, nil
 	case "hysteria2":

@@ -11,9 +11,11 @@
 | `boxmgr` | `manager.go`、`healer.go`、`landing_location.go`、`probe_projection.go`、`reload_rebase.go` | sing-box 实例生命周期与"代"、三条重载路径、自愈执行端 |
 | `monitor` | `node_registry.go`、`probe_scheduler.go`、`health_event_hub.go`、`health_applier.go`、`speedtest.go`、`tag_providers.go` | 运行态注册表、探测调度、健康事件游标投递、健康投影 |
 | `probe` | `applier.go` | 测量事件唯一应用链（收据/幂等/身份门禁/健康日志行） |
-| `builder` | `builder.go` | config+store → sing-box `option.Options` |
+| `builder` | `builder.go`、`shadowsocks_plugin.go` | config+store → sing-box `option.Options`；SS 混淆插件运行时适配 |
 
 ## 关键不变量
+
+SS 插件在 `shadowsocksRuntimePlugin` 适配 Clash 与 sing-box 的格式差异。适配仅作用于构建出的出站，不回写 URI、Spec、身份或导出配置；行为契约见 OUTBOUND-001。sing-box 内嵌实现插件，无需安装外部 obfs 可执行文件。
 
 1. **快照只读、选路无锁**：数据面读路径只做一次 `atomic.Pointer.Load()`；写侧走 `PrepareUpdate` → `Commit`，`PrepareUpdate` 失败必须 `Rollback` 并清理已创建成员。
 2. **代际不可覆盖**：出站 tag 命名唯一在 `runtimetag`（`<16hex>@vN`）。同 tag 重复 `CreateMember` 会关掉旧 outbound、无法排空，所以变更节点必须换新 `@vN`。

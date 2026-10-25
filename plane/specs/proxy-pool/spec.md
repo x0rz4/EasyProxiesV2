@@ -17,6 +17,18 @@
 | L4 控制面 | `monitor` API、`GroupPoolsPanel`、`GroupHealLog`、`store` 审计 | 已有策略校验和自愈日志；缺口聚合视图及策略变更留痕待补 |
 | L5 平台化 | `app` 单进程装配、SQLite、安装与发布工作流 | 单机部署；不提供多实例一致性协议 |
 
+## ADDED Requirement OUTBOUND-001：Clash SS obfs 运行时适配
+
+SS 出站构建 MUST 将插件名 `obfs` 适配为 sing-box 内嵌的 `obfs-local`，并将其 `mode` / `host` 参数映射为 `obfs` / `obfs-host`。同时存在原生键和别名时 MUST 优先采用原生键；参数转义及重复值 MUST 保留语义。适配 MUST 仅发生在出站构建阶段，不修改持久化 URI、节点身份或 Clash 导出格式；原生 `obfs-local` 与其它插件配置 MUST 保持原样。
+
+### Scenario: 订阅包含 TLS 混淆节点
+
+- GIVEN Clash SS 节点配置 `plugin: obfs` 和 `plugin-opts: {mode: tls, host: cdn.example}`。
+- WHEN 导入后冷启动、增量重载或全量重载。
+- THEN 内嵌插件使用 TLS 混淆及指定 host，不因插件名报错，也不退回 HTTP 模式；节点身份与原始导出配置保持兼容。
+
+代码：`internal/builder/shadowsocks_plugin.go`。测试：`TestClashObfsBuildsSupportedPlugin`、`TestShadowsocksPluginCompatibility`、`TestObfsPluginStartsAndReloads`。
+
 ## Requirement IDENTITY-001：结果必须绑定身份与运行时代际
 
 持久化测量 MUST 在联网前记录身份 token/revision、ProbeID 和 StartedAt；结果应用 MUST 拒绝旧身份、重复或乱序结果。NodeID、身份 revision 与 runtime tag generation 不是同一概念，不能互相替代。显示名不作为身份。
