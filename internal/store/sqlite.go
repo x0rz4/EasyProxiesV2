@@ -2604,15 +2604,24 @@ func (s *sqliteStore) Close() error {
 }
 
 func (s *sqliteStore) WithTx(ctx context.Context, fn func(tx Store) error) error {
+	return s.withTx(ctx, s.writerDB, fn)
+}
+
+func (s *sqliteStore) WithReadTx(ctx context.Context, fn func(tx Store) error) error {
+	return s.withTx(ctx, s.readerDB, fn)
+}
+
+func (s *sqliteStore) withTx(ctx context.Context, db *sql.DB, fn func(tx Store) error) error {
 	if s.tx != nil {
 		// Already in a transaction, just execute
 		return fn(s)
 	}
 
-	tx, err := s.writerDB.BeginTx(ctx, nil)
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
+	defer tx.Rollback() // Also release the connection if the callback panics.
 
 	txStore := &sqliteStore{writerDB: s.writerDB, readerDB: s.readerDB, tx: tx}
 	if err := fn(txStore); err != nil {

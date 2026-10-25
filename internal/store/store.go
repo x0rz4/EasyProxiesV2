@@ -281,6 +281,11 @@ type Store interface {
 	// WithTx executes fn within a transaction. If fn returns an error,
 	// the transaction is rolled back; otherwise it is committed.
 	WithTx(ctx context.Context, fn func(tx Store) error) error
+
+	// WithReadTx provides one consistent read snapshot on the reader pool.
+	// Nested transactions reuse the current transaction; writes on a reader
+	// transaction fail rather than acquiring the writer connection.
+	WithReadTx(ctx context.Context, fn func(tx Store) error) error
 }
 
 // SavedFilter stores a versioned query specification. Groups copy its content;

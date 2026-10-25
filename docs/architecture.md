@@ -131,7 +131,7 @@ GeoIP 预热 → 开 SQLite → 从 store 载入 nodes/groups/tags（store 覆�
 
 | 包 | 职责 | 关键入口 |
 | --- | --- | --- |
-| `store` | **唯一持久化层**：`Store` 接口（当前 **109** 个方法）+ 手写 migration（append-only，当前最新 **v25**）+ 单写连接 / WAL / 四读连接 | `Open` / `Migrate`、`sqlite.go`、`sqlite_tags.go`、`sqlite_location.go`、`health_events.go`、`node_identity.go`、`probe_id.go` |
+| `store` | **唯一持久化层**：`Store` 接口（当前 **110** 个方法）+ 手写 migration（append-only，当前最新 **v25**）+ 单写连接 / WAL / 四读连接 | `Open` / `Migrate`、`sqlite.go`、`sqlite_tags.go`、`sqlite_location.go`、`health_events.go`、`node_identity.go`、`probe_id.go` |
 
 ## 5. 依赖方向（2026-10-23 由 AST 级 import 扫描实测，修正了旧文档多处失实）
 

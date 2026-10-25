@@ -45,7 +45,7 @@ func (s *Server) loadNodeView(ctx context.Context, withFacts bool) (*nodeview.Vi
 	var nodes []nodeview.Node
 	names := map[int64]string{}
 	var facts []nodefacts.NodeFacts
-	err := s.store.WithTx(ctx, func(tx store.Store) error {
+	err := s.store.WithReadTx(ctx, func(tx store.Store) error {
 		managed, err := tx.ListManagedNodes(ctx, nil)
 		if err != nil {
 			return err

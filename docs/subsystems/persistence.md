@@ -4,7 +4,7 @@
 
 ## store 唯一持久化层
 
-`Store` 接口是数据库访问的唯一入口（当前 **109** 个方法），涵盖 nodes / subscriptions / stats / sessions / unlock / detection / group pools / tags。`Open()` 内部跑 `Migrate`。生产配置为**单写连接 + WAL + 四读连接**（规避进程内写锁争用）。
+`Store` 接口是数据库访问的唯一入口（当前 **110** 个方法），涵盖 nodes / subscriptions / stats / sessions / unlock / detection / group pools / tags。`Open()` 内部跑 `Migrate`。生产配置为**单写连接 + WAL + 四读连接**（规避进程内写锁争用）。
 
 页缓存默认每连接 4096 KiB，五个连接合计建议预算 20 MiB，按需增长而非预分配。启动环境变量 `EASY_PROXIES_SQLITE_CACHE_KIB` 可设置每连接预算（1–65536 KiB）；非法值导致启动明确失败，不支持热修改。SQLite 页缓存不是整个进程的硬内存上限。
 
@@ -45,3 +45,5 @@
 ## jsonx
 
 JSON 编解码统一出口（Sonic + `MarshalCanonical`）。`Marshal`/`Unmarshal` 默认 Sonic；需要**确定性字节序**（做哈希或比较）时用 `MarshalCanonical`。注意 Sonic 的 `ConfigDefault` 不排序 map 键——别拿 `Marshal` 输出直接做哈希/比较。
+
+节点视图的节点、标签与诊断事实在 WithReadTx 中使用同一 WAL 读快照；查询不占用写连接。嵌套事务复用当前事务，读事务内写入由 query_only 拒绝。WithTx 保持读己之写语义。

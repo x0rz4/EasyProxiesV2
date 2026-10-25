@@ -182,3 +182,43 @@ func TestSQLiteCloseClosesBothPools(t *testing.T) {
 		t.Fatal("writer pool remains open after Close")
 	}
 }
+
+func TestSQLiteReadTransactionSnapshotAllowsWriter(t *testing.T) {
+	db := openSQLiteStoreForPoolTest(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	node := &Node{URI: "http://snapshot.example:80", Name: "before", Source: NodeSourceManual, Enabled: true}
+	if err := db.CreateNode(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WithReadTx(ctx, func(tx Store) error {
+		before, err := tx.GetNode(ctx, node.ID)
+		if err != nil {
+			return err
+		}
+		node.Name = "after"
+		// A query using the writer would deadlock here until the deadline.
+		if err := db.UpdateNode(ctx, node); err != nil {
+			return fmt.Errorf("writer during read snapshot: %w", err)
+		}
+		return tx.WithReadTx(ctx, func(nested Store) error {
+			after, err := nested.GetNode(ctx, node.ID)
+			if err != nil {
+				return err
+			}
+			if after.Name != before.Name {
+				return fmt.Errorf("snapshot changed: %s -> %s", before.Name, after.Name)
+			}
+			if err := nested.WithTx(ctx, func(write Store) error { return write.UpdateNode(ctx, node) }); err == nil {
+				return errors.New("nested writer escaped read-only transaction")
+			}
+			return nil
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	found, err := db.GetNode(ctx, node.ID)
+	if err != nil || found.Name != "after" {
+		t.Fatalf("committed writer: %+v, %v", found, err)
+	}
+}
