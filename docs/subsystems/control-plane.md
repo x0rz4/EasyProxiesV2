@@ -36,6 +36,8 @@ monitor 从不反向 import httpapi；httpapi 不 import boxmgr
 
 ## controlplane 领域服务
 
+综合检测任务的状态写入按任务串行，运行进度至多每秒落库一次，状态转换与终态绕过节流。每次写入最多 5 秒，运行中写入随任务取消；取消后的终态使用独立有界预算。失败进入日志、SSE warning 与任务 `persistence_error` 字段；初始任务无法保存时创建失败，不启动后台检测。
+
 - `Auth`：会话、登录限流、API Key 凭据。
 - `Settings`：配置读写、校验、持久化、`ApplyPlan` —— **所有配置写入者的唯一序列化点**。
 - `ports.go`：跨层接口与领域错误（`ErrNodeNotFound`、`NodeDuplicateError`、`ErrRefreshInProgress` 等）。

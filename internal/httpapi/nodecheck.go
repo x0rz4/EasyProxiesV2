@@ -48,18 +48,19 @@ type nodeCheckStageStats struct {
 }
 
 type nodeCheckTaskSnapshot struct {
-	ID              string                         `json:"id"`
-	Status          string                         `json:"status"`
-	Stages          nodeCheckStages                `json:"stages"`
-	Settings        map[string]any                 `json:"settings"`
-	Stats           map[string]nodeCheckStageStats `json:"stats"`
-	TotalNodes      int                            `json:"total_nodes"`
-	CompletedNodes  int                            `json:"completed_nodes"`
-	DownloadedBytes int64                          `json:"downloaded_bytes"`
-	Error           string                         `json:"error,omitempty"`
-	CreatedAt       time.Time                      `json:"created_at"`
-	StartedAt       time.Time                      `json:"started_at,omitempty"`
-	FinishedAt      time.Time                      `json:"finished_at,omitempty"`
+	ID               string                         `json:"id"`
+	Status           string                         `json:"status"`
+	Stages           nodeCheckStages                `json:"stages"`
+	Settings         map[string]any                 `json:"settings"`
+	Stats            map[string]nodeCheckStageStats `json:"stats"`
+	TotalNodes       int                            `json:"total_nodes"`
+	CompletedNodes   int                            `json:"completed_nodes"`
+	DownloadedBytes  int64                          `json:"downloaded_bytes"`
+	Error            string                         `json:"error,omitempty"`
+	PersistenceError string                         `json:"persistence_error,omitempty"`
+	CreatedAt        time.Time                      `json:"created_at"`
+	StartedAt        time.Time                      `json:"started_at,omitempty"`
+	FinishedAt       time.Time                      `json:"finished_at,omitempty"`
 }
 
 type nodeCheckEvent struct {
@@ -80,17 +81,20 @@ type nodeCheckEvent struct {
 }
 
 type nodeCheckTask struct {
-	observations map[int64]nodeloc.Observation
-	mu           sync.Mutex
-	snapshot     nodeCheckTaskSnapshot
-	settings     config.NodeCheckConfig
-	nodes        []monitor.Snapshot
-	ctx          context.Context
-	cancel       context.CancelFunc
-	sequence     int64
-	subs         map[chan nodeCheckEvent]struct{}
-	latencyOK    map[int64]bool
-	landingIPs   map[int64]string
+	persistMu         sync.Mutex
+	lastPersist       time.Time
+	lastPersistStatus string
+	observations      map[int64]nodeloc.Observation
+	mu                sync.Mutex
+	snapshot          nodeCheckTaskSnapshot
+	settings          config.NodeCheckConfig
+	nodes             []monitor.Snapshot
+	ctx               context.Context
+	cancel            context.CancelFunc
+	sequence          int64
+	subs              map[chan nodeCheckEvent]struct{}
+	latencyOK         map[int64]bool
+	landingIPs        map[int64]string
 }
 
 // nodeIDs returns the store IDs of the task's nodes. task.nodes is fixed at
@@ -158,15 +162,19 @@ func (t *nodeCheckTask) updateStage(phase, status string) {
 }
 
 type nodeCheckManager struct {
-	server *Server
-	mu     sync.Mutex
-	active *nodeCheckTask
-	tasks  map[string]*nodeCheckTask
-	ipapi  *ipquality.IPAPIClient
+	server         *Server
+	mu             sync.Mutex
+	active         *nodeCheckTask
+	tasks          map[string]*nodeCheckTask
+	ipapi          *ipquality.IPAPIClient
+	ctx            context.Context
+	stop           context.CancelFunc
+	persistTimeout time.Duration
 }
 
 func newNodeCheckManager(server *Server) *nodeCheckManager {
-	return &nodeCheckManager{server: server, tasks: make(map[string]*nodeCheckTask), ipapi: &ipquality.IPAPIClient{}}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &nodeCheckManager{server: server, tasks: make(map[string]*nodeCheckTask), ipapi: &ipquality.IPAPIClient{}, ctx: ctx, stop: cancel, persistTimeout: 5 * time.Second}
 }
 
 type nodeCheckCreateRequest struct {
@@ -216,7 +224,7 @@ func (m *nodeCheckManager) create(request nodeCheckCreateRequest) (*nodeCheckTas
 		}
 		settings = override
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(m.ctx)
 	now := time.Now().UTC()
 	stats := make(map[string]nodeCheckStageStats)
 	for phase, enabled := range map[string]bool{"latency": request.Stages.Latency, "speed": request.Stages.Speed, "quality": request.Stages.Quality, "unlock": request.Stages.Unlock} {
@@ -230,8 +238,10 @@ func (m *nodeCheckManager) create(request nodeCheckCreateRequest) (*nodeCheckTas
 		snapshot: nodeCheckTaskSnapshot{ID: newNodeCheckID(), Status: nodeCheckTaskPending, Stages: request.Stages, Settings: nodeCheckPublicSettings(settings), Stats: stats, TotalNodes: len(nodes), CreatedAt: now},
 	}
 	task.observations = make(map[int64]nodeloc.Observation, len(nodes))
+	beginCtx, beginCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer beginCancel()
 	for _, node := range nodes {
-		observation, err := store.BeginLandingProbe(ctx, m.server.store, node.NodeID, node.URI, task.snapshot.ID)
+		observation, err := store.BeginLandingProbe(beginCtx, m.server.store, node.NodeID, node.URI, task.snapshot.ID)
 		if err != nil {
 			cancel()
 			return nil, err
@@ -250,7 +260,16 @@ func (m *nodeCheckManager) create(request nodeCheckCreateRequest) (*nodeCheckTas
 	}
 	m.active, m.tasks[task.snapshot.ID] = task, task
 	m.mu.Unlock()
-	m.persist(task)
+	if err := m.persist(task); err != nil {
+		cancel()
+		m.mu.Lock()
+		if m.active == task {
+			m.active = nil
+		}
+		delete(m.tasks, task.snapshot.ID)
+		m.mu.Unlock()
+		return nil, fmt.Errorf("保存检测任务: %w", err)
+	}
 	go m.run(task)
 	return task, nil
 }
@@ -293,9 +312,9 @@ func (m *nodeCheckManager) run(task *nodeCheckTask) {
 	}
 	task.snapshot.CompletedNodes = task.snapshot.TotalNodes
 	task.snapshot.FinishedAt = time.Now().UTC()
-	final := task.copySnapshotLocked()
 	task.mu.Unlock()
 	m.persist(task)
+	final := task.copySnapshot()
 	// Per-stage enqueues cover the facts each stage wrote; this is the backstop for
 	// a node whose stage failed early, and it costs nothing extra because the queue
 	// coalesces it with everything already pending.
@@ -620,18 +639,58 @@ func detectIPFamily(raw string) string {
 
 func snapshotPointer(value nodeCheckTaskSnapshot) *nodeCheckTaskSnapshot { return &value }
 
-func (m *nodeCheckManager) persist(task *nodeCheckTask) {
+func (m *nodeCheckManager) persist(task *nodeCheckTask) error {
 	if m.server.store == nil {
-		return
+		return nil
 	}
+	// Progress writers must not queue behind one slow database write. Terminal
+	// states wait for that writer and always bypass throttling.
+	terminal := nodeCheckTerminal(task.copySnapshot().Status)
+	if terminal {
+		task.persistMu.Lock()
+	} else if !task.persistMu.TryLock() {
+		return nil
+	}
+	defer task.persistMu.Unlock()
 	snapshot := task.copySnapshot()
+	terminal = nodeCheckTerminal(snapshot.Status)
+	if !terminal && snapshot.Status == task.lastPersistStatus && time.Since(task.lastPersist) < time.Second {
+		return nil
+	}
 	stagesJSON, _ := json.Marshal(snapshot.Stages)
 	statsJSON, _ := json.Marshal(snapshot.Stats)
 	settingsJSON, _ := json.Marshal(snapshot.Settings)
-	_ = m.server.store.UpsertNodeDetectionTask(context.Background(), &store.NodeDetectionTask{ID: snapshot.ID, Status: snapshot.Status, StagesJSON: string(stagesJSON), SettingsJSON: string(settingsJSON), StatsJSON: string(statsJSON), TotalNodes: snapshot.TotalNodes, CompletedNodes: snapshot.CompletedNodes, DownloadedBytes: snapshot.DownloadedBytes, Error: snapshot.Error, CreatedAt: snapshot.CreatedAt, StartedAt: snapshot.StartedAt, FinishedAt: snapshot.FinishedAt})
-	if snapshot.Status == nodeCheckTaskCompleted || snapshot.Status == nodeCheckTaskCancelled || snapshot.Status == nodeCheckTaskFailed {
-		_ = m.server.store.PruneNodeDetectionTasks(context.Background(), 20)
+	parent := task.ctx
+	if parent == nil {
+		parent = m.ctx
 	}
+	if terminal {
+		// A cancelled task still needs its final status persisted, with an
+		// independent bounded budget rather than an already-cancelled context.
+		parent = context.WithoutCancel(parent)
+	}
+	ctx, cancel := context.WithTimeout(parent, m.persistTimeout)
+	defer cancel()
+	err := m.server.store.UpsertNodeDetectionTask(ctx, &store.NodeDetectionTask{ID: snapshot.ID, Status: snapshot.Status, StagesJSON: string(stagesJSON), SettingsJSON: string(settingsJSON), StatsJSON: string(statsJSON), TotalNodes: snapshot.TotalNodes, CompletedNodes: snapshot.CompletedNodes, DownloadedBytes: snapshot.DownloadedBytes, Error: snapshot.Error, CreatedAt: snapshot.CreatedAt, StartedAt: snapshot.StartedAt, FinishedAt: snapshot.FinishedAt})
+	if err == nil {
+		task.lastPersist, task.lastPersistStatus = time.Now(), snapshot.Status
+		if terminal {
+			err = m.server.store.PruneNodeDetectionTasks(ctx, 20)
+		}
+	}
+	task.mu.Lock()
+	task.snapshot.PersistenceError = ""
+	if err != nil {
+		task.snapshot.PersistenceError = err.Error()
+	}
+	task.mu.Unlock()
+	if err != nil {
+		if m.server.logger != nil {
+			m.server.logger.Printf("[node-check] persist task %s: %v", snapshot.ID, err)
+		}
+		task.publish(nodeCheckEvent{Type: "warning", Phase: "persistence", Error: err.Error()})
+	}
+	return err
 }
 
 func (m *nodeCheckManager) get(id string) *nodeCheckTask {
@@ -665,6 +724,7 @@ func (m *nodeCheckManager) cancel(id string) bool {
 }
 
 func (m *nodeCheckManager) shutdown() {
+	m.stop()
 	m.mu.Lock()
 	active := m.active
 	m.mu.Unlock()
