@@ -33,6 +33,8 @@
 
 ## 探测链（L1）
 
+不响应取消的探测调用在实际返回前始终保留占位与 detached 计数，不按时间遗忘；同一个运行时调用不能重入。调度器另有 512 个真实未退出调用的总上限，覆盖运行时代际更替；触顶显式拒绝新调用。卡死的 Go 调用无法被强杀，须由底层连接退出或替换运行时恢复。
+
 `monitor.beginHealthResult` → `probe.Applier`（收据/幂等/身份/**日志行**） → `ProjectHealthOutcome` → `health_applier` → 运行态 entry → `HealthResultEvent`（**只作唤醒**） → 消费者按游标读 `health_events`。诊断 origin（`nodedetect`、`unlock`）**绝不发布健康事件**；`SnapshotOnly` 是可合并的刷新标志，只要求重读快照，MUST NOT 推进恢复/失败窗口（spec HEALTH-001/002/003、DIAGNOSTIC-001）。
 
 当前投递形态（2.2.6 起）：被接受的健康测量在**测量事务内**追加一条 `health_events` 行（`seq` 单调），订阅从日志按游标有序消费。pool 是持久消费者（key `pool:<groupID>`/`pool:base`），重启后从游标续读，重复投递按 ProbeID 幂等（`groupMemberRuntime.appliedProbes`，环深 64 = 一个投递批次）。日志容量 8192，满时**拒绝新测量并报错**（显式背压）。

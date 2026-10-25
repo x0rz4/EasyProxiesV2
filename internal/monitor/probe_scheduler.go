@@ -38,6 +38,7 @@ type probeExecutionEvent struct {
 }
 
 var errStaleProbeGeneration = errors.New("probe runtime generation changed")
+var errProbeCallLimit = errors.New("outstanding probe call limit reached")
 
 type activeProbeRound struct {
 	id          uint64
@@ -95,18 +96,13 @@ type probeAttemptKey struct {
 }
 
 type probeAttemptState struct {
-	detached  bool
-	startedAt time.Time
+	detached bool
 }
 
-// detachedProbeReclaimAfter bounds how long a detached probe may hold its
-// runningAttempts slot. The detach exists so an outbound that ignores context
-// cancellation does not block the caller past the deadline — but if that
-// outbound never returns at all, the slot would otherwise stay occupied
-// forever and every later probe of the node would fail with "previous probe
-// call is still running". Reclaiming the slot lets probing resume; the leaked
-// goroutine, if it ever completes, simply finds its state gone.
-const detachedProbeReclaimAfter = 10 * time.Minute
+// Detached calls still own resources. Only their actual return releases a slot;
+// forgetting them on a timer would allow an unbounded number of stuck calls.
+// This separate ceiling also bounds calls retained across runtime generations.
+const maxOutstandingProbeCalls = 512
 
 type probeCallResult struct {
 	latency time.Duration
@@ -427,12 +423,6 @@ func (s *probeScheduler) run() {
 				routineDueOnly = true
 			}
 			routinePending = true
-			for _, tag := range s.reapStalledDetachedProbes() {
-				if s.manager.logger != nil {
-					s.manager.logger.Warn("reclaimed stalled detached probe slot for ", tag,
-						" after ", detachedProbeReclaimAfter, "; later results from the leaked call are ignored")
-				}
-			}
 		}
 	}
 }
@@ -576,6 +566,10 @@ func (s *probeScheduler) runProbeAttempt(ctx context.Context, item probeWorkItem
 		s.attemptMu.Unlock()
 		return 0, errors.New("previous probe call is still running")
 	}
+	if len(s.runningAttempts) >= maxOutstandingProbeCalls {
+		s.attemptMu.Unlock()
+		return 0, errProbeCallLimit
+	}
 	s.runningAttempts[key] = state
 	s.attemptMu.Unlock()
 	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -606,7 +600,6 @@ func (s *probeScheduler) runProbeAttempt(ctx context.Context, item probeWorkItem
 		s.attemptMu.Lock()
 		if s.runningAttempts[key] == state {
 			state.detached = true
-			state.startedAt = time.Now()
 			s.detachedProbes.Add(1)
 			s.statusMu.Lock()
 			s.round.DetachedProbes = int(s.detachedProbes.Load())
@@ -639,33 +632,6 @@ func (s *probeScheduler) finishActiveRound(active *activeProbeRound, initialQueu
 	if active.convergence {
 		s.refreshInitialQueue(initialQueue)
 	}
-}
-
-// reapStalledDetachedProbes returns runningAttempts entries that detached
-// longer ago than detachedProbeReclaimAfter, so a probe whose outbound never
-// returns cannot pin the node out of probing forever. Runs on the actor
-// goroutine; the map surgery mirrors the goroutine-side cleanup and is safe
-// because the goroutine only deletes when it still owns the identical state
-// pointer.
-func (s *probeScheduler) reapStalledDetachedProbes() []string {
-	cutoff := time.Now().Add(-detachedProbeReclaimAfter)
-	s.attemptMu.Lock()
-	defer s.attemptMu.Unlock()
-	var reaped []string
-	for key, state := range s.runningAttempts {
-		if !state.detached || state.startedAt.IsZero() || state.startedAt.After(cutoff) {
-			continue
-		}
-		delete(s.runningAttempts, key)
-		s.detachedProbes.Add(-1)
-		reaped = append(reaped, key.tag)
-	}
-	if len(reaped) > 0 {
-		s.statusMu.Lock()
-		s.round.DetachedProbes = int(s.detachedProbes.Load())
-		s.statusMu.Unlock()
-	}
-	return reaped
 }
 
 func (s *probeScheduler) collectBatchProbeItems(dueOnly bool) []probeWorkItem {
@@ -817,6 +783,9 @@ func (s *probeScheduler) probeInitialAttempt(ctx context.Context, item probeWork
 		probeCtx := withProbePhaseTimeouts(ctx, policy.DialTimeout, policy.ResponseTimeout)
 		result.Latency, result.Err = s.runProbeAttempt(probeCtx, item, policy.StartupTimeout)
 	}
+	if errors.Is(result.Err, errProbeCallLimit) {
+		return result
+	}
 	if ctx.Err() == nil && entryRuntimeTag(item.entry) == item.tag && (result.Err == nil || commitFailure || item.probe == nil) {
 		if err := s.manager.commitHealthResult(item.entry, ticket, result.Latency, result.Err, time.Now()); err != nil {
 			result.Err = errors.Join(result.Err, err)
@@ -851,7 +820,7 @@ func (s *probeScheduler) probeRoutineItem(ctx context.Context, item probeWorkIte
 			break
 		}
 	}
-	if ctx.Err() == nil && entryRuntimeTag(item.entry) == result.Tag {
+	if ctx.Err() == nil && entryRuntimeTag(item.entry) == result.Tag && !errors.Is(result.Err, errProbeCallLimit) {
 		if err := s.manager.commitHealthResult(item.entry, ticket, result.Latency, result.Err, time.Now()); err != nil {
 			result.Err = errors.Join(result.Err, err)
 		}
