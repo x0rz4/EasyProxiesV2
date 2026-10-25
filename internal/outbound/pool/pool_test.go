@@ -713,12 +713,12 @@ func TestTrackedConnPreservesHalfClose(t *testing.T) {
 	defer right.Close()
 	underlying := &halfCloseConn{Conn: left}
 	var releases atomic.Int32
-	conn := &trackedConn{Conn: underlying, release: func() { releases.Add(1) }}
+	conn := (&trackedConn{Conn: underlying, release: func() { releases.Add(1) }}).withHalfClose()
 
-	if err := conn.CloseWrite(); err != nil {
+	if err := conn.(N.WriteCloser).CloseWrite(); err != nil {
 		t.Fatal(err)
 	}
-	if err := conn.CloseRead(); err != nil {
+	if err := conn.(N.ReadCloser).CloseRead(); err != nil {
 		t.Fatal(err)
 	}
 	if underlying.closeWriteCalls.Load() != 1 || underlying.closeReadCalls.Load() != 1 {
@@ -1058,8 +1058,8 @@ func TestEstablishedIOErrorDoesNotEvictGroupMember(t *testing.T) {
 }
 
 var _ net.Conn = (*halfCloseConn)(nil)
-var _ interface{ CloseWrite() error } = (*trackedConn)(nil)
-var _ interface{ CloseRead() error } = (*trackedConn)(nil)
+var _ N.WriteCloser = (*trackedDuplexConn)(nil)
+var _ N.ReadCloser = (*trackedDuplexConn)(nil)
 
 func TestSharedFailureWindowIgnoresExpiredFailures(t *testing.T) {
 	ResetSharedStateStore()

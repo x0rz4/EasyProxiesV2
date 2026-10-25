@@ -1680,7 +1680,7 @@ func (p *poolOutbound) wrapConn(conn net.Conn, member *memberState, destination 
 }
 
 func (p *poolOutbound) wrapConnWithRelease(conn net.Conn, member *memberState, destination string, snapshotRelease func()) net.Conn {
-	return &trackedConn{
+	tracked := &trackedConn{
 		Conn: conn,
 		release: func() {
 			p.decActive(member)
@@ -1702,6 +1702,7 @@ func (p *poolOutbound) wrapConnWithRelease(conn net.Conn, member *memberState, d
 			}
 		},
 	}
+	return tracked.withHalfClose()
 }
 
 func (p *poolOutbound) wrapPacketConnWithRelease(conn net.PacketConn, member *memberState, destination string, snapshotRelease func()) net.PacketConn {
@@ -1994,20 +1995,39 @@ func (c *trackedConn) recordIOError(err error) {
 	})
 }
 
-func (c *trackedConn) CloseWrite() error {
-	conn, ok := c.Conn.(interface{ CloseWrite() error })
-	if !ok {
-		return E.New("underlying connection does not support CloseWrite")
-	}
-	return conn.CloseWrite()
+type trackedReadConn struct {
+	*trackedConn
+	N.ReadCloser
 }
 
-func (c *trackedConn) CloseRead() error {
-	conn, ok := c.Conn.(interface{ CloseRead() error })
-	if !ok {
-		return E.New("underlying connection does not support CloseRead")
+type trackedWriteConn struct {
+	*trackedConn
+	N.WriteCloser
+}
+
+type trackedDuplexConn struct {
+	*trackedConn
+	N.ReadCloser
+	N.WriteCloser
+}
+
+// sing-box selects half-close by interface assertion. Advertising a capability
+// the underlying stream lacks turns normal EOF into an error; simply swallowing
+// that error would instead leave a stream open. Preserve its actual capabilities
+// so sing-box can choose its normal full-close fallback.
+func (c *trackedConn) withHalfClose() net.Conn {
+	reader, canRead := c.Conn.(N.ReadCloser)
+	writer, canWrite := c.Conn.(N.WriteCloser)
+	switch {
+	case canRead && canWrite:
+		return &trackedDuplexConn{trackedConn: c, ReadCloser: reader, WriteCloser: writer}
+	case canRead:
+		return &trackedReadConn{trackedConn: c, ReadCloser: reader}
+	case canWrite:
+		return &trackedWriteConn{trackedConn: c, WriteCloser: writer}
+	default:
+		return c
 	}
-	return conn.CloseRead()
 }
 
 func (c *trackedConn) Close() error {

@@ -25,6 +25,8 @@
 
 ## 三条重载路径（boxmgr）
 
+池的 TCP 连接包装只在底层实际支持时暴露 `CloseRead` / `CloseWrite`。缺少写半关闭能力时由 sing-box 走完整关闭，仍通过 tracked 连接释放计数；真实半关闭不释放活动连接。不能靠忽略半关闭错误替代关闭。
+
 节点集合的唯一来源是 `runtimenodes.Load`（enabled 非订阅 + enabled 订阅可达，按 identity 去重）。冷启动 `Start` / 增量 `reloadNodesIncrementally` / 全量蓝绿 `reload` 三条路径都必须走它，不得各自过滤 `enabled`。
 
 ## 自愈链（HEAL）
