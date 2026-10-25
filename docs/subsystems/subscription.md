@@ -35,3 +35,5 @@
 ## 订阅渲染（subrender）
 
 把节点 URI 渲染成 Clash/Mihomo 订阅文档与入口代理（`RenderClash`）。无运行时依赖，供 `/sub/*` 复用。
+
+Manager.Shutdown 取消下载并等待所属定时、初始化及后台刷新 worker 退出，再允许装配根关闭 store；Stop 保持取消语义。

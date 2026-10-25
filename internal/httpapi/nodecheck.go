@@ -171,6 +171,7 @@ func (t *nodeCheckTask) updateStage(phase, status string) {
 }
 
 type nodeCheckManager struct {
+	workers        sync.WaitGroup
 	server         *Server
 	mu             sync.Mutex
 	active         *nodeCheckTask
@@ -259,6 +260,11 @@ func (m *nodeCheckManager) create(request nodeCheckCreateRequest) (*nodeCheckTas
 	}
 
 	m.mu.Lock()
+	if m.ctx.Err() != nil {
+		m.mu.Unlock()
+		cancel()
+		return nil, errors.New("综合检测服务正在关闭")
+	}
 	if m.active != nil {
 		active := m.active.copySnapshot()
 		if active.Status == nodeCheckTaskPending || active.Status == nodeCheckTaskRunning {
@@ -268,8 +274,10 @@ func (m *nodeCheckManager) create(request nodeCheckCreateRequest) (*nodeCheckTas
 		}
 	}
 	m.active, m.tasks[task.snapshot.ID] = task, task
+	m.workers.Add(1)
 	m.mu.Unlock()
 	if err := m.persist(task); err != nil {
+		m.workers.Done()
 		cancel()
 		m.mu.Lock()
 		if m.active == task {
@@ -279,7 +287,7 @@ func (m *nodeCheckManager) create(request nodeCheckCreateRequest) (*nodeCheckTas
 		m.mu.Unlock()
 		return nil, fmt.Errorf("保存检测任务: %w", err)
 	}
-	go m.run(task)
+	go func() { defer m.workers.Done(); m.run(task) }()
 	return task, nil
 }
 

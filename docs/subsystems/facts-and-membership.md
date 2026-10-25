@@ -48,3 +48,5 @@
 ## 标签语义区分
 
 分组过滤存 **tag ID**（tag 改名不影响分组）；节点身上的标签是**名字**。两者由 `groupmember.NewFilter` 的 `WithTagNames` 桥接。`nodes.tags` 只是 `node_tags` 的**只读投影**（由 `refreshNodeTagProjection` 重写），改标签必须走 store 的 tag API（`SetManualNodeTags` / `ReplaceAutoNodeTags`），旁路写入会被下次重算覆盖。
+
+标签队列 CloseContext 接收退出预算；期限到达会取消正在执行的重算，已落库事实由下次启动全量重算收敛。普通 Close 也有五分钟上限。

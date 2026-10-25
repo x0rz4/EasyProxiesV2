@@ -1038,30 +1038,34 @@ func (m *Manager) markRollbackDegraded() {
 
 // Close terminates the active instance and auxiliary components.
 func (m *Manager) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return m.CloseContext(ctx)
+}
+
+func (m *Manager) CloseContext(ctx context.Context) error {
 	m.reloadMu.Lock()
 	defer m.reloadMu.Unlock()
 	groupErr := m.closeAllGroupRuntimes("stopped", "")
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	err := groupErr
-	if m.currentBox != nil {
-		if closeErr := m.currentBox.Close(); closeErr != nil && err == nil {
-			err = closeErr
-		}
-		m.currentBox = nil
-	}
-	if m.monitorServer != nil {
-		m.monitorServer.Shutdown(context.Background())
-		m.monitorServer = nil
-	}
-	if m.monitorMgr != nil {
-		m.monitorMgr.Stop()
-		m.monitorMgr = nil
-		m.healthCheckStarted = false
-	}
+	instance, server, mgr := m.currentBox, m.monitorServer, m.monitorMgr
+	m.currentBox, m.monitorServer, m.monitorMgr = nil, nil, nil
+	m.healthCheckStarted = false
 	m.baseCtx = nil
+	m.mu.Unlock()
+	// HTTP handlers may still read manager fields while shutting down.
+	// Do not hold mu while waiting for them or embedded instance closers.
+	if server != nil {
+		server.Shutdown(ctx)
+	}
+	err := groupErr
+	if instance != nil {
+		err = errors.Join(err, instance.Close())
+	}
+	if mgr != nil {
+		mgr.Stop()
+	}
 	pool.ResetAllRuntimeState()
 	return err
 }

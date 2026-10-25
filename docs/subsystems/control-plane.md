@@ -45,3 +45,5 @@ monitor 从不反向 import httpapi；httpapi 不 import boxmgr
 **不要**为"减少 handler 样板"引入泛型 `handle[Req,Resp]`（护栏 13）：14 个解码请求体的 handler 各带 3–19 个错误分支，包装只省最外层 decode/serialize，分支一个不少，且会丢掉 `respondNodeError` 的 `existing_node_id` 造成行为变化。
 
 综合检测 SSE 在同一任务锁内订阅并复制初始状态；已结束任务直接发送 done。终态事件在满队列时替换一条进度，保证可达。连接每 15 秒心跳，每次写入/flush 设置 10 秒期限，写失败、请求取消或 Server 关闭后解除订阅。
+
+Server 关闭幂等发送停止信号，HTTP 优雅关闭超时则关闭连接；等待综合检测任务完成终态写入后返回。自动随运行上下文关闭时使用十秒预算。

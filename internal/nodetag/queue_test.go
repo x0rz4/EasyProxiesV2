@@ -21,6 +21,32 @@ type recorder struct {
 	err  error
 }
 
+type cancelRecomputer struct{ entered chan struct{} }
+
+func (r cancelRecomputer) Recompute(ctx context.Context, _ []int64) ([]int64, error) {
+	close(r.entered)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+func (r cancelRecomputer) RecomputeAll(ctx context.Context) ([]int64, error) {
+	return r.Recompute(ctx, nil)
+}
+
+func TestQueueShutdownCancelsActiveRecompute(t *testing.T) {
+	r := cancelRecomputer{entered: make(chan struct{})}
+	q := NewQueue(r, WithDebounce(time.Millisecond), WithSweepInterval(time.Hour))
+	q.Enqueue(1)
+	<-r.entered
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := q.CloseContext(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("close: %v", err)
+	}
+	if err := q.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func newRecorder() *recorder {
 	return &recorder{calls: make(chan []int64, 16)}
 }

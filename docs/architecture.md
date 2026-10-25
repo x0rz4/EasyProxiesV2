@@ -231,3 +231,5 @@ docker compose up -d --build
 | subscription/config/nodecodec/subrender 订阅与解析 | [subsystems/subscription.md](subsystems/subscription.md) |
 | store/migrations/jsonx 持久化 | [subsystems/persistence.md](subsystems/persistence.md) |
 | frontend 前端 | [subsystems/frontend.md](subsystems/frontend.md) |
+
+退出由 internal/app/shutdown.go 的单一清理链负责：先取消运行上下文，再按逆装配顺序关闭组件，数据库最后关闭。整个退出（含启动失败清理）共享 30 秒预算；超时 Run 返回错误，由进程入口结束进程。不可取消的第三方 Close 只占用一个清理 goroutine，清理链仍按顺序等待，不会在后台组件未退出时提前关闭数据库。

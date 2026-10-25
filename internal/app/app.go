@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -44,7 +45,16 @@ func newTagService(dataStore store.Store, notify func([]int64)) *nodetag.Service
 }
 
 // Run builds the runtime components from config and blocks until shutdown.
-func Run(ctx context.Context, cfg *config.Config) error {
+func Run(ctx context.Context, cfg *config.Config) (runErr error) {
+	ctx, cancel := context.WithCancel(ctx)
+	shutdown := &shutdownStack{cancel: cancel}
+	defer func() {
+		budget, stop := context.WithTimeout(context.Background(), 30*time.Second)
+		defer stop()
+		if err := shutdown.close(budget); err != nil {
+			runErr = errors.Join(runErr, err)
+		}
+	}()
 	// ── 1. Prepare the GeoIP database before any landing-location work ──
 	// A download failure must not take down the proxy runtime. BoxManager opens
 	// only an existing validated database and will pause location classification
@@ -72,7 +82,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
-	defer dataStore.Close()
+	shutdown.add(func(context.Context) error { return dataStore.Close() })
 	if err := dataStore.InterruptRunningNodeDetectionTasks(ctx); err != nil {
 		return fmt.Errorf("interrupt stale node detection tasks: %w", err)
 	}
@@ -124,14 +134,14 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	boxMgr := boxmgr.New(cfg, monitorCfg, boxmgr.WithStore(dataStore))
 	groupPersister := newGroupStatePersister(dataStore)
 	group.SetGroupStateObserver(groupPersister.Observe)
-	defer func() {
+	shutdown.add(func(ctx context.Context) error {
 		group.SetGroupStateObserver(nil)
-		groupPersister.Close()
-	}()
+		return groupPersister.Shutdown(ctx)
+	})
+	shutdown.add(func(ctx context.Context) error { return boxMgr.CloseContext(ctx) })
 	if err := boxMgr.Start(ctx); err != nil {
 		return fmt.Errorf("start box manager: %w", err)
 	}
-	defer boxMgr.Close()
 
 	// ── 5b. Automatic node tagging ──
 	// The queue is what keeps a detection from writing tags inline: detections
@@ -143,10 +153,10 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	// reload: only the groups whose member set actually moved are touched, so the
 	// other listeners keep their live connections.
 	membershipUpdates := newMembershipQueue(ctx, boxMgr.ApplyGroupMembershipChanges, time.Second)
-	defer membershipUpdates.Close()
+	shutdown.add(func(context.Context) error { membershipUpdates.Close(); return nil })
 	tagService := newTagService(dataStore, membershipUpdates.Enqueue)
 	retagQueue := nodetag.NewQueue(tagService)
-	defer retagQueue.Close()
+	shutdown.add(retagQueue.CloseContext)
 	if server := boxMgr.MonitorServer(); server != nil {
 		server.SetTagService(tagService)
 		server.SetRetagQueue(retagQueue)
@@ -155,7 +165,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	// imported), so the first run reconciles everything.
 	retagQueue.EnqueueAll()
 	stopProbeProjections := startProbeProjections(ctx, dataStore, boxMgr.ProjectProbeOutcome, retagQueue.Enqueue)
-	defer stopProbeProjections()
+	shutdown.add(func(context.Context) error { stopProbeProjections(); return nil })
 
 	// ── 6. Create and start SubscriptionManager ──
 	// Always created so it can dynamically respond to config changes
@@ -167,7 +177,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	subMgr := subscription.New(cfg, boxMgr, subscription.WithStore(dataStore),
 		subscription.WithRefreshObserver(retagQueue.EnqueueAll))
 	subMgr.Start()
-	defer subMgr.Stop()
+	shutdown.add(subMgr.Shutdown)
 
 	// Register as config update listener so baseCfg stays in sync after reloads
 	boxMgr.AddConfigListener(subMgr)
@@ -176,15 +186,24 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		server.SetSubscriptionRefresher(subMgr)
 	}
 	stopGroupHealer := startGroupHealer(ctx, &healingBackend{Manager: boxMgr, db: dataStore, subscriptions: subMgr})
-	defer stopGroupHealer()
+	shutdown.add(func(context.Context) error { stopGroupHealer(); return nil })
 
 	// ── 7. Start periodic stats flush ──
 	statsCtx, statsCancel := context.WithCancel(ctx)
-	defer statsCancel()
-	go periodicStatsFlush(statsCtx, boxMgr, dataStore)
+	var statsWorkers sync.WaitGroup
+	statsWorkers.Go(func() { periodicStatsFlush(statsCtx, boxMgr, dataStore) })
 	// Timeline rows were never cleaned up (CleanupTimeline had no caller),
 	// so node_timeline grew without bound for as long as the process ran.
-	go periodicTimelineCleanup(statsCtx, dataStore)
+	statsWorkers.Go(func() { periodicTimelineCleanup(statsCtx, dataStore) })
+	shutdown.add(func(ctx context.Context) error {
+		statsCancel()
+		statsWorkers.Wait()
+		flushStatsToStore(ctx, boxMgr, dataStore)
+		return ctx.Err()
+	})
+	if server := boxMgr.MonitorServer(); server != nil {
+		shutdown.add(func(ctx context.Context) error { server.Shutdown(ctx); return ctx.Err() })
+	}
 
 	// ── 8. Wait for shutdown signal ──
 	sigCh := make(chan os.Signal, 1)
@@ -198,36 +217,8 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		fmt.Printf("Received %s, initiating graceful shutdown...\n", sig)
 	}
 
-	// ── 9. Graceful shutdown ──
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer shutdownCancel()
-
-	stopGroupHealer()
-	stopProbeProjections()
-	retagQueue.Close()
-	membershipUpdates.Close()
-
-	// Flush stats one final time before shutdown
-	flushStatsToStore(context.Background(), boxMgr, dataStore)
-
-	fmt.Println("Stopping subscription manager...")
-	if subMgr != nil {
-		subMgr.Stop()
-	}
-
-	fmt.Println("Stopping box manager...")
-	if err := boxMgr.Close(); err != nil {
-		fmt.Printf("Error closing box manager: %v\n", err)
-	}
-
-	fmt.Println("Waiting for connections to drain...")
-	select {
-	case <-time.After(2 * time.Second):
-		fmt.Println("Graceful shutdown completed")
-	case <-shutdownCtx.Done():
-		fmt.Println("Shutdown timeout exceeded, forcing exit")
-	}
-
+	// The deferred stack applies one budget to the whole chain, including
+	// error exits during startup. Cancellation reaches all producers first.
 	return nil
 }
 
@@ -241,12 +232,15 @@ func Run(ctx context.Context, cfg *config.Config) error {
 // shed an eviction, which is the failure this type used to have: a dropped
 // eviction leaves no row, so after a restart the bad node comes back healthy.
 type groupStatePersister struct {
-	store  store.Store
-	wake   chan struct{}
-	stop   chan struct{}
-	mu     sync.RWMutex
-	closed bool
-	wg     sync.WaitGroup
+	ctx       context.Context
+	cancel    context.CancelFunc
+	closeOnce sync.Once
+	store     store.Store
+	wake      chan struct{}
+	stop      chan struct{}
+	mu        sync.RWMutex
+	closed    bool
+	wg        sync.WaitGroup
 	// pending is keyed by group+node and always holds the newest state. Guarded
 	// by mu.
 	pending map[groupStateKey]group.GroupStateEvent
@@ -269,7 +263,9 @@ type groupStateKey struct {
 }
 
 func newGroupStatePersister(dataStore store.Store) *groupStatePersister {
+	ctx, cancel := context.WithCancel(context.Background())
 	p := &groupStatePersister{
+		ctx: ctx, cancel: cancel,
 		store:   dataStore,
 		wake:    make(chan struct{}, 1),
 		stop:    make(chan struct{}),
@@ -317,20 +313,23 @@ func (p *groupStatePersister) Merged() int64 { return p.merged.Load() }
 // Observe call is accepted, so a late state change is not silently dropped
 // behind a stopped writer.
 func (p *groupStatePersister) Close() {
-	p.mu.Lock()
-	closed := p.closed
-	p.closed = true
-	p.mu.Unlock()
-	if closed {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_ = p.Shutdown(ctx)
+}
+
+func (p *groupStatePersister) Shutdown(ctx context.Context) error {
+	p.closeOnce.Do(func() {
+		p.mu.Lock()
+		p.closed = true
+		p.mu.Unlock()
+		p.cancel()
+		close(p.stop)
 		p.wg.Wait()
-		return
-	}
-	// Final synchronous drain: the worker may already be exiting on stop, so
-	// flush here rather than racing it for the queue.
-	p.drainStates()
-	p.flushCurrent()
-	close(p.stop)
-	p.wg.Wait()
+		p.drainStates(ctx)
+		p.flushCurrent(ctx)
+	})
+	return ctx.Err()
 }
 
 func (p *groupStatePersister) run() {
@@ -342,17 +341,17 @@ func (p *groupStatePersister) run() {
 		case <-p.stop:
 			return
 		case <-p.wake:
-			p.drainStates()
+			p.drainStates(p.ctx)
 		case <-ticker.C:
-			p.drainStates()
-			p.flushCurrent()
+			p.drainStates(p.ctx)
+			p.flushCurrent(p.ctx)
 		}
 	}
 }
 
 // drainStates writes every pending member state. A failed write stays pending so
 // the next tick retries it instead of losing the transition.
-func (p *groupStatePersister) drainStates() {
+func (p *groupStatePersister) drainStates(parent context.Context) {
 	p.drainMu.Lock()
 	defer p.drainMu.Unlock()
 	p.mu.Lock()
@@ -363,7 +362,7 @@ func (p *groupStatePersister) drainStates() {
 	if len(batch) == 0 {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
 	var failed map[groupStateKey]group.GroupStateEvent
 	for key, event := range batch {
@@ -398,15 +397,15 @@ func (p *groupStatePersister) drainStates() {
 	}
 }
 
-func (p *groupStatePersister) flushCurrent() {
+func (p *groupStatePersister) flushCurrent(parent context.Context) {
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
+	defer cancel()
 	p.mu.Lock()
 	batch := p.current
 	p.current = make(map[int64]int64, len(batch))
 	p.mu.Unlock()
 	for groupID, nodeID := range batch {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		err := p.store.UpdateGroupCurrentActiveNode(ctx, groupID, nodeID)
-		cancel()
 		if err == nil {
 			continue
 		}

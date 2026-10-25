@@ -39,9 +39,12 @@ type Recomputer interface {
 //
 // Two properties matter more than throughput. Sends never block, because the
 // callers are probe goroutines: when the buffer is full the queue degrades to a
-// full recompute instead of dropping node IDs. And a coalesced request is never
-// lost on shutdown, because Close flushes what is pending before returning.
+// full recompute instead of dropping node IDs. Close flushes pending requests
+// within its budget; persisted facts are reconciled by the next startup sweep
+// if shutdown interrupts recomputation.
 type Queue struct {
+	ctx      context.Context
+	cancel   context.CancelFunc
 	service  Recomputer
 	events   chan int64
 	debounce time.Duration
@@ -97,7 +100,9 @@ func WithQueueLogf(logf func(string, ...any)) QueueOption {
 
 // NewQueue starts a queue driving service. Close it to stop the worker.
 func NewQueue(service Recomputer, options ...QueueOption) *Queue {
+	ctx, cancel := context.WithCancel(context.Background())
 	queue := &Queue{
+		ctx: ctx, cancel: cancel,
 		service:  service,
 		events:   make(chan int64, defaultQueueBuffer),
 		debounce: DefaultDebounce,
@@ -159,19 +164,31 @@ func (q *Queue) EnqueueAll() {
 // Close stops accepting requests, runs whatever is still pending, and waits for
 // the worker to finish.
 func (q *Queue) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultRecomputeTimeout)
+	defer cancel()
+	return q.CloseContext(ctx)
+}
+
+// CloseContext flushes pending facts within the caller's remaining budget.
+// Expiry cancels active recomputation; startup's full sweep reconciles any
+// persisted facts left behind by an interrupted final batch.
+func (q *Queue) CloseContext(ctx context.Context) error {
 	if q == nil {
 		return nil
 	}
 	q.mu.Lock()
 	if q.closed {
 		q.mu.Unlock()
-		return nil
+	} else {
+		q.closed = true
+		close(q.events)
+		q.mu.Unlock()
 	}
-	q.closed = true
-	close(q.events)
-	q.mu.Unlock()
+	stop := context.AfterFunc(ctx, q.cancel)
+	defer stop()
 	q.wg.Wait()
-	return nil
+	q.cancel()
+	return ctx.Err()
 }
 
 func (q *Queue) run() {
@@ -213,6 +230,8 @@ func (q *Queue) run() {
 	}
 	for {
 		select {
+		case <-q.ctx.Done():
+			return
 		case nodeID, open := <-q.events:
 			if !open {
 				q.flush(pending, full)
@@ -281,10 +300,13 @@ func stopTimer(timer *time.Timer) {
 // within seconds instead of the batch silently waiting for the next sweep
 // (up to the full sweep interval away).
 func (q *Queue) flush(pending map[int64]struct{}, full bool) bool {
+	if q.ctx.Err() != nil {
+		return false
+	}
 	if !full && len(pending) == 0 {
 		return true
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), q.timeout)
+	ctx, cancel := context.WithTimeout(q.ctx, q.timeout)
 	defer cancel()
 
 	var (

@@ -62,6 +62,8 @@ type runtimeManager interface {
 }
 
 type Manager struct {
+	workerMu   sync.Mutex
+	workers    sync.WaitGroup
 	mu         sync.RWMutex
 	baseCfg    *config.Config
 	boxMgr     runtimeManager
@@ -110,8 +112,24 @@ func (m *Manager) Start() {
 	if err := m.importConfiguredSubscriptions(m.ctx); err != nil {
 		m.logger.Errorf("import configured subscriptions: %v", err)
 	}
-	go m.refreshLoop()
-	go m.refreshInitialSnapshots()
+	m.startWorker(m.refreshLoop)
+	m.startWorker(m.refreshInitialSnapshots)
+}
+
+func (m *Manager) startWorker(work func()) {
+	m.workerMu.Lock()
+	defer m.workerMu.Unlock()
+	if m.ctx.Err() != nil {
+		return
+	}
+	m.workers.Go(work)
+}
+
+// Shutdown cancels downloads and joins all owned workers before the store closes.
+func (m *Manager) Shutdown(ctx context.Context) error {
+	m.Stop()
+	m.workers.Wait()
+	return ctx.Err()
 }
 
 // refreshInitialSnapshots populates memberships after migrating from the
@@ -139,7 +157,9 @@ func (m *Manager) refreshInitialSnapshots() {
 }
 
 func (m *Manager) Stop() {
+	m.workerMu.Lock()
 	m.cancel()
+	m.workerMu.Unlock()
 	if m.httpClient != nil {
 		m.httpClient.CloseIdleConnections()
 	}
@@ -299,13 +319,13 @@ func (m *Manager) updateSettings(ctx context.Context, id int64, input store.Subs
 // caller returns immediately; the fetch uses the manager context so shutdown
 // cancels it.
 func (m *Manager) refreshInBackground(id int64) {
-	go func() {
+	m.startWorker(func() {
 		m.refreshMu.Lock()
 		defer m.refreshMu.Unlock()
 		if err := m.refreshOneLocked(m.ctx, id, false); err != nil {
 			m.logger.Warnf("background refresh subscription %d failed: %v", id, err)
 		}
-	}()
+	})
 }
 
 func (m *Manager) Delete(ctx context.Context, id int64) error {

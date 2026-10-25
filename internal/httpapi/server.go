@@ -58,7 +58,8 @@ type Server struct {
 	groupOperationLocks sync.Map // map[int64]*sync.Mutex
 
 	// Lifecycle
-	done chan struct{} // closed on Shutdown to stop background goroutines
+	done         chan struct{} // closed on Shutdown to stop background goroutines
+	shutdownOnce sync.Once
 
 	subRefresher   controlplane.SubscriptionRefresher
 	nodeMgr        controlplane.NodeManager
@@ -335,7 +336,9 @@ func (s *Server) Start(ctx context.Context) {
 
 	go func() {
 		<-ctx.Done()
-		s.Shutdown(context.Background())
+		budget, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		s.Shutdown(budget)
 	}()
 }
 
@@ -348,13 +351,13 @@ func (s *Server) Shutdown(ctx context.Context) {
 		s.nodeChecks.shutdown()
 	}
 	// Signal background goroutines to stop
-	select {
-	case <-s.done:
-		// already closed
-	default:
-		close(s.done)
+	s.shutdownOnce.Do(func() { close(s.done) })
+	if err := s.srv.Shutdown(ctx); err != nil {
+		_ = s.srv.Close()
 	}
-	_ = s.srv.Shutdown(ctx)
+	if s.nodeChecks != nil {
+		s.nodeChecks.workers.Wait()
+	}
 }
 
 // authService returns the authentication domain, building it on first use.
