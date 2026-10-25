@@ -8,6 +8,7 @@
 
 | 文档 | 用途与状态 |
 | --- | --- |
+| [资源占用与稳定性修复计划](changes/resource-hardening/plan.md) | 2026-10-26 七项修复、独立提交顺序及验证记录 |
 | [当前契约与实现基线](specs/proxy-pool/spec.md) | 以代码定位描述现有能力，列出 MUST 约束及其验证场景；不是规模验收报告 |
 | [基础设施提案](changes/scale-proxy-pool/proposal.md) | 定位、范围、里程碑、规模假设和非目标 |
 | [分层设计](changes/scale-proxy-pool/design.md) | 依赖边界、事件契约、现状差异与取舍 |
