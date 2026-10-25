@@ -177,6 +177,9 @@ func Run(ctx context.Context, cfg *config.Config) (runErr error) {
 	subMgr := subscription.New(cfg, boxMgr, subscription.WithStore(dataStore),
 		subscription.WithRefreshObserver(retagQueue.EnqueueAll))
 	subMgr.Start()
+	// RefreshNow uses the manager's context as well. Cancel downloads before
+	// HTTP shutdown waits for an in-flight refresh handler to return.
+	shutdown.cancel = func() { cancel(); subMgr.Stop() }
 	shutdown.add(subMgr.Shutdown)
 
 	// Register as config update listener so baseCfg stays in sync after reloads
