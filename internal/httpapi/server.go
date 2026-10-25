@@ -15,6 +15,7 @@ import (
 	"easy_proxies/internal/geoip"
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/nodetag"
+	"easy_proxies/internal/probe"
 	"easy_proxies/internal/store"
 	"easy_proxies/internal/unlock"
 
@@ -92,7 +93,7 @@ func NewServer(cfg monitor.Config, mgr *monitor.Manager, logger *log.Logger) *Se
 		cfg:      cfg,
 		mgr:      mgr,
 		logger:   logger,
-		probeSem: semaphore.NewWeighted(int64(batchOperationConcurrency())),
+		probeSem: processDiagnosticBudgets[probe.Unlock],
 		done:     make(chan struct{}),
 	}
 	// Build the auth domain eagerly so the session-cleanup goroutine below has

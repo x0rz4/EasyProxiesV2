@@ -329,7 +329,7 @@ func (m *nodeCheckManager) run(task *nodeCheckTask) {
 }
 
 func (m *nodeCheckManager) runLatency(task *nodeCheckTask) {
-	monitor.RunLimited(task.settings.LatencyConcurrency, task.nodes, func(node monitor.Snapshot) {
+	m.server.runDiagnosticBatch(task.ctx, probe.Latency, task.settings.LatencyConcurrency, task.nodes, func(node monitor.Snapshot) {
 		if task.ctx.Err() != nil {
 			return
 		}
@@ -387,7 +387,7 @@ func (m *nodeCheckManager) runSpeed(task *nodeCheckTask) {
 		}
 		nodes = append(nodes, node)
 	}
-	monitor.RunLimited(task.settings.SpeedConcurrency, nodes, func(node monitor.Snapshot) {
+	m.server.runDiagnosticBatch(task.ctx, probe.Speed, task.settings.SpeedConcurrency, nodes, func(node monitor.Snapshot) {
 		if task.ctx.Err() != nil {
 			return
 		}
@@ -451,7 +451,7 @@ func (m *nodeCheckManager) runQuality(task *nodeCheckTask) {
 		outcomes[nodeID] = append(outcomes[nodeID], status)
 		outcomesMu.Unlock()
 	}
-	monitor.RunLimited(task.settings.QualityConcurrency, task.nodes, func(node monitor.Snapshot) {
+	m.server.runDiagnosticBatch(task.ctx, probe.Quality, task.settings.QualityConcurrency, task.nodes, func(node monitor.Snapshot) {
 		if task.ctx.Err() != nil {
 			return
 		}
@@ -489,7 +489,7 @@ func (m *nodeCheckManager) runQuality(task *nodeCheckTask) {
 
 	if task.settings.IPPureEnabled {
 		provider := ipquality.IPPureProvider{URL: task.settings.IPPureURL, Timeout: task.settings.QualityTimeout}
-		monitor.RunLimited(task.settings.QualityConcurrency, task.nodes, func(node monitor.Snapshot) {
+		m.server.runDiagnosticBatch(task.ctx, probe.Quality, task.settings.QualityConcurrency, task.nodes, func(node monitor.Snapshot) {
 			if task.ctx.Err() != nil {
 				return
 			}
@@ -521,7 +521,12 @@ func (m *nodeCheckManager) runQuality(task *nodeCheckTask) {
 			}
 		}
 		task.mu.Unlock()
+		release, err := m.server.acquireDiagnostic(task.ctx, probe.Quality)
+		if err != nil {
+			return
+		}
 		batch := m.ipapi.CheckBatch(task.ctx, ips)
+		release()
 		for _, node := range task.nodes {
 			task.mu.Lock()
 			ip := task.landingIPs[node.NodeID]
@@ -596,7 +601,7 @@ func (m *nodeCheckManager) saveQuality(task *nodeCheckTask, node monitor.Snapsho
 }
 
 func (m *nodeCheckManager) runUnlock(task *nodeCheckTask) {
-	monitor.RunLimited(task.settings.QualityConcurrency, task.nodes, func(node monitor.Snapshot) {
+	m.server.runDiagnosticBatch(task.ctx, probe.Unlock, task.settings.QualityConcurrency, task.nodes, func(node monitor.Snapshot) {
 		if task.ctx.Err() != nil {
 			return
 		}

@@ -181,6 +181,12 @@ func (s *Server) handleNodeSpeedtest(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	release, acquireErr := s.acquireDiagnostic(r.Context(), probe.Speed)
+	if acquireErr != nil {
+		writeAPIError(w, http.StatusServiceUnavailable, acquireErr.Error())
+		return
+	}
+	defer release()
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -249,6 +255,12 @@ func (s *Server) handleNodeUnlock(w http.ResponseWriter, r *http.Request) {
 	// more time than a single latency probe.
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
+	release, acquireErr := s.acquireDiagnostic(ctx, probe.Unlock)
+	if acquireErr != nil {
+		writeAPIError(w, http.StatusServiceUnavailable, acquireErr.Error())
+		return
+	}
+	defer release()
 	dialer, err := s.mgr.DialerFor(tag)
 	if err != nil {
 		writeJSON(w, map[string]any{"error": err.Error()})
@@ -423,7 +435,7 @@ func (s *Server) handleUnlockAll(w http.ResponseWriter, r *http.Request) {
 	// The per-batch errgroup limit prevents this request from launching an
 	// unbounded goroutine set. The shared weighted semaphore remains the
 	// cross-request limit for all concurrent unlock batches.
-	results := collectUnlockBatch(ctx, batchOperationConcurrency(), s.probeSem, snapshots, func(ctx context.Context, snap monitor.Snapshot) unlockBatchResult {
+	results := collectUnlockBatch(ctx, batchOperationConcurrency(), s.diagnosticSemaphore(probe.Unlock), snapshots, func(ctx context.Context, snap monitor.Snapshot) unlockBatchResult {
 		// Execute unlock check
 		checkCtx, checkCancel := context.WithTimeout(ctx, 60*time.Second)
 		defer checkCancel()
