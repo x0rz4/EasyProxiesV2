@@ -1,6 +1,6 @@
 # 控制面、刷新与退出链修复计划
 
-日期：2026-10-26。基线：2.2.9。状态：实施中。
+日期：2026-10-26。基线：2.2.9。状态：已完成（2.2.10）。
 
 承接资源稳定性修复后的七项审查发现。每项独立修改、验证并提交；最后统一递增 patch 版本。当前形态随实现更新到 `docs/`，此处保留问题、设计取舍与验收证据。
 
@@ -37,3 +37,32 @@ Q5：新增目标分组输入与只读运行快照，阶段、晋升、探测、
 Q6：管理/检测页详情、运行态与检测结果改为按当前页 ID 读取，跨页动作保存 ID；全局计数来自 facets，批量探测按需分批读详情。新增可见性与空 ID 不放宽、非法/重复/超量 ID、只调用 ByIDs、禁用节点详情回归。store/httpapi/boxmgr 全包及前端 lint/build 通过，构建仍有既有 chunk 大小提示。
 
 Q7：Auth 惰性单消费者、按 Key 合并最新时间、每分钟节流、五秒失败重试和退出最终落库；1024 项硬上限与显式溢出日志，换库代际隔离，SQL 时间单调更新。虚拟时间回归覆盖千次突发、最新观测、重试、同库重绑、换库隔离、关闭超时和容量边界；controlplane/httpapi/store 全包通过，定向用例连续三轮通过。
+
+## 契约同步
+
+本批 ADDED CONTROL-001、CONTROL-002、LIFECYCLE-001、SUBSCRIPTION-001、AUTH-001，已合入 [当前规格](../../specs/proxy-pool/spec.md)；HEAL-001 保持动作前新鲜校验，改为定向读取。修正当前规格尾部已过时的游标/状态分离和多次全组读取描述。
+
+## 独立提交
+
+| 项目 | 提交 |
+| --- | --- |
+| 计划 | 1ac71b9 |
+| Q1 读事务 | d527269 |
+| Q2 SSE | 2f23dcc |
+| Q3 统一退出 | bcae471 |
+| Q4 订阅流水线 | 91c6021 |
+| Q5 定向自愈 | adb5aae |
+| Q6 分页详情 | 604deb9 |
+| Q7 Key 元数据 | 2fb9bad |
+| 退出顺序补充 | 5520419 |
+
+退出顺序补充：订阅下载在等待 HTTP 退出前取消，避免 RefreshNow 使用管理器上下文而占用整段退出预算；app/subscription 回归通过。
+
+## 最终验收
+
+- go test -p 1 ./...：全包通过；退出顺序补充后 app/subscription 再次通过。
+- npm run lint、npm run build（2.2.10）：通过；之后才执行 Go 测试/构建。仍有既有的 Vite 大 chunk 提示（约 656 kB）。
+- Linux amd64、CGO_ENABLED=0、with_utls/with_quic/with_grpc/with_wireguard/with_gvisor 全生产 tags 构建链接：通过。产物 .tools/control-plane-scaling/easy-proxies-linux-amd64，51,589,280 字节；GOPROXY 仅对此命令设为 https://goproxy.cn,direct，未更改全局配置。
+- 未执行 -race：本机 CGO_ENABLED=0 且无 gcc；未调整应用控制策略。未做浏览器交互验收、线上采样或持续规模压测，不将回归通过描述为容量/OOM 证明。
+- 三处版本同步为 2.2.10；当前架构基线复核：非测试 Go 约 40.7k 行，测试约 23.1k 行，前端约 10.1k 行，Store 111 个方法，migration 仍为 v25。
+- 所有提交保留在本地分支，未推送或部署。

@@ -205,4 +205,64 @@
 
 ## 现状未满足的规模能力
 
-健康事件投递已改为"持久日志 + 游标"（HEALTH-002..005），不再因订阅队列溢出丢弃转移；剩余缺口是崩溃窗口内一批（≤64）事件可能重复应用（消除它需要把游标与分组状态写入同一事务），以及多进程共用同一数据库不受保证。`HealingInputs` 多次全量读取；预算和熔断未完整配置化；除健康投递外仍缺统一指标及确定的规模报告。WAL、单写连接和四读连接已经存在。统一拓扑事件、多实例权威状态、完整操作审计、备份恢复演练均不能声明已交付。
+健康事件采用持久日志与游标，游标和分组状态同事务提交（HEALTH-002..005）；多进程共用同一数据库不受保证。自愈每轮全组读取一次，其后只重查目标组；预算和熔断未完整配置化。除健康投递外仍缺统一指标及确定的规模报告。统一拓扑事件、多实例权威状态、完整操作审计、备份恢复演练均不能声明已交付。
+
+## Requirement CONTROL-001：节点分页保持一致快照与有界详情读取
+
+节点视图 MUST 在读连接池的一致性事务中加载节点、标签和事实，不占用唯一写连接。分页页面 MUST 只加载当前页 ID 的详情/结果；跨页选择保留 ID。详情接口的空 ID 列表 MUST 返回空，非法 ID MUST 拒绝，不能降级为全量读取；原有认证和订阅可见性保持不变。
+
+### Scenario: 查询时写入、空页和跨页选择
+
+- GIVEN WAL 读快照正在生成，用户在多页选择了节点。
+- WHEN 写事务提交、页面切换或请求空 ID 列表。
+- THEN 写入可继续，当前查询仍看到原快照；跨页操作使用已选 ID，空列表不读取全体节点。
+
+代码：`internal/store/sqlite.go`、`internal/httpapi/nodeview_handlers.go`、`internal/httpapi/node_ids.go`、`frontend/src/components/ManagePanel.tsx`、`frontend/src/components/UnlockPanel.tsx`。测试：`TestSQLiteReadTransactionSnapshotAllowsWriter`、`TestPagedResultReadsNeverWidenIDs`、`TestListManagedNodes`。
+
+## Requirement CONTROL-002：检测 SSE 终态可达且连接可退出
+
+初始任务快照与订阅 MUST 原子建立；任务结束时终态 MUST 不因进度队列已满而丢失。首帧保持 task 兼容格式，已完成任务补发 done 后退出。写入/flush MUST 有期限，服务关闭或请求取消后解除订阅。
+
+### Scenario: 初始 Flush 时任务完成
+
+- GIVEN 初始快照已读取，首次 Flush 尚未返回。
+- WHEN 任务完成或慢读者填满事件队列。
+- THEN 仍能读取终态；写失败或服务关闭会结束连接。
+
+代码：`internal/httpapi/nodecheck.go`、`internal/httpapi/nodecheck_api.go`。测试：`TestNodeCheckTerminalSurvivesFullSubscriber`、`TestNodeCheckStreamLifecycle`、`TestNodeCheckTaskEventsKeepsInitialEventShape`。
+
+## Requirement LIFECYCLE-001：应用退出共用预算并保持清理顺序
+
+Run 退出 MUST 先取消生产者，所有清理共享三十秒预算，超时 MUST 返回错误交给进程入口结束进程。最终统计和状态写入 MUST 接收预算 context；不可取消的第三方关闭函数只能留在同一条清理链内等待，MUST NOT 为跳过它而提前关闭其后的资源。
+
+### Scenario: 第三方关闭函数阻塞
+
+- GIVEN 关闭链仍有一个未返回的第三方函数。
+- WHEN 退出预算耗尽。
+- THEN Run 返回超时错误；清理链仍按顺序执行，不提前关闭链尾数据库。
+
+代码：`internal/app/shutdown.go`、`internal/app/app.go`、`internal/nodetag/queue.go`。测试：`TestShutdownBudgetPreservesResourceOrder`、`TestQueueShutdownCancelsActiveRecompute`。
+
+## Requirement SUBSCRIPTION-001：并发抓取与未提交结果同时有界
+
+批量订阅刷新 MUST 保持订阅顺序提交，最多持有三个未提交抓取结果；已可提交的前项不能等待全体抓取完成。版本门禁、失败/304 窄写与最后一次运行时对账 MUST 保留，取消 MUST 回收所有流水线 worker。
+
+### Scenario: 首项或后项提供者缓慢
+
+- GIVEN 一批订阅中某项尚未返回。
+- WHEN 后续抓取完成或调用方取消。
+- THEN 首项缓慢形成背压，后项缓慢不阻止前项提交；取消后所有抓取退出。
+
+代码：`internal/subscription/manager.go`。测试：`TestRefreshPipelineBackpressureAndEarlyCommit`、`TestRefreshDueFetchesConcurrently`。
+
+## Requirement AUTH-001：使用元数据与认证吞吐解耦
+
+API Key 使用记录 MUST 合并同一 Key 的最新观测，使用单一消费者、节流与失败重试，不为每次请求创建 goroutine。关闭 MUST 在预算内尝试保存最后观测；换库 MUST 隔离旧 ID，旧时间不能覆盖较新时间。队列上限触发时 MUST 显式记录元数据丢弃，不能影响认证结果。
+
+### Scenario: 同一 Key 突发访问和短暂写入失败
+
+- GIVEN 同一 Key 在一分钟内访问多次，数据库暂时写失败。
+- WHEN 新观测抵达、失败恢复或应用退出。
+- THEN 最新时间保留待重试，写入受节流约束，退出尝试最终写入。
+
+代码：`internal/controlplane/auth_usage.go`、`internal/store/sqlite.go`。测试：`TestAPIKeyUseCoalescesAndFlushesLatest`、`TestAPIKeyUseRetriesWithoutDroppingNewObservation`、`TestAPIKeyUseShutdownBudgetAndRebinding`、`TestAPIKeyUsageQueueIsBounded`。
