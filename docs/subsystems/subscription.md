@@ -26,6 +26,8 @@
 
 ## 配置解析（config）
 
+旧配置订阅与托管订阅都经 `config.ReadSubscriptionBody` 限制实际响应体为 10 MiB，至多多读一个字节用于判定超限；不依赖 Content-Length。超限返回明确错误，不解析或提交截断内容，托管订阅保留已有成员并记录刷新失败。
+
 - `ParseSubscriptionContent`（clash/v2ray/base64）、`ParseImportContent`（行级 issues 必须透出，不能静默吞掉 `ssr://`/非法行）。
 - `NodeKey()` 用于内联节点与库内节点的匹配回填。
 - **协议白名单唯一真源是 `nodecodec.ParseURI`**，`supportedProxyURISchemes` 必须与它一致。

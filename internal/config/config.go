@@ -3,7 +3,6 @@ package config
 import (
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -914,7 +913,7 @@ func loadNodesFromSubscription(subURL string, timeout time.Duration) ([]NodeConf
 		return nil, fmt.Errorf("subscription returned status %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := ReadSubscriptionBody(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
@@ -1050,7 +1049,7 @@ func ParseImportContent(content string) ([]NodeConfig, error) {
 	return requireImportedNodes(parseContent(strings.TrimPrefix(content, "\ufeff"), 0))
 }
 
-const maxDecodedContentBytes = 10 * 1024 * 1024
+const maxDecodedContentBytes = MaxSubscriptionBodyBytes
 
 func parseContent(content string, depth int) ([]NodeConfig, error) {
 	nodes, _, err := parseContentReport(content, depth)

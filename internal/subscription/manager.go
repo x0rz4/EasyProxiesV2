@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -749,12 +748,9 @@ func (m *Manager) fetchSubscription(parent context.Context, sub *store.Subscript
 	if resp.StatusCode != http.StatusOK {
 		return nil, nil, "", "", false, fmt.Errorf("status %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024+1))
+	body, err := config.ReadSubscriptionBody(resp.Body)
 	if err != nil {
 		return nil, nil, "", "", false, fmt.Errorf("read body: %w", err)
-	}
-	if len(body) > 10*1024*1024 {
-		return nil, nil, "", "", false, errors.New("subscription response exceeds 10MB")
 	}
 	nodes, parseIssues, err := config.ParseSubscriptionContentAsReport(string(body), format)
 	if err != nil {
