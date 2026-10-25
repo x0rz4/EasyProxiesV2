@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -217,7 +218,7 @@ func (s *Server) handleNodeCheckTaskEvents(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) streamNodeCheckTask(w http.ResponseWriter, r *http.Request, id string) {
-	flusher, ok := w.(http.Flusher)
+	_, ok := w.(http.Flusher)
 	if !ok {
 		writeAPIError(w, http.StatusInternalServerError, "Streaming unsupported")
 		return
@@ -230,24 +231,45 @@ func (s *Server) streamNodeCheckTask(w http.ResponseWriter, r *http.Request, id 
 		writeAPIError(w, http.StatusNotFound, "检测任务不存在或已归档")
 		return
 	}
-	initial := nodeCheckEvent{Type: "task", Task: snapshotPointer(task.copySnapshot())}
-	writeSSEJSON(w, initial)
-	flusher.Flush()
-	if nodeCheckTerminal(initial.Task.Status) {
+	initial, events, unsubscribe := s.nodeChecks.subscribe(task)
+	defer unsubscribe()
+	controller := http.NewResponseController(w)
+	defer controller.SetWriteDeadline(time.Time{})
+	write := func(event any) error {
+		if err := controller.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			return err
+		}
+		if err := writeSSEJSON(w, event); err != nil {
+			return err
+		}
+		return controller.Flush()
+	}
+	if err := write(initial); err != nil {
 		return
 	}
-	events, unsubscribe := s.nodeChecks.subscribe(task)
-	defer unsubscribe()
+	if nodeCheckTerminal(initial.Task.Status) {
+		_ = write(nodeCheckEvent{Type: "done", Sequence: initial.Sequence, Task: initial.Task})
+		return
+	}
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
 	for {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-s.done:
+			return
+		case <-heartbeat.C:
+			if err := write(nodeCheckEvent{Type: "heartbeat"}); err != nil {
+				return
+			}
 		case event, open := <-events:
 			if !open {
 				return
 			}
-			writeSSEJSON(w, event)
-			flusher.Flush()
+			if err := write(event); err != nil {
+				return
+			}
 			if event.Type == "done" {
 				return
 			}
@@ -255,12 +277,13 @@ func (s *Server) streamNodeCheckTask(w http.ResponseWriter, r *http.Request, id 
 	}
 }
 
-func writeSSEJSON(w http.ResponseWriter, value any) {
+func writeSSEJSON(w http.ResponseWriter, value any) error {
 	payload, err := json.Marshal(value)
 	if err != nil {
-		return
+		return err
 	}
-	_, _ = fmt.Fprintf(w, "data: %s\n\n", payload)
+	_, err = fmt.Fprintf(w, "data: %s\n\n", payload)
+	return err
 }
 
 func writeNodeCheckJSONStatus(w http.ResponseWriter, status int, value any) {

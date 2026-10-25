@@ -140,6 +140,15 @@ func (t *nodeCheckTask) publish(event nodeCheckEvent) {
 		select {
 		case sub <- event:
 		default:
+			if event.Type == "done" {
+				// Only progress may be dropped. Make room for the terminal
+				// snapshot even when a slow reader has filled its queue.
+				select {
+				case <-sub:
+				default:
+				}
+				sub <- event
+			}
 		}
 	}
 	t.mu.Unlock()
@@ -704,12 +713,16 @@ func (m *nodeCheckManager) get(id string) *nodeCheckTask {
 	return m.tasks[id]
 }
 
-func (m *nodeCheckManager) subscribe(task *nodeCheckTask) (<-chan nodeCheckEvent, func()) {
+func (m *nodeCheckManager) subscribe(task *nodeCheckTask) (nodeCheckEvent, <-chan nodeCheckEvent, func()) {
 	channel := make(chan nodeCheckEvent, 64)
 	task.mu.Lock()
+	initial := nodeCheckEvent{Type: "task", Sequence: task.sequence, Task: snapshotPointer(task.copySnapshotLocked())}
+	if task.subs == nil {
+		task.subs = make(map[chan nodeCheckEvent]struct{})
+	}
 	task.subs[channel] = struct{}{}
 	task.mu.Unlock()
-	return channel, func() {
+	return initial, channel, func() {
 		task.mu.Lock()
 		if _, ok := task.subs[channel]; ok {
 			delete(task.subs, channel)
