@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,12 +30,23 @@ type sqliteStore struct {
 const (
 	sqliteWriterConnections = 1
 	sqliteReaderConnections = 4
+	defaultSQLiteCacheKiB   = 4096
 )
 
 // Open creates a new SQLite-backed Store at the given path.
 // It applies all pending migrations and sets optimal PRAGMAs.
 func Open(dbPath string) (Store, error) {
-	connectionPragmas := "_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-64000)&_pragma=foreign_keys(ON)"
+	cacheKiB := defaultSQLiteCacheKiB
+	if value := strings.TrimSpace(os.Getenv("EASY_PROXIES_SQLITE_CACHE_KIB")); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 1 || parsed > 65536 {
+			return nil, errors.New("EASY_PROXIES_SQLITE_CACHE_KIB must be an integer between 1 and 65536")
+		}
+		cacheKiB = parsed
+	}
+	// The budget is per connection, not shared by the pools. At the default,
+	// all five connections together have a suggested page-cache budget of 20 MiB.
+	connectionPragmas := fmt.Sprintf("_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-%d)&_pragma=foreign_keys(ON)", cacheKiB)
 	writerDSN := dbPath + "?_pragma=journal_mode(WAL)&" + connectionPragmas
 
 	writerDB, err := sql.Open("sqlite", writerDSN)
@@ -89,7 +101,7 @@ func Open(dbPath string) (Store, error) {
 		return nil, errors.New("verify sqlite reader query_only: pragma is disabled")
 	}
 
-	log.Printf("[store] SQLite store opened: %s", dbPath)
+	log.Printf("[store] SQLite store opened: %s (page cache %d KiB per connection)", dbPath, cacheKiB)
 	return &sqliteStore{writerDB: writerDB, readerDB: readerDB}, nil
 }
 

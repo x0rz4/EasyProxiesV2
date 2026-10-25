@@ -6,6 +6,8 @@
 
 `Store` 接口是数据库访问的唯一入口（当前 **101** 个方法），涵盖 nodes / subscriptions / stats / sessions / unlock / detection / group pools / tags。`Open()` 内部跑 `Migrate`。生产配置为**单写连接 + WAL + 四读连接**（规避进程内写锁争用）。
 
+页缓存默认每连接 4096 KiB，五个连接合计建议预算 20 MiB，按需增长而非预分配。启动环境变量 `EASY_PROXIES_SQLITE_CACHE_KIB` 可设置每连接预算（1–65536 KiB）；非法值导致启动明确失败，不支持热修改。SQLite 页缓存不是整个进程的硬内存上限。
+
 ## migration 只追加（AGENTS §8）
 
 `internal/store/migrations.go` 的列表按 `Version` 递增、**只允许在末尾新增**。每个 migration 独立事务，`schema_migrations` 记录已应用版本。当前最新 **v25**（v23 仅为 `nodes.name` 建普通索引，名称**故意不唯一**；v24 新建 `health_events` 与 `health_event_cursors`；v25 给 `group_node_states` 加 `revision`，见下）。**新列必须带 `NOT NULL DEFAULT`**，保证升级行为不变。

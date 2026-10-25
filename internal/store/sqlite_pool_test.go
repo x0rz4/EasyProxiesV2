@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -21,6 +22,7 @@ func openSQLiteStoreForPoolTest(t *testing.T) *sqliteStore {
 }
 
 func TestSQLiteConnectionPools(t *testing.T) {
+	t.Setenv("EASY_PROXIES_SQLITE_CACHE_KIB", "")
 	store := openSQLiteStoreForPoolTest(t)
 
 	if got := store.writerDB.Stats().MaxOpenConnections; got != sqliteWriterConnections {
@@ -39,7 +41,10 @@ func TestSQLiteConnectionPools(t *testing.T) {
 		}
 		connections = append(connections, connection)
 
-		var queryOnly, value int
+		var queryOnly, value, cacheSize int
+		if err := connection.QueryRowContext(ctx, "PRAGMA cache_size").Scan(&cacheSize); err != nil || cacheSize != -defaultSQLiteCacheKiB {
+			t.Fatalf("reader %d page cache=%d err=%v", i, cacheSize, err)
+		}
 		if err := connection.QueryRowContext(ctx, "PRAGMA query_only").Scan(&queryOnly); err != nil {
 			t.Fatalf("query reader pragma on connection %d: %v", i, err)
 		}
@@ -61,6 +66,29 @@ func TestSQLiteConnectionPools(t *testing.T) {
 	}
 	if _, err := store.readerDB.ExecContext(ctx, "INSERT INTO sessions(token,created_at,expires_at) VALUES('reader-write','','')"); err == nil {
 		t.Fatal("reader pool accepted a write while query_only is enabled")
+	}
+}
+
+func TestSQLiteCacheBudgetOverride(t *testing.T) {
+	t.Setenv("EASY_PROXIES_SQLITE_CACHE_KIB", "2048")
+	store := openSQLiteStoreForPoolTest(t)
+	for name, db := range map[string]*sql.DB{"writer": store.writerDB, "reader": store.readerDB} {
+		var size int
+		if err := db.QueryRowContext(t.Context(), "PRAGMA cache_size").Scan(&size); err != nil || size != -2048 {
+			t.Fatalf("%s cache=%d err=%v", name, size, err)
+		}
+	}
+}
+
+func TestSQLiteRejectsInvalidCacheBudget(t *testing.T) {
+	for _, value := range []string{"0", "-1", "65537", "invalid"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("EASY_PROXIES_SQLITE_CACHE_KIB", value)
+			if db, err := Open(filepath.Join(t.TempDir(), "invalid.db")); err == nil {
+				db.Close()
+				t.Fatal("invalid cache budget accepted")
+			}
+		})
 	}
 }
 
