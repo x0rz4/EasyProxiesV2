@@ -21,6 +21,7 @@ type HealAudit struct {
 // revalidate current policy and candidate eligibility before performing work.
 type HealingBackend interface {
 	HealingInputs(context.Context, time.Time) ([]HealInput, error)
+	HealingInput(context.Context, int64, time.Time) (HealInput, error)
 	ApplyHealingSelection(context.Context, int64, []int64) error
 	ProbeHealingCandidate(context.Context, int64, int64) error
 	RefreshHealingSubscription(context.Context, int64, int64) error
@@ -93,17 +94,12 @@ func (h *Healer) Tick(ctx context.Context) error {
 }
 
 func (h *Healer) current(ctx context.Context, id int64) (HealInput, HealPlan, error) {
-	inputs, err := h.backend.HealingInputs(ctx, h.now())
+	in, err := h.backend.HealingInput(ctx, id, h.now())
 	if err != nil {
 		return HealInput{}, HealPlan{}, err
 	}
-	for _, in := range inputs {
-		if in.GroupID == id {
-			plan, err := PlanHealing(in)
-			return in, plan, err
-		}
-	}
-	return HealInput{}, HealPlan{}, &DeferredHealing{Reason: "group capacity policy removed or disabled"}
+	plan, err := PlanHealing(in)
+	return in, plan, err
 }
 
 func (h *Healer) audit(ctx context.Context, id int64, status string, action HealAction) error {

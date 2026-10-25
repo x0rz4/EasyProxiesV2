@@ -13,10 +13,39 @@ import (
 // HealingInputs uses the same candidate predicate as builder and normal
 // membership reconciliation. Runtime evidence never broadens that candidate set.
 func (m *Manager) HealingInputs(ctx context.Context, now time.Time) ([]group.HealInput, error) {
+	return m.healingInputs(ctx, now, 0)
+}
+
+// HealingInput revalidates only the requested group, using the same builder
+// and candidate predicate as the cycle's initial full snapshot.
+func (m *Manager) HealingInput(ctx context.Context, id int64, now time.Time) (group.HealInput, error) {
+	if id <= 0 {
+		return group.HealInput{}, &group.DeferredHealing{Reason: "invalid group ID"}
+	}
+	inputs, err := m.healingInputs(ctx, now, id)
+	if err != nil {
+		return group.HealInput{}, err
+	}
+	if len(inputs) == 0 {
+		return group.HealInput{}, &group.DeferredHealing{Reason: "group capacity policy removed or disabled"}
+	}
+	return inputs[0], nil
+}
+
+func (m *Manager) healingInputs(ctx context.Context, now time.Time, groupID int64) ([]group.HealInput, error) {
 	m.mu.RLock()
-	cfg, mon, db := m.cfg.Clone(), m.monitorMgr, m.store
+	source := m.cfg
+	if source != nil && groupID != 0 {
+		copy := *source
+		copy.Groups = nil
+		if g, ok := groupConfigByID(source, groupID); ok {
+			copy.Groups = append(copy.Groups, g)
+		}
+		source = &copy
+	}
+	cfg, mon, db := source.Clone(), m.monitorMgr, m.store
 	m.mu.RUnlock()
-	if cfg == nil || mon == nil {
+	if cfg == nil || mon == nil || len(cfg.Groups) == 0 {
 		return nil, nil
 	}
 	var subscriptionIDs []int64
@@ -35,7 +64,13 @@ func (m *Manager) HealingInputs(ctx context.Context, now time.Time) ([]group.Hea
 	for _, snapshot := range mon.Snapshot() {
 		health[snapshot.NodeID] = snapshot
 	}
-	runtimes := group.GroupRuntimeSnapshotsReadonly()
+	var runtimes map[int64]group.GroupRuntimeSnapshot
+	if groupID == 0 {
+		runtimes = group.GroupRuntimeSnapshotsReadonly()
+	} else {
+		snapshot, _ := group.GroupRuntimeSnapshotReadonly(groupID)
+		runtimes = map[int64]group.GroupRuntimeSnapshot{groupID: snapshot}
+	}
 	inputs := []group.HealInput{}
 	for _, g := range cfg.Groups {
 		if !g.Enabled || g.TargetSize <= 0 {
@@ -74,21 +109,15 @@ func (m *Manager) ApplyHealingSelection(ctx context.Context, groupID int64, desi
 		return err
 	}
 	defer releaseGroupSlot(slot)
-	inputs, err := m.HealingInputs(ctx, time.Now())
+	in, err := m.HealingInput(ctx, groupID, time.Now())
 	if err != nil {
 		return err
 	}
-	valid := false
-	for _, in := range inputs {
-		if in.GroupID != groupID || !in.Policy.Execute {
-			continue
-		}
-		plan, err := group.PlanHealing(in)
-		if err != nil {
-			return err
-		}
-		valid = slices.Equal(plan.DesiredIDs, desired)
+	plan, err := group.PlanHealing(in)
+	if err != nil {
+		return err
 	}
+	valid := in.Policy.Execute && slices.Equal(plan.DesiredIDs, desired)
 	if !valid {
 		return fmt.Errorf("group %d healing plan changed", groupID)
 	}
@@ -111,15 +140,12 @@ func (m *Manager) ApplyHealingSelection(ctx context.Context, groupID int64, desi
 // ProbeHealingCandidate uses the normal health pipeline; it neither clears an
 // eviction nor bypasses the group's recovery success threshold or cooldown.
 func (m *Manager) ProbeHealingCandidate(ctx context.Context, groupID, nodeID int64) error {
-	inputs, err := m.HealingInputs(ctx, time.Now())
+	in, err := m.HealingInput(ctx, groupID, time.Now())
 	if err != nil {
 		return err
 	}
 	allowed := false
-	for _, in := range inputs {
-		if in.GroupID != groupID || !in.Policy.Execute || !slices.Contains(in.Policy.Refill, group.ProbeQuarantined) {
-			continue
-		}
+	if group.HealingActionAllowed(in, group.ProbeQuarantined) {
 		plan, err := group.PlanHealing(in)
 		if err != nil {
 			return err

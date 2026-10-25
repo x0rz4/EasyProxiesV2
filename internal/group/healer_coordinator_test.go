@@ -9,6 +9,8 @@ import (
 )
 
 type fakeHealingBackend struct {
+	fullReads, targetedReads           int
+	disableOnRecheck                   bool
 	inputs                             []HealInput
 	audits                             []HealAudit
 	selections, probes, refreshes      int
@@ -17,12 +19,38 @@ type fakeHealingBackend struct {
 }
 
 func (b *fakeHealingBackend) HealingInputs(_ context.Context, now time.Time) ([]HealInput, error) {
+	b.fullReads++
 	result := slices.Clone(b.inputs)
 	for i := range result {
 		result[i].Now = now
 		result[i].Candidates = slices.Clone(result[i].Candidates)
 	}
 	return result, nil
+}
+func (b *fakeHealingBackend) HealingInput(_ context.Context, id int64, now time.Time) (HealInput, error) {
+	b.targetedReads++
+	for _, in := range b.inputs {
+		if in.GroupID == id {
+			if b.disableOnRecheck {
+				in.Policy.Execute = false
+			}
+			in.Now = now
+			in.Candidates = slices.Clone(in.Candidates)
+			return in, nil
+		}
+	}
+	return HealInput{}, &DeferredHealing{Reason: "group removed"}
+}
+
+func TestHealerTargetedReadSeesDisabledPolicy(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	b := &fakeHealingBackend{inputs: []HealInput{healingFixture(now)}, disableOnRecheck: true}
+	if err := NewHealer(b, func() time.Time { return now }).Tick(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if b.fullReads != 1 || b.targetedReads != 1 || b.probes+b.refreshes+b.selections != 0 {
+		t.Fatalf("stale policy executed: %+v", b)
+	}
 }
 func (b *fakeHealingBackend) ApplyHealingSelection(_ context.Context, groupID int64, ids []int64) error {
 	b.selections++
@@ -98,6 +126,9 @@ func TestHealerRechecksRecoveryBeforeRefreshing(t *testing.T) {
 	}
 	if b.probes != 1 || b.refreshes != 0 {
 		t.Fatalf("unnecessary refresh after recovery: %+v", b)
+	}
+	if b.fullReads != 1 || b.targetedReads == 0 {
+		t.Fatalf("full reads=%d targeted=%d", b.fullReads, b.targetedReads)
 	}
 	for _, event := range b.audits {
 		if event.Status == "alert" {

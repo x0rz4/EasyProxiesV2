@@ -24,14 +24,11 @@ func (b *healingBackend) AuditHealing(ctx context.Context, event group.HealAudit
 }
 
 func (b *healingBackend) RefreshHealingSubscription(ctx context.Context, groupID, subscriptionID int64) error {
-	inputs, err := b.HealingInputs(ctx, time.Now())
+	in, err := b.HealingInput(ctx, groupID, time.Now())
 	if err != nil {
 		return err
 	}
-	for _, in := range inputs {
-		if in.GroupID != groupID || !group.HealingActionAllowed(in, group.RefreshSubscription) || !slices.Contains(in.SubscriptionIDs, subscriptionID) {
-			continue
-		}
+	if group.HealingActionAllowed(in, group.RefreshSubscription) && slices.Contains(in.SubscriptionIDs, subscriptionID) {
 		plan, err := group.PlanHealing(in)
 		if err != nil {
 			return err

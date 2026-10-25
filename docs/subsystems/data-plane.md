@@ -51,3 +51,5 @@
 游标与它造成的状态**同事务**提交：消费者回调返回 `[]store.GroupNodeState`，hub 用 `AdvanceHealthCursorWithState` 一次写入游标 + `group_node_states`。分成两次写，崩溃就可能在游标领先的状态下丢掉一条踢出记录，重启后坏节点以健康身份复活。回调要带上**跨分组传播**的行（踢出/恢复是节点级事实），所以 `SnapshotStates` 扫所有分组。指向已删除分组/节点的行直接丢弃并继续推进游标——那种行无处可去，重试会永久卡住消费者。
 
 `group_node_states` 还有第二个写者：`internal/app` 的异步合并持久化器（当前节点与非健康转换）。两者都写"转换发生时的快照"，所以每行带单调 `revision`，写入只在 `revision = 0` 或不小于已存值时生效，否则晚到的旧快照会把刚解除的踢出写回去。`revision` 随 store→config→runtime 往返，启动时用它抬升全局时钟。
+
+自愈每轮 HealingInputs 仅构建一次全体输入。后续阶段和动作统一使用 HealingInput(groupID) 重读目标组，复用同一候选构造器和成员谓词；组运行快照只锁目标组，不扫描其它组。策略、健康与资格仍在执行前重新读取，审计和预算语义不变。

@@ -955,46 +955,60 @@ func groupRuntimeSnapshots(prune bool) map[int64]GroupRuntimeSnapshot {
 	result := make(map[int64]GroupRuntimeSnapshot)
 	groupRuntimeStore.Range(func(key, value any) bool {
 		runtime := value.(*groupRuntime)
-		runtime.mu.Lock()
-		var expiredEvents []GroupStateEvent
-		snapshot := GroupRuntimeSnapshot{GroupID: runtime.id, CurrentTag: runtime.currentTag}
-		if current := runtime.members[runtime.currentTag]; current != nil {
-			snapshot.CurrentNodeID = current.nodeID
-		}
-		for _, member := range runtime.members {
-			if prune && !member.evicted && pruneFailures(member, runtime.window, time.Now()) {
-				expiredEvents = append(expiredEvents, GroupStateEvent{GroupID: runtime.id, NodeID: member.nodeID,
-					FailureHistory: append([]int64(nil), member.failureHistory...), LastError: member.lastError, StateChanged: true,
-					Revision: member.touch()})
-			}
-			status := "ALIVE"
-			if member.evicted {
-				status = "EVICTED"
-			} else if len(member.failureHistory) > 0 {
-				status = "SUSPECT"
-			}
-			snapshotMember := GroupMemberSnapshot{NodeID: member.nodeID, Tag: member.tag,
-				Standby: member.standby,
-				Status:  status, FailureCount: len(member.failureHistory), FailureHistory: append([]int64(nil), member.failureHistory...),
-				LastError: member.lastError, EvictedAt: member.evictedAt}
-			if member.evicted && runtime.recovery.Enabled {
-				snapshotMember.RecoverySuccesses = member.recoverySuccesses
-				snapshotMember.RecoveryThreshold = runtime.recovery.SuccessThreshold
-				if cooldownEnd := member.evictedAt.Add(runtime.recovery.Cooldown); cooldownEnd.After(time.Now()) {
-					snapshotMember.RecoveryCooldownEnd = cooldownEnd
-				}
-			}
-			snapshot.Members = append(snapshot.Members, snapshotMember)
-		}
-		runtime.mu.Unlock()
-		for _, event := range expiredEvents {
-			notifyGroupState(event)
-		}
-		sort.Slice(snapshot.Members, func(i, j int) bool { return snapshot.Members[i].NodeID < snapshot.Members[j].NodeID })
+		snapshot := snapshotGroupRuntime(runtime, prune)
 		result[runtime.id] = snapshot
 		return true
 	})
 	return result
+}
+
+// GroupRuntimeSnapshotReadonly observes one group without pruning or events.
+func GroupRuntimeSnapshotReadonly(id int64) (GroupRuntimeSnapshot, bool) {
+	value, ok := groupRuntimeStore.Load(id)
+	if !ok {
+		return GroupRuntimeSnapshot{}, false
+	}
+	return snapshotGroupRuntime(value.(*groupRuntime), false), true
+}
+
+func snapshotGroupRuntime(runtime *groupRuntime, prune bool) GroupRuntimeSnapshot {
+	runtime.mu.Lock()
+	var expiredEvents []GroupStateEvent
+	snapshot := GroupRuntimeSnapshot{GroupID: runtime.id, CurrentTag: runtime.currentTag}
+	if current := runtime.members[runtime.currentTag]; current != nil {
+		snapshot.CurrentNodeID = current.nodeID
+	}
+	for _, member := range runtime.members {
+		if prune && !member.evicted && pruneFailures(member, runtime.window, time.Now()) {
+			expiredEvents = append(expiredEvents, GroupStateEvent{GroupID: runtime.id, NodeID: member.nodeID,
+				FailureHistory: append([]int64(nil), member.failureHistory...), LastError: member.lastError, StateChanged: true,
+				Revision: member.touch()})
+		}
+		status := "ALIVE"
+		if member.evicted {
+			status = "EVICTED"
+		} else if len(member.failureHistory) > 0 {
+			status = "SUSPECT"
+		}
+		snapshotMember := GroupMemberSnapshot{NodeID: member.nodeID, Tag: member.tag,
+			Standby: member.standby,
+			Status:  status, FailureCount: len(member.failureHistory), FailureHistory: append([]int64(nil), member.failureHistory...),
+			LastError: member.lastError, EvictedAt: member.evictedAt}
+		if member.evicted && runtime.recovery.Enabled {
+			snapshotMember.RecoverySuccesses = member.recoverySuccesses
+			snapshotMember.RecoveryThreshold = runtime.recovery.SuccessThreshold
+			if cooldownEnd := member.evictedAt.Add(runtime.recovery.Cooldown); cooldownEnd.After(time.Now()) {
+				snapshotMember.RecoveryCooldownEnd = cooldownEnd
+			}
+		}
+		snapshot.Members = append(snapshot.Members, snapshotMember)
+	}
+	runtime.mu.Unlock()
+	for _, event := range expiredEvents {
+		notifyGroupState(event)
+	}
+	sort.Slice(snapshot.Members, func(i, j int) bool { return snapshot.Members[i].NodeID < snapshot.Members[j].NodeID })
+	return snapshot
 }
 
 func Reset() {

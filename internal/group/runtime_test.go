@@ -36,6 +36,27 @@ func TestSlidingWindowEvictionPropagatesAndRestore(t *testing.T) {
 	}
 }
 
+func TestTargetedRuntimeSnapshotIgnoresOtherGroupLock(t *testing.T) {
+	Reset()
+	defer Reset()
+	Register(1001, time.Minute, 3, "a", map[string]GroupInitialState{"a": {NodeID: 1}})
+	Register(1002, time.Minute, 3, "b", map[string]GroupInitialState{"b": {NodeID: 2}})
+	value, _ := groupRuntimeStore.Load(int64(1002))
+	other := value.(*groupRuntime)
+	other.mu.Lock()
+	defer other.mu.Unlock()
+	result := make(chan GroupRuntimeSnapshot, 1)
+	go func() { snapshot, _ := GroupRuntimeSnapshotReadonly(1001); result <- snapshot }()
+	select {
+	case snapshot := <-result:
+		if snapshot.GroupID != 1001 || len(snapshot.Members) != 1 {
+			t.Fatalf("snapshot=%+v", snapshot)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("targeted read acquired unrelated group lock")
+	}
+}
+
 func TestSlidingWindowDropsExpiredFailures(t *testing.T) {
 	Reset()
 	defer Reset()
