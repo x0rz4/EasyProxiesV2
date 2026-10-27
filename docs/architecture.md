@@ -198,6 +198,8 @@ inbound → pool 取 PoolSnapshot（不可变）→ 按 mode 选成员 → 拨�
 
 ## 10. 默认端口与关键常量
 
+性能观测通过管理 API 提供：资源/流量/连接数、分组成员重叠与健康日志积压；profile 默认关闭，开启后要求本机连接与有效管理会话。实现、采样命令与指标边界见 [performance.md](performance.md)。
+
 共享池入口 `2323`、管理面板 `9888`、multi-port 起始 `24000`。标签重算防抖 `2s` + 全量 sweep `10min`。Healer 预算见 [spec.md](../plane/specs/proxy-pool/spec.md) Requirement HEAL-002。
 
 ## 11. 构建与开发命令

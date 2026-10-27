@@ -58,8 +58,9 @@ type Server struct {
 	groupOperationLocks sync.Map // map[int64]*sync.Mutex
 
 	// Lifecycle
-	done         chan struct{} // closed on Shutdown to stop background goroutines
-	shutdownOnce sync.Once
+	done           chan struct{} // closed on Shutdown to stop background goroutines
+	shutdownOnce   sync.Once
+	profileEnabled bool // startup opt-in; profiles also require a local authenticated caller
 
 	subRefresher   controlplane.SubscriptionRefresher
 	nodeMgr        controlplane.NodeManager
@@ -91,11 +92,12 @@ func NewServer(cfg monitor.Config, mgr *monitor.Manager, logger *log.Logger) *Se
 	}
 
 	s := &Server{
-		cfg:      cfg,
-		mgr:      mgr,
-		logger:   logger,
-		probeSem: processDiagnosticBudgets[probe.Unlock],
-		done:     make(chan struct{}),
+		cfg:            cfg,
+		mgr:            mgr,
+		logger:         logger,
+		probeSem:       processDiagnosticBudgets[probe.Unlock],
+		done:           make(chan struct{}),
+		profileEnabled: os.Getenv("EASY_PROXIES_PROFILE_ENABLED") == "1",
 	}
 	// Build the auth domain eagerly so the session-cleanup goroutine below has
 	// something to drive. The password is read through the server, so a settings

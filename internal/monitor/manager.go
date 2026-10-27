@@ -293,13 +293,14 @@ type NodeTrafficSpeed struct {
 }
 
 type TrafficSummary struct {
-	NodeCount     int                `json:"node_count"`
-	TotalUpload   int64              `json:"total_upload"`
-	TotalDownload int64              `json:"total_download"`
-	UploadSpeed   int64              `json:"upload_speed"`   // bytes/sec
-	DownloadSpeed int64              `json:"download_speed"` // bytes/sec
-	Nodes         []NodeTrafficSpeed `json:"nodes,omitempty"`
-	SampledAt     time.Time          `json:"sampled_at"`
+	ActiveConnections int64              `json:"active_connections"`
+	NodeCount         int                `json:"node_count"`
+	TotalUpload       int64              `json:"total_upload"`
+	TotalDownload     int64              `json:"total_download"`
+	UploadSpeed       int64              `json:"upload_speed"`   // bytes/sec
+	DownloadSpeed     int64              `json:"download_speed"` // bytes/sec
+	Nodes             []NodeTrafficSpeed `json:"nodes,omitempty"`
+	SampledAt         time.Time          `json:"sampled_at"`
 }
 
 type probeFunc func(ctx context.Context) (time.Duration, error)
@@ -1125,6 +1126,7 @@ func (m *Manager) TrafficSummary(includeNodes bool) TrafficSummary {
 	for _, e := range list {
 		totalUp := e.totalUpload.Load()
 		totalDown := e.totalDownload.Load()
+		summary.ActiveConnections += int64(e.active.Load())
 
 		e.mu.RLock()
 		upSpeed := e.uploadSpeed

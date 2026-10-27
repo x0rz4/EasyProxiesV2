@@ -8,6 +8,7 @@
 
 | 文档 | 用途与状态 |
 | --- | --- |
+| [池性能审计后续评估与修复](changes/pool-memory-throughput/followup.md) | 原五项后续建议、测量入口、内存/吞吐优化与逐项验收进度 |
 | [池快照内存与选路吞吐审计](changes/pool-memory-throughput/plan.md) | 架构评估、连接引用收敛、固定模式线性回退及基准验收 |
 | [解锁页在线可用范围](changes/unlock-healthy-scope/plan.md) | 列表、统计与检测目标统一限制在线可用，保留其它页面原范围 |
 | [安装器中文与更新](changes/installer-chinese-update/plan.md) | 默认 /opt 子目录、中文帮助、显式更新及服务/容器状态保留 |

@@ -70,6 +70,22 @@ type GroupRuntimeStatus struct {
 	Error  string `json:"runtime_error,omitempty"`
 }
 
+// RuntimeResourceReader observes live instances without exporting node metadata.
+type RuntimeResourceReader interface {
+	RuntimeResources() RuntimeResources
+}
+
+type RuntimeResources struct {
+	BaseInstances      int     `json:"base_instances"`
+	GroupInstances     int     `json:"group_instances"`
+	BaseMembers        int     `json:"base_members"`
+	GroupMembers       int     `json:"group_members"`
+	UniqueGroupMembers int     `json:"unique_group_members"`
+	MaxGroupsPerMember int     `json:"max_groups_per_member"`
+	RetiringMembers    int     `json:"retiring_members"`
+	GroupAmplification float64 `json:"group_amplification"`
+}
+
 // GroupRuntimeManager is implemented by runtimes that can apply one group
 // without reloading every listener. The HTTP layer keeps a TriggerReload
 // fallback for lightweight test managers and older integrations.

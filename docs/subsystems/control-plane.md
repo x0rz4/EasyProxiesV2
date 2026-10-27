@@ -18,6 +18,7 @@ monitor 从不反向 import httpapi；httpapi 不 import boxmgr
 | 文件 | 承载 |
 | --- | --- |
 | `server.go` | `Server` 生命周期、`//go:embed assets/*`、节点管理器注入 |
+| `server_resources.go` / `process_rss_*.go` | 资源指标及默认关闭的本机认证 profile；访问门禁与采样命令见 [性能观测](../performance.md) |
 | `routes.go` | 全部路由表 |
 | `response.go` | 响应管线：`pathID` / `pathIDOrNotFound` / `requireStore` / 三个域状态函数 / `decodeJSON` |
 | `server_auth.go` | 会话认证、`withAPIKey`、API Key 中间件 |

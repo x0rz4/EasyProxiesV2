@@ -39,6 +39,8 @@ SS 插件在 `shadowsocksRuntimePlugin` 适配 Clash 与 sing-box 的格式差�
 
 ## 自愈链（HEAL）
 
+`internal/boxmgr/resources.go` 实现 `controlplane.RuntimeResourceReader`，统计运行中的 base/分组实例、成员重叠倍数与退休成员数；只输出数量，不构建配置或获取 reloadMu。入口与指标边界见 [性能观测](../performance.md)。
+
 `group.PlanHealing`/`CapacitySelection` → `boxmgr.ApplyHealingSelection`（重 Plan → 增量 PrepareUpdate/Commit → NotifyEvents）。promote → probe → 再 promote → refresh；每阶段重读政策与状态；**planned 审计失败必须阻断动作**。预算/冷却见 spec Requirement HEAL-002。运维手册见 [group-healing](../../plane/group-healing.md)（不重新实现 Healer）。
 
 ## 探测链（L1）

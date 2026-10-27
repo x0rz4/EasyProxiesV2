@@ -267,6 +267,20 @@ TCP/UDP 选路和未完成的拨号重试 MUST 持有同一快照，防止候选
 
 代码：`internal/httpapi/nodecheck.go`、`internal/httpapi/nodecheck_api.go`。测试：`TestNodeCheckTerminalSurvivesFullSubscriber`、`TestNodeCheckStreamLifecycle`、`TestNodeCheckTaskEventsKeepsInitialEventShape`。
 
+## ADDED Requirement PERFORMANCE-001：性能采样显式启用且有界
+
+profile MUST 默认关闭，并同时受管理会话、非空管理密码与真实 loopback 对端约束，不信任转发头。只开放 heap/allocs/goroutine/cpu 二进制采样；CPU 时长 MUST 在 1–30 秒内，默认 10 秒，HEAD 不得启动采样。进程内最多一个 profile，请求取消或 Server 关闭 MUST 停止 CPU 采集，响应写入 MUST 有期限。
+
+### Scenario: 本机与远程请求同时采样
+
+- GIVEN 开启了性能采样，管理密码与会话有效。
+- WHEN 远程请求伪造 X-Forwarded-For，或第二个本机请求在采样期间到达。
+- THEN 远程请求被拒绝，并发请求返回 429；已进行的采样在取消/关闭后释放进程级占位。
+
+资源接口 MUST 只返回聚合数量，不能暴露节点凭据；RSS 不可用时明确标记，Go heap、Go 管理内存估计与 RSS 不得混同。分组统计是跨 slot 的观测，不承诺与并发重载原子一致。
+
+代码：`internal/httpapi/server_resources.go`、`internal/boxmgr/resources.go`。测试：`TestProfileAccessAndParameters`、`TestCPUProfileCancellationShutdownAndConcurrency`、`TestProfileReadableByGoTool`、`TestProfileOptInAndHead`、`TestResourceSnapshotReportsMemoryAndNoCredentials`、`TestRuntimeResourcesCountsOverlapAndExcludesStoppedSlots`。
+
 ## Requirement LIFECYCLE-001：应用退出共用预算并保持清理顺序
 
 Run 退出 MUST 先取消生产者，所有清理共享三十秒预算，超时 MUST 返回错误交给进程入口结束进程。最终统计和状态写入 MUST 接收预算 context；不可取消的第三方关闭函数只能留在同一条清理链内等待，MUST NOT 为跳过它而提前关闭其后的资源。
