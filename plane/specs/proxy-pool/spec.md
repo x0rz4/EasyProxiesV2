@@ -215,6 +215,18 @@ SS 出站构建 MUST 将插件名 `obfs` 适配为 sing-box 内嵌的 `obfs-loca
 
 代码：`internal/group/runtime.go`、`internal/outbound/pool`、`internal/boxmgr/healer.go`。已有测试：`TestCapacitySelectionPreservesSlotsAndExplicitEmpty`、`TestStandbyRecoveryPreservesStreakAcrossCapacityChange`、`TestHealingPromotesStandbyWithoutRestartingBoxes`。
 
+## ADDED Requirement RUNTIME-002：连接仅保留选中运行时引用
+
+TCP/UDP 选路和未完成的拨号重试 MUST 持有同一快照，防止候选 outbound 在拨号过程中被关闭。连接建立后 MUST 在释放快照前取得选中 memberRuntime 的 operation 引用；已建立连接 MUST NOT 因自身生命周期继续钉住整份旧拓扑。关闭（含重复关闭）MUST 只释放一次该连接的 operation 和活动计数；半关闭能力与错误归因保持原有语义。
+
+### Scenario: 热更新发生在拨号中，随后连接长期存活
+
+- GIVEN 拨号已加载旧快照且尚未返回。
+- WHEN 发布新拓扑并退休旧成员，之后原拨号成功建立连接。
+- THEN 拨号返回前旧候选仍受保护；返回后无关旧成员可独立排空，选中成员必须等待自身连接关闭，不能被提前关闭。
+
+代码：`internal/outbound/pool/pool.go`。测试：`TestConnectionPinsOnlySelectedRuntime`（TCP/UDP）、`TestRetiredMemberWaitsForLoadedSnapshotReader`、`TestDialContextKeepsLoadedSnapshotAcrossRetry`。
+
 ## Requirement AUDIT-001：控制面必须诚实表达观测和审计边界
 
 当前认证查询为 `GET /api/groups/{groupID}/healing-events?limit=50`；事件状态为 dry_run/planned/succeeded/failed/deferred/alert。每组限制 500 条和 30 天，5min 内相同状态及动作详情去重；清理发生在成功追加新事件时，不是独立定时清理。审计查询 MUST NOT 被当成无损动作计数器或无限期证据库。

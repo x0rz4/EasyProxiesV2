@@ -4,8 +4,8 @@
 > 权威行为契约见 [plane/specs/proxy-pool/spec.md](../plane/specs/proxy-pool/spec.md)（MUST/场景）；
 > 变更提案与历史见 [plane/](../plane/)。本文件只讲"现在是怎么搭的"，不写"应该怎么改"。
 >
-> 基线核对：v2.2.15，migration 至 v25，`internal/` + `cmd/` 约 **40.7k** 行非测试代码、约 **23.4k** 行测试，
-> 前端 `frontend/src` 约 **10.0k** 行 TS/TSX。核对日期 2026-10-26。
+> 基线核对：v2.2.16，migration 至 v25，`internal/` + `cmd/` 约 **40.7k** 行非测试代码、约 **23.6k** 行测试，
+> 前端 `frontend/src` 约 **10.0k** 行 TS/TSX。核对日期 2026-10-27。
 
 ## 1. 一句话说清这个系统
 
@@ -175,12 +175,15 @@ tag 代际不可覆盖：同一 tag 重复 `Create` 会当场关掉旧 outbound�
 
 ```
 inbound → pool 取 PoolSnapshot（不可变）→ 按 mode 选成员 → 拨号 → 成功/失败回写
+成功：先取得选中 runtime 的连接引用，再释放快照；连接关闭释放该 runtime
 失败：普通模式 sharedMemberState（阈值→临时黑名单）
       分组模式 group.RecordFailure（滑动窗口→SUSPECT/EVICTED，按 NodeID 全局传播到所有分组）
 被踢成员仍在周期探活；冷却 + 连续成功 N 次后 RecordHealthSuccess 自动恢复（恢复同样全局）
 ```
 
-**调用方取消/超时不得计入成员失败**（`dialFailureAttributable`），否则客户端断开风暴会误拉黑健康节点——见 LESSONS L-003。
+快照只覆盖选路/拨号/重试；长连接不保留整份池拓扑。固定模式失效回退复用快照索引、最坏 O(N)；balance 精确最少连接仍为 O(N)。实现与生命周期边界见 [数据面](subsystems/data-plane.md)。
+
+**调用方取消/超时不得计入成员失败**（`dialFailureAttributable`），否则客户端断开风暴会误拉黑健康节点——见 LESSONS L-004。
 
 ## 8. 控制面 API 与认证
 

@@ -25,6 +25,12 @@ SS 插件在 `shadowsocksRuntimePlugin` 适配 Clash 与 sing-box 的格式差�
 6. **事件与快照的顺序**：`ReconcileSilent` 先迁移状态，**等匹配的 pool 快照可见后再 `NotifyEvents`**（护栏 6）。
 7. **成员 outbound 不能声明静态依赖**：`CreateMember` 后 `Dependencies()` 非空会立即失败并回滚（否则 sing-box `dependByTag` 无法随快照更新）。
 
+## 选路与连接引用
+
+`internal/outbound/pool/pool.go` 中 TCP/UDP 在选路和全部拨号重试期间持有同一份快照。连接建立后，包装器先增加选中 `memberRuntime.operations`，函数返回时释放快照；关闭连接只释放该成员的 operation 和活动连接计数，重复关闭不会重复递减。这样长连接保护自己的 outbound，同时允许无关退休成员排空，旧快照的整份拓扑和索引也不再因该连接保留。拨号未返回时仍保护全部重试候选，不能提前释放快照。契约见 RUNTIME-002。
+
+固定模式失效回退沿拓扑循环查找下一个候选，复用快照的 TCP/UDP/全体候选索引，最坏 O(N)、零额外分配。控制面传入任意子集或重排候选时临时构建索引，O(N+K)，保留拓扑优先和返回候选下标的语义。`balance` 仍逐连接扫描候选求精确最小活动数。
+
 ## 三条重载路径（boxmgr）
 
 池的 TCP 连接包装只在底层实际支持时暴露 `CloseRead` / `CloseWrite`。缺少写半关闭能力时由 sing-box 走完整关闭，仍通过 tracked 连接释放计数；真实半关闭不释放活动连接。不能靠忽略半关闭错误替代关闭。

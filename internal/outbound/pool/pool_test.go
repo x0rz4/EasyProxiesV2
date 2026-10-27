@@ -427,7 +427,7 @@ func TestRetiredMemberWaitsForLoadedSnapshotReader(t *testing.T) {
 	member := &memberState{tag: "old", outbound: &fakeOutbound{}, shared: acquireSharedState("old")}
 	p := &poolOutbound{}
 	storeTestSnapshot(p, member)
-	_, release, err := p.acquireSnapshot()
+	snapshot, err := p.acquireSnapshot()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -437,7 +437,7 @@ func TestRetiredMemberWaitsForLoadedSnapshotReader(t *testing.T) {
 	if retired.Drained() {
 		t.Fatal("retired member drained while an old snapshot reader was paused")
 	}
-	release()
+	p.releaseSnapshotReader(snapshot)
 	if !retired.Drained() {
 		refs, operations, active := retired.Counts()
 		t.Fatalf("retired member did not drain after reader release: refs=%d operations=%d active=%d", refs, operations, active)

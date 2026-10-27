@@ -480,26 +480,26 @@ func (p *poolOutbound) loadSnapshot() (*PoolSnapshot, error) {
 	return p.current.Load(), nil
 }
 
-// acquireSnapshot pins the loaded snapshot until release is called. The second
+// acquireSnapshot pins the loaded snapshot until releaseSnapshotReader is called. The second
 // accepting check closes the Load/increment race with a concurrent publisher.
 // Once Close has run no new snapshot is ever published, so a retry loop here
 // would spin forever; closed pools fail fast with net.ErrClosed instead.
-func (p *poolOutbound) acquireSnapshot() (*PoolSnapshot, func(), error) {
+func (p *poolOutbound) acquireSnapshot() (*PoolSnapshot, error) {
 	for {
 		if p.closed.Load() {
-			return nil, nil, net.ErrClosed
+			return nil, net.ErrClosed
 		}
 		snapshot, err := p.loadSnapshot()
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		snapshot.readers.Add(1)
 		if snapshot.accepting.Load() {
-			return snapshot, func() { p.releaseSnapshotReader(snapshot) }, nil
+			return snapshot, nil
 		}
 		p.releaseSnapshotReader(snapshot)
 		if p.closed.Load() {
-			return nil, nil, net.ErrClosed
+			return nil, net.ErrClosed
 		}
 		runtime.Gosched()
 	}
@@ -1088,15 +1088,11 @@ func (p *poolOutbound) memberName(member *memberState) string {
 
 func (p *poolOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	dst := destination.String()
-	snapshot, release, err := p.acquireSnapshot()
+	snapshot, err := p.acquireSnapshot()
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		if release != nil {
-			release()
-		}
-	}()
+	defer p.releaseSnapshotReader(snapshot)
 	cursor, err := p.newAttemptCursor(snapshot, network)
 	if err != nil {
 		return nil, err
@@ -1118,9 +1114,7 @@ func (p *poolOutbound) DialContext(ctx context.Context, network string, destinat
 			continue
 		}
 		p.recordSuccess(member, dst)
-		wrapped := p.wrapConnWithRelease(conn, member, dst, release)
-		release = nil
-		return wrapped, nil
+		return p.wrapConn(conn, member, dst), nil
 	}
 	if dialErr != nil {
 		return nil, fmt.Errorf("all available proxies failed for %s: %w", dst, dialErr)
@@ -1130,15 +1124,11 @@ func (p *poolOutbound) DialContext(ctx context.Context, network string, destinat
 
 func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	dst := destination.String()
-	snapshot, release, err := p.acquireSnapshot()
+	snapshot, err := p.acquireSnapshot()
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		if release != nil {
-			release()
-		}
-	}()
+	defer p.releaseSnapshotReader(snapshot)
 	cursor, err := p.newAttemptCursor(snapshot, N.NetworkUDP)
 	if err != nil {
 		return nil, err
@@ -1160,9 +1150,7 @@ func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 			continue
 		}
 		p.recordSuccess(member, dst)
-		wrapped := p.wrapPacketConnWithRelease(conn, member, dst, release)
-		release = nil
-		return wrapped, nil
+		return p.wrapPacketConn(conn, member, dst), nil
 	}
 	if listenErr != nil {
 		return nil, fmt.Errorf("all available proxies failed for %s: %w", dst, listenErr)
@@ -1346,12 +1334,28 @@ func (p *poolOutbound) nextFixedIndex(snapshot *PoolSnapshot, candidates []*memb
 	if previousIndex < 0 {
 		return 0
 	}
+	var candidateIndex map[*MemberRef]int
+	switch {
+	case sameCandidateSlice(candidates, snapshot.tcpMembers):
+		candidateIndex = snapshot.tcpIndex
+	case sameCandidateSlice(candidates, snapshot.udpMembers):
+		candidateIndex = snapshot.udpIndex
+	case sameCandidateSlice(candidates, snapshot.Members):
+		candidateIndex = snapshot.memberIndex
+	default:
+		// Control-plane callers may provide a filtered or reordered subset.
+		// Keep their indexes without a second scan inside the topology walk.
+		candidateIndex = make(map[*MemberRef]int, len(candidates))
+		for index, member := range candidates {
+			if _, found := candidateIndex[member]; !found {
+				candidateIndex[member] = index
+			}
+		}
+	}
 	for offset := 1; offset <= len(snapshot.allMembers); offset++ {
 		member := snapshot.allMembers[(previousIndex+offset)%len(snapshot.allMembers)]
-		for index, candidate := range candidates {
-			if candidate == member {
-				return index
-			}
+		if index, found := candidateIndex[member]; found {
+			return index
 		}
 	}
 	return 0
@@ -1676,17 +1680,16 @@ func (p *poolOutbound) recordSuccess(member *memberState, destination string) {
 }
 
 func (p *poolOutbound) wrapConn(conn net.Conn, member *memberState, destination string) net.Conn {
-	return p.wrapConnWithRelease(conn, member, destination, nil)
-}
-
-func (p *poolOutbound) wrapConnWithRelease(conn net.Conn, member *memberState, destination string, snapshotRelease func()) net.Conn {
+	// The dial still holds its snapshot here. Acquire the selected runtime
+	// before that snapshot is released, so unrelated retired members can drain
+	// while this connection remains open. An already-started dial may finish
+	// after retirement, so acquireOperation's new-operation gate does not apply.
+	ensureMemberRuntime(member).operations.Add(1)
 	tracked := &trackedConn{
 		Conn: conn,
 		release: func() {
 			p.decActive(member)
-			if snapshotRelease != nil {
-				snapshotRelease()
-			}
+			member.releaseOperation()
 		},
 		onTraffic: func(upload, download int64) {
 			if member.shared != nil {
@@ -1705,14 +1708,13 @@ func (p *poolOutbound) wrapConnWithRelease(conn net.Conn, member *memberState, d
 	return tracked.withHalfClose()
 }
 
-func (p *poolOutbound) wrapPacketConnWithRelease(conn net.PacketConn, member *memberState, destination string, snapshotRelease func()) net.PacketConn {
+func (p *poolOutbound) wrapPacketConn(conn net.PacketConn, member *memberState, destination string) net.PacketConn {
+	ensureMemberRuntime(member).operations.Add(1)
 	return &trackedPacketConn{
 		PacketConn: conn,
 		release: func() {
 			p.decActive(member)
-			if snapshotRelease != nil {
-				snapshotRelease()
-			}
+			member.releaseOperation()
 		},
 		onTraffic: func(upload, download int64) {
 			if member.shared != nil {
