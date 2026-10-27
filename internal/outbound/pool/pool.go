@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"runtime"
@@ -41,6 +42,7 @@ const (
 	modeSequential    = "sequential"
 	modeRandom        = "random"
 	modeBalance       = "balance"
+	modeBalanceP2C    = "balance_p2c"
 	modeFixed         = "fixed"
 	modeLowestLatency = "lowest_latency"
 )
@@ -410,6 +412,8 @@ func normalizeOptions(options Options) Options {
 		options.Mode = modeRandom
 	case modeBalance:
 		options.Mode = modeBalance
+	case modeBalanceP2C:
+		options.Mode = modeBalanceP2C
 	case modeFixed:
 		options.Mode = modeFixed
 	case modeLowestLatency:
@@ -1279,12 +1283,19 @@ func (p *poolOutbound) selectionIndex(snapshot *PoolSnapshot, candidates []*Memb
 			if member.shared != nil {
 				active = member.shared.activeCount()
 			}
+			// Active counts cannot be negative. The first idle member is
+			// already the exact minimum, including the existing tie order.
+			if active == 0 {
+				return index
+			}
 			if index == 0 || active < minActive {
 				selected = index
 				minActive = active
 			}
 		}
 		return selected
+	case modeBalanceP2C:
+		return twoChoiceIndex(candidates, rand.Uint64())
 	case modeFixed, modeLowestLatency:
 		current := p.currentMember.Load()
 		if current != nil {
@@ -1305,6 +1316,31 @@ func (p *poolOutbound) selectionIndex(snapshot *PoolSnapshot, candidates []*Memb
 	default:
 		return int(p.rrCounter.Add(1)-1) % len(candidates)
 	}
+}
+
+// twoChoiceIndex uses disjoint halves of one random word to sample two
+// different network-eligible members. It deliberately does not promise the
+// global minimum; callers opt into this constant-work policy explicitly.
+func twoChoiceIndex(candidates []*MemberRef, random uint64) int {
+	if len(candidates) == 1 {
+		return 0
+	}
+	first := int(uint64(uint32(random)) % uint64(len(candidates)))
+	second := int((random >> 32) % uint64(len(candidates)-1))
+	if second >= first {
+		second++
+	}
+	var firstActive, secondActive int32
+	if candidates[first].shared != nil {
+		firstActive = candidates[first].shared.activeCount()
+	}
+	if candidates[second].shared != nil {
+		secondActive = candidates[second].shared.activeCount()
+	}
+	if secondActive < firstActive {
+		return second
+	}
+	return first
 }
 
 func (p *poolOutbound) nextRandom() uint64 {

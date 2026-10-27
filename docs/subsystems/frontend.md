@@ -10,6 +10,8 @@ React 19 + TypeScript + Vite 7 + Tailwind CSS 4 + DaisyUI 5 + TanStack Query + l
 
 无单测框架，验收标准 = `npm run lint` + `npm run build`（含 `tsc -b` 严格检查，`noUnusedLocals`/`noUnusedParameters` 开启）通过。
 
+系统设置的基础池调度支持显式 `balance_p2c`，并提示“双随机候选中取较少连接，不保证全池最少”；不改变分组调度选项或已有默认选择。
+
 ## 目录约定
 
 ```

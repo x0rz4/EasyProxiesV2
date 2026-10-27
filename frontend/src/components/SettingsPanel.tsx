@@ -534,7 +534,9 @@ export default function SettingsPanel() {
               <option value="sequential">sequential - 顺序轮询</option>
               <option value="random">random - 随机选择</option>
               <option value="balance">balance - 最小连接数负载均衡</option>
+              <option value="balance_p2c">balance_p2c - 双随机最少连接（大池优先）</option>
             </select>
+            {settings.pool_mode === 'balance_p2c' && <p className="mt-2 text-xs text-base-content/60">每次从两个随机候选中选择连接较少者，降低大池选路开销；不保证全池连接数最少。</p>}
           </fieldset>
 
           <fieldset className="fieldset">

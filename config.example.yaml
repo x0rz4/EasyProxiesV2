@@ -30,7 +30,8 @@ listener:
 # 代理池配置
 # ───────────────────────────────────────────────────────────────
 pool:
-  # 调度模式: sequential（顺序轮询）, random（随机选择）, balance（最小连接数负载均衡）
+  # 调度模式: sequential（顺序轮询）, random（随机）, balance（精确最少连接）
+  # balance_p2c: 双随机候选中取连接较少者，选路 O(1)，适合大池；不保证全局最少
   mode: sequential
   # 连续失败多少次后加入黑名单
   failure_threshold: 3

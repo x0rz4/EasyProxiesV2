@@ -181,7 +181,7 @@ inbound → pool 取 PoolSnapshot（不可变）→ 按 mode 选成员 → 拨�
 被踢成员仍在周期探活；冷却 + 连续成功 N 次后 RecordHealthSuccess 自动恢复（恢复同样全局）
 ```
 
-快照只覆盖选路/拨号/重试；长连接不保留整份池拓扑。固定模式失效回退复用快照索引、最坏 O(N)；balance 精确最少连接仍为 O(N)。实现与生命周期边界见 [数据面](subsystems/data-plane.md)。
+快照只覆盖选路/拨号/重试；长连接不保留整份池拓扑。固定模式失效回退复用快照索引、最坏 O(N)；balance 找到首个空闲成员即结束、最坏 O(N)。显式基础池 balance_p2c 使用两个随机候选比较连接数，O(1)，不承诺全局最少。实现与生命周期边界见 [数据面](subsystems/data-plane.md)。
 
 **调用方取消/超时不得计入成员失败**（`dialFailureAttributable`），否则客户端断开风暴会误拉黑健康节点——见 LESSONS L-004。
 

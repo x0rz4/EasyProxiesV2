@@ -37,4 +37,12 @@ go tool pprof -top -inuse_space ./easy-proxies heap.pprof
 
 ## 验证边界
 
+基础池可显式选用 `pool.mode: balance_p2c`，设置页也提供该选项。它以两个随机候选的连接数作近似选择，不保证全池最少；现有 `balance` 保持精确规则，并在发现空闲成员时提前结束。常空闲池的 balance 本身成本很低；所有成员均忙的大池可测量 p2c 的收益后决定是否启用。分组仍保持原有三种策略。
+
+```sh
+go test ./internal/outbound/pool -run '^$' -bench '^Benchmark(Balance|TwoChoice)' -benchmem -count 3
+```
+
+基准只包含选路和（并发版本的）活动计数，不包含协议握手、网络或带宽；RunParallel 的 ns/op 是总吞吐的倒数，不能当作单连接延迟。公平性回归使用固定种子的随机字，生产随机来自并发安全的标准库顶层函数。
+
 当前路由与访问控制、CPU 取消/关闭/并发、RSS 读取、分组重叠计数及 `go tool pprof -top` 解析由同包回归覆盖。可复现实验和具体规模结果记录在 `plane/changes/pool-memory-throughput/followup.md`；功能通过不代表特定生产机器的吞吐或内存容量已获认证。

@@ -233,6 +233,18 @@ TCP/UDP 选路和未完成的拨号重试 MUST 持有同一快照，防止候选
 
 代码：`internal/outbound/pool/pool.go`。测试：`TestConnectionPinsOnlySelectedRuntime`（TCP/UDP）、`TestRetiredMemberWaitsForLoadedSnapshotReader`、`TestDialContextKeepsLoadedSnapshotAcrossRetry`。
 
+## ADDED Requirement RUNTIME-003：基础池双随机策略必须显式启用
+
+现有 balance MUST 保留最少观测连接数与拓扑优先平局规则；计数非负时允许在首个空闲成员处结束扫描。只有显式基础池 `pool.mode=balance_p2c` 才能使用近似策略，MUST 从同一网络候选快照选择两个不同成员并比较观测活动数，平局用首个随机候选；单候选直接使用它。该策略 MUST NOT 承诺全池最少，MUST NOT 扩大健康/成员候选或改变快照重试与连接引用边界。默认值、现有策略与分组白名单保持兼容。
+
+### Scenario: 网络候选受限或同时建立连接
+
+- GIVEN TCP/UDP 候选不同，某成员被排除或黑名单，且多个连接并发选择。
+- WHEN 显式启用 balance_p2c。
+- THEN 只能选择本次网络候选中的成员，活动计数仍按连接一次性释放；比较是并发观测，不保证某一瞬间全池计数原子一致。
+
+代码：`internal/outbound/pool/pool.go`、`frontend/src/components/SettingsPanel.tsx`。测试：`TestBalanceKeepsExactMinimumAndFirstIdleTie`、`TestTwoChoiceAlwaysComparesDifferentMembers`、`TestTwoChoiceDistributionAndAccumulatedLoad`、`TestTwoChoiceConcurrentDispatchAndCandidateBoundary`、`TestTwoChoicePolicySurvivesPrepareAndCommit`、`TestSettingsPersistsExplicitTwoChoiceMode`。
+
 ## Requirement AUDIT-001：控制面必须诚实表达观测和审计边界
 
 当前认证查询为 `GET /api/groups/{groupID}/healing-events?limit=50`；事件状态为 dry_run/planned/succeeded/failed/deferred/alert。每组限制 500 条和 30 天，5min 内相同状态及动作详情去重；清理发生在成功追加新事件时，不是独立定时清理。审计查询 MUST NOT 被当成无损动作计数器或无限期证据库。
