@@ -341,6 +341,24 @@ API Key 使用记录 MUST 合并同一 Key 的最新观测，使用单一消费�
 
 代码：`internal/controlplane/auth_usage.go`、`internal/store/sqlite.go`。测试：`TestAPIKeyUseCoalescesAndFlushesLatest`、`TestAPIKeyUseRetriesWithoutDroppingNewObservation`、`TestAPIKeyUseShutdownBudgetAndRebinding`、`TestAPIKeyUsageQueueIsBounded`。
 
+## Requirement AUTH-002：浏览器退出撤销服务器会话
+
+浏览器 MUST 通过服务器认证状态恢复会话，MUST NOT 以 localStorage token 是否存在推断已授权。Bearer 只在内存保存，持久浏览器会话使用 HttpOnly/SameSite Cookie。认证退出 MUST 撤销请求中的有效 Cookie 与不同的 Bearer、清除 Cookie；持久删除失败 MUST 返回失败。持久读取和撤销 MUST 协调，防止旧读重新缓存已撤销会话，且等待/存储共用有界可取消预算。已授权在途请求不追溯撤销。退出/401 MUST 取消并清空前端查询缓存，旧会话迟到的 401 MUST NOT 注销新登录。
+
+### Scenario: 退出与在途缓存未命中读取交错
+
+- GIVEN 有效会话已持久化，一个读取已取到旧行但未完成缓存写入。
+- WHEN 当前会话成功退出。
+- THEN 此后请求及重启后的验证均拒绝该 token；存储失败可重试，等待能被取消。
+
+代码：`internal/controlplane/auth.go`、`internal/httpapi/server_auth.go`、`frontend/src/api/transport.ts`、`frontend/src/App.tsx`。回归：`TestRevokeSessionCannotBeResurrectedByInFlightStoreRead`、`TestRevokeSessionReportsDurableFailureAndCanRetry`、`TestSessionStoreWaitHonorsCancellation`、`TestBrowserSessionStatusAndLogoutRevokeCookieAndBearer`、`frontend/tests/api.test.mjs`。
+
+## Requirement WEB-001：前端流与静态资源边界
+
+页面卸载/取消及流终态 MUST 释放 reader 与连接；SSE MUST 保留跨 chunk 的 UTF-8/CRLF/多行 framing，正常 EOF 必须可恢复或显式报告中断，mutating probe-all POST MUST NOT 自动重放。认证失败共用会话清理路径。缺失 /assets/ 脚本 MUST 返回 404，HTML MUST 重新验证，哈希资源可以 immutable 缓存；HTML 使用同源 script/font/connect CSP，并禁止嵌入其它站点 iframe。页面加载失败 MUST 有局部错误边界，不能使导航整体失去功能。
+
+代码：`frontend/src/api/sse.ts`、`frontend/src/api/client.ts`、`frontend/src/components/ui/PanelBoundary.tsx`、`internal/httpapi/server_static.go`。回归：`frontend/tests/api.test.mjs`、`TestFrontendStaticBoundariesAndSensitiveResponseCaching`；可视页面验证方法见 `docs/subsystems/frontend.md`。
+
 ## Requirement DEPLOY-001：Linux 服务注册和自启可独立管理
 
 二进制默认安装 MUST 注册当前 Linux 服务管理器的服务、启用开机自启并启动；已有本地程序的 register 和各服务管理动作 MUST 不依赖 Release 下载。默认 install 的 no-start MUST 保持仅文件安装语义。禁用自启不停止当前进程；注销服务 MUST 保留程序、配置和数据库。非法环境或服务归属冲突 MUST 拒绝操作，启动/自启验证失败不得记录安装成功。

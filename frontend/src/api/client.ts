@@ -44,96 +44,15 @@ import type {
   TagsResponse,
 } from '../types'
 
-// ---- Token management ----
-
-let authToken: string | null = localStorage.getItem('auth_token')
-
-export function getToken(): string | null {
-  return authToken
-}
-
-export function setToken(token: string | null) {
-  authToken = token
-  if (token) {
-    localStorage.setItem('auth_token', token)
-  } else {
-    localStorage.removeItem('auth_token')
-  }
-}
-
-export function clearToken() {
-  setToken(null)
-}
-
-// ---- Base request helper ----
-
-function buildHeaders(extra?: HeadersInit): Record<string, string> {
-  const headers: Record<string, string> = {
-    ...(extra as Record<string, string> || {}),
-  }
-  // Add auth header if we have a token
-  if (authToken) {
-    headers['Authorization'] = `Bearer ${authToken}`
-  }
-  return headers
-}
-
-async function readErrorMessage(res: Response): Promise<string> {
-  let msg = `HTTP ${res.status}`
-  try {
-    const body = await res.json()
-    if (body.error) msg = body.error
-  } catch { /* ignore parse errors */ }
-  return msg
-}
-
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const headers = buildHeaders(options.headers)
-
-  // Set JSON content type for non-GET requests with body
-  if (options.body && typeof options.body === 'string') {
-    headers['Content-Type'] = 'application/json'
-  }
-
-  const res = await fetch(path, {
-    ...options,
-    headers,
-    credentials: 'include', // send cookies
-  })
-
-  if (res.status === 401) {
-    clearToken()
-    // Dispatch a custom event so App can react
-    window.dispatchEvent(new CustomEvent('auth:unauthorized'))
-    throw new ApiError('未授权，请重新登录', 401)
-  }
-
-  if (!res.ok) {
-    throw new ApiError(await readErrorMessage(res), res.status)
-  }
-
-  // Handle empty responses
-  const text = await res.text()
-  if (!text) return {} as T
-  return JSON.parse(text) as T
-}
-
-export class ApiError extends Error {
-  status: number
-  constructor(message: string, status: number) {
-    super(message)
-    this.name = 'ApiError'
-    this.status = status
-  }
-}
+import { ApiError, authFetch, clearToken, readErrorMessage, request, setToken } from './transport'
+export { ApiError } from './transport'
+import { readEvents, parseStreamJSON, waitForReconnect } from './sse'
 
 // ---- Auth API ----
 
 /** Check if password is required & login */
-export async function checkAuth(): Promise<AuthResponse> {
-  // Use GET-like behavior: /api/auth without POST returns password status
-  const res = await fetch('/api/auth', { credentials: 'include' })
-  return res.json()
+export async function checkAuth(signal?: AbortSignal): Promise<AuthResponse> {
+  return request('/api/auth', { signal })
 }
 
 export async function login(password: string): Promise<AuthResponse> {
@@ -156,7 +75,8 @@ export async function login(password: string): Promise<AuthResponse> {
   return data
 }
 
-export function logout() {
+export async function logout() {
+  await request('/api/auth/logout', { method: 'POST' })
   clearToken()
 }
 
@@ -179,8 +99,8 @@ export async function fetchNodesByIDs(ids: number[]) {
   return nodes
 }
 
-export async function fetchProbeSettings(): Promise<ProbeOperationsSettings> {
-  return request<ProbeOperationsSettings>('/api/operations/probe-settings')
+export async function fetchProbeSettings(signal?: AbortSignal): Promise<ProbeOperationsSettings> {
+  return request<ProbeOperationsSettings>('/api/operations/probe-settings', { signal })
 }
 
 export async function fetchNodeCheckSettings(): Promise<NodeCheckSettings> {
@@ -212,47 +132,25 @@ export function streamNodeCheckTask(taskId: string, onEvent: (event: NodeCheckEv
   const controller = new AbortController()
   void (async () => {
     while (!controller.signal.aborted) {
-      let terminal = false
       try {
-        const headers: Record<string, string> = {}
-        if (authToken) headers.Authorization = `Bearer ${authToken}`
-        const response = await fetch(`/api/node-check/tasks/${encodeURIComponent(taskId)}/events`, { headers, credentials: 'include', signal: controller.signal })
-        if (!response.ok) throw new ApiError(`连接检测任务失败: HTTP ${response.status}`, response.status)
-        const reader = response.body?.getReader()
-        if (!reader) throw new Error('No response body')
-        const decoder = new TextDecoder()
-        let buffer = ''
-        while (!controller.signal.aborted) {
-          const { done, value } = await reader.read()
-          if (done) break
-          buffer += decoder.decode(value, { stream: true })
-          const blocks = buffer.split('\n\n')
-          buffer = blocks.pop() || ''
-          for (const block of blocks) {
-            const data = block.split('\n').find((line) => line.startsWith('data: '))
-            if (!data) continue
-            try {
-              const event = JSON.parse(data.slice(6)) as NodeCheckEvent
-              onEvent(event)
-              terminal = event.type === 'done' || Boolean(event.task && ['completed', 'failed', 'cancelled', 'interrupted'].includes(event.task.status))
-            } catch { /* ignore malformed event */ }
+        for await (const frame of readEvents('/api/node-check/tasks/' + encodeURIComponent(taskId) + '/events', controller)) {
+          const event = parseStreamJSON<NodeCheckEvent>(frame.data)
+          if (!event) continue
+          onEvent(event)
+          if (event.type === 'done') return
+          if (event.task && ['completed', 'failed', 'cancelled', 'interrupted'].includes(event.task.status)) {
+            // A reconnect can start with an already-terminal task snapshot.
+            // Finish the UI exactly once before releasing its stream reader.
+            onEvent({ ...event, type: 'done' })
+            return
           }
         }
-        if (terminal || controller.signal.aborted) return
       } catch (error) {
         if (controller.signal.aborted) return
         if (error instanceof ApiError) { onError?.(error); return }
       }
-      // The task continues server-side. Reconnect and receive a fresh aggregate
-      // snapshot after transient network errors or an intermediary timeout.
-      await new Promise<void>((resolve) => {
-        const onAbort = () => { window.clearTimeout(timer); resolve() }
-        const timer = window.setTimeout(() => {
-          controller.signal.removeEventListener('abort', onAbort)
-          resolve()
-        }, 1000)
-        controller.signal.addEventListener('abort', onAbort, { once: true })
-      })
+      // GET resumes the server-side task through a fresh aggregate snapshot.
+      await waitForReconnect(controller.signal, 1000)
     }
   })()
   return controller
@@ -334,9 +232,11 @@ export async function seedTagTemplates(): Promise<{ created: string[]; skipped: 
   return request('/api/tags/templates', { method: 'POST' })
 }
 
-export async function fetchTagAssignments(nodeIds: number[] = []): Promise<{ assignments: NodeTagAssignment[] }> {
-  const query = nodeIds.length ? `?node_ids=${nodeIds.join(',')}` : ''
-  return request<{ assignments: NodeTagAssignment[] }>(`/api/tags/assignments${query}`)
+export async function fetchTagAssignments(nodeIds?: number[], signal?: AbortSignal): Promise<{ assignments: NodeTagAssignment[] }> {
+  // The legacy tag endpoint treats an empty query as all nodes. Resolve an
+  // explicit empty client selection locally rather than widening its scope.
+  if (nodeIds?.length === 0) return { assignments: [] }
+  return request(`/api/tags/assignments${nodeIDsQuery(nodeIds)}`, { signal })
 }
 
 export async function setNodeManualTags(nodeId: number, tagIds: number[]): Promise<{ assignment: NodeTagAssignment }> {
@@ -407,135 +307,65 @@ export async function fetchUnlockResults(ids?: number[], signal?: AbortSignal): 
 }
 
 /** Probe all nodes with SSE progress updates */
-export function probeAllNodes(
-  onEvent: (event: ProbeSSEEvent) => void,
-  onError?: (error: Error) => void
-): AbortController {
+export function probeAllNodes(onEvent: (event: ProbeSSEEvent) => void, onError?: (error: Error) => void): AbortController {
   const controller = new AbortController()
-
-  const doFetch = async () => {
+  void (async () => {
     try {
-      const headers: Record<string, string> = {}
-      if (authToken) {
-        headers['Authorization'] = `Bearer ${authToken}`
+      for await (const frame of readEvents('/api/nodes/probe-all', controller, 'POST')) {
+        const event = parseStreamJSON<ProbeSSEEvent>(frame.data)
+        if (!event) continue
+        onEvent(event)
+        if (event.type === 'complete') return
       }
-
-      const res = await fetch('/api/nodes/probe-all', {
-        method: 'POST',
-        headers,
-        credentials: 'include',
-        signal: controller.signal,
-      })
-
-      if (!res.ok) {
-        let message = `探测失败: HTTP ${res.status}`
-        try {
-          const body = await res.json() as { error?: string }
-          if (body.error) message = body.error
-        } catch { /* ignore parse errors */ }
-        throw new ApiError(message, res.status)
-      }
-
-      const reader = res.body?.getReader()
-      if (!reader) throw new Error('No response body')
-
-      const decoder = new TextDecoder()
-      let buffer = ''
-
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-
-        buffer += decoder.decode(value, { stream: true })
-        const lines = buffer.split('\n')
-        buffer = lines.pop() || ''
-
-        for (const line of lines) {
-          const trimmed = line.trim()
-          if (trimmed.startsWith('data: ')) {
-            try {
-              const data = JSON.parse(trimmed.slice(6)) as ProbeSSEEvent
-              onEvent(data)
-            } catch { /* skip malformed events */ }
-          }
-        }
-      }
-    } catch (err) {
-      if ((err as Error).name !== 'AbortError') {
-        onError?.(err as Error)
-      }
+      if (!controller.signal.aborted) throw new Error('探测连接提前断开，请刷新运行状态')
+    } catch (error) {
+      if (!controller.signal.aborted) onError?.(error as Error)
     }
-  }
-
-  doFetch()
+  })()
+  // A mutating probe-all POST must never be replayed automatically.
   return controller
 }
 
 // ---- Traffic Stream API ----
 
 /** Subscribe real-time traffic speeds via SSE */
-export function streamTraffic(
-  onEvent: (event: TrafficStreamEvent) => void,
-  onError?: (error: Error) => void
-): AbortController {
+export function streamTraffic(onEvent: (event: TrafficStreamEvent) => void, onError?: (error: Error) => void): AbortController {
   const controller = new AbortController()
-
-  const doFetch = async () => {
+  void (async () => {
     try {
-      const headers: Record<string, string> = {}
-      if (authToken) {
-        headers['Authorization'] = `Bearer ${authToken}`
+      for await (const frame of readEvents('/api/nodes/traffic/stream', controller)) {
+        const event = parseStreamJSON<TrafficStreamEvent>(frame.data)
+        if (event?.type === 'traffic') onEvent(event)
       }
-
-      const res = await fetch('/api/nodes/traffic/stream', {
-        method: 'GET',
-        headers,
-        credentials: 'include',
-        signal: controller.signal,
-      })
-
-      if (!res.ok) {
-        throw new ApiError(`流量流订阅失败: HTTP ${res.status}`, res.status)
-      }
-
-      const reader = res.body?.getReader()
-      if (!reader) throw new Error('No response body')
-
-      const decoder = new TextDecoder()
-      let buffer = ''
-
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-
-        buffer += decoder.decode(value, { stream: true })
-        const lines = buffer.split('\n')
-        buffer = lines.pop() || ''
-
-        for (const line of lines) {
-          const trimmed = line.trim()
-          if (trimmed.startsWith('data: ')) {
-            try {
-              const data = JSON.parse(trimmed.slice(6)) as TrafficStreamEvent
-              if (data.type === 'traffic') {
-                onEvent(data)
-              }
-            } catch { /* skip malformed events */ }
-          }
-        }
-      }
-    } catch (err) {
-      if ((err as Error).name !== 'AbortError') {
-        onError?.(err as Error)
-      }
+      if (!controller.signal.aborted) throw new Error('流量连接已断开')
+    } catch (error) {
+      if (!controller.signal.aborted) onError?.(error as Error)
     }
-  }
-
-  doFetch()
+  })()
   return controller
 }
 
 // ---- Debug API ----
+
+export function streamSpeedtest(tag: string, onSpeed: (mbps: number, done: boolean) => void, onError: (error: Error) => void): AbortController {
+  const controller = new AbortController()
+  void (async () => {
+    try {
+      for await (const frame of readEvents(`/api/nodes/${encodeURIComponent(tag)}/speedtest`, controller)) {
+        if (frame.type === 'error') {
+          const payload = parseStreamJSON<{ error?: string }>(frame.data)
+          throw new Error(payload?.error || frame.data || '测速失败')
+        }
+        const payload = parseStreamJSON<{ mbps?: number }>(frame.data)
+        if (typeof payload?.mbps !== 'number' || !Number.isFinite(payload.mbps)) continue
+        onSpeed(payload.mbps, frame.type === 'done')
+        if (frame.type === 'done') return
+      }
+      if (!controller.signal.aborted) throw new Error('测速连接提前断开')
+    } catch (error) { if (!controller.signal.aborted) onError(error as Error) }
+  })()
+  return controller
+}
 
 export async function fetchDebug(): Promise<DebugResponse> {
   return request<DebugResponse>('/api/debug')
@@ -543,49 +373,26 @@ export async function fetchDebug(): Promise<DebugResponse> {
 
 export function streamDebugLogs(onEvent: (event: DebugLogEvent) => void, onStatus: (connected: boolean) => void): AbortController {
   const controller = new AbortController()
-  const connect = async () => {
+  void (async () => {
     while (!controller.signal.aborted) {
       try {
-        const headers: Record<string, string> = {}
-        if (authToken) headers.Authorization = `Bearer ${authToken}`
-        const response = await fetch('/api/debug/stream', { headers, credentials: 'include', signal: controller.signal })
-        if (response.status === 401) {
-          clearToken()
-          window.dispatchEvent(new CustomEvent('auth:unauthorized'))
-          return
-        }
-        if (!response.ok || !response.body) throw new ApiError(`HTTP ${response.status}`, response.status)
-        onStatus(true)
-        const reader = response.body.getReader()
-        const decoder = new TextDecoder()
-        let buffer = ''
-        while (!controller.signal.aborted) {
-          const { done, value } = await reader.read()
-          if (done) break
-          buffer += decoder.decode(value, { stream: true })
-          const messages = buffer.split('\n\n')
-          buffer = messages.pop() ?? ''
-          for (const message of messages) {
-            const line = message.split('\n').find((item) => item.startsWith('data: '))
-            if (line) onEvent(JSON.parse(line.slice(6)) as DebugLogEvent)
-          }
+        for await (const frame of readEvents('/api/debug/stream', controller, 'GET', () => onStatus(true))) {
+          const event = parseStreamJSON<DebugLogEvent>(frame.data)
+          if (event) onEvent(event)
         }
       } catch (error) {
-        if ((error as Error).name === 'AbortError') return
-      } finally {
-        onStatus(false)
-      }
-      await new Promise((resolve) => setTimeout(resolve, 2000))
+        if (controller.signal.aborted || (error instanceof ApiError && error.status === 401)) return
+      } finally { onStatus(false) }
+      await waitForReconnect(controller.signal, 2000)
     }
-  }
-  void connect()
+  })()
   return controller
 }
 
 // ---- Settings API ----
 
-export async function fetchSettings(): Promise<SettingsData> {
-  return request<SettingsData>('/api/settings')
+export async function fetchSettings(signal?: AbortSignal): Promise<SettingsData> {
+  return request<SettingsData>('/api/settings', { signal })
 }
 
 export async function updateSettings(settings: SettingsData): Promise<SettingsUpdateResponse> {
@@ -761,18 +568,8 @@ export interface ExportResult {
 }
 
 export async function exportProxies(): Promise<ExportResult> {
-  const res = await fetch('/api/export', {
-    headers: buildHeaders(),
-    credentials: 'include',
-  })
-  if (res.status === 401) {
-    clearToken()
-    window.dispatchEvent(new CustomEvent('auth:unauthorized'))
-    throw new ApiError('未授权，请重新登录', 401)
-  }
-  if (!res.ok) {
-    throw new ApiError(await readErrorMessage(res), res.status)
-  }
+  const res = await authFetch('/api/export')
+  if (!res.ok) throw new ApiError(await readErrorMessage(res), res.status)
   const text = await res.text()
   const rawCount = res.headers.get('X-Export-Count')
   const parsed = rawCount === null ? Number.NaN : Number(rawCount)

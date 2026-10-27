@@ -1,23 +1,29 @@
-import React, { useState, useEffect, useCallback } from 'react'
+import React, { lazy, Suspense, useState, useEffect, useCallback } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
+import { toast } from 'sonner'
 import { 
   Activity, Cloud, Server, ShieldCheck, TerminalSquare, Settings, 
   Menu, Hexagon, Palette, ChevronDown, Check, LogOut, Layers3, Tags, Wrench, HeartPulse
 } from 'lucide-react'
-import MonitorPanel from './components/MonitorPanel'
-import ManagePanel from './components/ManagePanel'
-import DebugPanel from './components/DebugPanel'
-import SettingsPanel from './components/SettingsPanel'
-import SubscriptionsPanel from './components/SubscriptionsPanel'
-import UnlockPanel from './components/UnlockPanel'
 import LoginPage from './components/LoginPage'
-import GroupPoolsPanel from './components/GroupPoolsPanel'
-import OperationsPanel from './components/OperationsPanel'
-import TagsPanel from './components/TagsPanel'
-import NodeMaintenancePanel from './components/NodeMaintenancePanel'
-import { checkAuth, getToken, logout } from './api/client'
+import PanelBoundary from './components/ui/PanelBoundary'
+import { checkAuth, logout } from './api/client'
+import { readPreference, writePreference } from './utils/storage'
+import { allowNavigation } from './hooks/useUnsavedChanges'
 import packageJson from '../package.json'
 
-type AuthState = 'loading' | 'need_login' | 'authenticated'
+const MonitorPanel = lazy(() => import('./components/MonitorPanel'))
+const ManagePanel = lazy(() => import('./components/ManagePanel'))
+const DebugPanel = lazy(() => import('./components/DebugPanel'))
+const SettingsPanel = lazy(() => import('./components/SettingsPanel'))
+const SubscriptionsPanel = lazy(() => import('./components/SubscriptionsPanel'))
+const UnlockPanel = lazy(() => import('./components/UnlockPanel'))
+const GroupPoolsPanel = lazy(() => import('./components/GroupPoolsPanel'))
+const OperationsPanel = lazy(() => import('./components/OperationsPanel'))
+const TagsPanel = lazy(() => import('./components/TagsPanel'))
+const NodeMaintenancePanel = lazy(() => import('./components/NodeMaintenancePanel'))
+
+type AuthState = 'loading' | 'need_login' | 'authenticated' | 'error'
 type TabId = 'monitor' | 'groups' | 'manage' | 'maintenance' | 'tags' | 'subscriptions' | 'unlock' | 'operations' | 'debug' | 'settings'
 
 const ALL_THEMES = [
@@ -125,7 +131,7 @@ function getSystemTheme(): string {
 }
 
 function getInitialTheme(): string {
-  const saved = localStorage.getItem(THEME_STORAGE_KEY)
+  const saved = readPreference(THEME_STORAGE_KEY)
   if (saved && ALL_THEMES.includes(saved)) {
     return saved
   }
@@ -141,59 +147,79 @@ function getTabFromHash(): TabId {
 }
 
 function App() {
+  const queryClient = useQueryClient()
   const [activeTab, setActiveTab] = useState<TabId>(getTabFromHash)
   const [authState, setAuthState] = useState<AuthState>('loading')
   const [theme, setTheme] = useState(getInitialTheme)
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [authAttempt, setAuthAttempt] = useState(0)
+  const [loggingOut, setLoggingOut] = useState(false)
 
   // Sync hash → state on browser back/forward
   useEffect(() => {
-    const onHashChange = () => setActiveTab(getTabFromHash())
+    const onHashChange = () => {
+      const next = getTabFromHash()
+      if (next !== activeTab && !allowNavigation()) {
+        window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}#${activeTab}`)
+        return
+      }
+      setActiveTab(next)
+    }
     window.addEventListener('hashchange', onHashChange)
     return () => window.removeEventListener('hashchange', onHashChange)
-  }, [])
+  }, [activeTab])
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme)
-    localStorage.setItem(THEME_STORAGE_KEY, theme)
+    writePreference(THEME_STORAGE_KEY, theme)
   }, [theme])
 
   useEffect(() => {
+    const controller = new AbortController()
     const doCheck = async () => {
       try {
-        const res = await checkAuth()
-        if (res.no_password) {
-          setAuthState('authenticated')
-        } else if (getToken()) {
-          setAuthState('authenticated')
-        } else {
-          setAuthState('need_login')
-        }
+        const res = await checkAuth(controller.signal)
+        if (!controller.signal.aborted) setAuthState(res.no_password || res.authenticated ? 'authenticated' : 'need_login')
       } catch {
-        if (getToken()) {
-          setAuthState('authenticated')
-        } else {
-          setAuthState('need_login')
-        }
+        if (!controller.signal.aborted) setAuthState('error')
       }
     }
-    doCheck()
-  }, [])
+    void doCheck()
+    return () => controller.abort()
+  }, [authAttempt])
 
   useEffect(() => {
-    const handler = () => setAuthState('need_login')
+    const handler = () => {
+      void queryClient.cancelQueries()
+      queryClient.clear()
+      setAuthState('need_login')
+    }
     window.addEventListener('auth:unauthorized', handler)
     return () => window.removeEventListener('auth:unauthorized', handler)
-  }, [])
+  }, [queryClient])
+
+  useEffect(() => {
+    if (!sidebarOpen) return
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') setSidebarOpen(false) }
+    window.addEventListener('keydown', closeOnEscape)
+    return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [sidebarOpen])
 
   const handleLogin = useCallback(() => setAuthState('authenticated'), [])
-  const handleLogout = useCallback(() => {
-    logout()
-    setAuthState('need_login')
-  }, [])
+  const handleLogout = async () => {
+    if (!allowNavigation()) return
+    setLoggingOut(true)
+    try {
+      await logout()
+      await queryClient.cancelQueries()
+      queryClient.clear()
+      setAuthState('need_login')
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : '退出失败，请重试')
+    } finally { setLoggingOut(false) }
+  }
 
   const handleTabClick = useCallback((tab: TabId) => {
-    setActiveTab(tab)
     window.location.hash = tab
     setSidebarOpen(false)
   }, [])
@@ -227,6 +253,11 @@ function App() {
     return <LoginPage onLogin={handleLogin} />
   }
 
+  if (authState === 'error') return <div role="alert" className="min-h-screen flex flex-col items-center justify-center gap-4 bg-base-200">
+    <p>无法连接管理服务，请检查网络后重试。</p>
+    <button className="btn btn-primary" onClick={() => { setAuthState('loading'); setAuthAttempt(n => n + 1) }}>重新连接</button>
+  </div>
+
   return (
     <div className="flex flex-col h-screen overflow-hidden bg-base-100">
       {/* ===== Top Navbar ===== */}
@@ -235,7 +266,9 @@ function App() {
           <button
             className="btn btn-square btn-ghost btn-sm rounded-lg"
             onClick={() => setSidebarOpen(!sidebarOpen)}
-            aria-label="toggle sidebar"
+            aria-label="切换导航菜单"
+            aria-expanded={sidebarOpen}
+            aria-controls="main-navigation"
           >
             <Menu className="w-5 h-5" />
           </button>
@@ -260,14 +293,14 @@ function App() {
         <div className="flex-none flex items-center gap-2 lg:gap-3 ml-auto">
           {/* Theme Selector */}
           <div className="dropdown dropdown-end">
-            <div tabIndex={0} role="button" className="btn btn-ghost btn-sm h-9 px-3 gap-2 normal-case rounded-lg border border-base-300/50 hover:border-primary/30 hover:bg-primary/5 transition-all">
+            <button type="button" aria-label="选择主题" className="btn btn-ghost btn-sm h-9 px-3 gap-2 normal-case rounded-lg border border-base-300/50 hover:border-primary/30 hover:bg-primary/5 transition-all">
               <Palette className="h-4 w-4 shrink-0" />
               <div className="hidden sm:flex items-center gap-1.5">
                 <span className="text-xs capitalize font-medium">{theme}</span>
                 <span className="badge badge-ghost badge-xs">{getThemeProfile(theme).tag}</span>
               </div>
               <ChevronDown className="h-3 w-3 opacity-60" />
-            </div>
+            </button>
             <ul tabIndex={0} className="dropdown-content bg-base-200 border border-base-300/50 rounded-box shadow-2xl mt-2 p-2.5 w-80 max-h-96 overflow-y-auto z-[100] space-y-1">
               {ALL_THEMES.map((t) => {
                 const profile = getThemeProfile(t)
@@ -325,6 +358,8 @@ function App() {
           <button
             className="btn btn-ghost btn-sm h-9 w-9 p-0 rounded-lg hover:bg-error/10 hover:text-error transition-colors"
             onClick={handleLogout}
+            disabled={loggingOut}
+            aria-label="退出登录"
             title="退出登录"
           >
             <LogOut className="h-4 w-4" />
@@ -344,12 +379,13 @@ function App() {
 
         {/* Sidebar */}
         <aside
+          id="main-navigation"
           className={`
             fixed lg:static inset-y-0 left-0 z-40
             w-64 bg-base-100/95 backdrop-blur-xl border-r border-base-300/40
             transform transition-transform duration-300 ease-in-out
-            ${sidebarOpen ? 'translate-x-0 shadow-2xl' : '-translate-x-full'}
-            lg:translate-x-0 lg:shrink-0 lg:shadow-none
+            ${sidebarOpen ? 'translate-x-0 shadow-2xl visible' : '-translate-x-full invisible'}
+            lg:translate-x-0 lg:shrink-0 lg:shadow-none lg:visible
             flex flex-col
             pt-16 lg:pt-0
           `}
@@ -404,8 +440,8 @@ function App() {
                 <span className="relative inline-flex rounded-full h-3 w-3 bg-success"></span>
               </div>
               <div className="flex flex-col">
-                <span className="text-sm font-semibold text-base-content/80">系统运行正常</span>
-                <span className="text-xs text-base-content/40">{APP_VERSION}</span>
+                <span className="text-sm font-semibold text-base-content/80">管理控制台</span>
+                <span className="text-xs text-base-content/40">{APP_VERSION} · <a className="link" href="/FONT-LICENSE.txt">字体许可</a></span>
               </div>
             </div>
           </div>
@@ -413,7 +449,11 @@ function App() {
 
         {/* Main Content Area */}
         <main className="flex-1 overflow-y-auto bg-base-200/40 relative">
-          {renderContent()}
+          <PanelBoundary key={activeTab}>
+            <Suspense fallback={<div role="status" className="flex h-64 items-center justify-center gap-3"><span className="loading loading-spinner text-primary" />正在加载页面</div>}>
+              {renderContent()}
+            </Suspense>
+          </PanelBoundary>
         </main>
       </div>
 

@@ -357,6 +357,7 @@ export interface DebugLogEvent {
 // ---- Auth types ----
 
 export interface AuthResponse {
+  authenticated?: boolean
   message: string
   token?: string
   no_password?: boolean

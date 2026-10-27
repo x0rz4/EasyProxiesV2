@@ -28,10 +28,13 @@ monitor 从不反向 import httpapi；httpapi 不 import boxmgr
 ## 认证
 
 - `/api/*` 需认证（`management.password` 为空则免密；Cookie `session_token` 或 `Authorization: Bearer`，会话 24h 存 SQLite）。
+- GET /api/auth 除 no_password 外返回当前会话 authenticated；POST /api/auth/logout 撤销请求携带的 Cookie/Bearer 并删除 HttpOnly Cookie。持久删除失败返回错误；持久读取与撤销通过可取消 gate 串行，等待与数据库调用共用三秒预算，防止旧读重新填充已撤销缓存。已在途授权的请求不回溯撤销。
 - `/sub/{groupID}` 公开，但用分组 `SubscriptionToken` 做常量时间比较。
 - 免登录公共 API（`POST /api/public/subscriptions`、`/api/public/import`）由 `withAPIKey` 保护，接受 `X-API-Key`/`Bearer`/`?api_key=`，**故意不接受会话 Cookie**（面向脚本）。新公共接口一律复用现有 handler，不另写实现。
 
 ## 错误→状态码是三个策略（护栏 12）
+
+管理 API 默认 Cache-Control: no-store 和 nosniff（SSE 可覆盖缓存头以维持流约定）；HTML 需重新验证，哈希 /assets/ 文件长期 immutable 缓存，缺失脚本返回 404。静态 HTML 使用同源 CSP（style 允许 inline，script 不允许）、frame-ancestors none/X-Frame-Options DENY 和 no-referrer；前端字体不再依赖 CDN。不支持把管理页嵌入其它站点 iframe。
 
 `response.go`：`nodeErrorStatus`（类型驱动，`respondNodeError` 额外带 `existing_node_id`）、`subscriptionErrorStatus`（消息驱动，未识别→500）、`tagErrorStatus`（消息驱动，未识别→400）。**故意不一致**：同是"节点不存在"，tag 域 400、订阅域 404，`tag_handlers_test.go` 钉住了这个 400。调用方必须显式点名用哪个策略，不存在统一分发器。`pathID`（400）与 `pathIDOrNotFound`（公开 `/sub/*` 用 404，避免探测 ID 形态）不可互换。
 

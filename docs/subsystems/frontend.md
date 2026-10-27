@@ -8,7 +8,9 @@ React 19 + TypeScript + Vite 7 + Tailwind CSS 4 + DaisyUI 5 + TanStack Query + l
 
 **产物直接落到 `internal/httpapi/assets/`**，被 `//go:embed assets/*` 内嵌进二进制 → 单文件运行。`vite.config.ts` 的 `emptyOutDir` 会**先清空**该目录，因此**前端构建与 `go build`/`go test` 绝不能并行**。没有产物时 `go build ./...` 必失败。
 
-无单测框架，验收标准 = `npm run lint` + `npm run build`（含 `tsc -b` 严格检查，`noUnusedLocals`/`noUnusedParameters` 开启）通过。
+安全/流式传输回归使用 Node 内置 test runner，`scripts/test.mjs` 通过显式 esbuild 开发依赖打包到忽略目录 `.tools/frontend-audit/tests/`。验收为 `npm run lint`、`npm test`、`npm run build`（含 tsc -b 严格检查）。CI 和 Docker 前端阶段均运行这三项；Node 22 构建环境，建议使用当前受支持的 22.x 或 24.x。审计基线/方法见 [前端审计](../../plane/changes/frontend-audit/plan.md)。
+
+App 模块级 lazy/Suspense 按需加载十个页面，PanelBoundary 限制页面错误范围。国旗字体由 npm 锁定包同源输出，许可在 public/FONT-LICENSE.txt，页脚可访问；README 预览保留在 docs/images，不再作为 public 文件进入二进制。HTML lang=zh-CN；图标沿用管理台六边形。
 
 系统设置的基础池调度支持显式 `balance_p2c`，并提示“双随机候选中取较少连接，不保证全池最少”；不改变分组调度选项或已有默认选择。
 
@@ -16,7 +18,10 @@ React 19 + TypeScript + Vite 7 + Tailwind CSS 4 + DaisyUI 5 + TanStack Query + l
 
 ```
 frontend/src/
-  api/client.ts          全部 API 调用（唯一出口）
+  api/client.ts          业务 API 唯一入口
+  api/transport.ts       内存 Bearer、统一 Headers/401/非缓存请求
+  api/sse.ts             有界分帧、取消/reader 释放与重连等待
+  queryClient.ts         5 秒陈旧窗口、60 秒闲置回收、读取重试政策
   types/index.ts         共享类型
   utils/cn.ts            cn() 合并类名
   utils/format.ts / fuzzySearch.ts / region.ts / unlockDisplay.ts
@@ -32,7 +37,13 @@ frontend/src/
 
 复用 `components/ui/PageLayout.tsx` 的 `PageLayout` / `PageHeader` / `PageContent`，以及同文件导出的 `surfaceClass` / `controlClass` 类名常量。
 
-**表单字段 `Field` 目前不是共享组件**：`GroupPoolsPanel.tsx`、`OperationsPanel.tsx`、`tags/TagEditorDrawer.tsx` 各自定义了本地 `Field`，三者签名不同（`{label,hint,children}` vs `{id,label,hint,className,children}`）。写新表单时**不要**假设它来自 `PageLayout.tsx`。若要统一，先对齐这三份签名再上提。
+`ui/Field.tsx` 统一分组/运维/标签编辑器字段，支持可选 id/className/hint，保留显式 label 关联并命名单个直接原生控件。`ui/Modal.tsx` 和 `hooks/useModalFocus.ts` 共用首次焦点、Tab 环绕、Escape 关闭和关闭后恢复；onClose 最新回调由 useEffectEvent 读取，避免编辑时重复抢焦点。`ui/QueryError.tsx` 承接查询失败/重试，不能把失败当空列表。
+
+设置和运维参数将服务数据与本地 draft 分开，查询函数不写表单 state；在途读取/保存响应不覆盖保存后新输入。`useUnsavedChanges` 对系统设置、运维参数、订阅刷新草稿保护整页关闭、hash 导航和退出；强制 401 仍直接清除认证。未保存草稿没有落浏览器持久存储。
+
+浏览器会话只用服务器 HttpOnly Cookie 恢复，Bearer 只在内存保留，旧 auth_token 存储键在启动时清除。启动检查真实 authenticated 状态，网络失败提供重试；退出必须先成功撤销服务器会话，再取消并清空 QueryClient。旧会话请求的 401 不注销新登录。主题存储受限时降级为内存偏好。
+
+节点文本筛选等待 250 ms 静止后请求，querySpec 始终与输入一致，筛选查询闲置保留 30 秒；分页详情仍传 AbortSignal。标签分配仅在编辑时读取目标节点，初次加载成功前禁用保存。SSE 共用 16 Mi 字符事件上限与分帧器，正确处理 CRLF/多行/UTF-8；流量 EOF 触发重连，mutating probe-all POST 不重放，检测任务 GET 重连后读取新快照。测速抽屉关闭/换节点/卸载即取消，终态释放 reader。调试流每 100 ms 合并渲染一次，队列和显示各最多 1000 条。
 
 ## 页面与表格滚动
 

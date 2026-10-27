@@ -35,7 +35,7 @@ export default function MonitorPanel() {
   
   const { data: configData, error: configError } = useQuery({
     queryKey: ['configNodes'],
-    queryFn: () => fetchConfigNodes().catch(() => null)
+    queryFn: ({ signal }) => fetchConfigNodes(undefined, undefined, signal)
   })
 
   const loading = loadingNodes && !data
@@ -192,7 +192,7 @@ export default function MonitorPanel() {
       { label: '100-200', min: 100, max: 200, count: 0, color: 'oklch(0.80 0.18 84)' },
       { label: '200-300', min: 200, max: 300, count: 0, color: 'oklch(0.75 0.18 55)' },
       { label: '300+', min: 300, max: Infinity, count: 0, color: 'oklch(0.63 0.24 29)' },
-      { label: '超时', min: -1, max: 0, count: 0, color: 'oklch(0.50 0.10 250)' },
+      { label: '未测得', min: -1, max: 0, count: 0, color: 'oklch(0.50 0.10 250)' },
     ]
     for (const node of allNodes) {
       const ms = node.last_latency_ms

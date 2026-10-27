@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
-import type { ReactNode } from 'react'
+import Field from './ui/Field'
+import useUnsavedChanges from '../hooks/useUnsavedChanges'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Activity, Gauge, Play, Save, Square, Wrench } from 'lucide-react'
 import { toast } from 'sonner'
@@ -31,8 +32,7 @@ interface ProbeProgressState {
 export default function OperationsPanel() {
   const queryClient = useQueryClient()
   const abortRef = useRef<AbortController | null>(null)
-  const cachedSettings = queryClient.getQueryData<ProbeOperationsSettings>(['probeSettings'])
-  const [form, setForm] = useState<ProbeOperationsSettings>(() => cachedSettings ?? EMPTY_SETTINGS)
+  const [draft, setDraft] = useState<ProbeOperationsSettings | null>(null)
   const [saving, setSaving] = useState(false)
   const [probing, setProbing] = useState(false)
   const [progress, setProgress] = useState<ProbeProgressState | null>(null)
@@ -40,12 +40,9 @@ export default function OperationsPanel() {
 
   const settingsQuery = useQuery({
     queryKey: ['probeSettings'],
-    queryFn: async () => {
-      const settings = await fetchProbeSettings()
-      setForm((current) => JSON.stringify(current) === JSON.stringify(cachedSettings ?? EMPTY_SETTINGS) ? settings : current)
-      return settings
-    },
+    queryFn: ({ signal }) => fetchProbeSettings(signal),
   })
+  const form = draft ?? settingsQuery.data ?? EMPTY_SETTINGS
   const statusQuery = useQuery({
     queryKey: ['probeStatus'],
     queryFn: fetchProbeStatus,
@@ -57,9 +54,10 @@ export default function OperationsPanel() {
   const status = statusQuery.data
   const roundBusy = probing || Boolean(status?.round.in_flight)
   const dirty = Boolean(settingsQuery.data && JSON.stringify(form) !== JSON.stringify(settingsQuery.data))
+  useUnsavedChanges(dirty)
 
   const update = <K extends keyof ProbeOperationsSettings>(key: K, value: ProbeOperationsSettings[K]) => {
-    setForm((current) => ({ ...current, [key]: value }))
+    setDraft((current) => ({ ...(current ?? settingsQuery.data ?? EMPTY_SETTINGS), [key]: value }))
   }
 
   const saveSettings = async () => {
@@ -74,7 +72,7 @@ export default function OperationsPanel() {
     setSaving(true)
     try {
       const saved = await updateProbeSettings(form)
-      setForm(saved)
+      setDraft(current => current && JSON.stringify(current) === JSON.stringify(form) ? null : current)
       queryClient.setQueryData(['probeSettings'], saved)
       await queryClient.invalidateQueries({ queryKey: ['probeStatus'] })
       toast.success('探测参数已保存并热应用', { description: '正在运行的轮次继续使用启动时的策略快照' })
@@ -203,10 +201,6 @@ export default function OperationsPanel() {
       </PageContent>
     </PageLayout>
   )
-}
-
-function Field({ id, label, hint, className, children }: { id: string; label: string; hint: string; className?: string; children: ReactNode }) {
-  return <fieldset className={cn('fieldset', className)}><label htmlFor={id} className="fieldset-legend font-semibold text-base-content/80">{label}</label>{children}<p className="label mt-1 text-xs text-base-content/50">{hint}</p></fieldset>
 }
 
 function Metric({ label, value, detail, tone }: { label: string; value: string | number; detail: string; tone: string }) {

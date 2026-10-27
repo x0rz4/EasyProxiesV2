@@ -39,6 +39,7 @@ func (s *Server) routes() http.Handler {
 	// —— 认证 ——
 	public("GET /api/auth", s.handleAuthStatus)
 	public("POST /api/auth", s.handleAuthLogin)
+	authenticated("POST /api/auth/logout", s.handleAuthLogout)
 
 	// —— 设置 ——
 	authenticated("GET /api/settings", s.handleSettingsGet)
@@ -179,7 +180,11 @@ func (s *Server) routes() http.Handler {
 	publicSubscriptions.HandleFunc("GET /sub/{groupID}/entry", s.handleGroupSubscriptionEntry)
 
 	static.HandleFunc("GET /", s.handleIndex)
-	root.Handle("/api/", api)
+	root.Handle("/api/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		api.ServeHTTP(w, r)
+	}))
 	root.Handle("/sub/", publicSubscriptions)
 	root.Handle("/", static)
 	return root

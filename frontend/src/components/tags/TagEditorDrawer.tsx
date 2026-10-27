@@ -1,5 +1,6 @@
+import Modal from "../ui/Modal"
 import { useEffect, useRef, useState } from 'react'
-import type { ReactNode } from 'react'
+import Field from '../ui/Field'
 import { Eye, Save, X } from 'lucide-react'
 import type { Tag, TagCondition, TagMutexGroup, TagPayload, TagPreviewResponse, TagSchema } from '../../types'
 import { previewTagRule } from '../../api/client'
@@ -44,14 +45,6 @@ export default function TagEditorDrawer({ tag, mutexGroups, schema, saving, onCl
   const debouncedRule = useDebouncedValue(form.rule as TagCondition, 400)
 
   useEffect(() => {
-    const previousFocus = document.activeElement as HTMLElement | null
-    firstInput.current?.focus()
-    const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose() }
-    window.addEventListener('keydown', onKeyDown)
-    return () => { window.removeEventListener('keydown', onKeyDown); previousFocus?.focus() }
-  }, [onClose])
-
-  useEffect(() => {
     const controller = new AbortController()
     const loadPreview = async () => {
       setPreviewLoading(true)
@@ -80,7 +73,7 @@ export default function TagEditorDrawer({ tag, mutexGroups, schema, saving, onCl
   const canSave = form.name.trim().length > 0 && (!form.auto_enabled || Boolean(rule.field || rule.children?.length))
 
   return (
-    <div className="modal modal-open" role="dialog" aria-modal="true" aria-label={tag ? '编辑标签' : '新建标签'}>
+    <Modal label="标签编辑器" onClose={onClose}>
       <div className="modal-box flex h-[94dvh] max-h-[94vh] w-11/12 max-w-7xl flex-col overflow-hidden p-0">
         <header className="flex shrink-0 items-center justify-between border-b border-base-300 bg-base-100/95 px-5 py-4 backdrop-blur-xl">
           <div><h3 className="text-lg font-bold">{tag ? '编辑标签' : '新建标签'}</h3><p className="mt-0.5 text-xs text-base-content/50">人工标签立即生效；自动标签由规则重算维护</p></div>
@@ -104,10 +97,6 @@ export default function TagEditorDrawer({ tag, mutexGroups, schema, saving, onCl
         <footer className="flex shrink-0 items-center justify-between gap-3 border-t border-base-300 bg-base-100/95 px-5 py-4 backdrop-blur-xl"><span className="hidden text-xs text-base-content/45 sm:block">规则版本只在条件真正变化时递增</span><div className="ml-auto flex gap-2"><button type="button" className="btn btn-ghost" onClick={onClose}>取消</button><button type="button" className="btn btn-primary min-w-28 gap-2" disabled={!canSave || saving} onClick={() => void onSave({ ...form, name: form.name.trim() })}>{saving ? <span className="loading loading-spinner loading-sm" /> : <Save className="h-4 w-4" />}{tag ? '保存修改' : '创建标签'}</button></div></footer>
       </div>
       <button className="modal-backdrop" onClick={onClose} aria-label="关闭标签编辑器" />
-    </div>
+    </Modal>
   )
-}
-
-function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
-  return <fieldset className="fieldset"><legend className="fieldset-legend font-semibold text-base-content/80">{label}</legend>{children}{hint && <p className="mt-1 text-xs text-base-content/45">{hint}</p>}</fieldset>
 }

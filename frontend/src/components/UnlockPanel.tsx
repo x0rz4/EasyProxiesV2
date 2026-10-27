@@ -13,6 +13,7 @@ import type {
 import { queryNodeIDs, cancelNodeCheckTask, createNodeCheckTask, fetchConfigNodes, fetchNodeCheckResults, fetchNodeCheckSettings, fetchNodeCheckTasks, fetchNodes, fetchUnlockResults, listSubscriptions, streamNodeCheckTask, unlockNode, updateNodeCheckSettings } from '../api/client'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useNodeFilter } from '../hooks/useNodeFilter'
+import useModalFocus from '../hooks/useModalFocus'
 import type { NodeViewItem } from '../types/nodeView'
 import NodeFilterBar from './NodeFilterBar'
 import { regionFlag } from '../utils/region'
@@ -95,7 +96,7 @@ export default function UnlockPanel() {
   })
   const nodes = useMemo(() => pageDetails.data?.nodes || [], [pageDetails.data?.nodes])
   const configNodes = useMemo(() => pageDetails.data?.configNodes || [], [pageDetails.data?.configNodes])
-  const loading = metadataLoading || nodeFilter.query.isLoading || pageDetails.isLoading
+  const loading = metadataLoading || nodeFilter.isDebouncing || nodeFilter.query.isLoading || pageDetails.isLoading
 
   // node_id -> result. Results are kept across batch runs and single runs alike.
   // Keyed by the stable node ID, never by the runtime tag: tags carry a
@@ -773,19 +774,14 @@ function NodeCheckDialog({ settings, stages, scope, selectedCount, filteredCount
 }) {
   const [showSettings, setShowSettings] = useState(false)
   const closeRef = useRef<HTMLButtonElement>(null)
-  useEffect(() => {
-    closeRef.current?.focus()
-    const handler = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose() }
-    window.addEventListener('keydown', handler)
-    return () => window.removeEventListener('keydown', handler)
-  }, [onClose])
+  const dialogRoot = useModalFocus(onClose)
   const providerEnabled = settings.ippure_enabled || settings.ip_api_enabled
   const effectiveStages = { ...stages, quality: stages.quality && providerEnabled }
   const canStart = targetCount > 0 && Object.values(effectiveStages).some(Boolean)
   const updateSetting = <K extends keyof NodeCheckSettings>(key: K, value: NodeCheckSettings[K]) => onSettingsChange({ ...settings, [key]: value })
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/50 p-0 backdrop-blur-sm sm:items-center sm:p-6" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
-      <section role="dialog" aria-modal="true" aria-labelledby="node-check-title" className="max-h-[92vh] w-full overflow-y-auto rounded-t-2xl bg-base-100 shadow-2xl sm:max-w-3xl sm:rounded-2xl">
+      <section ref={dialogRoot} tabIndex={-1} role="dialog" aria-modal="true" aria-labelledby="node-check-title" className="max-h-[92vh] w-full overflow-y-auto rounded-t-2xl bg-base-100 shadow-2xl sm:max-w-3xl sm:rounded-2xl">
         <header className="sticky top-0 z-10 flex items-center justify-between border-b border-base-200 bg-base-100/95 px-5 py-4 backdrop-blur">
           <div><h2 id="node-check-title" className="flex items-center gap-2 text-lg font-bold"><Gauge className="h-5 w-5 text-primary" />节点综合检测</h2><p className="mt-1 text-xs text-base-content/55">手动诊断不会修改节点健康、黑名单或分组出口</p></div>
           <button ref={closeRef} className="btn btn-ghost btn-sm btn-square" onClick={onClose} aria-label="关闭综合检测"><X className="h-4 w-4" /></button>

@@ -1,0 +1,19 @@
+Twemoji Country Flags
+
+This application bundles the unmodified TwemojiCountryFlags.woff2 subset
+from country-flag-emoji-polyfill 0.1.10 by Egbert Teeselink / TalkJS:
+https://github.com/talkjs/country-flag-emoji-polyfill
+
+The subset was made upstream from Twemoji Mozilla:
+https://github.com/mozilla/twemoji-colr
+https://github.com/mozilla/twemoji-colr/blob/master/LICENSE.md
+
+Emoji artwork: Twemoji, Copyright Twitter, Inc. and other contributors.
+Artwork is used under Creative Commons Attribution 4.0 International:
+https://creativecommons.org/licenses/by/4.0/
+https://creativecommons.org/licenses/by/4.0/legalcode
+https://github.com/twitter/twemoji
+
+The upstream font subset is a modification of Twemoji Mozilla. EasyProxiesV2
+has not further modified that subset. No endorsement by these authors is implied.
+The polyfill's JavaScript is not included in the application bundle.

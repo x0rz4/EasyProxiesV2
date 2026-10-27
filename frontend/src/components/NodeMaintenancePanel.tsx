@@ -1,3 +1,4 @@
+import Modal from "./ui/Modal"
 import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import type { MaintenanceNode, NodeMaintenanceStatus } from '../types'
@@ -232,7 +233,7 @@ export default function NodeMaintenancePanel() {
                   <legend className="fieldset-legend font-semibold text-base-content/80">关键词</legend>
                   <label className={cn('input input-md w-full', controlClass)}>
                     <Search className="h-4 w-4 opacity-50" />
-                    <input
+                    <input aria-label="关键词"
                       type="text"
                       placeholder="名称 / 地区 / URI / 标签"
                       className="grow"
@@ -396,7 +397,7 @@ export default function NodeMaintenancePanel() {
 
         {/* ---- 二次确认 ---- */}
         {confirmOpen && (
-          <div className="modal modal-open">
+          <Modal label="确认清理节点" onClose={() => !deleting && setConfirmOpen(false)}>
             <div className="modal-box max-w-lg">
               <h3 className="mb-2 flex items-center gap-2 text-lg font-bold">
                 <AlertTriangle className="h-5 w-5 text-error" />确认删除节点
@@ -437,7 +438,7 @@ export default function NodeMaintenancePanel() {
             <form method="dialog" className="modal-backdrop" onClick={() => !deleting && setConfirmOpen(false)}>
               <button>close</button>
             </form>
-          </div>
+          </Modal>
         )}
       </PageContent>
     </PageLayout>

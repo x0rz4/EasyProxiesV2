@@ -44,6 +44,7 @@ jobs:
         run: |
           npm ci
           npm run lint
+          npm test
           npm run build
       - name: Setup Go
         uses: actions/setup-go@v5

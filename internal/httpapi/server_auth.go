@@ -22,27 +22,28 @@ func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		// 检查 Cookie 中的 session token
-		cookie, err := r.Cookie("session_token")
-		if err == nil && s.authService().Validate(r.Context(), cookie.Value) {
+		if s.authenticatedSession(r) != "" {
 			next(w, r)
 			return
-		}
-
-		// 检查 Authorization header (Bearer token)
-		authHeader := r.Header.Get("Authorization")
-		if authHeader != "" {
-			token := strings.TrimPrefix(authHeader, "Bearer ")
-			if s.authService().Validate(r.Context(), token) {
-				next(w, r)
-				return
-			}
 		}
 
 		// 未授权
 		w.WriteHeader(http.StatusUnauthorized)
 		writeJSON(w, map[string]any{"error": "未授权，请先登录"})
 	}
+}
+
+func (s *Server) authenticatedSession(r *http.Request) string {
+	if cookie, err := r.Cookie("session_token"); err == nil && s.authService().Validate(r.Context(), cookie.Value) {
+		return cookie.Value
+	}
+	if header := r.Header.Get("Authorization"); header != "" {
+		token := strings.TrimPrefix(header, "Bearer ")
+		if s.authService().Validate(r.Context(), token) {
+			return token
+		}
+	}
+	return ""
 }
 
 // apiKeyHeader is the canonical header carrying a session-free API credential.
@@ -169,15 +170,39 @@ func clientSource(r *http.Request) string {
 // deliberately readable without a session, because the login page needs it to
 // decide whether to render the form at all.
 func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	if !s.authService().PasswordRequired() {
 		writeJSON(w, map[string]any{"message": "无需密码", "no_password": true})
 		return
 	}
-	writeJSON(w, map[string]any{"message": "需要密码", "no_password": false})
+	writeJSON(w, map[string]any{"message": "需要密码", "no_password": false, "authenticated": s.authenticatedSession(r) != ""})
+}
+
+func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	tokens := []string{s.authenticatedSession(r)}
+	// Another tab may have replaced the cookie since this tab signed in.
+	// Revoke the in-memory bearer as well when it names a different session.
+	if header := r.Header.Get("Authorization"); header != "" {
+		token := strings.TrimPrefix(header, "Bearer ")
+		if token != tokens[0] && s.authService().Validate(r.Context(), token) {
+			tokens = append(tokens, token)
+		}
+	}
+	for _, token := range tokens {
+		if err := s.authService().RevokeSession(r.Context(), token); err != nil {
+			writeAPIError(w, http.StatusInternalServerError, "退出失败，请重试")
+			return
+		}
+	}
+	http.SetCookie(w, &http.Cookie{Name: "session_token", Value: "", Path: "/", HttpOnly: true,
+		Secure: r.TLS != nil, SameSite: http.SameSiteStrictMode, MaxAge: -1, Expires: time.Unix(1, 0)})
+	writeJSON(w, map[string]any{"ok": true})
 }
 
 // handleAuthLogin validates the password and issues a session cookie.
 func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	if !s.authService().PasswordRequired() {
 		writeJSON(w, map[string]any{"message": "无需密码", "no_password": true})
 		return

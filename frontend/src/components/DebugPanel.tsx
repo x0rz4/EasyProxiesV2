@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { memo, useEffect, useState } from 'react'
 import { fetchDebug, streamDebugLogs } from '../api/client'
 import type { DebugLogEvent, DebugNode, TimelineEvent } from '../types'
 import { controlClass, PageContent, PageHeader, PageLayout } from './ui/PageLayout'
@@ -41,6 +41,15 @@ function LogMessage({ event }: { event: TimelineEvent }) {
   return <><span className="text-slate-400">probe </span>{event.success ? <span className="text-emerald-400">succeeded</span> : <span className="text-red-400">failed{event.error ? `: ${event.error}` : ''}</span>}{event.latency_ms > 0 && <span className="text-amber-300"> ({event.latency_ms}ms)</span>}</>
 }
 
+const LogRow = memo(function LogRow({ log }: { log: LogEntry }) {
+  return <div className="flex min-w-max gap-3 rounded px-1 hover:bg-white/5">
+    <span className="select-none text-slate-600">{formatLogTime(log.event.time)}</span>
+    <span className={log.event.success ? 'w-12 text-emerald-400' : 'w-12 text-red-400'}>{log.event.success ? 'INFO' : 'ERROR'}</span>
+    <span className="w-40 truncate text-sky-300" title={log.nodeName}>[{log.nodeName}]</span>
+    <span className="text-slate-200"><LogMessage event={log.event} /></span>
+  </div>
+})
+
 export default function DebugPanel() {
   const [nodes, setNodes] = useState<DebugNode[]>([])
   const [logs, setLogs] = useState<LogEntry[]>([])
@@ -68,11 +77,20 @@ export default function DebugPanel() {
   }, [debugData])
 
   useEffect(() => {
+    let pending: LogEntry[] = []
+    let timer: ReturnType<typeof setTimeout> | undefined
     const stream = streamDebugLogs((message: DebugLogEvent) => {
       const log = { nodeTag: message.node_tag, nodeName: message.node_name || message.node_tag, event: message.event }
-      setLogs((current) => mergeLogs(current, [log]))
+      pending.push(log)
+      if (pending.length > maxLogEntries) pending = pending.slice(-maxLogEntries)
+      if (timer === undefined) timer = setTimeout(() => {
+        const batch = pending
+        pending = []
+        timer = undefined
+        setLogs(current => mergeLogs(current, batch))
+      }, 100)
     }, setConnected)
-    return () => stream.abort()
+    return () => { stream.abort(); clearTimeout(timer) }
   }, [])
 
   const error = (queryError as Error)?.message || ''
@@ -107,12 +125,7 @@ export default function DebugPanel() {
           </div>
           <div className="flex-1 overflow-auto p-4 font-mono text-xs leading-6 sm:text-sm">
             {loading ? <div className="flex h-full items-center justify-center"><span className="loading loading-spinner text-primary" /></div> : visibleLogs.length === 0 ? <div className="flex h-full items-center justify-center text-slate-500">{selectedNode === 'all' ? '暂无运行日志' : '该节点暂无运行日志'}</div> : visibleLogs.map((log) => (
-              <div key={logKey(log)} className="flex min-w-max gap-3 rounded px-1 hover:bg-white/5">
-                <span className="select-none text-slate-600">{formatLogTime(log.event.time)}</span>
-                <span className={log.event.success ? 'w-12 text-emerald-400' : 'w-12 text-red-400'}>{log.event.success ? 'INFO' : 'ERROR'}</span>
-                <span className="w-40 truncate text-sky-300" title={log.nodeName}>[{log.nodeName}]</span>
-                <span className="text-slate-200"><LogMessage event={log.event} /></span>
-              </div>
+              <LogRow key={logKey(log)} log={log} />
             ))}
           </div>
           <div className="flex items-center justify-between border-t border-slate-700/80 bg-[#171c26] px-4 py-2 text-xs text-slate-500">

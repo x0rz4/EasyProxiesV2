@@ -1,4 +1,6 @@
-import { useState, useRef } from 'react'
+import { useEffect, useState, useRef } from 'react'
+import { streamSpeedtest } from '../api/client'
+import useModalFocus from '../hooks/useModalFocus'
 import type { NodeCheckResultItem, NodeSnapshot, UnlockResult } from '../types'
 import { regionFlag } from '../utils/region'
 import { displayLatency, unlockNetworkInfo } from '../utils/unlockDisplay'
@@ -13,12 +15,17 @@ interface UnlockDrawerProps {
 }
 
 export default function UnlockDrawer({ node, result, diagnostic, isOpen, onClose }: UnlockDrawerProps) {
+  if (!isOpen || !node) return null
+  return <OpenUnlockDrawer key={node.tag} node={node} result={result} diagnostic={diagnostic} onClose={onClose} />
+}
+
+function OpenUnlockDrawer({ node, result, diagnostic, onClose }: Omit<UnlockDrawerProps, 'isOpen' | 'node'> & { node: NodeSnapshot }) {
   const [speed, setSpeed] = useState<number | null>(null)
   const [speedTesting, setSpeedTesting] = useState(false)
   const [speedError, setSpeedError] = useState('')
-  const esRef = useRef<EventSource | null>(null)
-
-  if (!isOpen || !node) return null
+  const streamRef = useRef<AbortController | null>(null)
+  const dialogRoot = useModalFocus(onClose)
+  useEffect(() => () => streamRef.current?.abort(), [])
 
   const detectedIP = diagnostic?.detection?.exit_ip || result?.ip.ip || ''
   const network = unlockNetworkInfo(diagnostic, result)
@@ -33,36 +40,17 @@ export default function UnlockDrawer({ node, result, diagnostic, isOpen, onClose
     setSpeedError('')
     setSpeedTesting(true)
 
-    const es = new EventSource(`/api/nodes/${encodeURIComponent(node.tag)}/speedtest`)
-    esRef.current = es
-
-    es.addEventListener('progress', (e) => {
-      const data = JSON.parse(e.data)
-      setSpeed(data.mbps)
-    })
-
-    es.addEventListener('done', (e) => {
-      const data = JSON.parse(e.data)
-      setSpeed(data.mbps)
+    streamRef.current = streamSpeedtest(node.tag, (mbps, done) => {
+      setSpeed(mbps)
+      if (done) setSpeedTesting(false)
+    }, error => {
+      setSpeedError(error.message)
       setSpeedTesting(false)
-      es.close()
-    })
-
-    es.addEventListener('error', (e) => {
-      // e.data might not exist on native EventSource error events unless we sent it
-      const errMessage = e instanceof MessageEvent && typeof e.data === 'string' && e.data
-        ? e.data
-        : '测速连接断开'
-      setSpeedError(errMessage)
-      setSpeedTesting(false)
-      es.close()
     })
   }
 
   const handleClose = () => {
-    if (esRef.current) {
-      esRef.current.close()
-    }
+    streamRef.current?.abort()
     setSpeedTesting(false)
     setSpeed(null)
     onClose()
@@ -74,7 +62,7 @@ export default function UnlockDrawer({ node, result, diagnostic, isOpen, onClose
         className="fixed inset-0 bg-black/40 z-40 transition-opacity backdrop-blur-sm"
         onClick={handleClose}
       />
-      <div className="fixed inset-y-0 right-0 w-full max-w-md bg-base-100 shadow-2xl z-50 transform transition-transform duration-300 flex flex-col translate-x-0">
+      <div ref={dialogRoot} tabIndex={-1} role="dialog" aria-modal="true" aria-label={`节点详情：${node.name}`} className="fixed inset-y-0 right-0 w-full max-w-md bg-base-100 shadow-2xl z-50 transform transition-transform duration-300 flex flex-col translate-x-0">
         
         {/* Header */}
         <div className="px-6 py-4 border-b border-base-200 flex justify-between items-center bg-base-200/50">
@@ -86,7 +74,7 @@ export default function UnlockDrawer({ node, result, diagnostic, isOpen, onClose
               <span className="font-mono">{node.tag}</span>
             </div>
           </div>
-          <button onClick={handleClose} className="btn btn-sm btn-ghost btn-square">
+          <button onClick={handleClose} aria-label="关闭节点详情" className="btn btn-sm btn-ghost btn-square">
             ✕
           </button>
         </div>

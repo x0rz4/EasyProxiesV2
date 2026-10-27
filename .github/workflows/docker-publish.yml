@@ -44,7 +44,9 @@ jobs:
         working-directory: frontend
         run: |
           npm ci
-          npx vite build --outDir ../internal/httpapi/assets/
+          npm run lint
+          npm test
+          npm run build
 
       - name: Set up Go
         uses: actions/setup-go@v5

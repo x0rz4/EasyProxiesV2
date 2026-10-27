@@ -10,10 +10,11 @@ import { PageContent, PageHeader, PageLayout, surfaceClass } from './ui/PageLayo
 import MutexGroupManager from './tags/MutexGroupManager'
 import TagEditorDrawer from './tags/TagEditorDrawer'
 import TagList from './tags/TagList'
+import QueryError from './ui/QueryError'
 
 export default function TagsPanel() {
   const queryClient = useQueryClient()
-  const { data, isLoading, isFetching, refetch } = useQuery({ queryKey: ['tags'], queryFn: fetchTags })
+  const { data, isLoading, isFetching, refetch, error } = useQuery({ queryKey: ['tags'], queryFn: fetchTags })
   const { data: schema } = useQuery({ queryKey: ['tagSchema'], queryFn: fetchTagSchema, staleTime: Infinity })
   const { data: configData } = useQuery({ queryKey: ['configNodes'], queryFn: () => fetchConfigNodes() })
   const [editing, setEditing] = useState<Tag | null | undefined>(undefined)
@@ -34,6 +35,8 @@ export default function TagsPanel() {
       queryClient.invalidateQueries({ queryKey: ['configNodes'] }),
       queryClient.invalidateQueries({ queryKey: ['nodes'] }),
       queryClient.invalidateQueries({ queryKey: ['groupPools'] }),
+      queryClient.invalidateQueries({ queryKey: ['nodeQuery'] }),
+      queryClient.invalidateQueries({ queryKey: ['nodeFacets'] }),
     ])
   }
   const run = async (key: string, task: () => Promise<unknown>, message: string) => {
@@ -78,6 +81,7 @@ export default function TagsPanel() {
     <PageLayout>
       <PageHeader title="节点标签" description="用人工标签和可审计规则组织节点，并驱动分组成员筛选" icon={<TagsIcon className="h-5 w-5" />} actions={<div className="flex gap-2"><button className="btn btn-ghost btn-sm btn-square" onClick={() => void refetch()} disabled={isFetching} aria-label="刷新标签"><RefreshCw className={cn('h-4 w-4', isFetching && 'animate-spin')} /></button><button className="btn btn-ghost btn-sm gap-2 border border-base-300" disabled={busy === 'recompute'} onClick={() => void run('recompute', () => recomputeTags(), '标签已全量重算')}>{busy === 'recompute' ? <span className="loading loading-spinner loading-xs" /> : <WandSparkles className="h-4 w-4" />}<span className="hidden lg:inline">重算全部</span></button><button className="btn btn-ghost btn-sm gap-2 border border-base-300" disabled={busy === 'seed'} onClick={() => void seed()}>{busy === 'seed' ? <span className="loading loading-spinner loading-xs" /> : <Sparkles className="h-4 w-4" />}<span className="hidden lg:inline">种入内置模板</span></button><button className="btn btn-primary btn-sm gap-2" onClick={() => setEditing(null)}><Plus className="h-4 w-4" /><span className="hidden sm:inline">新建标签</span></button></div>} />
       <PageContent>
+        <QueryError error={error} onRetry={() => void refetch()} />
         <section className="grid grid-cols-2 gap-4 xl:grid-cols-4"><SummaryCard label="标签数" value={tags.length} hint="人工与规则标签" icon={<TagsIcon className="h-5 w-5" />} tone="text-primary" /><SummaryCard label="自动标签" value={automaticTags} hint="当前启用规则" icon={<WandSparkles className="h-5 w-5" />} tone="text-success" /><SummaryCard label="互斥组" value={mutexGroups.length} hint="优先级裁决范围" icon={<GitCompareArrows className="h-5 w-5" />} tone="text-info" /><SummaryCard label="已打标节点" value={taggedNodes} hint="至少拥有一个标签" icon={<Users className="h-5 w-5" />} tone="text-warning" /></section>
         <div className="flex justify-end"><button className="btn btn-outline btn-sm gap-2" onClick={() => setMutexOpen(true)}><GitCompareArrows className="h-4 w-4" />管理互斥组</button></div>
         {tags.length === 0 ? <section className={cn(surfaceClass, 'flex min-h-80 flex-col items-center justify-center border-dashed px-6 text-center')}><div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-primary/10 text-primary"><TagsIcon className="h-8 w-8" /></div><h3 className="mt-5 text-xl font-bold">创建第一个节点标签</h3><p className="mt-2 max-w-md text-sm leading-6 text-base-content/55">可以先种入内置模板，也可以创建人工标签并逐个分配给节点。</p><div className="mt-6 flex gap-2"><button className="btn btn-outline gap-2" onClick={() => void seed()}><Sparkles className="h-4 w-4" />种入内置模板</button><button className="btn btn-primary gap-2" onClick={() => setEditing(null)}><Plus className="h-4 w-4" />新建标签</button></div></section> : <TagList tags={tags} mutexGroups={mutexGroups} busy={busy} onEdit={(tag) => setEditing(tag)} onDelete={remove} onToggleAuto={(tag) => void run(`auto-${tag.id}`, () => setTagAuto(tag.id, !tag.auto_enabled), tag.auto_enabled ? '已关闭自动打标' : '已启用自动打标')} onBatchAuto={(ids, enabled) => void run('batch-auto', () => Promise.all(ids.map((id) => setTagAuto(id, enabled))), enabled ? '所选标签已启用自动打标' : '所选标签已关闭自动打标')} />}

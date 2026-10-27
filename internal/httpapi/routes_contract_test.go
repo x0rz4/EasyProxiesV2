@@ -44,6 +44,7 @@ type routeContract struct {
 var routeContracts = []routeContract{
 	{classPublic, "GET", "/api/auth", "/api/auth"},
 	{classPublic, "POST", "/api/auth", "/api/auth"},
+	{classSession, "POST", "/api/auth/logout", "/api/auth/logout"},
 	{classSession, "GET", "/api/settings", "/api/settings"},
 	{classSession, "PUT", "/api/settings", "/api/settings"},
 	{classSession, "GET", "/api/operations/probe-settings", "/api/operations/probe-settings"},

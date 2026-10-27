@@ -1,3 +1,4 @@
+import Modal from "../ui/Modal"
 import { useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Pencil, Plus, Save, Trash2, X } from 'lucide-react'
@@ -59,7 +60,7 @@ export default function MutexGroupManager({ onClose }: MutexGroupManagerProps) {
   }
 
   return (
-    <div className="modal modal-open" role="dialog" aria-modal="true" aria-label="互斥组管理">
+    <Modal label="互斥组管理" onClose={onClose}>
       <div className="modal-box max-h-[90vh] w-11/12 max-w-3xl overflow-y-auto p-0">
         <header className="sticky top-0 z-10 flex items-center justify-between border-b border-base-300 bg-base-100/95 px-5 py-4 backdrop-blur-xl"><div><h3 className="text-lg font-bold">互斥组管理</h3><p className="mt-0.5 text-xs text-base-content/50">一个节点在同一互斥组内最多应用一个标签</p></div><button className="btn btn-ghost btn-sm btn-square" onClick={onClose} aria-label="关闭"><X className="h-4 w-4" /></button></header>
         <div className="grid gap-5 p-5 md:grid-cols-[minmax(0,1fr)_minmax(17rem,0.75fr)]">
@@ -68,6 +69,6 @@ export default function MutexGroupManager({ onClose }: MutexGroupManagerProps) {
         </div>
       </div>
       <button className="modal-backdrop" onClick={onClose} aria-label="关闭互斥组管理" />
-    </div>
+    </Modal>
   )
 }

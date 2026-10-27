@@ -1,3 +1,4 @@
+import Modal from "./ui/Modal"
 import { useDeferredValue, useEffect, useMemo, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -13,6 +14,8 @@ import {
 import { cn } from '../utils/cn'
 import { createFuzzySearcher, searchAllTokens } from '../utils/fuzzySearch'
 import { controlClass, PageContent, PageHeader, PageLayout, surfaceClass } from './ui/PageLayout'
+import Field from './ui/Field'
+import QueryError from './ui/QueryError'
 import { RegionSelect } from './NodeFilterBar'
 import { useNodeFacets } from '../hooks/useNodeFilter'
 import TagBadge from './tags/TagBadge'
@@ -115,7 +118,7 @@ function payloadFromGroup(group: GroupPool): GroupPoolPayload {
 
 export default function GroupPoolsPanel() {
   const queryClient = useQueryClient()
-  const { data, isLoading, isFetching, refetch } = useQuery({
+  const { data, isLoading, isFetching, refetch, error } = useQuery({
     queryKey: ['groupPools'], queryFn: listGroupPools, refetchInterval: 10_000,
 	})
 	const { data: tagData } = useQuery({ queryKey: ['tags'], queryFn: fetchTags })
@@ -342,6 +345,7 @@ export default function GroupPoolsPanel() {
         </div>} />
 
       <PageContent>
+        <QueryError error={error} onRetry={() => void refetch()} />
         <section className="grid grid-cols-2 gap-4 xl:grid-cols-4">
           <SummaryCard label="分组总数" value={groups.length} hint="独立入口池" icon={<Layers3 className="h-5 w-5" />} tone="text-primary" />
           <SummaryCard label="运行中" value={activeGroups} hint="已启用监听" icon={<Power className="h-5 w-5" />} tone="text-success" />
@@ -376,7 +380,7 @@ export default function GroupPoolsPanel() {
         )}
       </PageContent>
 
-      {editorOpen && <div className="modal modal-open" role="dialog" aria-modal="true" aria-label={editing ? '编辑分组池' : '新建分组池'}>
+      {editorOpen && <Modal label="分组池配置" onClose={closeEditor}>
         <div className="modal-box max-h-[92vh] w-11/12 max-w-5xl overflow-y-auto p-0">
           <div className="sticky top-0 z-10 flex items-center justify-between border-b border-base-300 bg-base-100/95 px-5 py-4 backdrop-blur-xl">
             <div><h3 className="text-lg font-bold">{editing ? '编辑分组池' : '新建分组池'}</h3><p className="mt-0.5 text-xs text-base-content/50">地区与手动节点取并集，订阅刷新后会自动重新匹配</p></div>
@@ -584,19 +588,15 @@ export default function GroupPoolsPanel() {
           </div>
           <div className="sticky bottom-0 flex justify-end gap-2 border-t border-base-300 bg-base-100/95 px-5 py-4 backdrop-blur-xl"><button className="btn btn-ghost" onClick={closeEditor}>取消</button><button className="btn btn-primary min-w-28" disabled={!form.name.trim() || busy === 'save' || editing?.runtime_status === 'starting' || editing?.runtime_status === 'reconfiguring'} onClick={() => void save()}>{busy === 'save' && <span className="loading loading-spinner loading-sm" />}{editing ? '保存修改' : '创建并加载'}</button></div>
         </div><button className="modal-backdrop" onClick={closeEditor} aria-label="关闭对话框" />
-      </div>}
+      </Modal>}
 
-      {deleteTarget && <div className="modal modal-open" role="dialog" aria-modal="true"><div className="modal-box max-w-md"><h3 className="text-lg font-bold">删除“{deleteTarget.name}”？</h3><p className="mt-3 text-sm leading-6 text-base-content/60">独立端口将立即停止监听，分组状态与失败历史也会一并删除。</p><div className="modal-action"><button className="btn btn-ghost" onClick={() => setDeleteTarget(null)}>取消</button><button className="btn btn-error" disabled={busy === `delete-${deleteTarget.id}`} onClick={() => void run(`delete-${deleteTarget.id}`, () => deleteGroupPool(deleteTarget.id), '分组池已删除').then(() => setDeleteTarget(null))}>{busy === `delete-${deleteTarget.id}` && <span className="loading loading-spinner loading-sm" />}确认删除</button></div></div><button className="modal-backdrop" onClick={() => setDeleteTarget(null)} aria-label="关闭对话框" /></div>}
+      {deleteTarget && <Modal label="确认删除分组池" onClose={() => setDeleteTarget(null)}><div className="modal-box max-w-md"><h3 className="text-lg font-bold">删除“{deleteTarget.name}”？</h3><p className="mt-3 text-sm leading-6 text-base-content/60">独立端口将立即停止监听，分组状态与失败历史也会一并删除。</p><div className="modal-action"><button className="btn btn-ghost" onClick={() => setDeleteTarget(null)}>取消</button><button className="btn btn-error" disabled={busy === `delete-${deleteTarget.id}`} onClick={() => void run(`delete-${deleteTarget.id}`, () => deleteGroupPool(deleteTarget.id), '分组池已删除').then(() => setDeleteTarget(null))}>{busy === `delete-${deleteTarget.id}` && <span className="loading loading-spinner loading-sm" />}确认删除</button></div></div><button className="modal-backdrop" onClick={() => setDeleteTarget(null)} aria-label="关闭对话框" /></Modal>}
     </PageLayout>
   )
 }
 
 function SummaryCard({ label, value, hint, icon, tone }: { label: string; value: number; hint: string; icon: React.ReactNode; tone: string }) {
   return <article className={cn(surfaceClass, 'p-4 sm:p-5')}><div className="flex items-center justify-between"><span className="text-sm font-medium text-base-content/55">{label}</span><span className={cn('rounded-xl bg-base-200 p-2', tone)}>{icon}</span></div><div className={cn('mt-2 text-3xl font-black tabular-nums', tone)}>{value}</div><p className="mt-1 text-xs text-base-content/45">{hint}</p></article>
-}
-
-function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
-  return <fieldset className="fieldset"><legend className="fieldset-legend font-semibold text-base-content/80">{label}</legend>{children}{hint && <p className="mt-1 text-xs text-base-content/45">{hint}</p>}</fieldset>
 }
 
 function LatencyValue({ value }: { value: number }) {

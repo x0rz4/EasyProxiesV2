@@ -1,3 +1,4 @@
+import Modal from "./ui/Modal"
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ConfigNodeConfig, ConfigNodePayload, NodeSnapshot } from '../types'
 import {
@@ -197,7 +198,7 @@ export default function ManagePanel() {
   const configNodes = useMemo(() => configRes?.nodes || [], [configRes?.nodes])
   const monitorData = monitorRes
   const subscriptions = subRes?.subscriptions || []
-  const loading = nodeFilter.query.isLoading || configLoading || monitorLoading || subLoading
+  const loading = nodeFilter.isDebouncing || nodeFilter.query.isLoading || configLoading || monitorLoading || subLoading
 
   const [needReload, setNeedReload] = useState(false)
 
@@ -283,7 +284,7 @@ export default function ManagePanel() {
         }
       }
 
-      let runtimeStatus: MergedNode['runtimeStatus'] = 'pending'
+      let runtimeStatus: MergedNode['runtimeStatus']
       if (snap.blacklisted) {
         runtimeStatus = 'blacklisted'
       } else if (!snap.initial_check_done) {
@@ -984,7 +985,7 @@ export default function ManagePanel() {
 
       {/* Create / Edit Modal */}
       {modalOpen && (
-        <div className="modal modal-open">
+        <Modal label="节点配置" onClose={() => !submitting && setModalOpen(false)}>
           <div className="modal-box">
             <h3 className="font-bold text-xl mb-4">
               {editingNode !== null ? `编辑节点: ${mergedNodes.find(node => node.id === editingNode)?.name ?? `#${editingNode}`}` : '添加节点'}
@@ -995,7 +996,7 @@ export default function ManagePanel() {
               )}
               <fieldset className="fieldset mb-3">
                 <legend className="fieldset-legend">名称 *</legend>
-                <input
+                <input aria-label="名称 *"
                   type="text" className="input input-sm w-full" placeholder="节点名称"
                   value={form.name}
                   onChange={(e) => setForm(f => ({ ...f, name: e.target.value }))}
@@ -1004,7 +1005,7 @@ export default function ManagePanel() {
               </fieldset>
               <fieldset className="fieldset mb-3">
                 <legend className="fieldset-legend">URI *</legend>
-                <input
+                <input aria-label="URI *"
                   type="text" className="input input-sm w-full font-mono text-xs"
                   placeholder="trojan://password@host:port?..."
                   value={form.uri}
@@ -1013,7 +1014,7 @@ export default function ManagePanel() {
               </fieldset>
               <fieldset className="fieldset mb-3">
                 <legend className="fieldset-legend">本地代理端口</legend>
-                <input
+                <input aria-label="本地代理端口"
                   type="number" className="input input-sm w-full" placeholder="0 = 自动分配"
                   value={form.port || ''}
                   onChange={(e) => setForm(f => ({ ...f, port: parseInt(e.target.value) || 0 }))}
@@ -1023,7 +1024,7 @@ export default function ManagePanel() {
               <div className="mb-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <fieldset className="fieldset">
                   <legend className="fieldset-legend">用户名</legend>
-                  <input
+                  <input aria-label="用户名"
                     type="text" className="input input-sm w-full" placeholder="可选"
                     value={form.username}
                     onChange={(e) => setForm(f => ({ ...f, username: e.target.value }))}
@@ -1031,7 +1032,7 @@ export default function ManagePanel() {
                 </fieldset>
                 <fieldset className="fieldset">
                   <legend className="fieldset-legend">密码</legend>
-                  <input
+                  <input aria-label="密码"
                     type="text" className="input input-sm w-full" placeholder="可选"
                     value={form.password}
                     onChange={(e) => setForm(f => ({ ...f, password: e.target.value }))}
@@ -1049,12 +1050,12 @@ export default function ManagePanel() {
           <form method="dialog" className="modal-backdrop" onClick={() => setModalOpen(false)}>
             <button>close</button>
           </form>
-        </div>
+        </Modal>
       )}
 
       {/* Import Modal */}
       {importModalOpen && (
-        <div className="modal modal-open">
+        <Modal label="导入节点配置" onClose={() => !importing && setImportModalOpen(false)}>
           <div className="modal-box max-w-2xl">
             <h3 className="font-bold text-xl mb-4">导入节点</h3>
             {importError && (
@@ -1149,12 +1150,12 @@ export default function ManagePanel() {
           <form method="dialog" className="modal-backdrop" onClick={() => !importing && setImportModalOpen(false)}>
             <button>close</button>
           </form>
-        </div>
+        </Modal>
       )}
 
       {/* Delete Confirmation Modal */}
       {deleteTarget && (
-        <div className="modal modal-open">
+        <Modal label="确认删除节点" onClose={() => !deleting && setDeleteTarget(null)}>
           <div className="modal-box max-w-sm">
             <h3 className="font-bold text-lg mb-2">确认删除</h3>
             <p className="text-base-content/70">
@@ -1170,12 +1171,12 @@ export default function ManagePanel() {
           <form method="dialog" className="modal-backdrop" onClick={() => !deleting && setDeleteTarget(null)}>
             <button>close</button>
           </form>
-        </div>
+        </Modal>
       )}
 
       {/* Batch Delete Confirmation Modal */}
       {batchDeleteConfirm && (
-        <div className="modal modal-open">
+        <Modal label="确认批量删除节点" onClose={() => !batchProcessing && setBatchDeleteConfirm(false)}>
           <div className="modal-box max-w-sm">
             <h3 className="font-bold text-lg mb-2">确认批量删除</h3>
             <p className="text-base-content/70">
@@ -1191,7 +1192,7 @@ export default function ManagePanel() {
           <form method="dialog" className="modal-backdrop" onClick={() => !batchProcessing && setBatchDeleteConfirm(false)}>
             <button>close</button>
           </form>
-        </div>
+        </Modal>
       )}
     </PageContent>
     </PageLayout>

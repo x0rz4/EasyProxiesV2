@@ -73,7 +73,7 @@
 - 重点覆盖：`group`（状态机/踢出/恢复）、`outbound/pool`（快照/选路）、`builder`（URI 解析）、`nodefacts`/`nodetag`（求值/规则往返）、`monitor`（探测调度）、`store`（migration 与 tag 投影）。
 - 手工构造 `&Server{}` 的测试必须显式设 `sessionTTL`（否则"创建即过期"会话随时序抖动 → 偶发 401）。
 - 偶发失败测试先**归因**（产品缺陷 vs 测试问题），用 `git stash` 在基线复现；不许把产品缺陷当"测试不稳"合过去。见 LESSONS DR-001。
-- 前端没有单测框架；验收 = `npm run lint` + `npm run build` 通过。
+- 前端安全/流式传输回归使用 Node 内置 test runner；验收 = `npm run lint` + `npm test` + `npm run build` 通过。
 
 ## I. 构建与发布
 

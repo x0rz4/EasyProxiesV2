@@ -1,4 +1,6 @@
 import { useState } from 'react'
+import QueryError from './ui/QueryError'
+import useUnsavedChanges from '../hooks/useUnsavedChanges'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import type { APIKey, Subscription, SubscriptionFormat, SubscriptionPayload, SubscriptionRefreshSettings } from '../types'
 import {
@@ -51,14 +53,14 @@ function maskToken(token: string): string {
 export default function SubscriptionsPanel() {
   const queryClient = useQueryClient()
 
-  const { data: status, isLoading: statusLoading } = useQuery({
+  const { data: status, isLoading: statusLoading, error: statusError } = useQuery({
     queryKey: ['subscriptionStatus'],
     queryFn: fetchSubscriptionStatus,
     // A create/update or manual refresh runs server-side after the response, so
     // poll while anything is syncing and stop as soon as it settles.
     refetchInterval: (query) => (query.state.data?.is_refreshing ? 2000 : false),
   })
-  const { data: subData, isLoading: subLoading } = useQuery({
+  const { data: subData, isLoading: subLoading, error: subscriptionsError } = useQuery({
     queryKey: ['subscriptions'],
     queryFn: listSubscriptions,
     refetchInterval: status?.is_refreshing ? 2000 : false,
@@ -81,7 +83,7 @@ export default function SubscriptionsPanel() {
   const [deleteTarget, setDeleteTarget] = useState<Subscription | null>(null)
 
   // --- Subscription auto-refresh settings (migrated from the settings page) ---
-  const { data: refreshData, isLoading: refreshLoading } = useQuery({
+  const { data: refreshData, isLoading: refreshLoading, error: refreshError } = useQuery({
     queryKey: ['subRefreshSettings'],
     queryFn: fetchSubscriptionRefreshSettings,
   })
@@ -90,13 +92,14 @@ export default function SubscriptionsPanel() {
   const refreshSettings = refreshDraft ?? refreshData ?? defaultRefreshSettings
   const refreshDirty = refreshDraft !== null && refreshData !== undefined
     && JSON.stringify(refreshDraft) !== JSON.stringify(refreshData)
+  useUnsavedChanges(refreshDirty)
 
   const updateRefreshField = <K extends keyof SubscriptionRefreshSettings>(key: K, value: SubscriptionRefreshSettings[K]) => {
     setRefreshDraft({ ...(refreshDraft ?? refreshData ?? defaultRefreshSettings), [key]: value })
   }
 
   // --- Session-free API credentials ---
-  const { data: keyData } = useQuery({ queryKey: ['apiKeys'], queryFn: listAPIKeys })
+  const { data: keyData, error: keysError } = useQuery({ queryKey: ['apiKeys'], queryFn: listAPIKeys })
   const apiKeys = keyData?.api_keys || []
   const [newKeyName, setNewKeyName] = useState('')
   const [keyAction, setKeyAction] = useState<string | null>(null)
@@ -233,6 +236,7 @@ export default function SubscriptionsPanel() {
       />
 
       <PageContent>
+        <QueryError error={subscriptionsError || statusError || refreshError || keysError} onRetry={() => { void queryClient.invalidateQueries({ queryKey: ['subscriptions'] }); void queryClient.invalidateQueries({ queryKey: ['subscriptionStatus'] }); void queryClient.invalidateQueries({ queryKey: ['subRefreshSettings'] }); void queryClient.invalidateQueries({ queryKey: ['apiKeys'] }) }} />
         {status?.last_error && <div role="alert" className="alert alert-warning alert-soft"><span>最近同步错误：{status.last_error}</span></div>}
 
         <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
@@ -248,10 +252,10 @@ export default function SubscriptionsPanel() {
             <span className="badge badge-ghost">{subscriptions.length} 个订阅源</span>
           </div>
           <div className="grid items-end gap-4 lg:grid-cols-2">
-            <fieldset className="fieldset"><legend className="fieldset-legend font-semibold text-base-content/80">订阅名称</legend><input className={cn(`input input-md w-full`, controlClass)} placeholder="例如：主力节点" value={newName} onChange={(event) => setNewName(event.target.value)} /></fieldset>
-            <fieldset className="fieldset"><legend className="fieldset-legend font-semibold text-base-content/80">订阅地址</legend><input type="url" className={cn(`input input-md w-full font-mono text-sm`, controlClass)} placeholder="https://example.com/subscribe" value={newUrl} onChange={(event) => setNewUrl(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && void addSubscription()} /></fieldset>
-            <fieldset className="fieldset"><legend className="fieldset-legend font-semibold text-base-content/80">响应格式</legend><select className={cn('select select-md w-full', controlClass)} value={newFormat} onChange={(event) => setNewFormat(event.target.value as SubscriptionFormat)}><option value="auto">自动识别（推荐）</option><option value="clash">Clash / Mihomo YAML</option><option value="base64">Base64 URI 列表</option><option value="sing-box">Sing-box JSON</option></select></fieldset>
-            <fieldset className="fieldset"><legend className="fieldset-legend font-semibold text-base-content/80">自定义 User-Agent</legend><input className={cn('input input-md w-full font-mono text-sm', controlClass)} placeholder="留空时按格式自动选择" value={newUserAgent} onChange={(event) => setNewUserAgent(event.target.value)} /></fieldset>
+            <fieldset className="fieldset"><legend className="fieldset-legend font-semibold text-base-content/80">订阅名称</legend><input aria-label="订阅名称" className={cn(`input input-md w-full`, controlClass)} placeholder="例如：主力节点" value={newName} onChange={(event) => setNewName(event.target.value)} /></fieldset>
+            <fieldset className="fieldset"><legend className="fieldset-legend font-semibold text-base-content/80">订阅地址</legend><input aria-label="订阅地址" type="url" className={cn(`input input-md w-full font-mono text-sm`, controlClass)} placeholder="https://example.com/subscribe" value={newUrl} onChange={(event) => setNewUrl(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && void addSubscription()} /></fieldset>
+            <fieldset className="fieldset"><legend className="fieldset-legend font-semibold text-base-content/80">响应格式</legend><select aria-label="响应格式" className={cn('select select-md w-full', controlClass)} value={newFormat} onChange={(event) => setNewFormat(event.target.value as SubscriptionFormat)}><option value="auto">自动识别（推荐）</option><option value="clash">Clash / Mihomo YAML</option><option value="base64">Base64 URI 列表</option><option value="sing-box">Sing-box JSON</option></select></fieldset>
+            <fieldset className="fieldset"><legend className="fieldset-legend font-semibold text-base-content/80">自定义 User-Agent</legend><input aria-label="自定义 User-Agent" className={cn('input input-md w-full font-mono text-sm', controlClass)} placeholder="留空时按格式自动选择" value={newUserAgent} onChange={(event) => setNewUserAgent(event.target.value)} /></fieldset>
             <div className="flex justify-end lg:col-span-2"><button className="btn btn-primary btn-md lg:min-w-28" disabled={!newName.trim() || !newUrl.trim() || busy} onClick={() => void addSubscription()}>{action === 'create' && <span className="loading loading-spinner loading-sm" />}添加订阅</button></div>
           </div>
         </section>
@@ -310,16 +314,16 @@ export default function SubscriptionsPanel() {
           {refreshSettings.sub_refresh_enabled && (
             <div className="mt-4 space-y-4 animate-in fade-in slide-in-from-top-2">
               <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                <fieldset className="fieldset"><legend className="fieldset-legend font-semibold text-base-content/80">刷新间隔</legend><input className={cn('input input-md w-full', controlClass)} placeholder="1h" value={refreshSettings.sub_refresh_interval} onChange={(event) => updateRefreshField('sub_refresh_interval', event.target.value)} /></fieldset>
-                <fieldset className="fieldset"><legend className="fieldset-legend font-semibold text-base-content/80">获取超时</legend><input className={cn('input input-md w-full', controlClass)} placeholder="30s" value={refreshSettings.sub_refresh_timeout} onChange={(event) => updateRefreshField('sub_refresh_timeout', event.target.value)} /></fieldset>
+                <fieldset className="fieldset"><legend className="fieldset-legend font-semibold text-base-content/80">刷新间隔</legend><input aria-label="刷新间隔" className={cn('input input-md w-full', controlClass)} placeholder="1h" value={refreshSettings.sub_refresh_interval} onChange={(event) => updateRefreshField('sub_refresh_interval', event.target.value)} /></fieldset>
+                <fieldset className="fieldset"><legend className="fieldset-legend font-semibold text-base-content/80">获取超时</legend><input aria-label="获取超时" className={cn('input input-md w-full', controlClass)} placeholder="30s" value={refreshSettings.sub_refresh_timeout} onChange={(event) => updateRefreshField('sub_refresh_timeout', event.target.value)} /></fieldset>
               </div>
               <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                <fieldset className="fieldset"><legend className="fieldset-legend font-semibold text-base-content/80">健康检查超时</legend><input className={cn('input input-md w-full', controlClass)} placeholder="1m" value={refreshSettings.sub_refresh_health_check_timeout} onChange={(event) => updateRefreshField('sub_refresh_health_check_timeout', event.target.value)} /></fieldset>
-                <fieldset className="fieldset"><legend className="fieldset-legend font-semibold text-base-content/80">排空超时</legend><input className={cn('input input-md w-full', controlClass)} placeholder="30s" value={refreshSettings.sub_refresh_drain_timeout} onChange={(event) => updateRefreshField('sub_refresh_drain_timeout', event.target.value)} /></fieldset>
+                <fieldset className="fieldset"><legend className="fieldset-legend font-semibold text-base-content/80">健康检查超时</legend><input aria-label="健康检查超时" className={cn('input input-md w-full', controlClass)} placeholder="1m" value={refreshSettings.sub_refresh_health_check_timeout} onChange={(event) => updateRefreshField('sub_refresh_health_check_timeout', event.target.value)} /></fieldset>
+                <fieldset className="fieldset"><legend className="fieldset-legend font-semibold text-base-content/80">排空超时</legend><input aria-label="排空超时" className={cn('input input-md w-full', controlClass)} placeholder="30s" value={refreshSettings.sub_refresh_drain_timeout} onChange={(event) => updateRefreshField('sub_refresh_drain_timeout', event.target.value)} /></fieldset>
               </div>
               <fieldset className="fieldset">
                 <legend className="fieldset-legend font-semibold text-base-content/80">最少可用节点数</legend>
-                <input type="number" min={0} className={cn('input input-md w-full', controlClass)} value={refreshSettings.sub_refresh_min_available_nodes} onChange={(event) => updateRefreshField('sub_refresh_min_available_nodes', Math.max(0, parseInt(event.target.value) || 0))} />
+                <input aria-label="最少可用节点数" type="number" min={0} className={cn('input input-md w-full', controlClass)} value={refreshSettings.sub_refresh_min_available_nodes} onChange={(event) => updateRefreshField('sub_refresh_min_available_nodes', Math.max(0, parseInt(event.target.value) || 0))} />
                 <p className="label mt-1 text-base-content/50">低于此值时不切换新节点（Go duration 格式：1h、30s、1m30s）</p>
               </fieldset>
             </div>
@@ -366,7 +370,7 @@ export default function SubscriptionsPanel() {
           <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-end">
             <fieldset className="fieldset flex-1">
               <legend className="fieldset-legend font-semibold text-base-content/80">凭证名称（可选）</legend>
-              <input className={cn('input input-md w-full', controlClass)} placeholder="例如：CI 定时导入" value={newKeyName} onChange={(event) => setNewKeyName(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && void generateAPIKey()} />
+              <input aria-label="凭证名称（可选）" className={cn('input input-md w-full', controlClass)} placeholder="例如：CI 定时导入" value={newKeyName} onChange={(event) => setNewKeyName(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && void generateAPIKey()} />
             </fieldset>
             <button className="btn btn-primary btn-md sm:min-w-32" disabled={keyAction === 'create'} onClick={() => void generateAPIKey()}>
               {keyAction === 'create' && <span className="loading loading-spinner loading-sm" />}

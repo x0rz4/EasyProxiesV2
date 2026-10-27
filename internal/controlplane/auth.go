@@ -89,6 +89,9 @@ type Auth struct {
 
 	sessionMu sync.RWMutex
 	sessions  map[string]*Session
+	// Serialize persistent cache misses with revocation, so an in-flight
+	// store read cannot repopulate a revoked session after logout returns.
+	sessionStoreGate chan struct{}
 
 	loginMu           sync.Mutex
 	loginFailures     map[string]*loginFailureState
@@ -116,13 +119,14 @@ func NewAuth(opts AuthOptions) *Auth {
 		passwd = func() string { return "" }
 	}
 	return &Auth{
-		store:         opts.Store,
-		logger:        logger,
-		passwd:        passwd,
-		ttl:           ttl,
-		now:           now,
-		sessions:      make(map[string]*Session),
-		loginFailures: make(map[string]*loginFailureState),
+		store:            opts.Store,
+		logger:           logger,
+		passwd:           passwd,
+		ttl:              ttl,
+		now:              now,
+		sessions:         make(map[string]*Session),
+		sessionStoreGate: make(chan struct{}, 1),
+		loginFailures:    make(map[string]*loginFailureState),
 	}
 }
 
@@ -301,12 +305,15 @@ func (a *Auth) Validate(ctx context.Context, token string) bool {
 	}
 
 	// Fallback: consult the store, e.g. after a restart.
+	callCtx, release, err := a.acquireSessionStore(ctx)
+	if err != nil {
+		return false
+	}
+	defer release()
 	st := a.currentStore()
 	if st == nil {
 		return false
 	}
-	callCtx, cancel := context.WithTimeout(ctx, storeCallTimeout)
-	defer cancel()
 	stored, err := st.GetSession(callCtx, token)
 	if err != nil || stored == nil {
 		return false
@@ -319,6 +326,41 @@ func (a *Auth) Validate(ctx context.Context, token string) bool {
 	a.sessions[token] = &Session{Token: stored.Token, CreatedAt: stored.CreatedAt, ExpiresAt: stored.ExpiresAt}
 	a.sessionMu.Unlock()
 	return true
+}
+
+// RevokeSession removes both durable and cached credentials. A failed durable
+// deletion is returned so the caller does not report a successful logout.
+func (a *Auth) RevokeSession(ctx context.Context, token string) error {
+	if token == "" {
+		return nil
+	}
+	callCtx, release, err := a.acquireSessionStore(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if st := a.currentStore(); st != nil {
+		if err := st.DeleteSession(callCtx, token); err != nil {
+			return fmt.Errorf("revoke session: %w", err)
+		}
+	}
+	a.sessionMu.Lock()
+	delete(a.sessions, token)
+	a.sessionMu.Unlock()
+	return nil
+}
+
+// The same budget includes waiting for a cache miss/revocation ahead of us.
+// Invalid sessions must not create an uncancellable mutex queue on slow stores.
+func (a *Auth) acquireSessionStore(ctx context.Context) (context.Context, func(), error) {
+	callCtx, cancel := context.WithTimeout(ctx, storeCallTimeout)
+	select {
+	case a.sessionStoreGate <- struct{}{}:
+		return callCtx, func() { <-a.sessionStoreGate; cancel() }, nil
+	case <-callCtx.Done():
+		cancel()
+		return nil, nil, callCtx.Err()
+	}
 }
 
 func (a *Auth) dropSession(ctx context.Context, token string) {

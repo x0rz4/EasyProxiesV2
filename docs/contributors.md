@@ -18,7 +18,7 @@
 | 任何后端 | `go vet -tags "with_utls with_quic with_grpc with_wireguard with_gvisor" ./...` + 对应包 `go test` |
 | 跨包 / 疑似并发 | 关键包 race：`go test -race ./internal/outbound/pool/ ./internal/group/ ./internal/boxmgr/` |
 | 全量 | `go test ./...`（**先前端构建**，见下） |
-| 前端 | `cd frontend && npm run lint && npm run build`（含 tsc -b 严格检查） |
+| 前端 | `cd frontend && npm run lint && npm test && npm run build`（含 tsc -b 严格检查）；可见改动另做桌面/手机与键盘验证 |
 | 依赖变更 | `go build ./cmd/easy_proxies` 验证**链接**（x/net 钉版陷阱，见 LESSONS L-014） |
 | install.sh | `bash -n install.sh` + `python3 -m unittest discover -s tests -p 'test_install.py'` |
 

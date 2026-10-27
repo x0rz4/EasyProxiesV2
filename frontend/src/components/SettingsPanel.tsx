@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import type { SettingsData } from '../types'
 import {
   fetchSettings,
@@ -9,6 +9,8 @@ import {
   updateGeoipDatabase,
 } from '../api/client'
 import { PageContent, PageHeader, PageLayout } from './ui/PageLayout'
+import QueryError from './ui/QueryError'
+import useUnsavedChanges from '../hooks/useUnsavedChanges'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import {
@@ -84,10 +86,7 @@ const defaultSettings: SettingsData = {
 
 export default function SettingsPanel() {
   const queryClient = useQueryClient()
-  const cachedSettings = queryClient.getQueryData<SettingsData>(['settings'])
-  const initialSettings = { ...defaultSettings, ...cachedSettings }
-  const [settings, setSettings] = useState<SettingsData>(() => initialSettings)
-  const [savedSettings, setSavedSettings] = useState<SettingsData>(() => initialSettings)
+  const [draft, setDraft] = useState<SettingsData | null>(null)
   const [saving, setSaving] = useState(false)
   const [reloading, setReloading] = useState(false)
   const [reloadWarning, setReloadWarning] = useState('')
@@ -95,17 +94,14 @@ export default function SettingsPanel() {
   const [needRestart, setNeedRestart] = useState(false)
   const [applied, setApplied] = useState<string[]>([])
   const [pending, setPending] = useState<string[]>([])
-  const [isDirty, setIsDirty] = useState(false)
-  const { isLoading: loading } = useQuery({
+  const { data: settingsData, isLoading: loading, error: settingsError, refetch: refetchSettings } = useQuery({
     queryKey: ['settings'],
-    queryFn: async () => {
-      const fetched = await fetchSettings()
-      const merged = { ...defaultSettings, ...fetched }
-      setSettings(prev => isDirty ? prev : merged)
-      setSavedSettings(merged)
-      return fetched
-    },
+    queryFn: ({ signal }) => fetchSettings(signal),
   })
+  const savedSettings = { ...defaultSettings, ...settingsData }
+  const settings = draft ?? savedSettings
+  const isDirty = draft !== null && JSON.stringify(draft) !== JSON.stringify(savedSettings)
+  useUnsavedChanges(isDirty)
 
   // GeoIP database management state
   const { data: geoipStatus, refetch: refetchGeoip } = useQuery({ queryKey: ['geoipStatus'], queryFn: fetchGeoipStatus })
@@ -159,8 +155,8 @@ export default function SettingsPanel() {
       const res = await updateSettings(payload)
       toast.success(res.reloaded ? '设置已保存并自动重载' : (res.message || '设置已保存'))
       setReloadWarning(res.reload_error ? `设置已保存，但自动重载失败：${res.reload_error}` : '')
-      setSavedSettings(payload)
-      setIsDirty(false)
+      queryClient.setQueryData(['settings'], payload)
+      setDraft(current => current && JSON.stringify(current) === JSON.stringify(settings) ? null : current)
       setNeedReload(Boolean(res.need_reload))
       setNeedRestart(Boolean(res.need_restart))
       setApplied(res.applied)
@@ -191,24 +187,8 @@ export default function SettingsPanel() {
   }
 
   const updateField = <K extends keyof SettingsData>(key: K, value: SettingsData[K]) => {
-    setSettings(s => {
-      const updated = { ...s, [key]: value }
-      setIsDirty(JSON.stringify(updated) !== JSON.stringify(savedSettings))
-      return updated
-    })
+    setDraft(current => ({ ...(current ?? savedSettings), [key]: value }))
   }
-
-  // Warn before leaving with unsaved changes
-  useEffect(() => {
-    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
-      if (isDirty) {
-        e.preventDefault()
-        e.returnValue = ''
-      }
-    }
-    window.addEventListener('beforeunload', handleBeforeUnload)
-    return () => window.removeEventListener('beforeunload', handleBeforeUnload)
-  }, [isDirty])
 
   if (loading) {
     return (
@@ -217,6 +197,8 @@ export default function SettingsPanel() {
       </div>
     )
   }
+
+  if (settingsError && !settingsData) return <PageLayout><PageHeader title="系统设置" description="加载设置失败，重试成功后再编辑" icon={<Settings className="h-5 w-5" />} /><PageContent><QueryError error={settingsError} onRetry={() => void refetchSettings()} /></PageContent></PageLayout>
 
   return (
     <PageLayout>
@@ -240,7 +222,7 @@ export default function SettingsPanel() {
             <button
               className={`btn btn-sm lg:btn-md gap-2 shadow-sm ${isDirty ? 'btn-primary' : 'btn-ghost border border-base-300'}`}
               onClick={handleSave}
-              disabled={saving || !isDirty}
+              disabled={saving || !isDirty || Boolean(settingsError)}
               title={isDirty ? '保存设置' : '设置已保存'}
               aria-label={isDirty ? '保存设置' : '设置已保存'}
             >
@@ -255,6 +237,7 @@ export default function SettingsPanel() {
       />
 
       <PageContent>
+      <QueryError error={settingsError} onRetry={() => void refetchSettings()} />
         {/* Alerts */}
       {reloadWarning && (
         <div role="alert" className="alert alert-warning alert-soft text-sm">
@@ -284,7 +267,7 @@ export default function SettingsPanel() {
       )}
 
       {/* Settings Cards Grid */}
-      <div className="grid items-start gap-5 lg:grid-cols-2 2xl:grid-cols-3">
+      <div className="grid grid-cols-1 items-start gap-5 lg:grid-cols-2 2xl:grid-cols-3">
 
         {/* ===== 全局设置 ===== */}
         <div className="panel-card space-y-5 p-5 transition-shadow hover:shadow-md lg:p-6">
@@ -300,7 +283,7 @@ export default function SettingsPanel() {
 
           <fieldset className="fieldset">
             <legend className="fieldset-legend font-semibold text-base-content/80">日志级别</legend>
-            <select
+            <select aria-label="日志级别"
               className="select select-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
               value={settings.log_level}
               onChange={(e) => updateField('log_level', e.target.value)}
@@ -314,7 +297,7 @@ export default function SettingsPanel() {
 
           <fieldset className="fieldset">
             <legend className="fieldset-legend font-semibold text-base-content/80">外部 IP 地址</legend>
-            <input
+            <input aria-label="外部 IP 地址"
               type="text"
               placeholder="例如: 1.2.3.4"
               className="input input-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
@@ -362,7 +345,7 @@ export default function SettingsPanel() {
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <fieldset className="fieldset">
               <legend className="fieldset-legend font-semibold text-base-content/80">监听地址</legend>
-              <input
+              <input aria-label="监听地址"
                 type="text"
                 className="input input-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
                 value={settings.listener_address}
@@ -372,7 +355,7 @@ export default function SettingsPanel() {
             </fieldset>
             <fieldset className="fieldset">
               <legend className="fieldset-legend font-semibold text-base-content/80">监听端口</legend>
-              <input
+              <input aria-label="监听端口"
                 type="number"
                 className="input input-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
                 value={settings.listener_port}
@@ -386,7 +369,7 @@ export default function SettingsPanel() {
 
           <fieldset className="fieldset">
             <legend className="fieldset-legend font-semibold text-base-content/80">监听协议</legend>
-            <select
+            <select aria-label="监听协议"
               className="select select-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
               value={settings.listener_protocol}
               onChange={(e) => updateField('listener_protocol', e.target.value)}
@@ -402,7 +385,7 @@ export default function SettingsPanel() {
           <div className="grid grid-cols-1 gap-4 pt-2 sm:grid-cols-2">
             <fieldset className="fieldset">
               <legend className="fieldset-legend font-semibold text-base-content/80">代理用户名</legend>
-              <input
+              <input aria-label="代理用户名"
                 type="text"
                 className="input input-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
                 placeholder="可选，留空表示无验证"
@@ -413,7 +396,7 @@ export default function SettingsPanel() {
             </fieldset>
             <fieldset className="fieldset">
               <legend className="fieldset-legend font-semibold text-base-content/80">代理密码</legend>
-              <input
+              <input aria-label="代理密码"
                 type="text"
                 className="input input-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
                 placeholder="可选，留空表示无验证"
@@ -449,7 +432,7 @@ export default function SettingsPanel() {
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <fieldset className="fieldset">
               <legend className="fieldset-legend font-semibold text-base-content/80">监听地址</legend>
-              <input
+              <input aria-label="监听地址"
                 type="text"
                 className="input input-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
                 value={settings.multi_port_address}
@@ -459,7 +442,7 @@ export default function SettingsPanel() {
             </fieldset>
             <fieldset className="fieldset">
               <legend className="fieldset-legend font-semibold text-base-content/80">起始端口</legend>
-              <input
+              <input aria-label="起始端口"
                 type="number"
                 className="input input-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
                 value={settings.multi_port_base_port}
@@ -473,7 +456,7 @@ export default function SettingsPanel() {
 
           <fieldset className="fieldset">
             <legend className="fieldset-legend font-semibold text-base-content/80">监听协议</legend>
-            <select
+            <select aria-label="监听协议"
               className="select select-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
               value={settings.multi_port_protocol}
               onChange={(e) => updateField('multi_port_protocol', e.target.value)}
@@ -489,7 +472,7 @@ export default function SettingsPanel() {
           <div className="grid grid-cols-1 gap-4 pt-2 sm:grid-cols-2">
             <fieldset className="fieldset">
               <legend className="fieldset-legend font-semibold text-base-content/80">默认用户名</legend>
-              <input
+              <input aria-label="默认用户名"
                 type="text"
                 className="input input-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
                 placeholder="可选"
@@ -500,7 +483,7 @@ export default function SettingsPanel() {
             </fieldset>
             <fieldset className="fieldset">
               <legend className="fieldset-legend font-semibold text-base-content/80">默认密码</legend>
-              <input
+              <input aria-label="默认密码"
                 type="text"
                 className="input input-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
                 placeholder="可选"
@@ -526,7 +509,7 @@ export default function SettingsPanel() {
 
           <fieldset className="fieldset">
             <legend className="fieldset-legend font-semibold text-base-content/80">调度模式</legend>
-            <select
+            <select aria-label="调度模式"
               className="select select-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
               value={settings.pool_mode}
               onChange={(e) => updateField('pool_mode', e.target.value)}
@@ -541,7 +524,7 @@ export default function SettingsPanel() {
 
           <fieldset className="fieldset">
             <legend className="fieldset-legend font-semibold text-base-content/80">失败阈值</legend>
-            <input
+            <input aria-label="失败阈值"
               type="number"
               className="input input-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
               value={settings.pool_failure_threshold}
@@ -553,7 +536,7 @@ export default function SettingsPanel() {
 
           <fieldset className="fieldset">
             <legend className="fieldset-legend font-semibold text-base-content/80">黑名单持续时间</legend>
-            <input
+            <input aria-label="黑名单持续时间"
               type="text"
               className="input input-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
               placeholder="例如: 24h, 1h30m"
@@ -588,7 +571,7 @@ export default function SettingsPanel() {
 
           <fieldset className="fieldset">
             <legend className="fieldset-legend font-semibold text-base-content/80">监听地址</legend>
-            <input
+            <input aria-label="监听地址"
               type="text"
               className="input input-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
               placeholder="0.0.0.0:9090"
@@ -599,7 +582,7 @@ export default function SettingsPanel() {
 
           <fieldset className="fieldset">
             <legend className="fieldset-legend font-semibold text-base-content/80">WebUI 密码</legend>
-            <input
+            <input aria-label="WebUI 密码"
               type="text"
               className="input input-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
               placeholder="为空则无需密码"
@@ -611,7 +594,7 @@ export default function SettingsPanel() {
 
           <fieldset className="fieldset">
             <legend className="fieldset-legend font-semibold text-base-content/80">启动准入策略</legend>
-            <select className="select select-md w-full bg-base-200/50" value={settings.management_startup_availability_policy} onChange={(e) => updateField('management_startup_availability_policy', e.target.value as 'optimistic' | 'strict')}>
+            <select aria-label="启动准入策略" className="select select-md w-full bg-base-200/50" value={settings.management_startup_availability_policy} onChange={(e) => updateField('management_startup_availability_policy', e.target.value as 'optimistic' | 'strict')}>
               <option value="optimistic">optimistic · 待复检节点先运行</option>
               <option value="strict">strict · 本轮成功后运行</option>
             </select>
@@ -695,7 +678,7 @@ export default function SettingsPanel() {
             <div className="space-y-4 pt-2 animate-in fade-in slide-in-from-top-2">
               <fieldset className="fieldset">
                 <legend className="fieldset-legend font-semibold text-base-content/80">数据库路径</legend>
-                <input
+                <input aria-label="数据库路径"
                   type="text"
                   className="input input-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
                   value={settings.geoip_database_path}
@@ -715,7 +698,7 @@ export default function SettingsPanel() {
               {settings.geoip_auto_update_enabled && (
                 <fieldset className="fieldset animate-in fade-in slide-in-from-top-2">
                   <legend className="fieldset-legend font-semibold text-base-content/80">更新间隔</legend>
-                  <input
+                  <input aria-label="更新间隔"
                     type="text"
                     className="input input-md w-full bg-base-200/50 focus:bg-base-100 transition-colors focus:border-primary/50"
                     placeholder="24h"
