@@ -1,6 +1,6 @@
 # 前端合理性、安全与性能审计
 
-日期：2026-10-28。基线 fdd9d08 / 2.2.17，分支 codex/frontend-audit。状态：进行中。
+日期：2026-10-28。基线 fdd9d08 / 2.2.17，分支 codex/frontend-audit。状态：已完成，版本 2.2.18。
 
 ## 范围与交付
 
@@ -8,11 +8,13 @@
 
 - [x] A 依赖：npm audit（完整/生产）、peer/engines、受影响入口分析；修复已知依赖漏洞、验证干净安装。
 - [x] B 安全：登录/退出/会话恢复、缓存与凭据清理、XSS/链接/静态资源边界；实测安全回归。
-- [ ] C 性能：首屏 bundle 与按需页面、查询取消/分页缓存/轮询、SSE/日志刷新开销；提供前后测量及资源清理回归。
-- [ ] D 适用性：全部页面数据/空态/失败态/破坏操作与移动端、键盘使用；修复确认的问题，评估共享组件边界。
-- [ ] E 验收：真实浏览器桌面/移动验证，前端 lint/build、安全/行为回归、Go 全量测试和生产 tags vet/链接；同步当前文档和最终证据，提交 Git。
+- [x] C 性能：首屏 bundle 与按需页面、查询取消/分页缓存/轮询、SSE/日志刷新开销；提供前后测量及资源清理回归。
+- [x] D 适用性：全部页面数据/空态/失败态/破坏操作与移动端、键盘使用；修复确认的问题，评估共享组件边界。
+- [x] E 验收：真实浏览器桌面/移动验证，前端 lint/build、安全/行为回归、Go 全量测试和生产 tags vet/链接；同步当前文档和最终证据，提交 Git。
 
 ## 初始证据
+
+本文各轮“验证中/未提交”为该轮时点记录；当前验收状态见末尾，避免将历史失败或工具限制覆盖为成功。
 
 - npm audit：6 个受影响包（5 high、1 moderate），均处于工具依赖链，不能解释成浏览器运行时有 6 个可远程利用漏洞。包括 Vite 7.3.6、brace-expansion 5.0.8、@humanfs/node、nanoid、source-map-js、zod。原始审计/版本输出：忽略目录 `.tools/frontend-audit/npm-{audit,outdated}-before.json`。brace-expansion 的旧 override 低于当前补丁下界 5.0.12；来源 [维护者公告](https://github.com/advisories/GHSA-q2hr-2g5m-vwhr)。
 - App 静态导入全部页面，当前生成单个约 655 kB JS（gzip 185 kB）；需重新构建量化并测量浏览器实际入口加载。
@@ -76,3 +78,61 @@ CI 两个前端构建入口加入 npm test，Docker 前端阶段改用 lint/test
 - `git diff --check` 通过；修正了删除本地 Field 后残留的 EOF 空行。Go 生产 41339、测试 25741 行，Store 方法 111、migration v25 未变。同步 AUTH-002 / WEB-001、架构/子系统/贡献者说明。
 
 本阶段按 code-standards §L 自审，没有旁路统一成员/节点/JSON/写入服务入口，没有把诊断当健康；只有合成 fixture 凭据和源码文档入库，实际配置、SQLite、profile、截图及编译产物均不提交。未执行 race（CGO_ENABLED=0、无 gcc/clang）；Linux 完成 vet/链接，未运行 Linux 浏览器/负载。当前阶段提交保留可复查的代码与证据；总体 C/D/E 尚待收尾，不宣称完整前端目标已验收，版本在整体完成时递增一次。
+
+### 收尾优化与隔离验证
+
+第一阶段提交 b0405c3。新增 opt-in `frontend_controls_test.go`：只有 EASY_PROXIES_FRONTEND_CONTROLS=1 的 loopback 测试代理注入同源测试脚本；不改生产构建、CSP 或接口。可按路径暂挂/失败请求、统计请求与取消、发送合成日志突发；不记录请求头、凭据或请求体。测试按钮控制 confirm 返回值，因此验证的是应用对取消/接受的处理，未声称自动操作了原生操作系统确认框。
+
+10000 节点夹具（第五轮）真实启动探测 10000/10000；设置草稿 127.0.0.2 在取消导航/退出后保留，接受后离开；后退返回已保存值。另一次服务端确认 GET /api/settings 在途数为 1，输入 127.0.0.3 后释放读取，值仍保留；取消后退仍停留设置并保留输入。订阅页服务已正常装配，明确显示零订阅/零 API Key 空态。节点管理总数 10000、tbody 仅 50 行。维护页用持久统计而非瞬时运行态，fixture 未启用 app 统计落库，故此轮显示 10000 待检测，不把它计为生产健康错误。
+
+第五轮注入 10000 条日志，显示上限 1000、MutationObserver 观察日志容器一批 childList 更新；离开后 debug SSE 活跃数 0、取消数 1。这里只是 DOM 更新批次数，不是 FPS。该轮使用已提交的第一阶段静态产物，用于批处理基线；通过命名停止文件结束，测试 PASS，793.56 秒。
+
+本批将 pending.slice(-1000) 改为固定容量环形缓冲，每事件缓存键和数值时间戳；细节、与原态/阶段一的 CPU 基准见 [架构复核](../architecture-review-2026-10-28.md)。历史读取加入 AbortSignal。新增回归验证 10007 项回绕、drain 引用释放/复用、去重/排序/行对象稳定、Debug 请求取消；用虚拟时间验证真实 QueryClient 闲置页 30 秒和普通查询 60 秒清理（不等待真实一分钟，不以测默认值代替实际移除）。Node 全部 15 项通过并正常退出。
+
+## 最终逐页评估
+
+保留页面级组件与 Query 管理服务器状态的结构；抽取共享 transport/SSE/Field/Modal/错误与日志 helper 即可，不引入额外状态库或新路由框架。十页均在真实最终构建中验证 1440×900 与 390×844；每页 main.scrollWidth 等于 main.clientWidth，表格内部滚动不扩大页面。桌面主区域 1174/1184 px，手机 380/390 px，差异来自页面纵向滚动条。逐页 DOM 记录在忽略目录 `browser-layout-final.json`，截图仅为测试证据不入库。
+
+| 页面 | 合理性、改动与实测 | 保留限制 / 建议 |
+| --- | --- | --- |
+| 监控 | 聚合图表与流量 SSE 适合概览，修正未知延迟文案、读取失败与 EOF 重连；1k/10k 正常显示 | 仍读取全量节点，未来增加轻量摘要，减少管理轮询对后端的 O(N) 影响 |
+| 订阅 | 来源、同步与 API Key 权限说明集中，真实服务空态正常；刷新草稿有离开提示 | 添加即刷新/改地址清旧节点已有明确说明；未对公网订阅发请求 |
+| 节点管理 | 10k 集合只渲染 50 行，详情按当前页 ID 读取；标签编辑在打开后才请求单个 ID | 跨页批量动作按当前 querySpec；破坏性动作验证取消，不执行删除真实数据 |
+| 维护 | 持久化健康统计与连续离线天数适合清理，清楚说明最多 30 秒延迟；无待清理时为空态 | 与瞬时监控来源不同，不能将 fixture 未运行统计落库当成健康不一致缺陷 |
+| 标签 | QueryError、刷新和重试可见；首轮创建标签与键盘弹窗验证通过，最终空态正常 | 最终注入 /api/tags 503，显示错误/重试；解除后恢复。规则编辑保留专门抽屉，未把复杂表单塞入共享 Field |
+| 分组 | 独立监听、成员、运行状态集中；真实 50 成员组显示，移动端无横向溢出 | 资源仍按重叠组放大，应结合资源 API 控制组数量 |
+| 解锁 | 仅健康节点范围、查询/详情分页，抽屉只在打开时挂载并取消流；结果未知不假装成功 | 表格保留独立滚动和稳定 ID；未以本次浏览器试验认证公网服务检测准确率 |
+| 运维 | 调度、进度、运行态集中；纯读取与草稿分离、离开提示、检测终态/重连回归通过 | 频繁状态轮询有后端成本；规模建议与架构复核共用证据 |
+| 调试 | 有界环形缓冲、100 ms 批处理、memo 行、历史与 SSE 取消；真实最终页面显示 1000 条上限 | 历史 API 仍为全节点，合并窗口有损；不是持久审计页面，不应接管健康事件日志职责 |
+| 设置 | 明确加载/失败态、独立草稿、保存中输入保留；读取在途后输入与取消导航/后退实测通过 | 原生 beforeunload 与 OS 确认框未自动验收；本次 confirm 返回由隔离测试脚本控制 |
+
+## 最终构建与浏览器验收（2.2.18）
+
+第六轮夹具使用最终构建产物、10000 节点、真实启动探测全部成功。注入 10000 条日志后显示 1000 行，初次观察两批日志容器 DOM 更新（history/stream 可以分别到达，不等于 FPS）。服务端暂挂历史请求时 history/SSE 活跃各 1，离开后均 0、history 取消 1；整个巡检多次进入调试页后 SSE 累计取消 4。当前页配置/运行态/诊断/解锁详情请求均按 50 个 ID，标签弹窗请求 node_ids_count=1，没有闭合状态全量 assignments 读取。
+
+破坏操作的删除弹窗准确显示恶意形态名称的文本，取消后弹窗消失、50 行仍在，服务端没有 DELETE 请求。注入 TagsPanel 脚本 503 后显示“页面加载失败”，仍可切换系统设置；解除并刷新后恢复。注入标签 API 503 显示错误/重试，解除后成功。控制台唯一 error 是预期注入的动态导入失败，没有把它隐去后声称全程零错误。退出后刷新仍显示登录页。手机与桌面十页复核后恢复默认视口；命名停止文件优雅退出夹具，456.12 秒 PASS。
+
+最终检查按前端先于 Go 的顺序执行，全部退出码 0：
+
+```powershell
+# frontend 目录
+npm run lint
+npm test
+npm run build
+npm audit --json
+npm audit --omit=dev --json
+# 仓库根目录
+$env:GOTMPDIR = (Resolve-Path .tools/frontend-audit).Path
+$env:CGO_ENABLED = '0'
+go test -p 1 ./...
+go build -o .tools/frontend-audit/final-windows.exe ./cmd/easy_proxies
+$env:GOOS = 'linux'
+$env:GOARCH = 'amd64'
+go vet -tags 'with_utls with_quic with_grpc with_wireguard with_gvisor' ./...
+go build -trimpath -ldflags '-s -w' -tags 'with_utls with_quic with_grpc with_wireguard with_gvisor' -o .tools/frontend-audit/final-linux-amd64 ./cmd/easy_proxies
+git diff --check
+```
+
+lint / 15 项行为测试 / tsc+Vite build 日志为 `lint-final.txt`、`test-final.txt`、`build-final.txt`；入口最终 295.22 kB（gzip 91.23 kB，Vite 估计），初始 655.32/185.30 kB。完整和生产 npm audit 均 0，代表本次锁定依赖的已知公告扫描，不是所有安全缺陷不存在的证明。Go 日志 `go-test-final.txt`、`windows-build-final.txt`、`linux-vet-final.txt`、`linux-build-final.txt`；Windows 二进制 48972288 B，Linux 51175584 B，均在忽略目录。
+
+版本三处同步 2.2.18，计数 Go 生产 41339、测试 25893、前端 TS/TSX 10116，Store 接口 111、migration v25 不变。当前架构、前端子系统、规格、CI/Docker 前端门禁与审计索引已同步；原始截图/日志/临时配置/SQLite/二进制不入 Git。未执行 race（无 gcc/clang，CGO_ENABLED=0）、Linux 运行态负载或本地 Docker/GitHub Actions；这些不计为通过。架构后续容量建议保留在独立复核报告，不冒充已实现。完成自审后提交本地 Git，不推送、打 tag 或发布。

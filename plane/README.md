@@ -8,7 +8,8 @@
 
 | 文档 | 用途与状态 |
 | --- | --- |
-| [前端合理性、安全与性能审计](changes/frontend-audit/plan.md) | 依赖、会话/缓存、按需加载、流式资源、表单与移动/键盘验证；实施中 |
+| [架构合理性与性能复核](changes/architecture-review-2026-10-28.md) | 单机形态取舍、内存/吞吐瓶颈、已实施结果和后续优先级 |
+| [前端合理性、安全与性能审计](changes/frontend-audit/plan.md) | 依赖、会话/缓存、按需加载、流式资源、表单与移动/键盘验证 |
 | [池性能审计后续评估与修复](changes/pool-memory-throughput/followup.md) | 原五项后续建议、测量入口、内存/吞吐优化与逐项验收进度 |
 | [池快照内存与选路吞吐审计](changes/pool-memory-throughput/plan.md) | 架构评估、连接引用收敛、固定模式线性回退及基准验收 |
 | [解锁页在线可用范围](changes/unlock-healthy-scope/plan.md) | 列表、统计与检测目标统一限制在线可用，保留其它页面原范围 |

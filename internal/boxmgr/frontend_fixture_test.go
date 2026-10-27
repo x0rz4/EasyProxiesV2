@@ -141,7 +141,11 @@ func TestFrontendBrowserFixture(t *testing.T) {
 	}
 	manager.MonitorServer().SetTagService(nodetag.NewService(db, nodetag.WithRegistry(monitor.NewTagFactRegistry()), nodetag.WithUnlockProviders(monitor.TagUnlockFactProviders())))
 	manager.MonitorServer().SetSubscriptionRefresher(subscription.New(cfg, manager, subscription.WithStore(db)))
-	t.Logf("FRONTEND_FIXTURE http://%s nodes=%d; synthetic password in test source; stop via named file", cfg.Management.Listen, nodes)
+	fixtureURL := "http://" + cfg.Management.Listen
+	if os.Getenv("EASY_PROXIES_FRONTEND_CONTROLS") == "1" {
+		fixtureURL = frontendControlledProxy(t, fixtureURL).URL
+	}
+	t.Logf("FRONTEND_FIXTURE %s nodes=%d; synthetic password in test source; stop via named file", fixtureURL, nodes)
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 	for {

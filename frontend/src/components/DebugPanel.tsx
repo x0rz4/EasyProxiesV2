@@ -4,26 +4,7 @@ import type { DebugLogEvent, DebugNode, TimelineEvent } from '../types'
 import { controlClass, PageContent, PageHeader, PageLayout } from './ui/PageLayout'
 import { useQuery } from '@tanstack/react-query'
 import { Terminal, RefreshCw } from 'lucide-react'
-
-interface LogEntry {
-  nodeTag: string
-  nodeName: string
-  event: TimelineEvent
-}
-
-const maxLogEntries = 1000
-
-function logKey(log: LogEntry): string {
-  return `${log.nodeTag}|${log.event.time}|${log.event.destination ?? ''}|${log.event.success}|${log.event.error ?? ''}`
-}
-
-function mergeLogs(current: LogEntry[], incoming: LogEntry[]): LogEntry[] {
-  const merged = new Map(current.map((log) => [logKey(log), log]))
-  for (const log of incoming) merged.set(logKey(log), log)
-  return [...merged.values()]
-    .sort((a, b) => new Date(b.event.time).getTime() - new Date(a.event.time).getTime())
-    .slice(0, maxLogEntries)
-}
+import { createLogBuffer, mergeLogs, runtimeLog, type LogEntry } from '../utils/runtimeLogs'
 
 function formatLogTime(value: string): string {
   const date = new Date(value)
@@ -58,7 +39,7 @@ export default function DebugPanel() {
 
   const { data: debugData, refetch: loadHistory, isFetching, error: queryError } = useQuery({
     queryKey: ['debugHistory'],
-    queryFn: fetchDebug,
+    queryFn: ({ signal }) => fetchDebug(signal),
     refetchOnWindowFocus: false
   })
 
@@ -66,31 +47,24 @@ export default function DebugPanel() {
     if (!debugData) return
     const timer = window.setTimeout(() => {
       setNodes(debugData.nodes)
-      const history = debugData.nodes.flatMap((node) => (node.timeline ?? []).map((event) => ({
-        nodeTag: node.tag,
-        nodeName: node.name || node.tag,
-        event,
-      })))
+      const history = debugData.nodes.flatMap(node => (node.timeline ?? []).map(event => runtimeLog(node.tag, node.name || node.tag, event)))
       setLogs((current) => mergeLogs(current, history))
     }, 0)
     return () => window.clearTimeout(timer)
   }, [debugData])
 
   useEffect(() => {
-    let pending: LogEntry[] = []
+    const pending = createLogBuffer()
     let timer: ReturnType<typeof setTimeout> | undefined
     const stream = streamDebugLogs((message: DebugLogEvent) => {
-      const log = { nodeTag: message.node_tag, nodeName: message.node_name || message.node_tag, event: message.event }
-      pending.push(log)
-      if (pending.length > maxLogEntries) pending = pending.slice(-maxLogEntries)
+      pending.push(runtimeLog(message.node_tag, message.node_name || message.node_tag, message.event))
       if (timer === undefined) timer = setTimeout(() => {
-        const batch = pending
-        pending = []
+        const batch = pending.drain()
         timer = undefined
         setLogs(current => mergeLogs(current, batch))
       }, 100)
     }, setConnected)
-    return () => { stream.abort(); clearTimeout(timer) }
+    return () => { stream.abort(); clearTimeout(timer); pending.drain() }
   }, [])
 
   const error = (queryError as Error)?.message || ''
@@ -125,7 +99,7 @@ export default function DebugPanel() {
           </div>
           <div className="flex-1 overflow-auto p-4 font-mono text-xs leading-6 sm:text-sm">
             {loading ? <div className="flex h-full items-center justify-center"><span className="loading loading-spinner text-primary" /></div> : visibleLogs.length === 0 ? <div className="flex h-full items-center justify-center text-slate-500">{selectedNode === 'all' ? '暂无运行日志' : '该节点暂无运行日志'}</div> : visibleLogs.map((log) => (
-              <LogRow key={logKey(log)} log={log} />
+              <LogRow key={log.key} log={log} />
             ))}
           </div>
           <div className="flex items-center justify-between border-t border-slate-700/80 bg-[#171c26] px-4 py-2 text-xs text-slate-500">

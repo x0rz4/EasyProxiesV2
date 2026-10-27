@@ -4,7 +4,7 @@
 > 权威行为契约见 [plane/specs/proxy-pool/spec.md](../plane/specs/proxy-pool/spec.md)（MUST/场景）；
 > 变更提案与历史见 [plane/](../plane/)。本文件只讲"现在是怎么搭的"，不写"应该怎么改"。
 >
-> 基线核对：v2.2.17（前端审计实施中），migration 至 v25，`internal/` + `cmd/` 约 **41.3k** 行非测试代码、约 **25.7k** 行测试，
+> 基线核对：v2.2.18，migration 至 v25，`internal/` + `cmd/` 约 **41.3k** 行非测试代码、约 **25.9k** 行测试，
 > 前端 `frontend/src` 约 **10.1k** 行 TS/TSX。核对日期 2026-10-28。
 
 ## 1. 一句话说清这个系统
@@ -194,7 +194,7 @@ inbound → pool 取 PoolSnapshot（不可变）→ 按 mode 选成员 → 拨�
 
 ## 9. 前端（React 19 + TS + Vite 7 + Tailwind 4 + DaisyUI 5）
 
-源码 `frontend/src/`（约 10k 行），`components/` `api/` `types/` `utils/`。构建产物直接落到 `internal/httpapi/assets/`，被 `//go:embed assets/*` 内嵌进二进制 → 单文件运行。**没有产物时 `go build ./...` 必失败**——先跑前端构建（AGENTS 构建顺序陷阱）。无单测框架，验收标准 = `npm run lint` + `npm run build` 通过。
+源码 `frontend/src/`（约 10k 行），`components/` `api/` `types/` `utils/`。构建产物直接落到 `internal/httpapi/assets/`，被 `//go:embed assets/*` 内嵌进二进制 → 单文件运行。**没有产物时 `go build ./...` 必失败**——先跑前端构建（AGENTS 构建顺序陷阱）。行为回归使用 Node 内置 test runner；验收标准 = `npm run lint` + `npm test` + `npm run build` 通过。
 
 ## 10. 默认端口与关键常量
 

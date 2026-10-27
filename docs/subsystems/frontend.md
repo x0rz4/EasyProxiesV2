@@ -45,6 +45,8 @@ frontend/src/
 
 节点文本筛选等待 250 ms 静止后请求，querySpec 始终与输入一致，筛选查询闲置保留 30 秒；分页详情仍传 AbortSignal。标签分配仅在编辑时读取目标节点，初次加载成功前禁用保存。SSE 共用 16 Mi 字符事件上限与分帧器，正确处理 CRLF/多行/UTF-8；流量 EOF 触发重连，mutating probe-all POST 不重放，检测任务 GET 重连后读取新快照。测速抽屉关闭/换节点/卸载即取消，终态释放 reader。调试流每 100 ms 合并渲染一次，队列和显示各最多 1000 条。
 
+`utils/runtimeLogs.ts` 提供固定 1000 槽的待处理环形缓冲；满载覆盖最早到达项，drain 后释放槽引用。每条事件只计算一次去重键与时间戳，合并保留未变行对象，供 memo 行复用。Debug 历史请求也接收 Query 的 AbortSignal，离开页面取消在途读取。该队列是即时展示的有损窗口，不替代后端健康日志；后端历史与节点元数据读取仍随节点总数增长。
+
 ## 页面与表格滚动
 
 - 解锁检测页与节点管理页使用默认 `PageLayout` / `PageContent`，由 App 的 `<main class="overflow-y-auto">` 整页滚动。

@@ -6,7 +6,7 @@ globalThis.window = new EventTarget()
 globalThis.localStorage = { removeItem() {}, getItem() { throw new Error('blocked') }, setItem() { throw new Error('blocked') } }
 const { ApiError, request, authFetch, setToken, clearToken } = await import('../src/api/transport.ts')
 const { EventStreamDecoder, readEvents, waitForReconnect } = await import('../src/api/sse.ts')
-const { streamTraffic, streamNodeCheckTask, probeAllNodes, fetchTagAssignments, streamSpeedtest } = await import('../src/api/client.ts')
+const { streamTraffic, streamNodeCheckTask, probeAllNodes, fetchTagAssignments, streamSpeedtest, fetchDebug } = await import('../src/api/client.ts')
 const { readPreference, writePreference } = await import('../src/utils/storage.ts')
 const { createQueryClient } = await import('../src/queryClient.ts')
 
@@ -123,6 +123,35 @@ test('terminal reconnect snapshots deliver one UI completion before releasing th
     assert.equal(cancelled, 1)
     assert.equal(body.locked, false)
   }
+})
+
+test('leaving debug history forwards cancellation to the in-flight request', async t => {
+  const controller = new AbortController()
+  t.mock.method(globalThis, 'fetch', (path, options) => {
+    assert.equal(path, '/api/debug')
+    assert.equal(options.signal, controller.signal)
+    return new Promise((resolve, reject) => options.signal.addEventListener('abort', () => reject(options.signal.reason), { once:true }))
+  })
+  const pending = fetchDebug(controller.signal)
+  controller.abort()
+  await assert.rejects(pending, { name:'AbortError' })
+})
+
+test('inactive production query caches release data at their configured deadline', async t => {
+  t.mock.timers.enable({ apis:['setTimeout','Date'], now:1700000000000 })
+  const client = createQueryClient()
+  try {
+    await client.fetchQuery({ queryKey:['page'], gcTime:30000, queryFn:async()=>({id:1}) })
+    await client.fetchQuery({ queryKey:['detail'], queryFn:async()=>({id:1}) })
+    t.mock.timers.tick(29999)
+    assert.deepEqual(client.getQueryData(['page']), {id:1})
+    t.mock.timers.tick(1)
+    assert.equal(client.getQueryData(['page']), undefined)
+    assert.deepEqual(client.getQueryData(['detail']), {id:1})
+    t.mock.timers.tick(30000)
+    assert.equal(client.getQueryData(['detail']), undefined)
+    assert.equal(client.getQueryCache().getAll().length, 0)
+  } finally { client.clear(); t.mock.timers.reset() }
 })
 
 test('named speed events finish and named server errors report without reconnecting', async t => {

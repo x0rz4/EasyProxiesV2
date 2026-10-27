@@ -367,8 +367,8 @@ export function streamSpeedtest(tag: string, onSpeed: (mbps: number, done: boole
   return controller
 }
 
-export async function fetchDebug(): Promise<DebugResponse> {
-  return request<DebugResponse>('/api/debug')
+export async function fetchDebug(signal?: AbortSignal): Promise<DebugResponse> {
+  return request<DebugResponse>('/api/debug', { signal })
 }
 
 export function streamDebugLogs(onEvent: (event: DebugLogEvent) => void, onStatus: (connected: boolean) => void): AbortController {
