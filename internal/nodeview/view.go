@@ -6,6 +6,7 @@ import (
 	"cmp"
 	"crypto/sha256"
 	"fmt"
+	"hash"
 	"slices"
 	"sort"
 	"strings"
@@ -177,31 +178,88 @@ type View struct {
 }
 
 func New(nodes []Node, names map[int64]string, facts []nodefacts.NodeFacts, now time.Time) *View {
-	v := &View{nodes: append([]Node(nil), nodes...), names: make(map[int64]string, len(names)), facts: map[int64]nodefacts.NodeFacts{}, now: now}
+	nodes = append([]Node(nil), nodes...)
+	copyNames := make(map[int64]string, len(names))
 	for id, name := range names {
-		v.names[id] = name
+		copyNames[id] = name
 	}
-	for i := range v.nodes {
-		v.nodes[i].Tags = append([]string(nil), v.nodes[i].Tags...)
-		v.nodes[i].SubscriptionIDs = append([]int64(nil), v.nodes[i].SubscriptionIDs...)
+	for i := range nodes {
+		nodes[i] = cloneNode(nodes[i])
 	}
-	for _, fact := range facts {
+	copyFacts := make([]nodefacts.NodeFacts, len(facts))
+	for i, fact := range facts {
 		copyFact := fact
 		copyFact.Values = make(map[string]nodefacts.Value, len(fact.Values))
 		for key, value := range fact.Values {
 			value.Set = append([]string(nil), value.Set...)
 			copyFact.Values[key] = value
 		}
-		v.facts[fact.NodeID] = copyFact
+		copyFacts[i] = copyFact
 	}
-	sort.Slice(v.nodes, func(i, j int) bool { return v.nodes[i].ID < v.nodes[j].ID })
-	encoded, _ := json.MarshalCanonical(struct {
-		Nodes []Node
-		Names map[int64]string
-		Facts []nodefacts.NodeFacts
-	}{v.nodes, v.names, facts})
-	v.revision = fmt.Sprintf("%x", sha256.Sum256(encoded))
+	return NewOwned(nodes, copyNames, copyFacts, now)
+}
+
+// NewOwned takes exclusive ownership of all inputs, including nested slices and
+// fact maps. The caller must not reuse or mutate them after this call. Use New
+// when inputs are shared. HTTP loaders can transfer freshly allocated data and
+// avoid duplicating an entire fact snapshot merely to cross the package boundary.
+func NewOwned(nodes []Node, names map[int64]string, facts []nodefacts.NodeFacts, now time.Time) *View {
+	v := &View{nodes: nodes, names: names, facts: make(map[int64]nodefacts.NodeFacts, len(facts)), now: now}
+	// Preserve the existing wire representation of empty nested slices. The
+	// defensive constructor historically normalized them to nil while cloning.
+	for i := range v.nodes {
+		if len(v.nodes[i].Tags) == 0 {
+			v.nodes[i].Tags = nil
+		}
+		if len(v.nodes[i].SubscriptionIDs) == 0 {
+			v.nodes[i].SubscriptionIDs = nil
+		}
+	}
+	for i := range facts {
+		if facts[i].Values == nil {
+			facts[i].Values = map[string]nodefacts.Value{}
+		}
+		for key, value := range facts[i].Values {
+			if value.Set != nil && len(value.Set) == 0 {
+				value.Set = nil
+				facts[i].Values[key] = value
+			}
+		}
+		v.facts[facts[i].NodeID] = facts[i]
+	}
+	slices.SortFunc(v.nodes, func(a, b Node) int { return cmp.Compare(a.ID, b.ID) })
+	slices.SortStableFunc(facts, func(a, b nodefacts.NodeFacts) int { return cmp.Compare(a.NodeID, b.NodeID) })
+	// Revision is opaque. Hash canonical records separately so JSON growth and
+	// escaping never require a second full-snapshot buffer. Newlines are safe
+	// record separators because JSON strings escape embedded newlines.
+	h := sha256.New()
+	_, _ = h.Write([]byte("nodeview:2\nnodes\n"))
+	for start := 0; start < len(v.nodes); start += 256 {
+		hashRevisionRecord(h, v.nodes[start:min(start+256, len(v.nodes))])
+	}
+	_, _ = h.Write([]byte("names\n"))
+	if names == nil {
+		names = map[int64]string{}
+	}
+	hashRevisionRecord(h, names)
+	_, _ = h.Write([]byte("facts\n"))
+	for start := 0; start < len(facts); start += 32 {
+		hashRevisionRecord(h, facts[start:min(start+32, len(facts))])
+	}
+	v.revision = fmt.Sprintf("%x", h.Sum(nil))
 	return v
+}
+
+func hashRevisionRecord(h hash.Hash, value any) {
+	encoded, _ := json.MarshalCanonical(value)
+	_, _ = h.Write(encoded)
+	_, _ = h.Write([]byte{'\n'})
+}
+
+func cloneNode(node Node) Node {
+	node.Tags = slices.Clone(node.Tags)
+	node.SubscriptionIDs = slices.Clone(node.SubscriptionIDs)
+	return node
 }
 
 func (v *View) Revision() string { return v.revision }
@@ -219,7 +277,7 @@ func (v *View) Candidates(spec nodeselect.Spec) []Candidate {
 		if !node.Enabled {
 			decision = nodeselect.Decision{Reason: "node_disabled"}
 		}
-		result = append(result, Candidate{Node: node, Decision: decision})
+		result = append(result, Candidate{Node: cloneNode(node), Decision: decision})
 	}
 	return result
 }
@@ -228,25 +286,67 @@ func (v *View) Query(spec Spec, page Page) (Result, error) {
 	if err := page.Normalize(); err != nil {
 		return Result{}, err
 	}
-	filter := spec.Filter(v.names)
-	matched := make([]Node, 0)
-	for _, node := range v.nodes {
-		allowed, err := v.allow(spec, filter, node)
+	matcher, err := v.matcher(spec)
+	if err != nil {
+		return Result{}, err
+	}
+	result := Result{Items: []Node{}, Page: page, SnapshotRevision: v.revision}
+	if page.Sort == "id" {
+		// The immutable snapshot is already in ID order. Count all matches but
+		// materialize only this page, including for reverse traversal.
+		for i := range v.nodes {
+			index := i
+			if page.Descending {
+				index = len(v.nodes) - 1 - i
+			}
+			node := v.nodes[index]
+			allowed, err := matcher.allow(node)
+			if err != nil {
+				return Result{}, err
+			}
+			if !allowed {
+				continue
+			}
+			if result.Total >= page.Offset && len(result.Items) < page.Limit {
+				result.Items = append(result.Items, cloneNode(node))
+			}
+			result.Total++
+		}
+		return result, nil
+	}
+	matched := make([]int, 0)
+	var nameKeys []string
+	if page.Sort == "name" {
+		nameKeys = make([]string, len(v.nodes))
+	}
+	for index, node := range v.nodes {
+		allowed, err := matcher.allow(node)
 		if err != nil {
 			return Result{}, err
 		}
 		if allowed {
-			matched = append(matched, node)
+			matched = append(matched, index)
+			if nameKeys != nil {
+				nameKeys[index] = strings.ToLower(node.Name)
+			}
 		}
 	}
+	field := ""
+	switch page.Sort {
+	case "speed_bps":
+		field = nodefacts.FieldSpeedBps
+	case "fraud_score":
+		field = nodefacts.FieldIPQMaxFraudScore
+	case "diagnostic_latency":
+		field = nodefacts.FieldLatencyMs
+	}
 	sort.Slice(matched, func(i, j int) bool {
-		a, b := matched[i], matched[j]
+		a, b := v.nodes[matched[i]], v.nodes[matched[j]]
 		cmp := 0
 		switch page.Sort {
 		case "name":
-			cmp = strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name))
+			cmp = strings.Compare(nameKeys[matched[i]], nameKeys[matched[j]])
 		case "speed_bps", "fraud_score", "diagnostic_latency":
-			field := map[string]string{"speed_bps": nodefacts.FieldSpeedBps, "fraud_score": nodefacts.FieldIPQMaxFraudScore, "diagnostic_latency": nodefacts.FieldLatencyMs}[page.Sort]
 			av, bv := v.facts[a.ID].Value(field), v.facts[b.ID].Value(field)
 			if av.Known != bv.Known {
 				return av.Known
@@ -270,12 +370,6 @@ func (v *View) Query(spec Spec, page Page) (Result, error) {
 			} else if a.LatencyMS > b.LatencyMS {
 				cmp = 1
 			}
-		case "id":
-			if a.ID < b.ID {
-				cmp = -1
-			} else if a.ID > b.ID {
-				cmp = 1
-			}
 		}
 		if cmp == 0 {
 			return a.ID < b.ID
@@ -285,10 +379,12 @@ func (v *View) Query(spec Spec, page Page) (Result, error) {
 		}
 		return cmp < 0
 	})
-	result := Result{Items: []Node{}, Total: len(matched), Page: page, SnapshotRevision: v.revision}
+	result.Total = len(matched)
 	start := min(page.Offset, len(matched))
 	end := start + min(page.Limit, len(matched)-start)
-	result.Items = append(result.Items, matched[start:end]...)
+	for _, index := range matched[start:end] {
+		result.Items = append(result.Items, cloneNode(v.nodes[index]))
+	}
 	return result, nil
 }
 
@@ -377,13 +473,32 @@ func (s Spec) inScope(node Node) bool {
 
 // Allow applies the same constraints as Query to one node from this snapshot.
 func (v *View) Allow(spec Spec, node Node) (bool, error) {
-	return v.allow(spec, spec.Filter(v.names), node)
+	matcher, err := v.matcher(spec)
+	if err != nil {
+		return false, err
+	}
+	return matcher.allow(node)
 }
-func (v *View) allow(spec Spec, filter nodeselect.Filter, node Node) (bool, error) {
+
+type viewMatcher struct {
+	view   *View
+	spec   Spec
+	filter nodeselect.Filter
+	text   string
+	preset *nodefacts.Condition
+}
+
+func (v *View) matcher(spec Spec) (viewMatcher, error) {
+	preset, err := DiagnosticCondition(spec.Diagnostic)
+	return viewMatcher{view: v, spec: spec, filter: spec.Filter(v.names), text: strings.ToLower(strings.TrimSpace(spec.Text)), preset: preset}, err
+}
+
+func (m viewMatcher) allow(node Node) (bool, error) {
+	v, spec, filter := m.view, m.spec, m.filter
 	if !filter.Allow(nodeselect.Node{ID: node.ID, Region: node.Region, Tags: node.Tags}) {
 		return false, nil
 	}
-	if spec.Text != "" && !strings.Contains(strings.ToLower(node.Name), strings.ToLower(strings.TrimSpace(spec.Text))) {
+	if spec.Text != "" && !strings.Contains(strings.ToLower(node.Name), m.text) {
 		return false, nil
 	}
 	if !spec.inScope(node) {
@@ -416,10 +531,8 @@ func (v *View) allow(spec Spec, filter nodeselect.Filter, node Node) (bool, erro
 			return false, nil
 		}
 	}
-	if preset, err := DiagnosticCondition(spec.Diagnostic); err != nil {
-		return false, err
-	} else if preset != nil {
-		ok, err := nodefacts.Evaluate(*preset, v.facts[node.ID], v.now)
+	if m.preset != nil {
+		ok, err := nodefacts.Evaluate(*m.preset, v.facts[node.ID], v.now)
 		if err != nil || !ok {
 			return false, err
 		}
@@ -442,9 +555,12 @@ func comparePorts(a, b uint16) int { return cmp.Compare(a, b) }
 // over a changing runtime or sorting/materializing full node responses.
 func (v *View) IDs(spec Spec) ([]int64, error) {
 	ids := []int64{}
-	filter := spec.Filter(v.names)
+	matcher, err := v.matcher(spec)
+	if err != nil {
+		return nil, err
+	}
 	for _, node := range v.nodes {
-		allowed, err := v.allow(spec, filter, node)
+		allowed, err := matcher.allow(node)
 		if err != nil {
 			return nil, err
 		}

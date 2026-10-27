@@ -56,6 +56,13 @@ func (l *Loader) Load(ctx context.Context, nodeIDs []int64) ([]NodeFacts, error)
 	if err != nil {
 		return nil, err
 	}
+	return l.LoadFromNodes(ctx, nodes)
+}
+
+// LoadFromNodes reuses nodes already loaded in the caller's consistent read
+// transaction. It reads the remaining fact families through the same Source;
+// an empty slice is empty, never a request to widen to every node.
+func (l *Loader) LoadFromNodes(ctx context.Context, nodes []store.Node) ([]NodeFacts, error) {
 	if len(nodes) == 0 {
 		return nil, nil
 	}
@@ -94,6 +101,13 @@ func (l *Loader) Load(ctx context.Context, nodeIDs []int64) ([]NodeFacts, error)
 	out := make([]NodeFacts, 0, len(nodes))
 	for _, node := range nodes {
 		facts := NewNodeFacts(node.ID, node.Name, noderegion.Normalize(node.Region))
+		// Most nodes expose about 32 base fields. Provider rows add more; this
+		// is only a growth hint, not a limit or a second field registry.
+		capacity := 32 + len(qualities[node.ID])*10
+		if unlock := unlocks[node.ID]; unlock != nil {
+			capacity += 8 + len(unlock.Services)*3
+		}
+		facts.Values = make(map[string]Value, capacity)
 		applyNodeFields(facts, node)
 		applySourceFields(facts, subscriptionIDs[node.ID], subscriptionNames, manualTags[node.ID])
 		applyStatsFields(facts, stats[node.ID])

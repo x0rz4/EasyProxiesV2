@@ -8,13 +8,14 @@ import (
 // DiagnosticCondition exposes named UI presets through the existing fact DSL.
 // These predicates never publish health events or alter pool membership.
 func DiagnosticCondition(name string) (*nodefacts.Condition, error) {
+	if name == "" {
+		return nil, nil
+	}
 	leaf := func(field string, op nodefacts.Operator, value any) nodefacts.Condition {
 		return nodefacts.Condition{FieldName: field, Op: op, Value: value}
 	}
 	var result nodefacts.Condition
 	switch name {
-	case "":
-		return nil, nil
 	case "untested":
 		result = leaf(nodefacts.FieldUnlockState, nodefacts.OpIsUnknown, nil)
 	case "failed", "unlocked", "mixed":

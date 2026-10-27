@@ -29,6 +29,12 @@
 
 ## 事实引擎与标签（nodefacts + nodetag）
 
+节点视图 `internal/nodeview/view.go` 保持不可变快照：`New` 深复制共享输入；`NewOwned` 接管调用方新建的节点、标签名及嵌套事实数据，调用后不得复用或修改输入。HTTP 加载器在同一个 WithReadTx 中构造新鲜数据后转移所有权，避免复制整份事实；页面与候选响应独立复制嵌套切片，调用方无法通过响应修改快照。
+
+revision 是不透明标识：按 ID 排序，以固定大小批次的 canonical JSON 逐段做 SHA-256，不再创建整份快照的 JSON 临时副本。ID 页面仅计数并物化当前页；其它排序保存节点下标，名称键与诊断预设按请求准备一次，成员资格仍通过同一 nodeselect 谓词。
+
+`internal/nodefacts/loader.go` 的 `LoadFromNodes` 供已经持有同一读事务节点行的调用方复用；空输入直接返回空，不重新读取或扩大节点范围。其它事实族仍从同一 Source 加载；普通 `Load` 保持原行为。事实 map 使用按基础字段和 provider 数量估计的容量提示，不限制字段数或引入第二份字段注册表。
+
 - `nodefacts`：纯事实/条件引擎（store 行 → 类型化 fact、字段注册表 `Registry`、条件 DSL `Condition` 与求值）。**不认 tag、不 import unlock/ipquality**（provider 经 `ProviderInfo` 注入）。
 - `nodetag`：tag 语义与调度（规则编译、互斥组仲裁、manual 覆盖 auto、重算队列 2s 防抖 + 10min sweep、落库、内置模板）。
 

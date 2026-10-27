@@ -253,6 +253,8 @@ TCP/UDP 选路和未完成的拨号重试 MUST 持有同一快照，防止候选
 
 节点视图 MUST 在读连接池的一致性事务中加载节点、标签和事实，不占用唯一写连接。分页页面 MUST 只加载当前页 ID 的详情/结果；跨页选择保留 ID。详情接口的空 ID 列表 MUST 返回空，非法 ID MUST 拒绝，不能降级为全量读取；原有认证和订阅可见性保持不变。
 
+同一视图中已有的 managed 行 MUST 在加载事实时复用，不能因节点重复读取而扩大范围；元数据和事实仍共享该读事务。新鲜数据可以通过显式所有权转移交给不可变视图，共享输入仍须防御性复制；调用方不得通过修改返回页面/候选的嵌套集合改写快照。ID 分页 MUST 仅物化当前页，计数与 query-ids、其它排序仍保持相同成员谓词。snapshot_revision 是不透明标识，编码实现可以改变，MUST 覆盖节点、标签名与已加载事实，不能依赖输入行顺序。
+
 ### Scenario: 查询时写入、空页和跨页选择
 
 - GIVEN WAL 读快照正在生成，用户在多页选择了节点。
@@ -260,6 +262,8 @@ TCP/UDP 选路和未完成的拨号重试 MUST 持有同一快照，防止候选
 - THEN 写入可继续，当前查询仍看到原快照；跨页操作使用已选 ID，空列表不读取全体节点。
 
 代码：`internal/store/sqlite.go`、`internal/httpapi/nodeview_handlers.go`、`internal/httpapi/node_ids.go`、`frontend/src/components/ManagePanel.tsx`、`frontend/src/components/UnlockPanel.tsx`。测试：`TestSQLiteReadTransactionSnapshotAllowsWriter`、`TestPagedResultReadsNeverWidenIDs`、`TestListManagedNodes`。
+
+视图优化测试：`TestNodeViewReusesManagedRowsWithinConsistentReadSnapshot`、`TestLoadFromNodesReusesRowsAndPreservesFacts`、`TestViewConstructorsAgreeAndDefensiveSnapshotIsDetached`、`TestViewResponsesCannotMutateSnapshot`、`TestRevisionIsDeterministicAndIncludesNodesNamesAndFacts`、`TestIDPagesKeepTotalsFiltersAndDirection`、`TestIndexedSortsPreserveKnownFirstAndStableTies`。
 
 ## Requirement CONTROL-002：检测 SSE 终态可达且连接可退出
 

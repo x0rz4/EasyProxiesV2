@@ -2,12 +2,38 @@ package nodefacts
 
 import (
 	"context"
+	"reflect"
 	"testing"
 	"time"
 
 	"easy_proxies/internal/noderesult"
 	"easy_proxies/internal/store"
 )
+
+func TestLoadFromNodesReusesRowsAndPreservesFacts(t *testing.T) {
+	nodes := []store.Node{{ID: 1, Name: "first", URI: "http://127.0.0.1:80", Enabled: true, Region: "hk"}, {ID: 2, Name: "second", URI: "socks5://127.0.0.1:81", Enabled: true}}
+	source := newCountingSource(nodes...)
+	source.stats[1] = &store.NodeStats{NodeID: 1, InitialCheckDone: true, Available: true, LastLatencyMs: 21, UpdatedAt: loadNow}
+	source.subscriptions[1] = []int64{7}
+	loader := NewLoader(source)
+	want, err := loader.Load(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source.calls = map[string]int{}
+	got, err := loader.LoadFromNodes(context.Background(), nodes)
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("preloaded facts differ: %v", err)
+	}
+	if source.calls["ListNodes"] != 0 {
+		t.Fatal("preloaded rows were read again")
+	}
+	source.calls = map[string]int{}
+	got, err = loader.LoadFromNodes(context.Background(), nil)
+	if err != nil || len(got) != 0 || source.total() != 0 {
+		t.Fatal("empty preloaded input widened or read other data")
+	}
+}
 
 var loadNow = time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
 

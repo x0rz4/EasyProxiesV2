@@ -57,9 +57,15 @@ func (s *Server) loadNodeView(ctx context.Context, withFacts bool) (*nodeview.Vi
 		for _, tag := range tags {
 			names[tag.ID] = tag.Name
 		}
-		ids := make([]int64, 0, len(managed))
+		nodes = make([]nodeview.Node, 0, len(managed))
+		var factNodes []store.Node
+		if withFacts {
+			factNodes = make([]store.Node, 0, len(managed))
+		}
 		for _, node := range managed {
-			ids = append(ids, node.ID)
+			if withFacts {
+				factNodes = append(factNodes, node.Node)
+			}
 			live, found := runtime[node.ID]
 			status := "pending"
 			if !node.Enabled {
@@ -85,8 +91,8 @@ func (s *Server) loadNodeView(ctx context.Context, withFacts bool) (*nodeview.Vi
 				Source: string(node.Source), Protocol: strings.ToLower(protocol), SubscriptionIDs: node.SubscriptionIDs, Status: status, LatencyMS: latency,
 				Port: node.Port, RuntimeTag: live.Tag, Healthy: node.Enabled && found && live.InitialCheckDone && live.Available && !live.Blacklisted && !live.Provisional, Enabled: node.Enabled})
 		}
-		if withFacts && len(ids) > 0 {
-			facts, err = nodefacts.NewLoader(tx).Load(ctx, ids)
+		if withFacts && len(factNodes) > 0 {
+			facts, err = nodefacts.NewLoader(tx).LoadFromNodes(ctx, factNodes)
 			if err != nil {
 				return err
 			}
@@ -96,7 +102,7 @@ func (s *Server) loadNodeView(ctx context.Context, withFacts bool) (*nodeview.Vi
 	if err != nil {
 		return nil, err
 	}
-	return nodeview.New(nodes, names, facts, time.Now().UTC()), nil
+	return nodeview.NewOwned(nodes, names, facts, time.Now().UTC()), nil
 }
 
 func (s *Server) handleNodeQuery(w http.ResponseWriter, r *http.Request) {
