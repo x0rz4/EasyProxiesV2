@@ -16,19 +16,16 @@ const (
 	// batch only after the previous callbacks returned, so a wedged consumer
 	// stops at one batch instead of buffering the whole journal in memory.
 	healthEventReadBatch = 64
-	// healthEventConsumedRetention is how long an event that every active
-	// consumer has already passed stays readable. Journal size in steady state is
-	// rate × this window, so it also sets the sustainable probe rate: 8192 rows
-	// over 5 minutes is ~27 measurements/second, far above any configured probe
-	// interval. A longer window would let a normally-behaving deployment fill the
-	// journal and start rejecting measurements even with every consumer caught
-	// up.
+	// Retain consumed history when capacity allows. Under pressure, acknowledged
+	// rows can be reclaimed earlier; unconsumed rows are never discarded.
 	healthEventConsumedRetention = 5 * time.Minute
 	// healthEventRetention applies when no consumer is registered: nothing owes
 	// the journal, so it is reclaimed by age alone.
-	healthEventRetention     = 30 * time.Minute
-	healthEventPruneInterval = time.Minute
-	healthEventRetryDelay    = time.Second
+	healthEventRetention         = 30 * time.Minute
+	healthEventPruneInterval     = time.Minute
+	healthEventPressureInterval  = time.Second
+	healthEventPressureThreshold = store.HealthEventJournalLimit * 3 / 4
+	healthEventRetryDelay        = time.Second
 	// healthEventInlineLimit bounds the compatibility path used when no store is
 	// configured (embedders and unit tests). It is deliberately still lossy and
 	// MUST NOT be read as the production contract: production delivery is the
@@ -517,6 +514,9 @@ type HealthEventConsumerStats struct {
 // the number of journal rows the slowest consumer still owes.
 // HealthEventStats is the JSON surface of GET /api/operations/health-events.
 type HealthEventStats struct {
+	PressureThreshold    int                        `json:"pressure_threshold"`
+	PressurePrunes       int64                      `json:"pressure_prunes"`
+	PrunedEvents         int64                      `json:"pruned_events"`
 	Capacity             int                        `json:"capacity"`
 	Count                int64                      `json:"count"`
 	MaxSeq               int64                      `json:"max_seq"`
@@ -527,14 +527,16 @@ type HealthEventStats struct {
 }
 
 type healthEventHub struct {
-	mu       sync.RWMutex
-	nextID   atomic.Uint64
-	byID     map[uint64]*healthEventSubscription
-	global   map[uint64]struct{}
-	byTag    map[string]map[uint64]struct{}
-	byNodeID map[int64]map[uint64]struct{}
-	journal  func() store.Store
-	rejected atomic.Int64
+	mu             sync.RWMutex
+	nextID         atomic.Uint64
+	byID           map[uint64]*healthEventSubscription
+	global         map[uint64]struct{}
+	byTag          map[string]map[uint64]struct{}
+	byNodeID       map[int64]map[uint64]struct{}
+	journal        func() store.Store
+	rejected       atomic.Int64
+	pressurePrunes atomic.Int64
+	prunedEvents   atomic.Int64
 }
 
 func newHealthEventHub(journal func() store.Store) *healthEventHub {
@@ -686,7 +688,8 @@ func (h *healthEventHub) close() {
 // stats merges journal capacity with per-consumer progress. Journal rows beyond
 // the slowest durable cursor are the backlog that still owes the state machine.
 func (h *healthEventHub) stats(ctx context.Context) (HealthEventStats, error) {
-	stats := HealthEventStats{Capacity: store.HealthEventJournalLimit, RejectedMeasurements: h.rejected.Load(), Consumers: []HealthEventConsumerStats{}}
+	stats := HealthEventStats{Capacity: store.HealthEventJournalLimit, RejectedMeasurements: h.rejected.Load(), Consumers: []HealthEventConsumerStats{},
+		PressureThreshold: healthEventPressureThreshold, PressurePrunes: h.pressurePrunes.Load(), PrunedEvents: h.prunedEvents.Load()}
 	h.mu.RLock()
 	subscriptions := make([]*healthEventSubscription, 0, len(h.byID))
 	for _, subscription := range h.byID {

@@ -11,6 +11,7 @@
 - `runtime` 由可选 `controlplane.RuntimeResourceReader` 提供：base/分组实例数、当前成员引用数、独立分组成员数、单成员最多覆盖组数、退休中成员数及 `group_amplification=group_members/unique_group_members`。计入 standby，因为它们仍持有 outbound。停止的 slot 不计作运行实例；退休引用单独计数。
 - 分组指标是跨 slot 的观测值，不是与并发重载原子一致的拓扑快照；不返回 tag、URI、身份或组配置。流量/连接数来自 monitor 注册表的聚合。
 - 健康日志容量、积压、最老事件年龄、拒绝次数与每消费者游标继续查看 `GET /api/operations/health-events`，避免每次资源采样都扫描日志。
+- 健康日志还返回 `pressure_threshold`、`pressure_prunes` 与 `pruned_events`。后两项是本次进程内成功压力清理次数和总回收行数，重启归零。到达 75% 容量时已确认历史可提前回收，不能把它当成固定保留五分钟的审计档案；未确认积压仍触发硬上限背压。
 
 常规生产采样建议每 5–10 秒一次，按时间差计算累计分配/流量/CPU 的速率；保持节点数、组数、重叠率、连接数和负载模式相同再比较。
 

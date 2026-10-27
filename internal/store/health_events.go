@@ -35,7 +35,6 @@ type HealthEventJournalStats struct {
 	MinSeq           int64
 	MaxSeq           int64
 	OldestRecordedAt time.Time
-	ConsumerCursors  map[string]int64
 }
 
 // HealthEventJournalLimit bounds the journal. Reaching it is a hard backpressure
@@ -142,27 +141,14 @@ func (s *sqliteStore) MaxHealthEventSeq(ctx context.Context) (int64, error) {
 }
 
 func (s *sqliteStore) HealthEventJournalStats(ctx context.Context) (HealthEventJournalStats, error) {
-	stats := HealthEventJournalStats{ConsumerCursors: make(map[string]int64)}
+	var stats HealthEventJournalStats
 	var oldest sql.NullString
 	if err := s.readConn().QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(MIN(seq),0), COALESCE(MAX(seq),0), COALESCE(MIN(recorded_at),'') FROM health_events`).
 		Scan(&stats.Count, &stats.MinSeq, &stats.MaxSeq, &oldest); err != nil {
 		return stats, err
 	}
 	stats.OldestRecordedAt = parseHealthEventTime(oldest.String)
-	rows, err := s.readConn().QueryContext(ctx, `SELECT consumer,seq FROM health_event_cursors`)
-	if err != nil {
-		return stats, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var consumer string
-		var seq int64
-		if err := rows.Scan(&consumer, &seq); err != nil {
-			return stats, err
-		}
-		stats.ConsumerCursors[consumer] = seq
-	}
-	return stats, rows.Err()
+	return stats, nil
 }
 
 // GetHealthEventCursor reports the persisted progress of a durable consumer.
@@ -246,12 +232,12 @@ func (s *sqliteStore) PruneHealthEvents(ctx context.Context, olderThan time.Time
 	query := `DELETE FROM health_events WHERE recorded_at < ?`
 	args := []any{formatHealthEventTime(olderThan)}
 	if len(activeConsumers) > 0 {
-		// An active consumer with no cursor row yet is positioned at the journal
-		// tail, so falling back to MAX(seq) only releases rows everyone has
-		// already passed.
-		query += ` AND seq <= (SELECT COALESCE(MIN(seq),
-     (SELECT COALESCE(MAX(seq),0) FROM health_events)) FROM health_event_cursors WHERE consumer IN (` +
-			placeholders(len(activeConsumers)) + `))`
+		// Missing initial cursors are not proof of persisted progress. Include
+		// them as zero so one failed registration write cannot release events
+		// the consumer has not durably acknowledged.
+		query += ` AND seq <= (SELECT MIN(COALESCE(c.seq,0)) FROM (VALUES ` +
+			strings.TrimSuffix(strings.Repeat("(?),", len(activeConsumers)), ",") +
+			`) AS active LEFT JOIN health_event_cursors c ON c.consumer=active.column1)`
 		for _, consumer := range activeConsumers {
 			args = append(args, consumer)
 		}

@@ -28,6 +28,7 @@
 - `health_event_cursors`：持久消费者的投递进度（`consumer` 为主键）；`PutHealthEventCursor` 只前进不后退，重试旧批次不会回退游标。游标 MUST 与该批事件产出的 `group_node_states` 同一事务提交（`AdvanceHealthCursorWithState`），否则崩溃可能留下"游标说已应用、状态却没落盘"的组合，踢出记录随之丢失。
 - 容量 `HealthEventJournalLimit`=8192；满时 `AppendHealthEvent` 返回 `ErrHealthEventJournalFull`，测量整体回滚（显式背压，不静默丢旧事实）。
 - `PruneHealthEvents(olderThan, activeConsumers)` 只删"超过保留窗口**且** `seq <= MIN(活跃游标)`"的行。`activeConsumers` 是**当前注册**的消费者键，不是整张 `health_event_cursors` 表：已删除/禁用分组留下的游标行必须被忽略，否则会永久钉住清理（详见 spec HEALTH-005）。没有注册消费者时按年龄清理。
+- 活跃消费者缺少游标行时按 0 处理，防止初始游标写失败后误删未确认记录。monitor 在达到 75% 容量时将本次历史窗口缩短为 0，仍受同一已提交游标边界约束；正常年龄清理保留原窗口。日志聚合统计不读取整张游标表，消费者投递状态由 monitor 自身提供。
 - 时间列用固定宽度布局 `2006-01-02T15:04:05.000000000Z07:00`：`RFC3339Nano` 会去掉末尾零，使 `…:00Z` 在 SQL 字符串比较里排到 `…:00.1Z` 之后，按年龄清理就会删错行。
 
 ## 分组节点状态（v25）

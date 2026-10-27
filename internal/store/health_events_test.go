@@ -280,6 +280,23 @@ func TestPruneHealthEventsWithoutConsumersUsesAgeOnly(t *testing.T) {
 	}
 }
 
+func TestPruneHealthEventsMissingActiveCursorKeepsDebt(t *testing.T) {
+	db := openHealthEventJournal(t)
+	ctx := context.Background()
+	seq := appendHealthEvent(t, db, 7, "unconfirmed", true)
+	if err := db.PutHealthEventCursor(ctx, "fast", seq); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := db.PruneHealthEvents(ctx, time.Now().Add(time.Second), []string{"fast", "not-persisted"})
+	if err != nil || removed != 0 {
+		t.Fatalf("missing active cursor released debt: removed=%d err=%v", removed, err)
+	}
+	removed, err = db.PruneHealthEvents(ctx, time.Now().Add(time.Second), []string{"not-persisted"})
+	if err != nil || removed != 0 {
+		t.Fatalf("all missing active cursors released debt: removed=%d err=%v", removed, err)
+	}
+}
+
 // group_node_states has two writers (the synchronous health-delivery
 // transaction and the asynchronous persister). Their snapshots can commit out of
 // order, so a write carrying an older revision must not overwrite a newer one:

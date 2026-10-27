@@ -450,30 +450,22 @@ func (m *Manager) healthJournal() store.Store {
 // passed them. Rows still owed by a slow consumer are never deleted, so a
 // wedged consumer shows up as backlog instead of a silent gap.
 func (m *Manager) pruneHealthJournal() {
-	ticker := time.NewTicker(healthEventPruneInterval)
+	ticker := time.NewTicker(healthEventPressureInterval)
 	defer ticker.Stop()
+	lastAgeSweep := time.Now()
 	for {
 		select {
 		case <-m.ctx.Done():
 			return
-		case <-ticker.C:
-			db := m.healthJournal()
-			if db == nil {
-				continue
-			}
-			consumers := m.healthEvents.durableConsumers()
-			window := healthEventConsumedRetention
-			if len(consumers) == 0 {
-				// Nothing owes the journal: reclaim by age alone.
-				window = healthEventRetention
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			removed, err := db.PruneHealthEvents(ctx, time.Now().UTC().Add(-window), consumers)
+		case now := <-ticker.C:
+			ageSweep := now.Sub(lastAgeSweep) >= healthEventPruneInterval
+			ctx, cancel := context.WithTimeout(m.ctx, 10*time.Second)
+			_, err := m.healthEvents.prune(ctx, now, ageSweep)
 			cancel()
 			if err != nil {
 				log.Printf("[monitor] prune health event journal: %v", err)
-			} else if removed > 0 {
-				log.Printf("[monitor] pruned %d consumed health event(s)", removed)
+			} else if ageSweep {
+				lastAgeSweep = now
 			}
 		}
 	}
