@@ -4,7 +4,7 @@
 > 权威行为契约见 [plane/specs/proxy-pool/spec.md](../plane/specs/proxy-pool/spec.md)（MUST/场景）；
 > 变更提案与历史见 [plane/](../plane/)。本文件只讲"现在是怎么搭的"，不写"应该怎么改"。
 >
-> 基线核对：v2.2.16（后续性能批次实施中），migration 至 v25，`internal/` + `cmd/` 约 **41.2k** 行非测试代码、约 **24.5k** 行测试，
+> 基线核对：v2.2.17，migration 至 v25，`internal/` + `cmd/` 约 **41.3k** 行非测试代码、约 **25.4k** 行测试，
 > 前端 `frontend/src` 约 **10.0k** 行 TS/TSX。核对日期 2026-10-27。
 
 ## 1. 一句话说清这个系统
@@ -139,7 +139,7 @@ GeoIP 预热 → 开 SQLite → 从 store 载入 nodes/groups/tags（store 覆�
 cmd → app
 
 app → boxmgr config geoip group monitor nodecodec nodetag probe runtimenodes store subscription
-boxmgr → builder config controlplane geoip group groupmember httpapi monitor netx nodecodec
+boxmgr → builder config controlplane geoip group groupmember httpapi jsonx monitor netx nodecodec
          nodedetect nodeloc outbound probe runtimenodes runtimetag store
 httpapi → config controlplane geoip group ipquality jsonx monitor nodecodec nodedetect nodefacts
           nodeloc noderegion noderesult nodeselect nodetag nodeview probe store subrender unlock

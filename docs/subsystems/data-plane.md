@@ -27,6 +27,8 @@ SS 插件在 `shadowsocksRuntimePlugin` 适配 Clash 与 sing-box 的格式差�
 
 ## 选路与连接引用
 
+每次发布独立的只读拓扑与索引；同一快照内，候选内容和顺序相同的 TCP/UDP/全体视图共用切片和索引，空协议视图不分配索引。按延迟排序前复制网络列表，避免改写拓扑顺序；不同版本不共享这些容器。monitor 的每节点 timeline 在首次实际事件时才分配，保留原有 20 条上限和迁移历史。
+
 `internal/outbound/pool/pool.go` 中 TCP/UDP 在选路和全部拨号重试期间持有同一份快照。连接建立后，包装器先增加选中 `memberRuntime.operations`，函数返回时释放快照；关闭连接只释放该成员的 operation 和活动连接计数，重复关闭不会重复递减。这样长连接保护自己的 outbound，同时允许无关退休成员排空，旧快照的整份拓扑和索引也不再因该连接保留。拨号未返回时仍保护全部重试候选，不能提前释放快照。契约见 RUNTIME-002。
 
 固定模式失效回退沿拓扑循环查找下一个候选，复用快照的 TCP/UDP/全体候选索引，最坏 O(N)、零额外分配。控制面传入任意子集或重排候选时临时构建索引，O(N+K)，保留拓扑优先和返回候选下标的语义。`balance` 仍逐连接扫描候选求精确最小活动数。
@@ -38,6 +40,8 @@ SS 插件在 `shadowsocksRuntimePlugin` 适配 Clash 与 sing-box 的格式差�
 池的 TCP 连接包装只在底层实际支持时暴露 `CloseRead` / `CloseWrite`。缺少写半关闭能力时由 sing-box 走完整关闭，仍通过 tracked 连接释放计数；真实半关闭不释放活动连接。不能靠忽略半关闭错误替代关闭。
 
 节点集合的唯一来源是 `runtimenodes.Load`（enabled 非订阅 + enabled 订阅可达，按 identity 去重）。冷启动 `Start` / 增量 `reloadNodesIncrementally` / 全量蓝绿 `reload` 三条路径都必须走它，不得各自过滤 `enabled`。
+
+`groupAppliedFingerprint` 以 canonical JSON 编码运行配置形态后计算 SHA-256，仅保留 64 字符摘要；成员先走统一谓词，再纳入原 YAML 指纹包含的 Name/URI/Port/Username/Password。ID、地区、标签和身份缓存不直接参与连接形态，空 refill 与 nil 等价；监听、策略、健康/恢复和 healing 配置仍参与比较。各 box 仍独立拥有 outbound，sharedMemberState 不承担跨 box 的关闭归属。
 
 ## 自愈链（HEAL）
 

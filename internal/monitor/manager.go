@@ -1410,6 +1410,9 @@ func (e *entry) recordSuccessWithLatency(latency time.Duration) {
 }
 
 func (e *entry) appendTimelineLocked(success bool, latencyMs int64, errStr string, destination string) {
+	if e.timeline == nil {
+		e.timeline = make([]TimelineEvent, 0, maxTimelineSize)
+	}
 	evt := TimelineEvent{
 		Time:        time.Now(),
 		Success:     success,

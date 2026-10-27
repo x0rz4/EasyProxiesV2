@@ -1,6 +1,6 @@
 # 后续评估与修复
 
-日期：2026-10-27。基线：502e5eb / 2.2.16。状态：实施中。承接 [首批审计](plan.md) 的全部五项后续建议，不将微基准视为生产容量认证。
+日期：2026-10-27。基线：502e5eb / 2.2.16。状态：已完成（2.2.17）。承接 [首批审计](plan.md) 的全部五项后续建议，不将微基准视为生产容量认证。
 
 ## 交付与验证清单
 
@@ -8,8 +8,8 @@
 - [x] S2 健康日志：实测追加、投递、清理与单写连接饱和；解决容量/保留窗口对规模的限制，保持慢消费者背压、游标与状态原子提交及崩溃重放。报告不同探测速率和消费积压下的边界。
 - [x] S3 节点查询：测量事实加载、revision、筛选/排序与序列化成本；优化主导成本，评估 SQL 下推，保持 CONTROL-001、统一成员谓词和接口输出。增加 1k/10k 节点基准及快照一致性回归。
 - [x] S4 balance：测量精确最少连接策略成本；评估并实现合适的吞吐优化。若采用双随机选择需明确配置/兼容性并验证公平性与并发，禁止默默改变既有 balance 语义。
-- [ ] S5 分组资源与规模报告：量化组数、成员重叠率、连接数与堆/RSS；评估跨组共享 outbound 的生命周期成本，依据 profile 实施可验证的资源修复，写明采纳/不采纳共享的理由。运行真实本地转发负载并保存命令、输入和结果。
-- [ ] 最终验收：逐条核对原五项建议；同步架构/子系统/规格与版本；前端 lint/build、全量 Go 测试、生产 tags vet/链接后提交 Git。未执行的验证必须说明原因。
+- [x] S5 分组资源与规模报告：量化组数、成员重叠率、连接数与堆/RSS；评估跨组共享 outbound 的生命周期成本，依据 profile 实施可验证的资源修复，写明采纳/不采纳共享的理由。运行真实本地转发负载并保存命令、输入和结果。
+- [x] 最终验收：逐条核对原五项建议；同步架构/子系统/规格与版本；前端 lint/build、全量 Go 测试、生产 tags vet/链接后提交 Git。未执行的验证必须说明原因。
 
 每项修复独立记录源码证据、变更和验证。先建立测量入口与本地可复现基线，再执行其余项；不会把“已有测试”直接计为规模验证。
 
@@ -26,7 +26,7 @@ profile 只在启动时显式设置 `EASY_PROXIES_PROFILE_ENABLED=1` 后开放�
 - `TestProfileReadableByGoTool` 实际生成 heap/CPU 文件，并分别调用 `go tool pprof -top` 成功解析；测试临时产物不入库。
 - Windows 本机 `go build ./cmd/easy_proxies` 及 Linux amd64 全生产 tags `go vet ./...` / `go build` 均通过。GOTMPDIR 使用仓库忽略目录，未调整系统策略。
 - 操作说明与指标局限已写入 `docs/performance.md`，行为约束同步 PERFORMANCE-001。全目标版本统一在最终验收时递增一次。
-- S1 是测量能力交付，不声称已经改善吞吐或证明线上 RSS 下降；S2–S5 继续执行。
+- S1 阶段只交付测量能力，不声称该阶段已经改善吞吐或证明线上 RSS 下降；后续测量与修复见 S2–S5。
 
 ## S2 设计与源码证据
 
@@ -69,7 +69,7 @@ go test -overlay .tools/pool-performance/health-overlay.json -p 1 ./internal/sto
 
 S2 最终验证：`go test -p 1 ./...` 全包通过（包括原有日志/游标重启、失败重试、游标与状态原子提交、重复 ProbeID、陈旧 revision 及新压力清理用例）；Windows 本机编译、Linux amd64 全生产 tags vet 与链接通过。未引入 migration、扩大硬上限或旁路事务边界。当前实现要求可用的清理调度与已确认前缀：若每秒新增超过剩余空间、写连接长期被占用或消费者卡死，仍可能触发显式背压。单写管线参考吞吐不构成无条件接纳率承诺。
 
-S1 提交：ddb096b。S2 提交：efeaea8。各项当前状态以上方清单为准，尚未完成整体验收。
+S1 提交：ddb096b。S2 提交：efeaea8。此处记录该阶段验证，全部交付状态与整体验收见首部清单及文末。
 
 ## S3 测量计划
 
@@ -121,7 +121,7 @@ go tool pprof -top -alloc_space .tools/pool-performance/view-after.test.exe .too
 - 新增回归验证 defensive/owned 构造等价与输入脱离、响应不能修改快照、revision 的排序稳定性与内容覆盖、所有既有排序键/方向/已知值优先/稳定平局、ID 页偏移与空页、共享成员筛选，以及 Loader 空集合不扩大与不重复读取。
 - `TestNodeViewReusesManagedRowsWithinConsistentReadSnapshot` 在 managed 行读取后真实提交并发写入，再按旧名称事实查询，确认元数据/事实仍来自同一 WAL 读快照，且 ListNodes 调用数为 0。
 - Windows 本机编译、Linux amd64 全生产 tags vet 与链接均通过；无新依赖、migration、Store 方法或前端代码变更。未执行 race（环境仍为 CGO_ENABLED=0 且无 C 编译器）。
-- 已同步 CONTROL-001 与子系统文档。当前 Go 生产代码 41,166 行、测试 24,503 行；版本留待全目标最后统一递增。S4/S5 与整体验收继续执行。
+- 已同步 CONTROL-001 与子系统文档。S3 时点 Go 生产代码 41,166 行、测试 24,503 行；该阶段版本尚未递增，后续结果见 S4/S5 与整体验收。
 
 ## S4 测量与设计
 
@@ -152,4 +152,119 @@ go tool pprof -top -alloc_space .tools/pool-performance/view-after.test.exe .too
 
 命令：`go test -p 1 ./internal/outbound/pool -run '^$' -bench '^Benchmark(Balance|TwoChoice)' -benchmem -count 3`；原始结果 `.tools/pool-performance/balance-before.txt`、`balance-after.txt`。首轮新增策略提交测试的手工 fixture 缺少 production 构造器会初始化的 runtimeByTag map，panic 后 defer Close 等锁；通过 15 秒隔离超时栈确认并补齐 fixture，未改生产生命周期代码来掩盖问题。修正后完整 pool/controlplane 包实际运行通过。
 
-S4 最终验证：前端 `npm run lint` / `npm run build` 通过后再执行 Go 检查；`go test -p 1 ./...` 全包通过、Windows 编译及 Linux amd64 全生产 tags vet/链接通过。Vite 保持既有大 chunk 提示。规格同步 RUNTIME-003，配置不新增字段和 migration。版本仍在全目标最后统一递增，S5 与最终验收继续执行。
+S4 最终验证：前端 `npm run lint` / `npm run build` 通过后再执行 Go 检查；`go test -p 1 ./...` 全包通过、Windows 编译及 Linux amd64 全生产 tags vet/链接通过。Vite 保持既有大 chunk 提示。规格同步 RUNTIME-003，配置不新增字段和 migration。该阶段版本尚未递增，后续结果见 S5 与最终验收。
+
+## S5 实验计划
+
+基线 3663506。增加显式 opt-in 的本地 TCP 实验：真实 HTTP CONNECT 客户端 → sing-box 基础池/分组监听 → 本地 HTTP CONNECT 上游 → TCP echo；校验每块 payload。覆盖 100/1000 个独立节点身份、1/8/32 组、每组 50%/100% 成员、1/16/64 个并发长连接。每个配置单独启动/关闭 manager，记录启动时间、资源 API 的 heap/GoMemory/RSS、活动连接、成员放大倍数、收发统计与有效 echo 吞吐；输出 JSON 与 heap/CPU profile 到忽略目录。
+
+输入仅使用 loopback 与合成凭据，不访问公网，不改变实际配置或数据库。实验程序、上游与负载发生器同在测试进程，因此 RSS 包含这些固定/随连接变化的成本；报告测量范围与噪声，不作生产容量承诺。通过强制实验 GC 的存活堆和 profile 识别放大项，再选取保持代际与排空语义的资源修复；另用池快照发布基准验证局部收益。
+
+### S5 发现与修复选择
+
+完整七场景已在临时 SQLite 上跑通，节点、分组、合成已缓存诊断与管理会话均通过正常 store/API；初检保持原有 optimistic 语义，没有把诊断写成路由健康。每场景 3 秒、32 KiB payload，逐块校验。100 节点全重叠从 1/8/32 组时，空闲存活堆约 3.55/7.48/19.27 MB；1000 节点 8 组约 37.46 MB，确认成员与实例数的线性放大。这里 MB 是十进制原始字节的近似，完整结果后续按 MiB 展示。
+
+1000 节点、8 组 heap profile 中，独立 dialer 约占存活样本 22.5%；另外有构建选项、pool 成员/策略、预留 timeline、DNS 缓存和分组状态。累计分配中 YAML emitter 约占 13%，来自保存分组应用指纹；数据传输 CPU 样本主要落在 Windows I/O/调度，不在选路算法。
+
+本批选取三项不改变资源归属的修复：
+
+1. pool 快照不为没有 UDP 的池预分配整张 UDP 索引；当网络候选顺序相同，共用当前快照内的只读切片/索引，全部可用时与 allMembers 共用只读列表。每次发布仍有独立快照数据，不跨版本复用可变容器。
+2. monitor 注册新节点不立即预分配 20 条 timeline，首次实际事件才按原上限分配，避免大量未使用/备用节点承担完整历史缓冲。迁移仍保留已有历史。
+3. 分组 appliedFingerprint 不保存包含全体成员的 YAML 文本。显式提取原 YAML 包含的五个连接字段和外层策略，使用 canonical JSON 后计算 SHA-256，只保留 64 字符摘要；空 refill 规范化为 nil。YAML emitter 本身分配很高，故没有仅把 YAML 输出接到哈希器。地区/标签等原 yaml:"-" 元数据仍通过统一成员判定影响成员集合，不直接变成连接字段。
+
+暂不跨组共享 outbound：HTTP 实验下可见 dialer 重复成本，但单纯把同一实例塞进多个 box 会破坏每 box manager 的 Close/Remove 归属、路由/DNS context 和代际排空；现有共享 sharedMemberState 仅共享计数/历史，不是 outbound 所有权协议。共享需要独立的中心 runtime owner、租约/引用与跨 box 关闭协议，不能用当前快照引用直接代替。保留独立分组/增量更新的边界，先消除已确认的无效容器与文本保留；此结论不宣称所有协议的 dialer 成本都与 HTTP 相同。
+
+### S5 局部基准
+
+环境同前；修改前 3663506 与修改后在同一机器顺序运行，默认校准、`-benchmem -count 3`，取中位数：
+
+| 10000 节点阶段 | 修改前 → 后 ns/op | 修改前 → 后 B/op | 修改前 → 后 allocs/op |
+| --- | --- | --- | --- |
+| TCP 快照发布 | 842960 → 378879 | 1589683 → 377696 | 140 → 36 |
+| 双协议快照发布 | 1010720 → 379142 | 1900072 → 377696 | 158 → 36 |
+| 混合协议快照发布 | 851791 → 629137 | 1588776 → 982832 | 154 → 104 |
+| 空闲注册表构建 | 7709072 → 2403958 | 22745987 → 7385991 | 30164 → 20164 |
+| 分组应用指纹 | 36691268 → 9083061 | 102215270 → 20975265 | 160196 → 88 |
+
+TCP 快照分配减少约 76%，混合协议约 38%；注册表每个未发生事件的节点少预留 1536 B。分组指纹保留字节从 759237 B 变为 64 B，计算累计分配减少约 79.5%。摘要仍需暂时编码成员连接形态，不能据保留长度宣称计算只需常量内存。1k TCP 快照 154400 → 45360 B/op，空闲注册表 2312250 → 776243 B/op，分组指纹 9888075 → 1089103 B/op。
+
+命令与原始结果：
+
+```powershell
+$env:GOTMPDIR = (Resolve-Path .tools/pool-performance).Path
+go test -p 1 ./internal/outbound/pool ./internal/monitor ./internal/boxmgr -run '^$' -bench '^Benchmark(SnapshotPublication|RegistryIdleNodes|AppliedGroupFingerprint)$' -benchmem -count 3
+```
+
+`.tools/pool-performance/snapshot-before.txt`、`resource-before.txt`、`resource-after.txt`。回归覆盖不可变拓扑与旧版本索引、延迟排序的复制边界、可用性/协议/固定回退、首次 timeline 分配与有界迁移历史，以及指纹对连接/策略的敏感性和对非连接元数据的排除。
+
+### S5 真实连接矩阵与独立进程复测
+
+前后相同 harness、真实 SQLite、每场景 3 秒，矩阵均启用 heap/CPU 采样；全部 payload、活动连接数、最终归零和双向流量下界通过。MiB = 2^20 字节，吞吐只计算完成 echo 校验的单向 payload：
+
+| 节点 / 组 / 每组成员 / 连接 | 空闲堆 MiB 前 → 后 | RSS MiB 前 → 后 | echo MiB/s 前 → 后 |
+| --- | --- | --- | --- |
+| 100 / 1 / 100% / 1 | 3.39 → 3.25 | 37.18 → 36.38 | 588.9 → 584.5 |
+| 100 / 1 / 100% / 16 | 3.76 → 3.45 | 38.39 → 37.48 | 3602.4 → 3598.7 |
+| 100 / 8 / 100% / 16 | 7.13 → 6.91 | 43.42 → 42.44 | 3594.2 → 3601.4 |
+| 100 / 32 / 100% / 16 | 18.38 → 17.81 | 56.39 → 54.91 | 3560.0 → 3524.9 |
+| 100 / 8 / 50% / 16 | 6.07 → 5.88 | 55.71 → 51.44 | 3603.5 → 3569.8 |
+| 1000 / 8 / 100% / 16 | 35.73 → 33.15 | 101.08 → 89.89 | 3587.4 → 3589.8 |
+| 1000 / 8 / 100% / 64 | 35.61 → 33.16 | 102.31 → 90.83 | 4215.3 → 4200.1 |
+
+表内为完整矩阵各一次，顺序场景的 RSS 包含前序高水位影响，不能横向解释成成员越少 RSS 必然越低。随后只选 `n1000-g8-p100-c16`，关闭 profile，用前后测试二进制各启动 3 个独立进程，中位数：空闲堆 35.77 → 33.18 MiB（约 -7.2%），RSS 96.20 → 85.16 MiB（约 -11.5%），持有连接堆 38.51 → 35.69 MiB，启动 742 → 716 ms，echo 3642.0 → 3614.6 MiB/s。RSS/堆收益在重复中方向一致；吞吐差异在此短测试的波动范围内，未证明端到端吞吐提升，也未作统计显著性结论。
+
+代码与环境变量见 [性能观测文档](../../../docs/performance.md)。前后编译相同新增 harness（修改生产代码前保留 before 二进制），命令：
+
+```powershell
+$env:EASY_PROXIES_SCALE_EXPERIMENT = '1'
+$env:EASY_PROXIES_SCALE_SECONDS = '3'
+$env:EASY_PROXIES_SCALE_OUTPUT = Join-Path $env:GOTMPDIR 'scale-after.json'
+$env:EASY_PROXIES_SCALE_PROFILE_DIR = Join-Path $env:GOTMPDIR 'scale-after-profiles'
+go test -p 1 ./internal/boxmgr -run '^TestPoolScaleExperiment$' -v -count 1 -timeout 180s -o .tools/pool-performance/scale-after.test.exe
+# 独立进程复测时精确筛选单场景、清空 PROFILE_DIR，分别输出每次 JSON
+$env:EASY_PROXIES_SCALE_CASE = 'n1000-g8-p100-c16'
+$env:EASY_PROXIES_SCALE_PROFILE_DIR = ''
+& .tools/pool-performance/scale-after.test.exe '-test.run=^TestPoolScaleExperiment$' '-test.v=true' '-test.timeout=90s'
+```
+
+JSON/日志：`.tools/pool-performance/scale-before.*`、`scale-after.*`、`scale-fresh-{before,after}-{1,2,3}.{json,txt}`；profile 在 `scale-{before,after}-profiles/`。PowerShell 直接执行测试 exe 必须把含点的 testing 参数作为完整字符串，否则会被传成不存在的 `-test`；首次复测仅参数错误未运行实验，修正后六次全部通过。关闭负载时取消 context 主动关闭连接产生 Windows I/O abort 日志，负载有效期间的 I/O 错误仍使测试失败。
+
+最终复核修正实验期限：15 秒仅约束 CONNECT 握手，成功后清除该期限，负载退出由 context 关闭连接负责；否则允许的 30 秒场景会被握手期限提前打断。额外用 100 节点/1 组/1 连接运行 30 秒上界，原始结果保存为 `scale-duration-30.{json,txt}`。
+
+修改后 1k/8 组 heap 样本中独立 dialer 仍约 21.9%，builder、DNS 缓存、成员和分组状态继续占用资源；默认 heap 采样误差导致该 profile 总样本甚至略高于前态，故实际存活量用资源指标判断。CPU 1 秒样本以 Windows I/O 和调度为主；累计 alloc profile 包含启动及前序场景，不能当作该场景单次请求成本。下一步是否承担跨 box owner 改造，应由实际协议分布与线上 profile 决定。
+
+## 整体验收（2.2.17）
+
+原五项建议逐一闭环：
+
+| 原建议 | 结果与保留边界 |
+| --- | --- |
+| profile 与统一规模观测 | S1 默认关闭的认证本机 profile、资源 API；S5 真实本地 TCP 矩阵与重复进程测量。未测线上/公网容量。 |
+| 日志容量/保留与吞吐 | S2 75% 压力回收确认前缀、缺游标按 0、去除无用全游标读取；原子游标与慢消费者背压保留。 |
+| 查询事实/筛选成本与 SQL 下推 | S3 减少输入复制、分段 revision、复用同事务 managed 行与仅物化 ID 页；已评估暂不另写 SQL DSL，完整事实加载仍 O(N)。 |
+| 精确 balance 与近似策略 | S4 精确规则空闲早停、显式基础池 balance_p2c、并发/公平性及配置持久化回归；默认和分组白名单不变。 |
+| 多组重叠与共享数据面 | S5 量化资源，减少快照容器、闲置历史和指纹文本；明确独立 owner/租约未建立前不共享 outbound，保留排空边界。 |
+
+版本三处从 2.2.16 同步为 2.2.17；无新依赖、Store 方法或 migration（仍 111 个接口方法、v25）。核对源码实际行数：Go 生产 41254、测试 25357，前端 TS/TSX 10005；同步架构依赖图 boxmgr→jsonx、数据面/性能文档及 RUNTIME-001。首批 502e5eb、S1 ddb096b、S2 efeaea8、S3 eebb45e、S4 3663506；S5 源码、实验与最终记录在本次提交中。
+
+最终命令（顺序执行前端后 Go，全部退出码 0）：
+
+```powershell
+# frontend 目录
+npm run lint
+npm run build
+# 仓库根目录
+$env:GOTMPDIR = (Resolve-Path .tools/pool-performance).Path
+$env:CGO_ENABLED = '0'
+go test -p 1 ./...
+go build -o .tools/pool-performance/final-windows.exe ./cmd/easy_proxies
+$env:GOOS = 'linux'
+$env:GOARCH = 'amd64'
+go vet -tags 'with_utls with_quic with_grpc with_wireguard with_gvisor' ./...
+go build -trimpath -ldflags '-s -w' -tags 'with_utls with_quic with_grpc with_wireguard with_gvisor' -o .tools/pool-performance/final-linux-amd64 ./cmd/easy_proxies
+git diff --check
+```
+
+日志在 `.tools/pool-performance/final-{frontend-lint,frontend-build,go-test,windows-build,linux-vet,linux-build}.txt`。所有新增回归及原有启动/增量/回滚/组间隔离/退休排空链已纳入全量包测试；实验另有两轮完整矩阵和六次独立进程通过。Vite 仍提示既有大 chunk，不影响构建。自审对照 code-standards §L：未旁路统一谓词/节点加载/JSON 出口、未改锁与事件通知顺序、未修改健康归因，只有合成 fixture 凭据入库；二进制、真实配置、SQLite、profile 和原始日志均不提交。
+
+未执行 race：当前 CGO_ENABLED=0 且本机无 gcc/clang；已执行确定性并发与真实连接回归，不能替代 race 认证。Linux 已完成生产 tags 的 vet/链接，未在 Linux 上运行负载。短时 loopback 吞吐没有显著提升结论；线上不同协议与长时间运行容量需用已交付观测入口另行采样。本任务不包含推送、打 tag 或发布。

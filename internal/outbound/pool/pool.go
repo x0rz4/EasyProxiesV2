@@ -549,21 +549,21 @@ func (p *poolOutbound) publishSnapshotLocked(members []*memberState) *PoolSnapsh
 		version = previous.Version + 1
 	}
 	snapshot := &PoolSnapshot{
-		Version:     version,
-		mode:        p.mode,
-		allMembers:  append([]*MemberRef(nil), members...),
-		memberIndex: make(map[*MemberRef]int, len(members)),
-		tcpIndex:    make(map[*MemberRef]int, len(members)),
-		udpIndex:    make(map[*MemberRef]int, len(members)),
+		Version: version, mode: p.mode,
+		allMembers: append([]*MemberRef(nil), members...),
 	}
-	for _, member := range snapshot.allMembers {
+	snapshot.Members, snapshot.tcpMembers, snapshot.udpMembers = snapshot.allMembers, snapshot.allMembers, snapshot.allMembers
+	now := time.Now()
+	for index, member := range snapshot.allMembers {
 		ensureMemberRuntime(member)
 		member.runtime.snapshotRefs.Add(1)
-		if !p.memberAvailableForSnapshot(member, time.Now()) {
+		available := p.memberAvailableForSnapshot(member, now)
+		snapshot.Members = snapshotSubset(snapshot.Members, snapshot.allMembers, index, available)
+		if !available {
+			snapshot.tcpMembers = snapshotSubset(snapshot.tcpMembers, snapshot.allMembers, index, false)
+			snapshot.udpMembers = snapshotSubset(snapshot.udpMembers, snapshot.allMembers, index, false)
 			continue
 		}
-		snapshot.memberIndex[member] = len(snapshot.Members)
-		snapshot.Members = append(snapshot.Members, member)
 		// Tests and control-plane preparation may use metadata-only references.
 		// A published runtime member always has an outbound; treating a nil one as
 		// dual-stack here keeps snapshot construction side-effect free and lets
@@ -572,22 +572,21 @@ func (p *poolOutbound) publishSnapshotLocked(members []*memberState) *PoolSnapsh
 		if member.outbound != nil {
 			networks = member.outbound.Network()
 		}
-		if common.Contains(networks, N.NetworkTCP) {
-			snapshot.tcpMembers = append(snapshot.tcpMembers, member)
-		}
-		if common.Contains(networks, N.NetworkUDP) {
-			snapshot.udpMembers = append(snapshot.udpMembers, member)
-		}
+		snapshot.tcpMembers = snapshotSubset(snapshot.tcpMembers, snapshot.allMembers, index, available && common.Contains(networks, N.NetworkTCP))
+		snapshot.udpMembers = snapshotSubset(snapshot.udpMembers, snapshot.allMembers, index, available && common.Contains(networks, N.NetworkUDP))
 	}
 	if p.mode == modeLowestLatency {
+		// Sorting a network view must not reorder the topology it aliases.
+		snapshot.tcpMembers = slices.Clone(snapshot.tcpMembers)
+		snapshot.udpMembers = slices.Clone(snapshot.udpMembers)
 		sort.SliceStable(snapshot.tcpMembers, func(i, j int) bool { return p.latencyMemberLess(snapshot.tcpMembers[i], snapshot.tcpMembers[j]) })
 		sort.SliceStable(snapshot.udpMembers, func(i, j int) bool { return p.latencyMemberLess(snapshot.udpMembers[i], snapshot.udpMembers[j]) })
 	}
-	for index, member := range snapshot.tcpMembers {
-		snapshot.tcpIndex[member] = index
-	}
-	for index, member := range snapshot.udpMembers {
-		snapshot.udpIndex[member] = index
+	snapshot.memberIndex = snapshotMemberIndex(snapshot.Members)
+	snapshot.tcpMembers, snapshot.tcpIndex = snapshotNetworkIndex(snapshot.tcpMembers, snapshot.Members, snapshot.memberIndex)
+	snapshot.udpMembers, snapshot.udpIndex = snapshotNetworkIndex(snapshot.udpMembers, snapshot.tcpMembers, snapshot.tcpIndex)
+	if slices.Equal(snapshot.udpMembers, snapshot.Members) {
+		snapshot.udpMembers, snapshot.udpIndex = snapshot.Members, snapshot.memberIndex
 	}
 	snapshot.accepting.Store(true)
 	if previous != nil {
@@ -601,6 +600,39 @@ func (p *poolOutbound) publishSnapshotLocked(members []*memberState) *PoolSnapsh
 		p.logger.Info("published pool snapshot v", snapshot.Version, " with ", len(snapshot.Members), "/", len(snapshot.allMembers), " available members")
 	}
 	return snapshot
+}
+
+// A subset shares the immutable topology until its first exclusion. Empty
+// networks allocate nothing, and an all-eligible network needs no extra slice.
+func snapshotSubset(current, all []*MemberRef, index int, keep bool) []*MemberRef {
+	if sameCandidateSlice(current, all) {
+		if keep {
+			return current
+		}
+		return append([]*MemberRef(nil), all[:index]...)
+	}
+	if keep {
+		return append(current, all[index])
+	}
+	return current
+}
+
+func snapshotMemberIndex(members []*MemberRef) map[*MemberRef]int {
+	if len(members) == 0 {
+		return nil
+	}
+	index := make(map[*MemberRef]int, len(members))
+	for i, member := range members {
+		index[member] = i
+	}
+	return index
+}
+
+func snapshotNetworkIndex(members, existing []*MemberRef, index map[*MemberRef]int) ([]*MemberRef, map[*MemberRef]int) {
+	if slices.Equal(members, existing) {
+		return existing, index
+	}
+	return members, snapshotMemberIndex(members)
 }
 
 func (p *poolOutbound) memberAvailableForSnapshot(member *MemberRef, now time.Time) bool {

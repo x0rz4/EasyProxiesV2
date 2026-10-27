@@ -3,6 +3,7 @@ package boxmgr
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log"
@@ -22,6 +23,7 @@ import (
 	"easy_proxies/internal/group"
 	"easy_proxies/internal/groupmember"
 	"easy_proxies/internal/httpapi"
+	"easy_proxies/internal/jsonx"
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/netx"
 	"easy_proxies/internal/nodecodec"
@@ -649,6 +651,22 @@ func groupMemberRuntimeShape(cfg *config.Config, groupCfg config.GroupPoolConfig
 }
 
 func groupAppliedFingerprint(cfg *config.Config, groupCfg config.GroupPoolConfig) string {
+	// Match the connection fields the old YAML fingerprint encoded. Runtime
+	// IDs, location, identity caches and tags were yaml:"-" and stay excluded;
+	// membership is still resolved by the shared predicate before fingerprinting.
+	type connectionShape struct {
+		Name, URI          string
+		Port               uint16
+		Username, Password string
+	}
+	var members []connectionShape
+	for _, member := range groupMemberNodes(cfg, groupCfg) {
+		members = append(members, connectionShape{member.Name, member.URI, member.Port, member.Username, member.Password})
+	}
+	healing := groupCfg.HealPolicy
+	if len(healing.Refill) == 0 {
+		healing.Refill = nil
+	}
 	shape := struct {
 		Enabled        bool
 		BindAddress    string
@@ -662,15 +680,15 @@ func groupAppliedFingerprint(cfg *config.Config, groupCfg config.GroupPoolConfig
 		HealthInterval time.Duration
 		Preferred      int64
 		SkipCertVerify bool
-		Members        []config.NodeConfig
+		Members        []connectionShape
 		Healing        group.HealPolicy
 		Recovery       group.RecoveryPolicy
 	}{groupCfg.Enabled, groupCfg.BindAddress, groupCfg.BindPort, groupCfg.Protocol, groupCfg.Username, groupCfg.Password,
 		groupCfg.DispatchMode, groupCfg.FailureWindow, groupCfg.FailureThreshold, groupCfg.HealthCheckInterval,
-		groupCfg.CurrentActiveNodeID, cfg != nil && cfg.SkipCertVerify, groupMemberRuntimeShape(cfg, groupCfg), groupCfg.HealPolicy,
+		groupCfg.CurrentActiveNodeID, cfg != nil && cfg.SkipCertVerify, members, healing,
 		group.RecoveryPolicy{Enabled: groupCfg.RecoveryEnabled, SuccessThreshold: groupCfg.RecoverySuccessThreshold, Cooldown: groupCfg.RecoveryCooldown}}
-	encoded, _ := yaml.Marshal(shape)
-	return string(encoded)
+	encoded, _ := jsonx.MarshalCanonical(shape)
+	return fmt.Sprintf("%x", sha256.Sum256(encoded))
 }
 
 func groupListenerEqual(before, after *store.GroupPool) bool {

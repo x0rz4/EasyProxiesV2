@@ -46,3 +46,33 @@ go test ./internal/outbound/pool -run '^$' -bench '^Benchmark(Balance|TwoChoice)
 基准只包含选路和（并发版本的）活动计数，不包含协议握手、网络或带宽；RunParallel 的 ns/op 是总吞吐的倒数，不能当作单连接延迟。公平性回归使用固定种子的随机字，生产随机来自并发安全的标准库顶层函数。
 
 当前路由与访问控制、CPU 取消/关闭/并发、RSS 读取、分组重叠计数及 `go tool pprof -top` 解析由同包回归覆盖。可复现实验和具体规模结果记录在 `plane/changes/pool-memory-throughput/followup.md`；功能通过不代表特定生产机器的吞吐或内存容量已获认证。
+
+## 本地转发与分组规模实验
+
+`internal/boxmgr/scale_experiment_test.go` 提供显式 opt-in 实验，平常测试跳过。真实 HTTP CONNECT 客户端经基础池/分组监听和本地 CONNECT 上游到达 echo，32 KiB 块逐块校验；临时 SQLite 通过正常 store 创建节点/组和合成缓存诊断，启动不访问公网。覆盖 100/1000 节点、1/8/32 组、50%/100% 成员和 1/16/64 条连接的七个场景，校验活动连接及关闭后的计数与流量。
+
+在仓库根目录执行；前端构建必须先完成：
+
+```powershell
+New-Item -ItemType Directory -Force .tools/pool-performance | Out-Null
+$env:GOTMPDIR = (Resolve-Path .tools/pool-performance).Path
+$env:EASY_PROXIES_SCALE_EXPERIMENT = '1'
+$env:EASY_PROXIES_SCALE_OUTPUT = Join-Path $env:GOTMPDIR 'scale.json'
+$env:EASY_PROXIES_SCALE_SECONDS = '3' # 每场景 1..30 秒，默认 3
+$env:EASY_PROXIES_SCALE_PROFILE_DIR = Join-Path $env:GOTMPDIR 'scale-profiles' # 可选
+# 可选精确场景名；不设置则运行全部七项
+$env:EASY_PROXIES_SCALE_CASE = 'n1000-g8-p100-c16'
+go test -p 1 ./internal/boxmgr -run '^TestPoolScaleExperiment$' -v -count 1 -timeout 180s
+Remove-Item Env:EASY_PROXIES_SCALE_EXPERIMENT
+Remove-Item Env:EASY_PROXIES_SCALE_CASE
+```
+
+输出 JSON 包含启动时间、实例/成员、空闲/持有连接/关闭后的 heap、GoMemory、RSS、goroutine、流量和有效 echo MiB/s。profile 通过真实本机认证接口保存 heap 和负载中的 1 秒 CPU；会自动启用该实验管理服务器的 profile。输出文件保持在忽略目录；输入只有合成凭据，不使用实际配置/数据库。
+
+负载发生器、echo、SQLite 和代理同进程，内存与 CPU 也包含它们；每场景取堆指标前显式 GC，仅用于实验。吞吐表示校验成功的单向 payload 字节率，echo 还产生等量返回流量；不是公网带宽或独立服务进程容量。顺序矩阵的 RSS 会受前一场景预留页影响，比较时另用独立进程重复同一场景。默认采样率下 heap profile 有噪声，用资源指标和独立基准共同判断。冷启动计时不含建库/种子；短时间转发未验证长期稳定、其它协议或 Linux 实测性能。
+
+局部分配基准：
+
+```sh
+go test -p 1 ./internal/outbound/pool ./internal/monitor ./internal/boxmgr -run '^$' -bench '^Benchmark(SnapshotPublication|RegistryIdleNodes|AppliedGroupFingerprint)$' -benchmem -count 3
+```

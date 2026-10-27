@@ -213,13 +213,15 @@ SS 出站构建 MUST 将插件名 `obfs` 适配为 sing-box 内嵌的 `obfs-loca
 
 成员和容量变化 MUST 使用已有增量发布边界，先 ReconcileSilent 与 PrepareUpdate/Commit，快照可见后再 NotifyEvents；不得为了提升备用节点重启 base box/listener。备用 MUST 保留探测和恢复状态，已有连接不得仅因降为备用被关闭。真实流量失败可以进入 Runtime；成功诊断不能成为恢复依据。
 
+快照的拓扑和候选索引 MUST 在发布后保持只读。同一版本可共用内容、顺序相同的容器，但网络排序 MUST NOT 改写拓扑，新版本 MUST NOT 改写旧版本容器；TCP/UDP 与可用性筛选仍独立生效。
+
 ### Scenario: 活动槽位变更时存在长连接
 
 - GIVEN 某成员正在传输且因容量策略转为 standby。
 - WHEN 发布新活动选择。
 - THEN 新选路使用新快照，原连接继续；组状态迁移与通知顺序可解释。
 
-代码：`internal/group/runtime.go`、`internal/outbound/pool`、`internal/boxmgr/healer.go`。已有测试：`TestCapacitySelectionPreservesSlotsAndExplicitEmpty`、`TestStandbyRecoveryPreservesStreakAcrossCapacityChange`、`TestHealingPromotesStandbyWithoutRestartingBoxes`。
+代码：`internal/group/runtime.go`、`internal/outbound/pool/pool.go`、`internal/boxmgr/healer.go`。已有测试：`TestCapacitySelectionPreservesSlotsAndExplicitEmpty`、`TestStandbyRecoveryPreservesStreakAcrossCapacityChange`、`TestHealingPromotesStandbyWithoutRestartingBoxes`、`TestSnapshotNetworkOrderingDoesNotMutateTopologyOrOlderIndexes`、`TestSnapshotSubsetsPreserveAvailabilityAndProtocolIndexes`。
 
 ## ADDED Requirement RUNTIME-002：连接仅保留选中运行时引用
 

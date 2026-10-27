@@ -114,7 +114,6 @@ func (r *nodeRegistry) register(info NodeInfo) *entry {
 	if item == nil {
 		item = &entry{
 			info:         info,
-			timeline:     make([]TimelineEvent, 0, maxTimelineSize),
 			healthSource: "none",
 			reloadGen:    r.reload,
 			onTimeline:   r.manager.publishDebugLog,
@@ -164,7 +163,7 @@ func (r *nodeRegistry) migrate(nodeID int64, info NodeInfo) *entry {
 		item.mu.RUnlock()
 		delete(r.byTag, oldTag)
 	} else {
-		item = &entry{timeline: make([]TimelineEvent, 0, maxTimelineSize), healthSource: "none", onTimeline: r.manager.publishDebugLog}
+		item = &entry{healthSource: "none", onTimeline: r.manager.publishDebugLog}
 	}
 	item.mu.Lock()
 	identityChanged := false
