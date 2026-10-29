@@ -8,6 +8,7 @@
 
 | 文档 | 用途与状态 |
 | --- | --- |
+| [启动探测 CI 时间隔离](changes/probe-startup-ci-timing.md) | 15 ms 实时间夹具的调度不确定性、虚拟时间与失败清理回归 |
 | [架构合理性与性能复核](changes/architecture-review-2026-10-28.md) | 单机形态取舍、内存/吞吐瓶颈、已实施结果和后续优先级 |
 | [前端合理性、安全与性能审计](changes/frontend-audit/plan.md) | 依赖、会话/缓存、按需加载、流式资源、表单与移动/键盘验证 |
 | [池性能审计后续评估与修复](changes/pool-memory-throughput/followup.md) | 原五项后续建议、测量入口、内存/吞吐优化与逐项验收进度 |
