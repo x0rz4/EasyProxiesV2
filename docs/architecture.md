@@ -4,7 +4,7 @@
 > 权威行为契约见 [plane/specs/proxy-pool/spec.md](../plane/specs/proxy-pool/spec.md)（MUST/场景）；
 > 变更提案与历史见 [plane/](../plane/)。本文件只讲"现在是怎么搭的"，不写"应该怎么改"。
 >
-> 基线核对：v2.2.19，migration 至 v25，`internal/` + `cmd/` 约 **41.3k** 行非测试代码、约 **25.9k** 行测试，
+> 基线核对：v2.2.20，migration 至 v25，`internal/` + `cmd/` 约 **41.3k** 行非测试代码、约 **25.9k** 行测试，
 > 前端 `frontend/src` 约 **10.1k** 行 TS/TSX。核对日期 2026-10-29。
 
 ## 1. 一句话说清这个系统
@@ -18,7 +18,7 @@
 | 层 | 技术 |
 | --- | --- |
 | 后端 | Go 1.27（`go.mod`: `go 1.27.0` + `toolchain go1.27.1`）、标准库 `net/http`（Go 1.22+ `ServeMux`） |
-| sing-box | `github.com/sagernet/sing-box v1.13.x` + `sing`、`sing-tun`、`sing-quic`、`sing-vmess`，按可选 tags 编译 |
+| sing-box | `github.com/sagernet/sing-box v1.13.21` + `sing`、`sing-tun`、`sing-quic`、`sing-vmess`，按可选 tags 编译 |
 | 存储 | SQLite（`modernc.org/sqlite`，**纯 Go，CGO_ENABLED=0 可交叉编译**）+ 手写 migration |
 | JSON | 统一走 `internal/jsonx`（默认 Sonic；需要确定性字节序时用 `MarshalCanonical`） |
 | GeoIP | `oschwald/geoip2-golang/v2`（mmdb 首次启动自动下载，可热更新） |

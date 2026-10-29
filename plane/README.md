@@ -8,6 +8,7 @@
 
 | 文档 | 用途与状态 |
 | --- | --- |
+| [sing-box 1.13.21 升级](changes/sing-box-1.13.21.md) | 精确依赖升级、兼容钉版及生产 tags 验证 |
 | [启动探测 CI 时间隔离](changes/probe-startup-ci-timing.md) | 15 ms 实时间夹具的调度不确定性、虚拟时间与失败清理回归 |
 | [架构合理性与性能复核](changes/architecture-review-2026-10-28.md) | 单机形态取舍、内存/吞吐瓶颈、已实施结果和后续优先级 |
 | [前端合理性、安全与性能审计](changes/frontend-audit/plan.md) | 依赖、会话/缓存、按需加载、流式资源、表单与移动/键盘验证 |

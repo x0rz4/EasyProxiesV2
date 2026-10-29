@@ -8,11 +8,12 @@ require (
 	github.com/bytedance/sonic v1.15.4
 	github.com/oschwald/geoip2-golang/v2 v2.2.0
 	github.com/sagernet/sing v0.8.14
-	github.com/sagernet/sing-box v1.13.19
+	github.com/sagernet/sing-box v1.13.21
 	github.com/tailscale/hujson v0.0.0-20260718110524-10d7940d4c87
 	go.yaml.in/yaml/v3 v3.0.5
 	golang.org/x/net v0.50.0
 	golang.org/x/sync v0.22.0
+	golang.org/x/sys v0.47.0
 	golang.org/x/text v0.35.0
 	modernc.org/sqlite v1.52.0
 )
@@ -44,7 +45,6 @@ require (
 	github.com/gaissmai/bart v0.18.0 // indirect
 	github.com/go-chi/chi/v5 v5.2.5 // indirect
 	github.com/go-chi/render v1.0.3 // indirect
-	github.com/go-json-experiment/json v0.0.0-20250813024750-ebf49471dced // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/gobwas/httphead v0.1.0 // indirect
 	github.com/gobwas/pool v0.2.1 // indirect
@@ -122,14 +122,14 @@ require (
 	github.com/sagernet/nftables v0.3.0-mod.2 // indirect
 	github.com/sagernet/quic-go v0.59.0-sing-box-mod.4 // indirect
 	github.com/sagernet/sing-mux v0.3.5 // indirect
-	github.com/sagernet/sing-quic v0.6.4-0.20260803041914-d83826c306d7 // indirect
+	github.com/sagernet/sing-quic v0.6.5 // indirect
 	github.com/sagernet/sing-shadowsocks v0.2.8 // indirect
 	github.com/sagernet/sing-shadowsocks2 v0.2.1 // indirect
 	github.com/sagernet/sing-shadowtls v0.2.1 // indirect
-	github.com/sagernet/sing-tun v0.8.12-0.20260810140523-7c73233bd0fb // indirect
+	github.com/sagernet/sing-tun v0.8.15 // indirect
 	github.com/sagernet/sing-vmess v0.2.8-0.20250909125414-3aed155119a1 // indirect
 	github.com/sagernet/smux v1.5.50-sing-box-mod.1 // indirect
-	github.com/sagernet/tailscale v1.92.4-sing-box-1.13-mod.9 // indirect
+	github.com/sagernet/tailscale v1.92.4-sing-box-1.13-mod.10 // indirect
 	github.com/sagernet/wireguard-go v0.0.4 // indirect
 	github.com/sagernet/ws v0.0.0-20231204124109-acfe8907c854 // indirect
 	github.com/tailscale/certstore v0.1.1-0.20231202035212-d3fa0460f47e // indirect
@@ -157,7 +157,6 @@ require (
 	golang.org/x/exp v0.0.0-20251219203646-944ab1f22d93 // indirect
 	golang.org/x/mod v0.34.0 // indirect
 	golang.org/x/oauth2 v0.34.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/term v0.45.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
 	golang.org/x/tools v0.42.0 // indirect
